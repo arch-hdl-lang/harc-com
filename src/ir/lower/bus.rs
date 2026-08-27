@@ -10,14 +10,13 @@
 //!   dance inline — so they lower structurally to `DutWrite` /
 //!   `DutRead` / budget-loop blocks. Placement sees exactly what they
 //!   are: cycle-anchored Tier-0 pin work.
-//! * **`tlm_method` calls stay call edges.** A blocking method call
+//! * **`tlm_method` calls retain protocol seams.** A blocking method call
 //!   lowers to `Assign(dest, Expr::Call(CallTarget::TransactorMethod
-//!   { bus_field, method }, args))` and is NEVER inlined at the IR
-//!   level — the sequence→transactor boundary is the Tier-1/Tier-0
-//!   placement cut (docs/tb-ir-design.md §CallTarget), and the
-//!   verifier enforces the seam (top-of-Assign-RHS position only,
-//!   Run/Check functions only). Backends expand the edge themselves;
-//!   the tbir backend mirrors v1's req/rsp wire protocol.
+//!   { bus_field, method }, args))` and is NEVER inlined at the IR level.
+//!   A direct `out_of_order` call lowers to an adjacent tagged `TlmFork` /
+//!   one-entry `TlmJoinAll`, reusing the existing asynchronous protocol seam
+//!   synchronously. Placement and the verifier enforce both shapes; backends
+//!   expand their req/rsp wire protocols.
 
 use super::{not_implemented, FuncBuilder, LowerError, V1Status};
 use crate::ast::{
@@ -382,7 +381,7 @@ impl FuncBuilder<'_> {
                     )));
                 };
                 let bind = id.name.clone();
-                self.lower_tlm_method_call(&bind, &m, args, dest)?;
+                self.lower_tlm_method_call(e, &bind, &m, args, dest)?;
                 return Ok(true);
             }
         }
@@ -518,19 +517,69 @@ impl FuncBuilder<'_> {
     /// trace events) is backend-owned; the IR carries only the edge.
     fn lower_tlm_method_call(
         &mut self,
+        call_expr: &AstExpr,
         bind: &str,
         m: &TlmMethod,
         args: &[CallArg],
         dest: BusCallDest<'_>,
     ) -> Result<(), LowerError> {
-        // The parser admits only `blocking` and `out_of_order tags N`, so
-        // this arm is reachable exactly for a *direct* (non-`fork`) call on
-        // an `out_of_order` method. v1 rejects that shape as well: "HARC
-        // direct-Verilator lowering currently supports only `blocking`
-        // tlm_method calls; `out_of_order` is parsed for ARCH compatibility
-        // but not lowered here". Verified by mutating `tlm_method_bus_test`
-        // one token (dropping `fork` from `let forked0 = fork
-        // mem.read_ooo(9)`); the control lowers in both backends.
+        // A direct OOO call is synchronous at the source level: issue one
+        // tagged request and immediately drain that same response. Reuse the
+        // fork/join lowering so the request handshake, tag routing, return
+        // typing, verifier seam, and backend protocol remain one contract.
+        if m.mode.name == "out_of_order" {
+            if self.concurrent_target_ooo_lanes {
+                return Err(not_implemented(
+                    &format!(
+                        "direct out_of_order call `{bind}.{}` inside a concurrently instanced \
+                         out_of_order target responder body",
+                        m.name.name
+                    ),
+                    "use an explicit downstream fork/join design with runtime-safe tag ownership, \
+                     or serve the front-side method as blocking",
+                    V1Status::Rejects,
+                ));
+            }
+            if self
+                .pending_tlm_forks
+                .iter()
+                .any(|pending| pending.bus_field == bind && pending.method == m.name.name)
+            {
+                return Err(LowerError::Invalid(format!(
+                    "direct call `{bind}.{}` cannot share an out_of_order method with pending forks; \
+                     join_all before the direct call",
+                    m.name.name
+                )));
+            }
+
+            // No request on this method remains outstanding, so tag 0 is
+            // reusable even after earlier direct calls. This also prevents a
+            // sequence of synchronous calls from walking beyond `tags N`.
+            let tag_key = (bind.to_string(), m.name.name.clone());
+            let saved_next_tag = self.next_tlm_fork_tag.insert(tag_key.clone(), 0);
+            let fork_expr = AstExpr::new(
+                ExprKind::ForkCall {
+                    call: call_expr.clone(),
+                },
+                call_expr.span,
+            );
+            let prior_pending = self.pending_tlm_forks.len();
+            let result = self.try_lower_tlm_fork_impl(&fork_expr, dest, false);
+            if let Some(next) = saved_next_tag {
+                self.next_tlm_fork_tag.insert(tag_key, next);
+            } else {
+                self.next_tlm_fork_tag.remove(&tag_key);
+            }
+            let lowered = result?;
+            debug_assert!(lowered, "synthetic direct OOO fork must resolve");
+            let direct = self
+                .pending_tlm_forks
+                .pop()
+                .expect("direct OOO lowering appended its descriptor");
+            debug_assert_eq!(self.pending_tlm_forks.len(), prior_pending);
+            self.push(Stmt::TlmJoinAll(vec![direct]));
+            return Ok(());
+        }
         if m.mode.name != "blocking" {
             return Err(not_implemented(
                 &format!("`{}` tlm_method calls", m.mode.name),
@@ -665,6 +714,18 @@ impl FuncBuilder<'_> {
         e: &AstExpr,
         dest: BusCallDest<'_>,
     ) -> Result<bool, LowerError> {
+        self.try_lower_tlm_fork_impl(e, dest, true)
+    }
+
+    /// Shared descriptor construction for a source `fork bus.m(...)` and the
+    /// synthetic issue half of a direct OOO call. `source_is_fork` affects
+    /// diagnostics only; both shapes intentionally share protocol lowering.
+    fn try_lower_tlm_fork_impl(
+        &mut self,
+        e: &AstExpr,
+        dest: BusCallDest<'_>,
+        source_is_fork: bool,
+    ) -> Result<bool, LowerError> {
         let ExprKind::ForkCall { call } = &*e.kind else {
             return Ok(false);
         };
@@ -752,8 +813,13 @@ impl FuncBuilder<'_> {
         }
         if m.ret.is_none() && !matches!(dest, BusCallDest::Discard) {
             return Err(LowerError::Invalid(format!(
-                "bus.{} returns no value; `fork` it as a statement",
-                m.name.name
+                "bus.{} returns no value; {}",
+                m.name.name,
+                if source_is_fork {
+                    "`fork` it as a statement"
+                } else {
+                    "use it as a statement"
+                }
             )));
         }
         // Request payload evaluates now (same cycle as the request, no
@@ -762,7 +828,11 @@ impl FuncBuilder<'_> {
         super::reject_misplaced_named_args(
             args,
             &declared,
-            &format!("a `fork bus.{}(...)` call", m.name.name),
+            &if source_is_fork {
+                format!("a `fork bus.{}(...)` call", m.name.name)
+            } else {
+                format!("a `bus.{}(...)` call", m.name.name)
+            },
         )?;
         let mut lowered = Vec::with_capacity(args.len());
         for (a, (aname, decl_ty)) in args.iter().zip(m.args.iter()) {
@@ -777,8 +847,10 @@ impl FuncBuilder<'_> {
                 self.ctx.reject_dynamic_list_record_wire(
                     record,
                     &format!(
-                        "record parameter `{}` of forked bus method `{}` crossing a TLM request wire",
-                        aname.name, m.name.name
+                        "record parameter `{}` of {} bus method `{}` crossing a TLM request wire",
+                        aname.name,
+                        if source_is_fork { "forked" } else { "direct" },
+                        m.name.name
                     ),
                 )?;
             }
@@ -786,8 +858,10 @@ impl FuncBuilder<'_> {
                 &v,
                 &want,
                 &format!(
-                    "parameter `{}` of forked bus method `{}`",
-                    aname.name, m.name.name
+                    "parameter `{}` of {} bus method `{}`",
+                    aname.name,
+                    if source_is_fork { "forked" } else { "direct" },
+                    m.name.name
                 ),
             )?;
             lowered.push(v);
@@ -800,7 +874,8 @@ impl FuncBuilder<'_> {
             self.ctx.reject_dynamic_list_record_wire(
                 record,
                 &format!(
-                    "record return from forked bus method `{}` crossing a TLM response wire",
+                    "record return from {} bus method `{}` crossing a TLM response wire",
+                    if source_is_fork { "forked" } else { "direct" },
                     m.name.name
                 ),
             )?;
@@ -855,6 +930,13 @@ impl FuncBuilder<'_> {
                  fork TLM calls before one `join_all`"
                     .to_string(),
             ));
+        }
+        // Tags name outstanding requests, not source locations. Once the
+        // barrier drains a tagged group, release its per-method allocator so
+        // the next group starts again within `0..tags N`.
+        for completed in pending.iter().filter(|call| call.tag.is_some()) {
+            self.next_tlm_fork_tag
+                .remove(&(completed.bus_field.clone(), completed.method.clone()));
         }
         self.push(Stmt::TlmJoinAll(pending));
         Ok(())
