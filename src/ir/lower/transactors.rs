@@ -519,7 +519,7 @@ pub(crate) fn lower_transactor(
     }
     for (h, active_only) in methods_ast {
         let mname = &h.name.name;
-        check_scalar_ty(tname, mname, "return type", h.return_ty.as_ref())?;
+        check_method_return_ty(tname, mname, "return type", h.return_ty.as_ref())?;
 
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
         let mut b = FuncBuilder::new(&method_ctx, helper_registry, side_tables);
@@ -1569,7 +1569,7 @@ fn lower_bound_initiator_transactor(
     }
     for (h, active_only) in methods_ast {
         let mname = &h.name.name;
-        check_scalar_ty(tname, mname, "return type", h.return_ty.as_ref())?;
+        check_method_return_ty(tname, mname, "return type", h.return_ty.as_ref())?;
 
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
         let mut b = FuncBuilder::new(&method_ctx, helper_registry, side_tables);
@@ -1988,12 +1988,9 @@ fn lower_state_field(
     })
 }
 
-/// Method returns and TLM bus-target args must be scalar (bool / uint /
-/// sint) and at most 64 bits wide — the tbir value model is `uint64_t`.
-/// v1 lowers wider widths through `_harc_u128` / `VlWide`; this slice
-/// only mirrors that for *active-method value params* (see
-/// [`check_method_param_ty`]), so every other site stays ≤64 bits. The
-/// rejection names the offending site.
+/// TLM bus-target args and returns must be scalar (bool / uint / sint) and at
+/// most 64 bits wide because their wire protocol is 64-bit. Active transactor
+/// method params and returns use their separate exact-width gates below.
 fn check_scalar_ty(
     tname: &str,
     mname: &str,
@@ -2012,6 +2009,19 @@ fn check_scalar_ty(
 /// applies here (`u32::MAX` = effectively unbounded). Non-scalar param types
 /// are still rejected precisely.
 fn check_method_param_ty(
+    tname: &str,
+    mname: &str,
+    what: &str,
+    ty: Option<&TypeExpr>,
+) -> Result<(), LowerError> {
+    check_scalar_ty_max(tname, mname, what, ty, u32::MAX)
+}
+
+/// Active-method scalar return values use the same exact-width C++ ABI as
+/// active-method parameters. The return slot, method schema, call destination,
+/// and emitted `std::function` all carry this `IrType`, so widths above 64 bits
+/// must not be rejected at the declaration gate.
+fn check_method_return_ty(
     tname: &str,
     mname: &str,
     what: &str,

@@ -105,6 +105,9 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Record-leaf fixed-vector event payloads, including recursively nested
   vectors, with resolved record IDs carried through schemas, handlers, emits,
   connects, verifier checks, and C++ callback signatures.
+- [x] Wide scalar transactor method returns, retaining the declared signedness
+  and width through return slots, method schemas, call destinations, sibling
+  calls, and exact `_harc_u128`/`HarcWide<N>` C++ signatures.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -332,6 +335,8 @@ not applicable before requesting review:
    Nested scalar and record-leaf fixed-vector event payloads similarly route
    around the shared non-scalar event constructor. The current raw inventory
    remains 119 textual matches (118 constructors plus the helper definition).
+   Wide scalar transactor returns route around the shared width diagnostic, so
+   this slice also leaves that raw inventory unchanged.
    The scoreboard source families did not remove constructors because
    unsupported non-scalar fields share it. Nested bus expressions and sized
    cover widths were also reclassified because v1 rejects or silently
