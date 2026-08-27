@@ -1000,6 +1000,53 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                         ),
                     });
                 }
+                let function_ret = function
+                    .ret
+                    .and_then(|ret| function.locals.get(ret.index()))
+                    .map(|local| local.ty.clone());
+                if method.has_ret != method.ret_ty.is_some() {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "component c{ci} `{}` method `{}` has_ret={} disagrees with return schema {:?}",
+                            component.name,
+                            method.name,
+                            method.has_ret,
+                            method.ret_ty,
+                        ),
+                    });
+                }
+                let materialized_return = matches!(
+                    method.ret_ty,
+                    Some(
+                        IrType::Record(_)
+                            | IrType::FixedVec { .. }
+                            | IrType::UInt(_)
+                            | IrType::SInt(_)
+                            | IrType::Bool
+                    )
+                );
+                if materialized_return && method.ret_ty != function_ret {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "component c{ci} `{}` method `{}` return schema {:?} disagrees with fn{} return {:?}",
+                            component.name,
+                            method.name,
+                            method.ret_ty,
+                            method.function.0,
+                            function_ret
+                        ),
+                    });
+                }
+                if let Some(ty @ IrType::FixedVec { .. }) = &method.ret_ty {
+                    if !component_fixed_vec_elem_valid(ty, prog.records.len()) {
+                        errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "component c{ci} `{}` method `{}` has invalid fixed-vector return schema {ty:?}",
+                                component.name, method.name
+                            ),
+                        });
+                    }
+                }
             }
         }
         for edge in &component.connects {
@@ -3933,6 +3980,12 @@ impl Checker<'_> {
         match vec_shape? {
             Some((len, elem)) => Ok(Some(WholeCollectionShape::FixedVec(len, elem))),
             None => match ty {
+                Some(IrType::FixedVec { elem, len }) => {
+                    crate::codegen::cpp_tb::ir_vec_elem_class(&elem)
+                        .map(|class| WholeCollectionShape::FixedVec(len, class))
+                        .map(Some)
+                        .ok_or_else(|| "fixed vector has an invalid element type".to_string())
+                }
                 Some(IrType::Seq(elem)) => crate::codegen::cpp_tb::ir_vec_elem_class(&elem)
                     .map(WholeCollectionShape::DynamicSeq)
                     .map(Some)
@@ -4031,7 +4084,27 @@ impl Checker<'_> {
                         self.check_tseq_call(*l, name, args);
                         continue;
                     }
-                    self.check_expr(e, false, "Assign value");
+                    let fixed_vec_dest = self
+                        .func
+                        .locals
+                        .get(l.index())
+                        .and_then(|local| match &local.ty {
+                            IrType::FixedVec { elem, len } => {
+                                crate::codegen::cpp_tb::ir_vec_elem_class(elem)
+                                    .map(|class| (*len, class))
+                            }
+                            _ => None,
+                        });
+                    if let Some(shape) = fixed_vec_dest {
+                        self.check_whole_vec_write_value(
+                            Ok(Some(shape)),
+                            self.func.locals.get(l.index()).map(|local| local.ty.clone()),
+                            e,
+                            "Assign value",
+                        );
+                    } else {
+                        self.check_expr(e, false, "Assign value");
+                    }
                     // Invariant 15.
                     if self.func.locals.get(l.index()).is_some() {
                         let expected = &self.func.local(*l).ty;
@@ -5131,6 +5204,31 @@ impl Checker<'_> {
                                         actual
                                     ),
                                 });
+                            }
+                        }
+                        if let Some(d) = dest {
+                            let actual = self.func.locals.get(d.index()).map(|local| &local.ty);
+                            match (&schema.ret_ty, actual) {
+                                (Some(expected), Some(IrType::Unknown))
+                                    if !matches!(expected, IrType::FixedVec { .. }) => {}
+                                (Some(expected), Some(actual))
+                                    if !matches!(actual, IrType::Unknown)
+                                        && assign_compatible(actual, expected) => {}
+                                (Some(expected), Some(actual)) => {
+                                    self.errs.push(VerifyError::BadProgramRef {
+                                        what: format!(
+                                            "fn{} b{} ComponentCall `{method}` returns {expected:?}, but destination is {actual:?}",
+                                            self.fid.0, self.bid.0
+                                        ),
+                                    });
+                                }
+                                (None, _) => self.errs.push(VerifyError::BadProgramRef {
+                                    what: format!(
+                                        "fn{} b{} void ComponentCall `{method}` captured into a destination",
+                                        self.fid.0, self.bid.0
+                                    ),
+                                }),
+                                _ => {}
                             }
                         }
                     }

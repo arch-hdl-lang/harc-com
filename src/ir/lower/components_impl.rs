@@ -806,7 +806,7 @@ pub(crate) fn lower_component_schema(
                     let ret_ty = h
                         .return_ty
                         .as_ref()
-                        .map(|t| method_schema_ir_type(Some(t), ids, record_ids, false));
+                        .map(|t| method_schema_ir_type(Some(t), ids, record_ids, true));
                     let fid = FunctionId(*next_fn);
                     *next_fn += 1;
                     methods.push(ComponentMethodSchema {
@@ -2399,7 +2399,7 @@ fn lower_method_body(
         // few lines up use, so a parameter and a return spelled with the
         // same type can no longer disagree.
         //
-        // RECORD and SCALAR only. `method_param_ir_type` also resolves
+        // RECORD, fixed-vector, and SCALAR only. `method_param_ir_type` also resolves
         // `TSeq<T>` and component-typed spellings, but the method
         // emitter maps both of those returns to `uint64_t` and no
         // fixture returns one — typing the slot without teaching the
@@ -2409,7 +2409,11 @@ fn lower_method_body(
         // have; issue #642 lists expanding unrelated features as a
         // non-goal.
         match method_param_ir_type(Some(rt), ctx) {
-            ty @ (IrType::Record(_) | IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) => {
+            ty @ (IrType::Record(_)
+            | IrType::FixedVec { .. }
+            | IrType::UInt(_)
+            | IrType::SInt(_)
+            | IrType::Bool) => {
                 b.set_local_type(ret, ty)
             }
             _ => {}
