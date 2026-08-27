@@ -2084,14 +2084,23 @@ fn emit_stmt(
             let recv = super::expr::resolve_state_instance(cx, instance)?;
             let e = expr_cpp(cx, value)?;
             let recv = format!("{recv}.{field}");
-            let dst = super::expr::record_access_cpp(
-                cx,
-                &recv,
-                &path[0],
-                &path[1..],
-                mid_indices,
-                index.as_ref(),
-            )?;
+            let dst = if path.is_empty() {
+                let Some(index) = index.as_ref() else {
+                    return Err(EmitError(format!(
+                        "tbir: fixed-vector state write `{field}` lacks an index"
+                    )));
+                };
+                format!("{recv}[{}]", expr_cpp(cx, index)?)
+            } else {
+                super::expr::record_access_cpp(
+                    cx,
+                    &recv,
+                    &path[0],
+                    &path[1..],
+                    mid_indices,
+                    index.as_ref(),
+                )?
+            };
             writeln!(out, "{pad}{dst} = {e};").ok();
         }
         // `pending.push(value)` on a bound-to target transactor `queue<T>`

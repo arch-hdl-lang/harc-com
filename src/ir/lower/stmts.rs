@@ -2492,6 +2492,33 @@ impl FuncBuilder<'_> {
         // state field: `target.read_count = 0` (scalar) or a whole-record
         // copy `target.last = <same-typed record>`.
         if let Some((instance, field)) = self.as_transactor_state(target) {
+            if let Some(crate::ir::StateFieldKind::FixedVec { ty }) = self
+                .ctx
+                .target_state
+                .get(&instance)
+                .and_then(|fields| fields.get(&field))
+            {
+                let IrType::FixedVec { elem, len } = ty else {
+                    unreachable!("fixed-vector state kind carries a fixed-vector type")
+                };
+                let shape = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
+                    .map(|class| (*len, class));
+                let e = match shape {
+                    Some(shape) => self.whole_vec_copy_rhs(shape, value)?,
+                    None => None,
+                };
+                let Some(e) = e else {
+                    return Err(LowerError::Invalid(format!(
+                        "`{instance}.{field}` requires a matching fixed-vector value"
+                    )));
+                };
+                self.push(Stmt::TransactorStateWrite {
+                    instance,
+                    field,
+                    value: e,
+                });
+                return Ok(());
+            }
             let e = self.lower_expr_no_ports(value)?;
             // The SAME record-type check the bare-name lane below makes,
             // which this lane did not. Without it `drv.rec = 5` lowered,
@@ -2513,6 +2540,18 @@ impl FuncBuilder<'_> {
                         self.ctx.records[rid.index()].name
                     )));
                 }
+            }
+            if let Some(crate::ir::StateFieldKind::Scalar { ty, .. }) = self
+                .ctx
+                .target_state
+                .get(&instance)
+                .and_then(|fields| fields.get(&field))
+            {
+                self.check_owner_scalar_field_write(
+                    &e,
+                    ty,
+                    &format!("transactor state field `{instance}.{field}`"),
+                )?;
             }
             if let Some(record) = self.target_state_record(&instance, &field) {
                 if self.record_id_of_expr(&e) != Some(record) {
@@ -3133,7 +3172,7 @@ impl FuncBuilder<'_> {
             // mutated via `.push`/`.pop` (rejected here).
             if let Some(kind) = self.target_state_fields.get(&id.name).cloned() {
                 match kind {
-                    crate::ir::StateFieldKind::Scalar { .. } => {
+                    crate::ir::StateFieldKind::Scalar { ty, .. } => {
                         let e = self.lower_expr_no_ports(value)?;
                         // The bare-name spelling of the write whose
                         // DOTTED spelling the mirror already guards.
@@ -3142,6 +3181,11 @@ impl FuncBuilder<'_> {
                         // guarded and the dotted one was not — but it
                         // is the same one-lane-checked-one-not shape.
                         self.reject_record_into_scalar(&e, &format!("state field `{}`", id.name))?;
+                        self.check_owner_scalar_field_write(
+                            &e,
+                            &ty,
+                            &format!("state field `{}`", id.name),
+                        )?;
                         self.push(Stmt::TransactorStateWrite {
                             instance: String::new(),
                             field: id.name.clone(),
@@ -3172,6 +3216,29 @@ impl FuncBuilder<'_> {
                                  fields individually (`<field>.<sub> = ...`)",
                             ));
                         }
+                        self.push(Stmt::TransactorStateWrite {
+                            instance: String::new(),
+                            field: id.name.clone(),
+                            value: e,
+                        });
+                        return Ok(());
+                    }
+                    crate::ir::StateFieldKind::FixedVec { ty } => {
+                        let IrType::FixedVec { elem, len } = &ty else {
+                            unreachable!("fixed-vector state kind carries a fixed-vector type")
+                        };
+                        let shape = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
+                            .map(|class| (*len, class));
+                        let e = match shape {
+                            Some(shape) => self.whole_vec_copy_rhs(shape, value)?,
+                            None => None,
+                        };
+                        let Some(e) = e else {
+                            return Err(LowerError::Invalid(format!(
+                                "state field `{}` requires a matching fixed-vector value",
+                                id.name
+                            )));
+                        };
                         self.push(Stmt::TransactorStateWrite {
                             instance: String::new(),
                             field: id.name.clone(),
@@ -3212,6 +3279,53 @@ impl FuncBuilder<'_> {
         // depth (`s.a.b[i] = v`). Resolve the field chain, then lower the
         // index and value into an indexed `RecordFieldWrite`.
         if let ExprKind::Index { target: it, index } = &*target.kind {
+            if let Some((instance, field, ty)) = self.as_transactor_state_fixed_vec(it) {
+                let IrType::FixedVec { elem, len } = ty else {
+                    unreachable!("fixed-vector state resolver returned another type")
+                };
+                if matches!(*elem, IrType::FixedVec { .. }) {
+                    return Err(not_implemented(
+                        &format!("nested fixed-vector state field `{field}` element write"),
+                        "select through every fixed-vector dimension",
+                        V1Status::EmitsUncompilable,
+                    ));
+                }
+                let index = self.lower_expr_no_ports(index)?;
+                super::exprs::check_literal_vec_index_bounds(&field, &index, len)?;
+                let value = self.lower_expr_no_ports(value)?;
+                match elem.as_ref() {
+                    IrType::Record(expected) => {
+                        if self.record_id_of_expr(&value) != Some(*expected) {
+                            return Err(self.record_assign_mismatch(
+                                &value,
+                                *expected,
+                                format!("element of fixed-vector state field `{field}`"),
+                                "assign a value of the vector's declared record element type",
+                            ));
+                        }
+                    }
+                    expected => {
+                        self.reject_record_into_scalar(
+                            &value,
+                            &format!("element of fixed-vector state field `{field}`"),
+                        )?;
+                        self.check_owner_scalar_field_write(
+                            &value,
+                            expected,
+                            &format!("element of fixed-vector state field `{field}`"),
+                        )?;
+                    }
+                }
+                self.push(Stmt::TransactorStateRecordFieldWrite {
+                    instance,
+                    field,
+                    path: Vec::new(),
+                    mid_indices: Vec::new(),
+                    index: Some(index),
+                    value,
+                });
+                return Ok(());
+            }
             if let Some(mut chain) = self.as_transactor_state_record_field(it)? {
                 if matches!(chain.leaf_ty, IrType::Seq(_)) {
                     let dotted = format!("{}.{}", chain.field, chain.path.join("."));

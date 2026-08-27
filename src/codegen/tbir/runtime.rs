@@ -330,6 +330,10 @@ fn emit_state_struct_body(
                 let rname = &records[record.index()].name;
                 writeln!(out, "{INDENT}{INDENT}{rname} {}{{}};", f.name).ok();
             }
+            crate::ir::StateFieldKind::FixedVec { ty } => {
+                let cty = super::aggregate_value_cty(ty, records);
+                writeln!(out, "{pad}{cty} {}{{}};", f.name).ok();
+            }
         }
     }
     // Activity stamps, mirroring v1's auto-injected component fields

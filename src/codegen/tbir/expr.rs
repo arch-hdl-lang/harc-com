@@ -326,14 +326,23 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             index,
         } => {
             let recv = format!("{}.{field}", resolve_state_instance(cx, instance)?);
-            record_access_cpp(
-                cx,
-                &recv,
-                &path[0],
-                &path[1..],
-                mid_indices,
-                index.as_deref(),
-            )?
+            if path.is_empty() {
+                let Some(index) = index.as_deref() else {
+                    return Err(EmitError(format!(
+                        "tbir: fixed-vector state access `{field}` lacks an index"
+                    )));
+                };
+                format!("{recv}[{}]", expr_cpp(cx, index)?)
+            } else {
+                record_access_cpp(
+                    cx,
+                    &recv,
+                    &path[0],
+                    &path[1..],
+                    mid_indices,
+                    index.as_deref(),
+                )?
+            }
         }
         // Bound-to target transactor `queue<T>` state field size/empty
         // read — a `harc_rt::HarcQueue<T>` member of the per-instance
@@ -1447,6 +1456,9 @@ pub(super) fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
                 crate::ir::StateFieldKind::Record { record } => {
                     record_path_type(cx, crate::ir::IrType::Record(record), path.iter())
                 }
+                crate::ir::StateFieldKind::FixedVec {
+                    ty: crate::ir::IrType::FixedVec { ref elem, .. },
+                } if path.is_empty() => Some((**elem).clone()),
                 _ => None,
             })
             .and_then(|ty| ir_type_width(&ty)),
@@ -1636,6 +1648,9 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
                 crate::ir::StateFieldKind::Record { record } => {
                     record_path_is_sint(cx, crate::ir::IrType::Record(record), path.iter())
                 }
+                crate::ir::StateFieldKind::FixedVec {
+                    ty: crate::ir::IrType::FixedVec { ref elem, .. },
+                } if path.is_empty() => matches!(**elem, crate::ir::IrType::SInt(_)),
                 _ => false,
             }),
         Expr::ComponentField { base, field } => {

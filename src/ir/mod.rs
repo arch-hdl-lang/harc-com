@@ -1835,11 +1835,9 @@ pub enum TbStateFieldSchema {
     Queue(TbQueueFieldSchema),
 }
 
-/// One persistent state field of a bound-to target transactor. A field
-/// is either a scalar counter or a typed FIFO queue, reusing the same
-/// `QueueElem` machinery scoreboards/components already carry so both
-/// seams lower a `queue<Record>` element through the identical shape
-/// (`harc_rt::HarcQueue<Rec>`).
+/// One persistent state field of a transactor. Scalar, queue, record, and
+/// fixed-vector state reuse the same value schemas carried by component
+/// fields so the three transactor owner forms share one runtime layout.
 #[derive(Debug, Clone)]
 pub struct StateFieldSchema {
     pub name: String,
@@ -1866,6 +1864,10 @@ pub enum StateFieldKind {
     /// `FieldWrite`); the whole record is read/copied through the scalar
     /// `Expr::TransactorState` / `Stmt::TransactorStateWrite` forms.
     Record { record: RecordId },
+    /// `lanes : Vec<T, N>` — a fixed-size aggregate held by value.
+    /// The complete `IrType::FixedVec` preserves nested-vector and record
+    /// element metadata for indexed access and whole-value copies.
+    FixedVec { ty: IrType },
 }
 
 /// One test-scope bus binding (`let axil : BusAxiLite = bind dut`).

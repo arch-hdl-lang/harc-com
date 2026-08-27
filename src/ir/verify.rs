@@ -1245,13 +1245,30 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     // tables directly off these links.
     for (xi, x) in prog.transactors.iter().enumerate() {
         for field in &x.state_fields {
-            if let StateFieldKind::Queue { elem } = &field.kind {
-                verify_queue_elem_schema(
+            match &field.kind {
+                StateFieldKind::Queue { elem } => verify_queue_elem_schema(
                     elem,
                     prog.records.len(),
                     format!("transactor x{xi} state field `{}`", field.name),
                     &mut errs,
-                );
+                ),
+                StateFieldKind::FixedVec { ty } => {
+                    let valid = matches!(
+                        ty,
+                        IrType::FixedVec { elem, len }
+                            if *len != 0
+                                && component_fixed_vec_elem_valid(elem, prog.records.len())
+                    );
+                    if !valid {
+                        errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "transactor x{xi} state field `{}` has invalid fixed-vector metadata {ty:?}",
+                                field.name
+                            ),
+                        });
+                    }
+                }
+                _ => {}
             }
         }
         for method in &x.methods {
@@ -1787,6 +1804,12 @@ fn target_state_matches_component(target: &TransactorSchema, component: &Compone
                     StateFieldKind::Record { record: a },
                     ComponentFieldKind::Record { record: b },
                 ) => a == b,
+                (StateFieldKind::FixedVec { ty }, ComponentFieldKind::FixedVec(vec)) => {
+                    ty == &IrType::FixedVec {
+                        elem: Box::new(vec.elem.clone()),
+                        len: vec.len,
+                    }
+                }
                 _ => false,
             }
         })
@@ -3535,6 +3558,7 @@ impl Checker<'_> {
                 match &state.kind {
                     StateFieldKind::Scalar { ty, .. } => Some(ty.clone()),
                     StateFieldKind::Record { record } => Some(IrType::Record(*record)),
+                    StateFieldKind::FixedVec { ty } => Some(ty.clone()),
                     StateFieldKind::Queue { .. } => Some(IrType::Unknown),
                 }
             }
@@ -3544,16 +3568,43 @@ impl Checker<'_> {
                 path,
                 mid_indices,
                 ..
-            } => {
-                let Ok(record) = self.transactor_state_record(instance, field) else {
-                    return Some(IrType::Unknown);
-                };
-                let segments: Vec<&str> = path.iter().map(String::as_str).collect();
-                let positions: Vec<usize> = mid_indices.iter().map(|(pos, _)| *pos).collect();
-                self.record_path_leaf_type(record, &segments, &positions)
-                    .or(Some(IrType::Unknown))
-            }
+            } => self
+                .transactor_state_record_field_type(instance, field, path, mid_indices)
+                .or(Some(IrType::Unknown)),
             _ => assignment_expr_type(self.prog, self.func, value).or(Some(IrType::Unknown)),
+        }
+    }
+
+    /// Exact fixed-vector type of a whole-value RHS. Unlike the general
+    /// assignment classifier, this never applies scalar common-type rules to
+    /// aggregate ternary arms: both arms must independently be the same
+    /// fixed-vector type.
+    fn exact_fixed_vec_expr_type(&self, value: &Expr) -> Option<IrType> {
+        match value {
+            Expr::Ternary(cond, then_expr, else_expr) => {
+                if !matches!(
+                    self.aggregate_assignment_expr_type(cond),
+                    Some(IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::Unknown)
+                ) {
+                    return None;
+                }
+                let then_ty = self.exact_fixed_vec_expr_type(then_expr)?;
+                let else_ty = self.exact_fixed_vec_expr_type(else_expr)?;
+                (then_ty == else_ty).then_some(then_ty)
+            }
+            _ => {
+                let ty = self.aggregate_assignment_expr_type(value)?;
+                if matches!(ty, IrType::FixedVec { .. }) {
+                    return Some(ty);
+                }
+                let Ok(Some((len, _))) = self.expr_whole_vec_shape(value) else {
+                    return None;
+                };
+                Some(IrType::FixedVec {
+                    elem: Box::new(ty),
+                    len,
+                })
+            }
         }
     }
 
@@ -3648,9 +3699,43 @@ impl Checker<'_> {
         index: Option<&Expr>,
     ) -> Result<Option<(usize, String)>, String> {
         if path.is_empty() {
-            return Err(format!(
-                "transactor state record field `{instance}.{field}` has an empty path"
-            ));
+            if !mid_indices.is_empty() {
+                return Err(format!(
+                    "fixed-vector state field `{instance}.{field}` has record-path indices"
+                ));
+            }
+            let StateFieldKind::FixedVec { ty } =
+                &self.transactor_state_field(instance, field)?.kind
+            else {
+                return Err(format!(
+                    "transactor state field `{instance}.{field}` has an empty record path"
+                ));
+            };
+            let IrType::FixedVec { elem, len } = ty else {
+                return Err(format!(
+                    "transactor state field `{instance}.{field}` has malformed vector metadata"
+                ));
+            };
+            let Some(idx) = index else {
+                return Err(format!(
+                    "fixed-vector state field `{instance}.{field}` empty-path access lacks an index"
+                ));
+            };
+            if !matches!(
+                self.aggregate_assignment_expr_type(idx),
+                Some(IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::Unknown)
+            ) {
+                return Err(format!(
+                    "fixed-vector state field `{instance}.{field}` has a non-scalar index"
+                ));
+            }
+            if matches!(idx, Expr::Literal { value, .. } if *value as usize >= *len) {
+                return Err(format!(
+                    "fixed-vector state field `{instance}.{field}` index is out of bounds for length {len}"
+                ));
+            }
+            let _ = elem;
+            return Ok(None);
         }
         let record = self.transactor_state_record(instance, field)?;
         let segments: Vec<&str> = path.iter().map(String::as_str).collect();
@@ -3747,6 +3832,17 @@ impl Checker<'_> {
         path: &[String],
         mid_indices: &[(usize, Expr)],
     ) -> Option<IrType> {
+        if path.is_empty() {
+            let StateFieldKind::FixedVec { ty } =
+                &self.transactor_state_field(instance, field).ok()?.kind
+            else {
+                return None;
+            };
+            let IrType::FixedVec { elem, .. } = ty else {
+                return None;
+            };
+            return Some((**elem).clone());
+        }
         let record = self.transactor_state_record(instance, field).ok()?;
         let segments: Vec<&str> = path.iter().map(String::as_str).collect();
         let positions: Vec<usize> = mid_indices.iter().map(|(position, _)| *position).collect();
@@ -4194,11 +4290,89 @@ impl Checker<'_> {
                         }
                     }
                 }
-                Stmt::TransactorStateWrite { value, .. } => {
-                    // Instance/field resolution is a lowering concern
-                    // (the verifier has no transactor-binding context);
-                    // just hold the value to the no-inline-port rule.
-                    self.check_expr(value, false, "TransactorStateWrite value");
+                Stmt::TransactorStateWrite {
+                    instance,
+                    field,
+                    value,
+                } => {
+                    match self.transactor_state_field(instance, field) {
+                        Ok(state) => {
+                            let expected = match &state.kind {
+                                StateFieldKind::Scalar { ty, .. } => Some(ty.clone()),
+                                StateFieldKind::Record { record } => {
+                                    Some(IrType::Record(*record))
+                                }
+                                StateFieldKind::FixedVec { ty } => Some(ty.clone()),
+                                StateFieldKind::Queue { .. } => None,
+                            };
+                            let actual = match &state.kind {
+                                StateFieldKind::FixedVec { .. } => {
+                                    self.exact_fixed_vec_expr_type(value)
+                                }
+                                StateFieldKind::Record { .. } => {
+                                    self.aggregate_assignment_expr_type(value)
+                                }
+                                // Mirror TbFieldWrite: arithmetic IR does not
+                                // retain the destination context that made
+                                // `0 - 8` signed during lowering. Only enforce
+                                // scalar types that are explicit in the IR;
+                                // otherwise a valid sint state assignment is
+                                // misclassified as unsigned here.
+                                StateFieldKind::Scalar { .. } => match value {
+                                    Expr::Literal {
+                                        ty: IrType::Unknown,
+                                        ..
+                                    } => assignment_expr_type(self.prog, self.func, value),
+                                    _ => expr_type(self.prog, self.func, value),
+                                },
+                                StateFieldKind::Queue { .. } => None,
+                            };
+                            if let (Some(expected), Some(actual)) = (&expected, actual.as_ref()) {
+                                let compatible = if matches!(expected, IrType::FixedVec { .. }) {
+                                    fixed_vec_abi_compatible(expected, actual)
+                                } else {
+                                    aggregate_assignment_compatible(expected, actual)
+                                };
+                                if !compatible {
+                                    self.errs.push(VerifyError::BadProgramRef {
+                                        what: format!(
+                                            "fn{} b{} writes transactor state `{instance}.{field}` of type {expected:?} from incompatible type {actual:?}",
+                                            self.fid.0, self.bid.0
+                                        ),
+                                    });
+                                }
+                            } else if expected.is_none() {
+                                self.errs.push(VerifyError::BadProgramRef {
+                                    what: format!(
+                                        "fn{} b{} writes queue transactor state `{instance}.{field}` as a whole value",
+                                        self.fid.0, self.bid.0
+                                    ),
+                                });
+                            } else if matches!(expected, Some(IrType::FixedVec { .. })) {
+                                self.errs.push(VerifyError::BadProgramRef {
+                                    what: format!(
+                                        "fn{} b{} writes fixed-vector transactor state `{instance}.{field}` from a non-matching whole-vector expression",
+                                        self.fid.0, self.bid.0
+                                    ),
+                                });
+                            }
+                            self.check_expr_inner(
+                                value,
+                                false,
+                                "TransactorStateWrite value",
+                                matches!(expected, Some(IrType::FixedVec { .. })),
+                            );
+                        }
+                        Err(detail) => {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} transactor-state write `{instance}.{field}`: {detail}",
+                                    self.fid.0, self.bid.0
+                                ),
+                            });
+                            self.check_expr(value, false, "TransactorStateWrite value");
+                        }
+                    }
                 }
                 Stmt::TransactorStateRecordFieldWrite {
                     instance,
@@ -4225,10 +4399,24 @@ impl Checker<'_> {
                         self.transactor_state_record_field_type(instance, field, path, mid_indices);
                     self.check_whole_vec_write_value(
                         dst_shape,
-                        dst_ty,
+                        dst_ty.clone(),
                         value,
                         "TransactorStateRecordFieldWrite value",
                     );
+                    if path.is_empty() {
+                        if let (Some(expected), Some(actual)) =
+                            (dst_ty, self.aggregate_assignment_expr_type(value))
+                        {
+                            if !aggregate_assignment_compatible(&expected, &actual) {
+                                self.errs.push(VerifyError::BadProgramRef {
+                                    what: format!(
+                                        "fn{} b{} writes fixed-vector state element `{instance}.{field}` of type {expected:?} from incompatible type {actual:?}",
+                                        self.fid.0, self.bid.0
+                                    ),
+                                });
+                            }
+                        }
+                    }
                 }
                 Stmt::TransactorStateQueuePush {
                     instance,
@@ -6952,6 +7140,32 @@ fn aggregate_assignment_compatible(expected: &IrType, actual: &IrType) -> bool {
         (IrType::Record(_), _) | (_, IrType::Record(_)) => false,
         _ => assign_compatible(expected, actual),
     }
+}
+
+/// Whole fixed-vector copies follow the same rule as lowering and v1: the
+/// arrays must have the same length and the same emitted C++ element carrier.
+/// Declared scalar widths that share that carrier remain copy-compatible.
+fn fixed_vec_abi_compatible(expected: &IrType, actual: &IrType) -> bool {
+    let (
+        IrType::FixedVec {
+            elem: expected_elem,
+            len: expected_len,
+        },
+        IrType::FixedVec {
+            elem: actual_elem,
+            len: actual_len,
+        },
+    ) = (expected, actual)
+    else {
+        return false;
+    };
+    let (Some(expected_class), Some(actual_class)) = (
+        crate::codegen::cpp_tb::ir_vec_elem_class(expected_elem),
+        crate::codegen::cpp_tb::ir_vec_elem_class(actual_elem),
+    ) else {
+        return false;
+    };
+    expected_len == actual_len && expected_class == actual_class
 }
 
 fn wide_literal_bits(words: &[u32]) -> u32 {

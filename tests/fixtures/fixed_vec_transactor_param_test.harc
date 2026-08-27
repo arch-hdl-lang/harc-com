@@ -1,9 +1,12 @@
 transactor VecParamSink
     dut : Top
+    remembered : Vec<uint<8>, 2>
 
     when active
         hookable consume(values: Vec<uint<8>, 2>, expected: Vec<uint<8>, 2>)
             assert values == expected else fail("fixed-vector parameter changed")
+            remembered = values
+            assert remembered[0] == expected[0] else fail("fixed-vector state write changed")
             dut.en = 1
         end consume
 
@@ -29,6 +32,7 @@ impl FixedVecTransactorParamTest for FixedVecTransactorParamTb
         expected[0] = 3
         expected[1] = 7
         sink.relay(values, expected, wrong_shape)
+        assert sink.remembered[1] == 7 else fail("fixed-vector state did not persist")
         wait 1 cycle
         assert dut.count_out == 1 else fail("fixed-vector transactor call did not run")
     end run

@@ -687,6 +687,17 @@ impl super::FuncBuilder<'_> {
                 let ty = self.ctx.tb_scalar_fields.get(field)?.clone();
                 return matches!(ty, IrType::FixedVec { .. }).then_some(ty);
             }
+            Expr::TransactorState { instance, field } => {
+                let kind = if instance.is_empty() {
+                    self.target_state_fields.get(field)?
+                } else {
+                    self.ctx.target_state.get(instance)?.get(field)?
+                };
+                let crate::ir::StateFieldKind::FixedVec { ty } = kind else {
+                    return None;
+                };
+                return Some(ty.clone());
+            }
             Expr::RecordField {
                 local,
                 field,
@@ -1032,7 +1043,8 @@ impl FuncBuilder<'_> {
                         // for a record this is a by-value struct read
                         // (copied into a `let`, pushed onto a queue, …).
                         crate::ir::StateFieldKind::Scalar { .. }
-                        | crate::ir::StateFieldKind::Record { .. } => Ok(Expr::TransactorState {
+                        | crate::ir::StateFieldKind::Record { .. }
+                        | crate::ir::StateFieldKind::FixedVec { .. } => Ok(Expr::TransactorState {
                             instance: String::new(),
                             field: id.name.clone(),
                         }),
@@ -1834,6 +1846,27 @@ impl FuncBuilder<'_> {
                             });
                         }
                     }
+                }
+                if let Some((instance, field, ty)) = self.as_transactor_state_fixed_vec(target) {
+                    let IrType::FixedVec { elem, len } = ty else {
+                        unreachable!("fixed-vector state resolver returned another type")
+                    };
+                    if matches!(*elem, IrType::FixedVec { .. }) {
+                        return Err(not_implemented(
+                            &format!("nested fixed-vector state field `{field}` element value"),
+                            "select through every fixed-vector dimension",
+                            V1Status::EmitsUncompilable,
+                        ));
+                    }
+                    let index = self.lower_expr(index)?;
+                    check_literal_vec_index_bounds(&field, &index, len)?;
+                    return Ok(Expr::TransactorStateRecordField {
+                        instance,
+                        field,
+                        path: Vec::new(),
+                        mid_indices: Vec::new(),
+                        index: Some(Box::new(index)),
+                    });
                 }
                 if let Some(mut chain) = self.as_transactor_state_record_field(target)? {
                     if matches!(chain.leaf_ty, IrType::Seq(_)) {
@@ -3203,6 +3236,7 @@ impl FuncBuilder<'_> {
                 match kind? {
                     crate::ir::StateFieldKind::Scalar { ty, .. } => Some(ty.clone()),
                     crate::ir::StateFieldKind::Record { record } => Some(IrType::Record(*record)),
+                    crate::ir::StateFieldKind::FixedVec { ty } => Some(ty.clone()),
                     crate::ir::StateFieldKind::Queue { .. } => None,
                 }
             }
@@ -3218,10 +3252,17 @@ impl FuncBuilder<'_> {
                 } else {
                     self.ctx.target_state.get(instance)?.get(field)
                 };
-                let crate::ir::StateFieldKind::Record { record } = kind? else {
-                    return None;
-                };
-                self.record_path_value_type(*record, path, mid_indices, index.is_some())
+                match kind? {
+                    crate::ir::StateFieldKind::Record { record } => {
+                        self.record_path_value_type(*record, path, mid_indices, index.is_some())
+                    }
+                    crate::ir::StateFieldKind::FixedVec {
+                        ty: IrType::FixedVec { elem, .. },
+                    } if path.is_empty() && mid_indices.is_empty() && index.is_some() => {
+                        Some((**elem).clone())
+                    }
+                    _ => None,
+                }
             }
             Expr::ScoreboardQuery { sb, query, .. } => match query {
                 crate::ir::ScoreboardQuery::Scalar { scalar } => self
@@ -4448,7 +4489,9 @@ impl FuncBuilder<'_> {
         matches!(
             fields.get(&name.name),
             Some(
-                crate::ir::StateFieldKind::Scalar { .. } | crate::ir::StateFieldKind::Record { .. }
+                crate::ir::StateFieldKind::Scalar { .. }
+                    | crate::ir::StateFieldKind::Record { .. }
+                    | crate::ir::StateFieldKind::FixedVec { .. }
             )
         )
         .then(|| (instance, name.name.clone()))
@@ -4539,6 +4582,28 @@ impl FuncBuilder<'_> {
         fields
             .get(&name.name)
             .map(|kind| (instance, name.name.clone(), kind.clone()))
+    }
+
+    /// Resolve a whole fixed-vector state receiver in either a responder
+    /// body (`lanes`) or test scope (`target.lanes`).
+    pub(crate) fn as_transactor_state_fixed_vec(
+        &self,
+        e: &AstExpr,
+    ) -> Option<(String, String, IrType)> {
+        if let ExprKind::Ident(id) = &*e.kind {
+            if self.lookup(&id.name).is_none() {
+                if let Some(crate::ir::StateFieldKind::FixedVec { ty }) =
+                    self.target_state_fields.get(&id.name)
+                {
+                    return Some((String::new(), id.name.clone(), ty.clone()));
+                }
+            }
+        }
+        let (instance, field, kind) = self.as_transactor_state_any(e)?;
+        match kind {
+            crate::ir::StateFieldKind::FixedVec { ty } => Some((instance, field, ty)),
+            _ => None,
+        }
     }
 
     /// Resolve an AST field-access chain onto a SUB-FIELD of a bound-to
@@ -4925,9 +4990,17 @@ impl FuncBuilder<'_> {
                 index,
                 ..
             } => {
-                let Some(crate::ir::StateFieldKind::Record { record }) =
-                    self.state_field_kind(instance, field)
-                else {
+                let Some(kind) = self.state_field_kind(instance, field) else {
+                    return None;
+                };
+                if let crate::ir::StateFieldKind::FixedVec {
+                    ty: IrType::FixedVec { elem, .. },
+                } = kind
+                {
+                    return (path.is_empty() && index.is_some())
+                        .then(|| (**elem).clone());
+                }
+                let crate::ir::StateFieldKind::Record { record } = kind else {
                     return None;
                 };
                 // `index` came from `main`'s indexed record-state
