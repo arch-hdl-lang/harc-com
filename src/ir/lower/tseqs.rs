@@ -73,18 +73,31 @@ fn tseq_element_name(decl: &TseqDecl) -> Option<String> {
     }
 }
 
-/// The scalar element `IrType` of a `tseq`'s `-> TSeq<scalar>` return when
-/// the inner type is a primitive builtin (`uint<N>`/`sint<N>`/`bool`/…).
-/// `None` for a non-builtin inner (record element) or a non-`TSeq` return.
+/// The value element `IrType` of a `tseq`'s `-> TSeq<T>` return when the
+/// inner type is a primitive scalar or scalar-leaf fixed vector. `None` for a named
+/// record element or a non-`TSeq` return.
 fn tseq_scalar_element(decl: &TseqDecl) -> Option<IrType> {
     let args = tseq_args(decl)?;
     let TypeArg::Type(inner) = args.first()? else {
         return None;
     };
+    if let Some(fixed) = super::components::fixed_vec_elem_ir_type(inner) {
+        return Some(fixed);
+    }
+    if let TypeExpr::Builtin { name, .. } = inner {
+        match name {
+            // v1's tseq return renderer maps both to `uint64_t` storage.
+            BuiltinTy::Int => return Some(IrType::UInt(Some(32))),
+            BuiltinTy::Time => return Some(IrType::UInt(Some(64))),
+            _ => {}
+        }
+    }
     match ir_type_of(Some(inner)) {
         // `ir_type_of` returns `Unknown` for a `Named` (record) inner —
         // those are handled by the record-element path, not here.
-        ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) => Some(ty),
+        ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::FixedVec { .. }) => {
+            Some(ty)
+        }
         _ => None,
     }
 }
@@ -108,8 +121,9 @@ pub(crate) type TseqTable = HashMap<String, (TseqElem, Vec<String>, Vec<IrType>)
 
 /// Build the `tseq name → element type` map, validating each declaration
 /// up front. A `tseq`'s element is either a declared record (`TSeq<Record>`,
-/// → `TseqElem::Record`) or a primitive scalar (`TSeq<uint<N>>`, →
-/// `TseqElem::Scalar`); both render as `std::vector<T>`.
+/// → `TseqElem::Record`) or a supported value (`TSeq<uint<N>>` /
+/// `TSeq<Vec<T, N>>`, → `TseqElem::Scalar`); both render as
+/// `std::vector<T>`.
 ///
 /// A `tseq` with NO return type at all defaults its element to a signed
 /// 64-bit scalar, matching v1's `std::vector<int64_t>`. A `TSeq<Name>`
@@ -141,8 +155,9 @@ pub(crate) fn collect_tseq_records(
                 return Err(not_implemented(
                     &format!("`tseq {}` element type `{name}`", decl.name.name),
                     format!(
-                        "only declared `transaction`/`struct` records and primitive scalars \
-                         (`uint<N>`/`sint<N>`/`bool`) are lowered as tseq element types; v1 \
+                        "only declared `transaction`/`struct` records, primitive scalars \
+                         (`uint<N>`/`sint<N>`/`bool`), and scalar-leaf fixed vectors are lowered as tseq \
+                         element types; v1 \
                          emits the name verbatim as `std::vector<{name}>`, which does not \
                          compile"
                     ),
@@ -167,10 +182,9 @@ pub(crate) fn collect_tseq_records(
             TseqElem::Scalar(IrType::SInt(Some(64)))
         } else {
             // A `-> TSeq<...>` that is PRESENT but names neither a
-            // scalar builtin nor a declared record — `TSeq<int>`,
-            // `TSeq<time>`, `TSeq<Vec<uint<8>, 4>>`. The default above
-            // must not swallow these: v1 renders each differently
-            // (`vector<uint64_t>`, `vector<std::array<uint64_t,4>>`),
+            // supported value nor a declared record — `TSeq<int>` or
+            // `TSeq<time>`. The default above must not swallow these: v1
+            // renders each as `vector<uint64_t>`,
             // so defaulting them to `int64_t` would silently change the
             // element type rather than close a gap.
             //
@@ -180,8 +194,8 @@ pub(crate) fn collect_tseq_records(
             // default arm.
             return Err(unsupported(
                 &format!("`tseq {}` element type", decl.name.name),
-                "a `-> TSeq<T>` must name a declared `transaction`/`struct` record or a \
-                 primitive scalar (`uint<N>`/`sint<N>`/`bool`)",
+                "a `-> TSeq<T>` must name a declared `transaction`/`struct` record, a \
+                 primitive scalar (`uint<N>`/`sint<N>`/`bool`), or scalar-leaf fixed vector",
             ));
         };
         let param_names: Vec<String> = decl.params.iter().map(|p| p.name.name.clone()).collect();

@@ -3085,9 +3085,11 @@ case and only locally-determinable `Assign` types are compared).
       `TSeq<uint<N>>`.
     * The arm was the fall-through for any annotation that is neither a
       scalar builtin nor a single identifier, not just an absent one, so
-      `TSeq<int>`, `TSeq<time>` and `TSeq<Vec<uint<8>, 4>>` all became
-      `vector<int64_t>` — where v1 renders `vector<uint64_t>` and
-      `vector<std::array<uint64_t,4>>`. Now gated on v1's own condition
+      `TSeq<int>`, `TSeq<time>` and (at that point)
+      `TSeq<Vec<uint<8>, 4>>` all became `vector<int64_t>` — where v1
+      renders `vector<uint64_t>` and `vector<std::array<uint64_t,4>>`.
+      The fixed-vector case is now supported explicitly; the remaining
+      fallback is gated on v1's own condition
       (`tseq_args` absent), so absent and present-but-unusable stay
       separate, which was the point of the split in the first place.
 

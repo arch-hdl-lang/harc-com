@@ -1819,6 +1819,22 @@ impl FuncBuilder<'_> {
                 ))
             }
             ExprKind::Index { target, index } => {
+                // Fixed-vector locals and dynamic sequences share the same
+                // emitted `<local>[index]` shape. The verifier recovers the
+                // exact element type from the receiver local.
+                if let ExprKind::Ident(id) = &*target.kind {
+                    if let Some(local) = self.lookup(&id.name) {
+                        if let IrType::FixedVec { len, .. } = self.local_type(local) {
+                            let len = *len;
+                            let index = self.lower_expr(index)?;
+                            check_literal_vec_index_bounds(&id.name, &index, len)?;
+                            return Ok(Expr::SeqIndex {
+                                seq: local,
+                                index: Box::new(index),
+                            });
+                        }
+                    }
+                }
                 if let Some(mut chain) = self.as_transactor_state_record_field(target)? {
                     if matches!(chain.leaf_ty, IrType::Seq(_)) {
                         let dotted = format!("{}.{}", chain.field, chain.path.join("."));
