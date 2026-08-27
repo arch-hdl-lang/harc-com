@@ -14,7 +14,8 @@ test PromotedLetRuntimeInitTest
     let dut : Top
     let first : uint<32> = seed()
     let middle : uint<32> = first + 1
-    let observed : uint<32> = middle + 1
+    // The promoted field type is inferred from the preceding typed local.
+    let observed = middle + 1
 
     clock clk = SysDomain
 

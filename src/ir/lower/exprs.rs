@@ -11,7 +11,7 @@ use crate::ir::{
     BinOp, Expr, IrType, LocalId, PortAccess, PortRef, RecordId, Stmt, UnOp, WidthCastKind,
 };
 
-fn common_expr_type(lhs: Option<IrType>, rhs: Option<IrType>) -> Option<IrType> {
+pub(super) fn common_expr_type(lhs: Option<IrType>, rhs: Option<IrType>) -> Option<IrType> {
     let (lhs, rhs) = match (lhs, rhs) {
         (Some(lhs), Some(rhs)) => (lhs, rhs),
         (lhs, rhs) => return lhs.or(rhs),
