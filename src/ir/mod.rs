@@ -367,7 +367,7 @@ pub struct ConstraintSite {
 /// `write(addr, data)` / `read(addr) -> data` methods. Field-level
 /// decomposition, `bitbash`, the passive `record_write`/`record_read`
 /// API, per-register `on` callbacks, and `addrmap` composition are
-/// explicit `Unsupported` rejections (see `src/ir/lower/regblock.rs`).
+/// represented by the regblock lowering paths in `src/ir/lower/regblock.rs`.
 /// The `via` helper must be an unbound DUT-poking transactor; the
 /// bus-bound helper form is the documented residual blocker for the
 /// corpus `regblock_*` fixtures.
@@ -2153,6 +2153,15 @@ pub enum Stmt {
         mid_indices: Vec<(usize, Expr)>,
         index: Option<Expr>,
         value: Expr,
+    },
+    /// `let value = regs.record_read(addr)` with a runtime address. The
+    /// regblock schema supplies the source-ordered address decoder; an
+    /// unmatched address reads as zero, matching v1's generated helper.
+    RecordRead {
+        dest: LocalId,
+        local: LocalId,
+        regblock: RegblockId,
+        addr: Expr,
     },
     /// `regs.record_write(addr, data)` where the binding has a per-register
     /// `on regs.REG` write callback registered — the firing form of the

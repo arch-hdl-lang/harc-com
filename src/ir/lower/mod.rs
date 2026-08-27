@@ -4857,6 +4857,7 @@ fn lower_test(
         regblock_bindings_map.insert(
             binding.clone(),
             regblock::RegblockBindingCtx {
+                regblock: *rbid,
                 record: rb.record,
                 helper_field: helper_field.clone(),
                 registers: rb.registers.clone(),
@@ -8255,7 +8256,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 ir::Stmt::TransactorStateQueuePop { instance, .. } => {
                     (!instance.is_empty()).then(|| instance.clone())
                 }
-                ir::Stmt::Assign(_, e) | ir::Stmt::DutWrite(_, e) => in_expr(e),
+                ir::Stmt::Assign(_, e)
+                | ir::Stmt::DutWrite(_, e)
+                | ir::Stmt::RecordRead { addr: e, .. } => in_expr(e),
                 ir::Stmt::RecordFieldWrite { value, .. }
                 | ir::Stmt::RecordWriteCb { value, .. }
                 | ir::Stmt::TbFieldWrite { value, .. }
@@ -8513,7 +8516,9 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                     );
                     *i = instance.to_string();
                 }
-                ir::Stmt::Assign(_, e) | ir::Stmt::DutWrite(_, e) => fill_expr(e, instance),
+                ir::Stmt::Assign(_, e)
+                | ir::Stmt::DutWrite(_, e)
+                | ir::Stmt::RecordRead { addr: e, .. } => fill_expr(e, instance),
                 ir::Stmt::RecordFieldWrite { value, .. }
                 | ir::Stmt::RecordWriteCb { value, .. }
                 | ir::Stmt::TbFieldWrite { value, .. }
@@ -8817,6 +8822,7 @@ fn fill_initiator_bus_prefix(
                         visit_port(p, placeholder, binding, remap, rewrite, &mut conflict)
                     }
                     Stmt::Assign(_, e)
+                    | Stmt::RecordRead { addr: e, .. }
                     | Stmt::RecordFieldWrite { value: e, .. }
                     | Stmt::RecordWriteCb { value: e, .. }
                     | Stmt::TbFieldWrite { value: e, .. }

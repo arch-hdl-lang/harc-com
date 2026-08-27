@@ -1892,6 +1892,32 @@ fn emit_stmt(
                 super::expr::record_access_cpp(cx, name, field, path, mid_indices, index.as_ref())?;
             writeln!(out, "{pad}{dst} = {e};").ok();
         }
+        Stmt::RecordRead {
+            dest,
+            local,
+            regblock,
+            addr,
+        } => {
+            let dst = &names[dest.index()];
+            let mirror = &names[local.index()];
+            let addr = expr_cpp(cx, addr)?;
+            let schema = &prog.regblocks[regblock.index()];
+            writeln!(out, "{pad}{{").ok();
+            let p1 = INDENT.repeat(depth + 1);
+            writeln!(out, "{p1}uint64_t _rec_addr = (uint64_t)({addr});").ok();
+            writeln!(out, "{p1}{dst} = 0;").ok();
+            for (i, reg) in schema.registers.iter().enumerate() {
+                let kw = if i == 0 { "if" } else { "else if" };
+                writeln!(
+                    out,
+                    "{p1}{kw} (_rec_addr == {offset}ull) {{ {dst} = {mirror}.{field}; }}",
+                    offset = reg.offset,
+                    field = reg.name,
+                )
+                .ok();
+            }
+            writeln!(out, "{pad}}}").ok();
+        }
         Stmt::RecordWriteCb {
             local,
             binding,

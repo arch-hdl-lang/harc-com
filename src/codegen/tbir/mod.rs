@@ -1726,6 +1726,7 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         DutWrite(p, e) => port_is_probe(p) || expr_has_probe(e),
         DutRead(_, p) | ProbeRelease(p) => port_is_probe(p),
         Assign(_, e)
+        | RecordRead { addr: e, .. }
         | RecordFieldWrite { value: e, .. }
         | RecordWriteCb { value: e, .. }
         | TbFieldWrite { value: e, .. }
@@ -2011,6 +2012,7 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
             }
         }
         Assign(_, e)
+        | RecordRead { addr: e, .. }
         | RecordWriteCb { value: e, .. }
         | TbFieldWrite { value: e, .. }
         | TbQueuePush { value: e, .. }

@@ -53,8 +53,13 @@ regblock DmaRegs via AxilHelper width 32
     register S2MM_SA   @ 0x20 access rw
 end regblock DmaRegs
 
+agent RuntimeAddressHolder
+    values : Vec<uint<8>, 2>
+end agent RuntimeAddressHolder
+
 testbench RegblockRecordApiTb
     dut : AxiLiteRegs
+    holder : RuntimeAddressHolder
 end testbench RegblockRecordApiTb
 
 impl RegblockRecordApiTest for RegblockRecordApiTb
@@ -95,6 +100,12 @@ impl RegblockRecordApiTest for RegblockRecordApiTb
         let sa  = regs.record_read(0x18)
         let s2  = regs.record_read(0x20)
         let len = regs.record_read(0x28)
+        // Runtime decode: a local address must select the same mirror
+        // cell, while an unmatched runtime address returns zero.
+        let runtime_addr = 0x20
+        let missing_addr = 0x24
+        let s2_runtime = regs.record_read(runtime_addr)
+        let missing_runtime = regs.record_read(missing_addr)
 
         assert sa == 305419896
             else fail("record_read MM2S_SA (got 0x${sa:08x})")
@@ -102,6 +113,10 @@ impl RegblockRecordApiTest for RegblockRecordApiTb
             else fail("record_read S2MM_SA (got 0x${s2:08x})")
         assert len == 4096
             else fail("record_read MM2S_LEN (got 0x${len:08x})")
+        assert s2_runtime == 64
+            else fail("runtime record_read S2MM_SA (got 0x${s2_runtime:08x})")
+        assert missing_runtime == 0
+            else fail("runtime record_read unmatched address (got 0x${missing_runtime:08x})")
 
         // A second observed write to an already-shadowed register
         // overwrites the mirror cell (last-writer-wins, masked to the

@@ -340,6 +340,9 @@ not applicable before requesting review:
    Fixed-vector transactor method parameters and whole-vector call arguments
    route through the same shared aggregate decoder/read fence, so this slice
    likewise leaves the raw inventory unchanged.
+   Runtime-address passive `record_read` now carries the regblock decoder in
+   `Stmt::RecordRead`; the adjacent runtime-address `record_write` constructor
+   remains, so this slice also leaves the raw inventory unchanged.
    The scoreboard source families did not remove constructors because
    unsupported non-scalar fields share it. Nested bus expressions and sized
    cover widths were also reclassified because v1 rejects or silently

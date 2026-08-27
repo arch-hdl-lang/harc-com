@@ -9397,6 +9397,24 @@ former `transaction` group lives in
      callee, and trace-diffs v1 against TBIR. Recursive dynamic lists remain
      outside this batch.
 
+153. **Runtime-address passive `record_read` (2026-08-27).**
+
+     `regs.record_read(addr)` now retains a non-constant address in TB-IR and
+     emits the same source-ordered register-offset decoder as v1. The new
+     `RecordRead` statement names the mirror local and owning regblock schema,
+     initializes its destination to zero, and selects the matching mirror
+     field; an unmatched runtime address therefore returns zero. Constant
+     addresses keep the existing direct `RecordField` path and its precise
+     invalid-address diagnostic. The destination uses the API's unsigned
+     host-scalar type. The verifier checks that ABI, the scalar address shape,
+     the regblock reference, mirror-record identity, address expression, and
+     destination definition. Aggregate detection includes whole component,
+     record, and state fixed vectors whose scalar expression type is
+     intentionally absent; they retain v1's measured emits-uncompilable grade.
+     The equivalence fixture observes both a matching local address and an
+     unmatched local address under both emitters. Runtime-address
+     `record_write` remains the adjacent follow-up batch.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

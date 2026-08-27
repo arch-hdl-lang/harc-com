@@ -47,13 +47,15 @@ use super::{not_implemented, unsupported, LowerError, V1Status};
 use crate::ast::{CallArg, ExprKind, RegAccess as AstRegAccess, RegblockDecl};
 use crate::ir::{
     self, BinOp, Expr, FmtArg, FmtArgs, IrType, RecordFieldSchema, RecordId, RecordSchema,
-    RegAccess, RegFieldSchema, RegRegisterSchema, RegblockSchema, Stmt, UnOp,
+    RegAccess, RegFieldSchema, RegRegisterSchema, RegblockId, RegblockSchema, Stmt, UnOp,
 };
 
 /// Per-binding context for register access resolution. Built at the
 /// `let regs : R = bind <helper>` site and carried in `LowerCtx`.
 #[derive(Debug, Clone)]
 pub(crate) struct RegblockBindingCtx {
+    /// Owning regblock schema, used by runtime record-API decoders.
+    pub regblock: RegblockId,
     /// Mirror record (the synthetic `RecordSchema`).
     pub record: RecordId,
     /// Transactor instance field the frontdoor `write`/`read` route
@@ -934,8 +936,9 @@ impl super::FuncBuilder<'_> {
     /// `let v = regs.record_read(addr)` — **passive** mirror read keyed
     /// by address (decode + mirror read, no bus). Returns `Ok(true)` when
     /// `value` is a `record_read` call on a regblock binding (and lowers
-    /// it into `dest_name`), `Ok(false)` when it is not. A non-constant
-    /// `addr` or an `addr` matching no register is rejected precisely.
+    /// it into `dest_name`), `Ok(false)` when it is not. Constant addresses
+    /// keep the direct field-read path; runtime addresses lower to a
+    /// source-ordered decoder whose unmatched result is zero.
     pub(crate) fn try_lower_record_read_let(
         &mut self,
         dest_name: &str,
@@ -972,13 +975,54 @@ impl super::FuncBuilder<'_> {
             &["addr".to_string()],
             "a `record_read(...)` call",
         )?;
-        let reg = self.resolve_record_api_reg(&binding, "record_read", call_arg(&args[0]))?;
         let Some(mirror) = self.lookup(&binding) else {
             return Err(LowerError::Invalid(format!(
                 "regblock binding `{binding}` is not in scope at its record_read site"
             )));
         };
         let id = self.declare(dest_name);
+        self.set_local_type(id, IrType::UInt(None));
+        let Some(addr_val) = self.const_eval_index(call_arg(&args[0])) else {
+            let addr = self.lower_expr_no_ports(call_arg(&args[0]))?;
+            let aggregate_addr = self.record_id_of_expr(&addr).is_some()
+                || self.ir_whole_vec_type(&addr).is_some()
+                || matches!(addr, Expr::ComponentValue { .. })
+                || matches!(
+                    self.expr_type(&addr),
+                    Some(
+                        IrType::Record(_)
+                            | IrType::RecordSeq(_)
+                            | IrType::Seq(_)
+                            | IrType::FixedVec { .. }
+                            | IrType::Component(_)
+                            | IrType::Event(_)
+                    )
+                );
+            if aggregate_addr {
+                return Err(not_implemented(
+                    &format!("`{binding}.record_read(...)` with a non-scalar address"),
+                    "v1 casts the aggregate address to `uint64_t`, which does not compile",
+                    V1Status::EmitsUncompilable,
+                ));
+            }
+            self.push(Stmt::RecordRead {
+                dest: id,
+                local: mirror,
+                regblock: self.ctx.regblock_bindings[&binding].regblock,
+                addr,
+            });
+            return Ok(true);
+        };
+        let reg = self.ctx.regblock_bindings[&binding]
+            .registers
+            .iter()
+            .find(|r| r.offset == addr_val)
+            .cloned()
+            .ok_or_else(|| {
+                LowerError::Invalid(format!(
+                    "`{binding}.record_read(0x{addr_val:x}, ...)`: address matches no register offset in the regblock"
+                ))
+            })?;
         self.push(Stmt::Assign(
             id,
             Expr::RecordField {

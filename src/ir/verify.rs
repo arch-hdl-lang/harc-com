@@ -3962,6 +3962,54 @@ impl Checker<'_> {
                         "RecordFieldWrite value",
                     );
                 }
+                Stmt::RecordRead {
+                    dest,
+                    local,
+                    regblock,
+                    addr,
+                } => {
+                    self.check_local(*dest);
+                    self.check_local(*local);
+                    self.check_expr(addr, false, "RecordRead address");
+                    let dest_valid = self
+                        .func
+                        .locals
+                        .get(dest.index())
+                        .is_some_and(|l| l.ty == IrType::UInt(None));
+                    let addr_ty = self.aggregate_assignment_expr_type(addr);
+                    let addr_is_collection = self
+                        .expr_whole_collection_shape(addr)
+                        .is_ok_and(|shape| shape.is_some());
+                    let addr_valid = !addr_is_collection
+                        && !matches!(
+                            addr_ty,
+                            Some(
+                                IrType::Record(_)
+                                    | IrType::RecordSeq(_)
+                                    | IrType::Seq(_)
+                                    | IrType::FixedVec { .. }
+                                    | IrType::Component(_)
+                                    | IrType::Event(_)
+                            )
+                        );
+                    let refs_valid = self
+                        .prog
+                        .regblocks
+                        .get(regblock.index())
+                        .is_some_and(|rb| {
+                            self.func.locals.get(local.index()).is_some_and(|l| {
+                                l.ty == IrType::Record(rb.record)
+                            })
+                        });
+                    if !dest_valid || !addr_valid || !refs_valid {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "invalid RecordRead destination/address/regblock/local in fn{}",
+                                self.fid.0
+                            ),
+                        });
+                    }
+                }
                 Stmt::RecordWriteCb {
                     local,
                     field,
@@ -6885,7 +6933,8 @@ fn check_def_before_use(
     for (bi, b) in func.blocks.iter().enumerate() {
         for s in &b.stmts {
             match s {
-                Stmt::Assign(l, _) | Stmt::DutRead(l, _) | Stmt::RecordInit(l, _) => {
+                Stmt::Assign(l, _) | Stmt::DutRead(l, _) | Stmt::RecordInit(l, _)
+                | Stmt::RecordRead { dest: l, .. } => {
                     bit_set(&mut gens[bi], l.index());
                 }
                 Stmt::TransactorCall { dest: Some(l), .. } => {
@@ -6974,6 +7023,19 @@ fn check_def_before_use(
                 }
                 Stmt::DutRead(l, _) | Stmt::RecordInit(l, _) => {
                     bit_set(&mut defined, l.index());
+                }
+                Stmt::RecordRead {
+                    dest, local, addr, ..
+                } => {
+                    if local.index() < nlocals && !bit_get(&defined, local.index()) {
+                        errs.push(VerifyError::LocalUseBeforeDef {
+                            func: fid,
+                            block: bid,
+                            local: *local,
+                        });
+                    }
+                    check_e(addr, &defined, errs);
+                    bit_set(&mut defined, dest.index());
                 }
                 Stmt::RecordFieldWrite { local, value, .. }
                 | Stmt::RecordWriteCb { local, value, .. } => {

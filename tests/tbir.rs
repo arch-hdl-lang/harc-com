@@ -23513,8 +23513,9 @@ fn regblock_record_corpus_lowers_with_callback() {
 
 /// The passive `record_write`/`record_read` API — WITHOUT a per-register
 /// callback — fully lowers: a constant-address `record_write` decodes to
-/// a masked mirror `RecordFieldWrite` and `record_read` to a mirror
-/// `RecordField` read, with no bus traffic and no callback dispatch.
+/// a masked mirror `RecordFieldWrite`; constant `record_read` becomes a
+/// mirror field read and runtime-address `record_read` carries the
+/// regblock's source-ordered decoder in `RecordRead`.
 #[test]
 fn regblock_record_api_lowers() {
     let prog = lower_with_stdlib_bus("regblock_record_api_test.harc", "BusAxiLite.arch")
@@ -23529,6 +23530,93 @@ fn regblock_record_api_lowers() {
     assert!(
         dump.contains("& 4294967295"),
         "expected the record_write value masked to the register width: {dump}"
+    );
+    assert_eq!(
+        dump.matches("RecordRead(").count(),
+        2,
+        "expected matched and unmatched runtime record_read decoders: {dump}"
+    );
+    let run = &prog.functions[prog.tests[0].run.index()];
+    for dest in run.blocks.iter().flat_map(|b| &b.stmts).filter_map(|s| {
+        match s {
+            ir::Stmt::RecordRead { dest, .. } => Some(*dest),
+            _ => None,
+        }
+    }) {
+        assert_eq!(run.locals[dest.index()].ty, ir::IrType::UInt(None));
+    }
+
+    let aggregate_addr = fixture("regblock_record_api_test.harc").replacen(
+        "regs.record_read(runtime_addr)",
+        "regs.record_read(holder.values)",
+        1,
+    );
+    let err = lower_with_stdlib_bus_src(&aggregate_addr)
+        .expect_err("an aggregate runtime address must not reach invalid TBIR C++");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("whole-vector") || msg.contains("non-scalar address"), "{msg}");
+
+    let mut bad_regblock = prog.clone();
+    let stmt = bad_regblock
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find(|s| matches!(s, ir::Stmt::RecordRead { .. }))
+        .expect("runtime RecordRead exists");
+    if let ir::Stmt::RecordRead { regblock, .. } = stmt {
+        *regblock = ir::RegblockId(u32::MAX);
+    }
+    let errs = verify::verify_program(&bad_regblock)
+        .expect_err("a RecordRead with an invalid regblock id must fail verification");
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("invalid RecordRead destination/address/regblock/local")
+        )),
+        "{errs:?}"
+    );
+
+    let mut bad_dest = prog.clone();
+    let function = &mut bad_dest.functions[bad_dest.tests[0].run.index()];
+    let dest = function
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .find_map(|s| match s {
+            ir::Stmt::RecordRead { dest, .. } => Some(*dest),
+            _ => None,
+        })
+        .expect("runtime RecordRead exists");
+    function.locals[dest.index()].ty = ir::IrType::Record(ir::RecordId(0));
+    verify::verify_program(&bad_dest)
+        .expect_err("an aggregate RecordRead destination must fail verification");
+
+    let mut bad_addr = prog;
+    let function = &mut bad_addr.functions[bad_addr.tests[0].run.index()];
+    let addr = function
+        .blocks
+        .iter_mut()
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|s| match s {
+            ir::Stmt::RecordRead { addr, .. } => Some(addr),
+            _ => None,
+        })
+        .expect("runtime RecordRead exists");
+    *addr = ir::Expr::ComponentField {
+        base: ir::ComponentBase::Path(vec!["holder".to_string()]),
+        field: "values".to_string(),
+    };
+    let errs = verify::verify_program(&bad_addr)
+        .expect_err("a whole component vector RecordRead address must fail verification");
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("invalid RecordRead destination/address/regblock/local")
+        )),
+        "{errs:?}"
     );
 }
 

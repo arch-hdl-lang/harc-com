@@ -676,6 +676,18 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
                 expr_str(func, value)
             )
         }
+        Stmt::RecordRead {
+            dest,
+            local,
+            regblock,
+            addr,
+        } => format!(
+            "RecordRead({}, {}, rb{}, {})",
+            local_str(func, *dest),
+            local_str(func, *local),
+            regblock.0,
+            expr_str(func, addr)
+        ),
         Stmt::RecordWriteCb {
             local,
             binding,
