@@ -202,6 +202,9 @@ impl Display for TbProgram {
                     crate::ir::StateFieldKind::Record { record } => {
                         writeln!(f, "    state {} : rec{}", sf.name, record.index())?;
                     }
+                    crate::ir::StateFieldKind::FixedVec { ty } => {
+                        writeln!(f, "    state {} : {:?}", sf.name, ty)?;
+                    }
                 }
             }
             for m in &x.methods {

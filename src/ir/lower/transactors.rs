@@ -1658,12 +1658,14 @@ impl StateFieldOwner {
 }
 
 /// Lower one persistent state field of a transactor, in any of the
-/// three forms `StateFieldOwner` names. Two kinds are lowered, reusing
+/// three forms `StateFieldOwner` names. The kinds reuse
 /// the machinery scoreboards and composite components already carry:
 ///   * a scalar `<=64`-bit counter/latch (`read_count : uint<32>
 ///     default 0`) with a plain-integer/bool default (or none -> 0);
 ///   * a typed FIFO `queue<scalar>` / `queue<Record>`, whose
 ///     element type resolves through the shared `lower_queue_elem` seam.
+///   * a fixed vector, whose complete recursive `IrType` resolves through
+///     the component fixed-vector decoder.
 ///
 /// `record_ids` resolves `queue<Record>` element names. It is NOT a
 /// "does v1 declare this type" oracle — it also holds regblock MIRRORS,
@@ -1866,6 +1868,25 @@ fn lower_state_field(
             kind: StateFieldKind::Queue { elem },
         });
     }
+    // A fixed-vector state field uses the same recursive resolver as
+    // component fields and method parameters.  Keep the complete type so
+    // state element accesses retain nested-vector/record leaf metadata.
+    if let Some(ty @ IrType::FixedVec { .. }) =
+        super::components::fixed_vec_ir_type_with_records(&f.ty, record_ids)
+    {
+        if f.default.is_some() {
+            return Err(not_implemented(
+                &format!("{who} `{tname}` fixed-vector state field `{fname}` with a default"),
+                "a fixed-vector state field is value-initialised; drop the `default`"
+                    .to_string(),
+                V1Status::EmitsUncompilable,
+            ));
+        }
+        return Ok(StateFieldSchema {
+            name: fname.clone(),
+            kind: StateFieldKind::FixedVec { ty },
+        });
+    }
     // A whole value-record state field (`last : Beat`) → the shared
     // record machinery (`IrType::Record` / `RecordId`), reused verbatim
     // from the `queue<Record>` / scoreboard / component record seam so
@@ -1938,7 +1959,7 @@ fn lower_state_field(
         //   `uint<2048>`        -> `harc_rt::HarcWide<64> w;`, compiles
         //                          — past the declared-field width, and
         //                          v1 does handle the declaration
-        //   `Vec<uint<8>, 4>`   -> `std::array<uint64_t, 4> v{};`, compiles
+        //   `Vec<uint<8>, 4>`   -> handled by the fixed-vector arm above
         //   `stream<uint<8>>`   -> `uint64_t s;`                 , compiles
         //   `buffer<uint<8>,N>` -> `uint64_t bf;`                , compiles
         //   an enum type        -> `Color m;`  — g++: does not name a type
@@ -1954,7 +1975,8 @@ fn lower_state_field(
         return Err(not_implemented(
             &format!("{who} `{tname}` state field `{fname}` with a non-scalar type"),
             "transactor state must be a scalar `uint<N>`/`sint<N>`/`bool` (up to 1024 \
-             bits), a whole value-record, or a `queue<scalar>` / `queue<Record>`; v1 \
+             bits), a fixed vector, a whole value-record, or a `queue<scalar>` / \
+             `queue<Record>`; v1 \
              emits a bare `uint64_t` member for a `stream`/`buffer` field, which compiles \
              and means something else (for a `uint<N>` past 1024 bits v1 declares the \
              member correctly, so `--codegen v1` does work for that one)"

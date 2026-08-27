@@ -9429,6 +9429,20 @@ former `transaction` group lives in
      Registered equivalence fixtures cover matched and unmatched writes plus
      a runtime-selected callback dispatch under both emitters.
 
+155. **Fixed-vector persistent transactor state (2026-08-27).**
+
+     A one-dimensional `Vec<T, N>` state field now lowers for all three
+     transactor owners: an unbound DUT-poking transactor, a bound target
+     responder, and a bound initiator BFM. `StateFieldKind::FixedVec` carries
+     the complete aggregate `IrType`; the runtime emits per-instance
+     `std::array` storage, whole values copy through the existing state
+     read/write nodes, and element reads/writes reuse the state aggregate path
+     with verifier-checked index and element metadata. Tests cover responder
+     placeholder substitution, direct test-scope access, every declaration
+     route, malformed record references, and the positive v1 declaration
+     control. Nested state-vector element access remains explicitly fenced;
+     recursive dynamic lists are not part of this batch.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

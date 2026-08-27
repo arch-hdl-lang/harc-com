@@ -108,6 +108,11 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Wide scalar transactor method returns, retaining the declared signedness
   and width through return slots, method schemas, call destinations, sibling
   calls, and exact `_harc_u128`/`HarcWide<N>` C++ signatures.
+- [x] One-dimensional fixed-vector persistent transactor state across unbound,
+  bound-target, and bound-initiator owners, including exact recursive element
+  metadata, whole-array copies, indexed reads/writes, verifier checks, and
+  per-instance `std::array` storage. Recursive state-vector element access is
+  an explicit follow-up boundary; recursive dynamic lists remain excluded.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call

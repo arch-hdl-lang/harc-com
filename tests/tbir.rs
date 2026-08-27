@@ -935,6 +935,11 @@ end impl HTest"#,
         cpp.contains("((int64_t)(env.delta)) >> 1"),
         "sint component field read by path must get an arithmetic shift; got:\n{cpp}"
     );
+
+    let transactor = fixture("signed_state_field_test.harc");
+    let prog = lower_src(&transactor).expect("signed transactor state lowers");
+    verify::verify_program(&prog)
+        .expect("contextual signed arithmetic assigned to transactor state verifies");
 }
 
 #[test]
@@ -11839,13 +11844,11 @@ end impl T
         );
     }
 
-    // ── the non-scalar guard admits five, and `stream` sets the label ─
-    for (field, needle) in [
-        ("    v : Vec<uint<8>, 4>", "std::array<uint64_t, 4> v{};"),
-        // The row that sets the verdict: a stream becomes a bare
-        // integer. It compiles, and it is not a stream.
-        ("    s : stream<uint<8>>", "uint64_t s;"),
-    ] {
+    // ── the residual non-scalar guard: `stream` sets the label ───────
+    // Fixed vectors now leave this catch-all through their typed state
+    // schema. A stream still becomes a bare integer under v1: it compiles,
+    // and it is not a stream.
+    for (field, needle) in [("    s : stream<uint<8>>", "uint64_t s;")] {
         let err = lower_src(&prog(field)).unwrap_err();
         let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
         assert!(msg.contains("non-scalar type"), "`{field}`: {msg}");
@@ -11914,14 +11917,7 @@ impl T for Tb
     end run
 end impl T
 "#;
-    let msg = lower_src(unbound).unwrap_err().to_string();
-    // `contains("transactor `Poker` …")` alone would be satisfied by the
-    // OLD wrong message, which contains it as a suffix. The label has to
-    // be pinned exactly.
-    assert!(
-        msg.contains("HARC does not implement transactor `Poker` state field `v`"),
-        "the unbound form names itself exactly: {msg}"
-    );
+    lower_src(unbound).expect("fixed-vector state lowers on the unbound owner");
 
     // …and the two initiator-side sites, which say something different
     // again. Without a case each, a mutant that collapses
@@ -11952,13 +11948,8 @@ impl T for Tb
     end run
 end impl T
 "#;
-    let msg = lower_with_stdlib_bus_src(initiator)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        msg.contains("initiator-side bound-to transactor `AxilHelper` state field `v`"),
-        "the initiator form names itself: {msg}"
-    );
+    lower_with_stdlib_bus_src(initiator)
+        .expect("fixed-vector state lowers on the initiator owner");
 
     // A DIRECTIONAL field on the INITIATOR owner. The suite had none,
     // so reinstating the pre-check that used to shadow the shared rule
@@ -11998,16 +11989,8 @@ end impl T
         "a directional module handle is still refused: {msg}"
     );
 
-    // The bound-TARGET label, pinned on a row above that only checked
-    // the construct.
-    let msg = lower_src(&prog("    v : Vec<uint<8>, 4>"))
-        .unwrap_err()
-        .to_string();
-    assert!(
-        msg.contains("bound-to transactor `TlmMemTarget` state field `v`")
-            && !msg.contains("initiator-side"),
-        "the bound-target form names itself: {msg}"
-    );
+    lower_src(&prog("    v : Vec<uint<8>, 4>"))
+        .expect("fixed-vector state lowers on the bound-target owner");
 
     // ── generic application: dropped without a word ──────────────────
     let err = lower_src(&prog("    b : Beat<uint<8>>")).unwrap_err();
@@ -12020,6 +12003,387 @@ end impl T
         control_v1,
         "v1's output is byte-identical to the control: the argument list vanishes"
     );
+}
+
+/// A one-dimensional `Vec<T, N>` is persistent transactor state in the
+/// same three owner forms as scalar/record/queue state.  The target fixture
+/// exercises both responder-body placeholder substitution and direct
+/// test-scope access; the other two fixtures pin their declaration paths.
+#[test]
+fn fixed_vector_transactor_state_lowers_verifies_and_emits() {
+    let target = r#"
+struct Bundle
+    data : Vec<uint<8>, 4>
+end struct Bundle
+agent VecSource
+    values : Vec<uint<8>, 4>
+    wide_values : Vec<uint<32>, 4>
+end agent VecSource
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+transactor TlmMemTarget bound to TlmMemBus
+    lanes : Vec<uint<8>, 4>
+    shadow : Vec<uint<8>, 4>
+    cursor : uint<8> default 0
+    bundle : Bundle
+    thread bus.read(addr: uint<8>)
+        lanes[cursor] = addr
+        shadow = lanes
+        return lanes[cursor]
+    end thread
+end transactor TlmMemTarget
+testbench Tb
+    dut : TlmReadInitiator
+    source : VecSource
+end testbench Tb
+impl T for Tb
+    let mem : TlmMemBus = bind dut
+    let target : TlmMemTarget passive = bind mem
+    run
+        target.cursor = 1
+        target.lanes[1] = 9
+        target.shadow = target.lanes
+        target.shadow = source.values
+        target.shadow = source.wide_values
+        target.shadow = target.bundle.data
+        assert target.lanes[1] == 9
+        wait 2 cycles
+    end run
+end impl T"#;
+    let prog = lower_src(target).expect("fixed-vector target state lowers");
+    verify::verify_program(&prog).expect("fixed-vector target state verifies");
+    let cpp = emit_cpp_src(target);
+    assert!(cpp.contains("std::array<uint64_t, 4> lanes{};"), "{cpp}");
+    assert!(cpp.contains("target.lanes[target.cursor] = addr;"), "{cpp}");
+    assert!(cpp.contains("target.shadow = target.lanes;"), "{cpp}");
+    assert!(cpp.contains("target.shadow = source.values;"), "{cpp}");
+    assert!(
+        cpp.contains("target.shadow = source.wide_values;"),
+        "same-carrier element widths remain copy-compatible: {cpp}"
+    );
+    assert!(cpp.contains("target.shadow = target.bundle.data;"), "{cpp}");
+    assert!(cpp.contains("target.lanes[1] = 9;"), "{cpp}");
+    assert!(cpp.contains("target.cursor = 1;"), "{cpp}");
+    assert!(
+        cpp_tb::emit(&merged_src(target))
+            .expect("v1 emits the positive control")
+            .contains("std::array<uint64_t, 4> lanes{};"),
+        "v1 carries the same persistent fixed-vector member"
+    );
+    for (label, bad) in [
+        (
+            "dotted target state",
+            target.replace("target.lanes[1] = 9", "target.cursor = 300"),
+        ),
+        (
+            "responder-body state",
+            target.replace("lanes[cursor] = addr", "cursor = 300"),
+        ),
+    ] {
+        let err = lower_src(&bad).expect_err("an oversized state literal is rejected");
+        let msg = assert_invalid(&err);
+        assert!(msg.contains("narrows"), "{label}: {msg}");
+    }
+    let mut oversized_scalar_ir = prog.clone();
+    let scalar_write = oversized_scalar_ir
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find(|stmt| matches!(stmt, ir::Stmt::TransactorStateWrite { field, .. } if field == "cursor"))
+        .expect("fixture contains a scalar state write");
+    let ir::Stmt::TransactorStateWrite { value, .. } = scalar_write else {
+        unreachable!()
+    };
+    *value = ir::Expr::Literal {
+        value: 300,
+        ty: ir::IrType::Unknown,
+    };
+    assert!(
+        verify::verify_program(&oversized_scalar_ir).is_err(),
+        "the verifier rejects an oversized ordinary literal in malformed scalar-state IR"
+    );
+    let mut broken = prog.clone();
+    let ir::StateFieldKind::FixedVec { ty } = &mut broken.transactors[0].state_fields[0].kind
+    else {
+        panic!("lanes remains fixed-vector state")
+    };
+    *ty = ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::Record(ir::RecordId(999))),
+        len: 4,
+    };
+    assert!(
+        verify::verify_program(&broken).is_err(),
+        "missing record references in state-vector metadata are rejected"
+    );
+
+    let mut missing_field = prog.clone();
+    let whole_write = missing_field
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find(|stmt| matches!(stmt, ir::Stmt::TransactorStateWrite { field, .. } if field == "shadow"))
+        .expect("fixture contains a whole state-vector copy");
+    let ir::Stmt::TransactorStateWrite { field, .. } = whole_write else {
+        unreachable!()
+    };
+    *field = "missing".to_string();
+    assert!(
+        verify::verify_program(&missing_field).is_err(),
+        "whole state-vector writes must resolve their destination"
+    );
+
+    let mut wrong_whole_value = prog.clone();
+    let whole_write = wrong_whole_value
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find(|stmt| matches!(stmt, ir::Stmt::TransactorStateWrite { field, .. } if field == "shadow"))
+        .expect("fixture contains a whole state-vector copy");
+    let ir::Stmt::TransactorStateWrite { value, .. } = whole_write else {
+        unreachable!()
+    };
+    *value = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::Unknown,
+    };
+    assert!(
+        verify::verify_program(&wrong_whole_value).is_err(),
+        "whole state-vector writes require a matching aggregate value"
+    );
+    for matching_arm_first in [true, false] {
+        let mut mismatched_ternary = prog.clone();
+        let whole_write = mismatched_ternary
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.stmts)
+            .find(|stmt| matches!(stmt, ir::Stmt::TransactorStateWrite { field, .. } if field == "shadow"))
+            .expect("fixture contains a whole state-vector copy");
+        let ir::Stmt::TransactorStateWrite { value, .. } = whole_write else {
+            unreachable!()
+        };
+        let matching = ir::Expr::TransactorState {
+            instance: "target".to_string(),
+            field: "lanes".to_string(),
+        };
+        let scalar = ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::Unknown,
+        };
+        let (then_expr, else_expr) = if matching_arm_first {
+            (matching, scalar)
+        } else {
+            (scalar, matching)
+        };
+        *value = ir::Expr::Ternary(
+            Box::new(ir::Expr::Literal {
+                value: 1,
+                ty: ir::IrType::Bool,
+            }),
+            Box::new(then_expr),
+            Box::new(else_expr),
+        );
+        assert!(
+            verify::verify_program(&mismatched_ternary).is_err(),
+            "whole state-vector ternary arms are checked independent of order"
+        );
+    }
+    let mut aggregate_ternary_condition = prog.clone();
+    let whole_write = aggregate_ternary_condition
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find(|stmt| matches!(stmt, ir::Stmt::TransactorStateWrite { field, .. } if field == "shadow"))
+        .expect("fixture contains a whole state-vector copy");
+    let ir::Stmt::TransactorStateWrite { value, .. } = whole_write else {
+        unreachable!()
+    };
+    let matching = ir::Expr::TransactorState {
+        instance: "target".to_string(),
+        field: "lanes".to_string(),
+    };
+    *value = ir::Expr::Ternary(
+        Box::new(matching.clone()),
+        Box::new(matching.clone()),
+        Box::new(matching),
+    );
+    assert!(
+        verify::verify_program(&aggregate_ternary_condition).is_err(),
+        "whole state-vector ternaries require a scalar condition"
+    );
+
+    let mut wrong_element_value = prog.clone();
+    let element_write = wrong_element_value
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find(|stmt| {
+            matches!(stmt, ir::Stmt::TransactorStateRecordFieldWrite { path, .. } if path.is_empty())
+        })
+        .expect("fixture contains a state-vector element write");
+    let ir::Stmt::TransactorStateRecordFieldWrite { value, .. } = element_write else {
+        unreachable!()
+    };
+    *value = ir::Expr::TransactorState {
+        instance: "target".to_string(),
+        field: "lanes".to_string(),
+    };
+    assert!(
+        verify::verify_program(&wrong_element_value).is_err(),
+        "state-vector element writes reject aggregate RHS values"
+    );
+
+    let mut missing_write_index = prog.clone();
+    let element_write = missing_write_index
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find(|stmt| {
+            matches!(stmt, ir::Stmt::TransactorStateRecordFieldWrite { path, .. } if path.is_empty())
+        })
+        .expect("fixture contains a state-vector element write");
+    let ir::Stmt::TransactorStateRecordFieldWrite { index, .. } = element_write else {
+        unreachable!()
+    };
+    *index = None;
+    assert!(
+        verify::verify_program(&missing_write_index).is_err(),
+        "empty-path state-vector writes require an index"
+    );
+
+    let mut aggregate_write_index = prog.clone();
+    let element_write = aggregate_write_index
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find(|stmt| {
+            matches!(stmt, ir::Stmt::TransactorStateRecordFieldWrite { path, .. } if path.is_empty())
+        })
+        .expect("fixture contains a state-vector element write");
+    let ir::Stmt::TransactorStateRecordFieldWrite { index, .. } = element_write else {
+        unreachable!()
+    };
+    *index = Some(ir::Expr::TransactorState {
+        instance: "target".to_string(),
+        field: "lanes".to_string(),
+    });
+    assert!(
+        verify::verify_program(&aggregate_write_index).is_err(),
+        "state-vector indices must be scalar values"
+    );
+
+    let mut missing_read_index = prog.clone();
+    let read = missing_read_index
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::AssertCheck {
+                cond: ir::Expr::Binary(_, lhs, _),
+                ..
+            } if matches!(lhs.as_ref(), ir::Expr::TransactorStateRecordField { path, .. } if path.is_empty()) => {
+                Some(lhs.as_mut())
+            }
+            _ => None,
+        })
+        .expect("fixture contains a state-vector element read");
+    let ir::Expr::TransactorStateRecordField { index, .. } = read else {
+        unreachable!()
+    };
+    *index = None;
+    assert!(
+        verify::verify_program(&missing_read_index).is_err(),
+        "empty-path state-vector reads require an index"
+    );
+
+    let wrong_record_element = r#"
+struct A
+    value : uint<8>
+end struct A
+struct B
+    value : uint<8>
+end struct B
+transactor X
+    dut : Top
+    values : Vec<A, 2>
+    when active
+        hookable put(value: B)
+            values[0] = value
+        end put
+    end when
+end transactor X
+testbench Tb
+    dut : Top
+    x : X active
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#;
+    assert!(
+        lower_src(wrong_record_element).is_err(),
+        "a state vector rejects the wrong record element type during lowering"
+    );
+
+    let unbound = r#"
+transactor Poker
+    dut : Top
+    lanes : Vec<uint<8>, 4>
+    when active
+        hookable poke()
+            lanes[0] = 7
+            assert lanes[0] == 7
+        end poke
+    end when
+end transactor Poker
+testbench Tb
+    dut : Top
+    poker : Poker active
+end testbench Tb
+impl T for Tb
+    run
+        poker.dut = dut
+        poker.poke()
+        wait 1 cycle
+    end run
+end impl T"#;
+    let prog = lower_src(unbound).expect("fixed-vector unbound state lowers");
+    verify::verify_program(&prog).expect("fixed-vector unbound state verifies");
+    assert!(emit_cpp_src(unbound).contains("std::array<uint64_t, 4> lanes{};"));
+
+    let initiator = r#"
+use BusAxiLite
+transactor AxilHelper bound to BusAxiLite
+    lanes : Vec<uint<8>, 4>
+    hookable poke()
+        lanes[0] = 3
+        assert lanes[0] == 3
+    end poke
+end transactor AxilHelper
+testbench Tb
+    dut : AxiLiteRegs
+end testbench Tb
+impl T for Tb
+    let axil : BusAxiLite = bind dut
+    let helper : AxilHelper active = bind axil
+    run
+        helper.poke()
+        wait 1 cycle
+    end run
+end impl T"#;
+    let prog = lower_with_stdlib_bus_src(initiator)
+        .expect("fixed-vector initiator-side state lowers");
+    verify::verify_program(&prog).expect("fixed-vector initiator-side state verifies");
 }
 
 /// Event direction is a source-level producer/consumer role. All software
@@ -17012,8 +17376,8 @@ fn fixed_vector_transactor_params_are_typed_end_to_end() {
 
     let cpp = emit_cpp_src(&src);
     assert!(
-        cpp.contains("std::function<void(std::array<uint64_t, 2>, std::array<uint64_t, 2>, std::array<uint64_t, 3>)> VecParamSink_relay;")
-            && cpp.contains("VecParamSink_relay = [&](std::array<uint64_t, 2> values, std::array<uint64_t, 2> expected, std::array<uint64_t, 3> spare) -> void"),
+        cpp.contains("std::function<void(_VecParamSink_state&, std::array<uint64_t, 2>, std::array<uint64_t, 2>, std::array<uint64_t, 3>)> VecParamSink_relay;")
+            && cpp.contains("VecParamSink_relay = [&](_VecParamSink_state& self_state, std::array<uint64_t, 2> values, std::array<uint64_t, 2> expected, std::array<uint64_t, 3> spare) -> void"),
         "{cpp}"
     );
 
