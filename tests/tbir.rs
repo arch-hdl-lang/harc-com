@@ -16857,6 +16857,109 @@ end impl LazyArgTest
 }
 
 #[test]
+fn wide_transactor_method_returns_keep_their_declared_type() {
+    let src = fixture("wide_transactor_return_test.harc");
+    let prog = lower_src(&src).expect("wide transactor return lowers");
+    verify::verify_program(&prog).expect("wide transactor return verifies");
+
+    let schema = prog
+        .transactors
+        .iter()
+        .find(|schema| schema.name == "WideReturnSource")
+        .unwrap();
+    let method = schema
+        .methods
+        .iter()
+        .find(|method| method.name == "value")
+        .unwrap();
+    assert_eq!(method.ret_ty, Some(ir::IrType::UInt(Some(128))));
+    let function = &prog.functions[method.function.index()];
+    assert_eq!(
+        function.ret.map(|ret| function.locals[ret.index()].ty.clone()),
+        Some(ir::IrType::UInt(Some(128)))
+    );
+    let run = &prog.functions[prog.tests[0].run.index()];
+    assert_eq!(
+        run.locals
+            .iter()
+            .find(|local| local.name == "got")
+            .map(|local| local.ty.clone()),
+        Some(ir::IrType::UInt(Some(128)))
+    );
+
+    let cpp = emit_cpp_src(&src);
+    assert!(
+        cpp.contains(
+            "std::function<_harc_u128(_WideReturnSource_state&)> WideReturnSource_value;"
+        ),
+        "{cpp}"
+    );
+    assert!(
+        cpp.contains(
+            "WideReturnSource_value = [&](_WideReturnSource_state& self_state) -> _harc_u128"
+        ),
+        "{cpp}"
+    );
+
+    let wider = src.replace("uint<128>", "uint<256>");
+    let wider_prog = lower_src(&wider).expect("HarcWide transactor return lowers");
+    verify::verify_program(&wider_prog).expect("HarcWide transactor return verifies");
+    let wider_cpp = emit_cpp_src(&wider);
+    assert!(
+        wider_cpp.contains(
+            "std::function<harc_rt::HarcWide<8>(_WideReturnSource_state&)> WideReturnSource_value;"
+        ),
+        "{wider_cpp}"
+    );
+
+    let signed = src.replace("uint<128>", "sint<128>");
+    let signed_prog = lower_src(&signed).expect("signed wide transactor return lowers");
+    verify::verify_program(&signed_prog).expect("signed wide transactor return verifies");
+
+    let mut broken = prog.clone();
+    let schema = broken
+        .transactors
+        .iter_mut()
+        .find(|schema| schema.name == "WideReturnSource")
+        .unwrap();
+    let method = schema
+        .methods
+        .iter_mut()
+        .find(|method| method.name == "value")
+        .unwrap();
+    method.ret_ty = Some(ir::IrType::UInt(Some(64)));
+    verify::verify_program(&broken)
+        .expect_err("method schema and wide return slot must agree");
+
+    let bound = r#"use BusAxiLite
+transactor BoundWideReturn bound to BusAxiLite
+    when active
+        hookable value() -> uint<128>
+            return 42
+        end value
+    end when
+end transactor BoundWideReturn
+testbench BoundTb
+    dut : AxiLiteRegs
+end testbench BoundTb
+impl BoundTest for BoundTb
+    run
+        wait 1 cycle
+    end run
+end impl BoundTest"#;
+    let bound = lower_with_stdlib_bus_src(bound)
+        .expect("bound-initiator wide return declaration lowers");
+    verify::verify_program(&bound).expect("bound-initiator wide return verifies");
+    assert!(bound.transactors.iter().any(|schema| {
+        schema.name == "BoundWideReturn"
+            && schema.methods.iter().any(|method| {
+                method.name == "value"
+                    && method.ret_ty == Some(ir::IrType::UInt(Some(128)))
+            })
+    }));
+}
+
+#[test]
 fn expression_transactor_results_retain_type_and_allow_widening() {
     let direct = r#"
 transactor SignedDriver

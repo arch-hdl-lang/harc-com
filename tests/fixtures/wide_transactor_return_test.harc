@@ -1,0 +1,35 @@
+transactor WideReturnSource
+    dut : Top
+    stored : uint<128> default 0
+
+    when active
+        hookable store(v: uint<128>)
+            stored = v
+        end store
+
+        hookable value() -> uint<128>
+            return stored
+        end value
+
+        hookable relay() -> uint<128>
+            return value()
+        end relay
+    end when
+end transactor WideReturnSource
+
+testbench WideTransactorReturnTb
+    dut : Top
+    source : WideReturnSource active
+end testbench WideTransactorReturnTb
+
+impl WideTransactorReturnTest for WideTransactorReturnTb
+    run
+        source.dut = dut
+        let high : uint<128> = 1
+        high = high << 100
+        source.store(high)
+        let got : uint<128> = source.relay()
+        assert got == high else fail("wide transactor return truncated")
+        wait 1 cycle
+    end run
+end impl WideTransactorReturnTest
