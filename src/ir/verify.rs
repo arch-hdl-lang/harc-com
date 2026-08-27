@@ -3975,6 +3975,25 @@ impl Checker<'_> {
                 Stmt::TbFieldWrite { field, value } => {
                     self.check_tb_field(field);
                     self.check_expr(value, false, "TbFieldWrite value");
+                    if let (Some(expected), Some(actual)) = (
+                        self.tb_scalar_field_ty(field),
+                        // Keep this backstop to expression forms whose type
+                        // is explicit in the IR. The assignment typer gives
+                        // arithmetic such as `0 - 8` an unsigned width even
+                        // when lowering correctly contextualizes it as sint;
+                        // treating that approximation as authoritative here
+                        // would reject valid signed field writes.
+                        expr_type(self.prog, self.func, value),
+                    ) {
+                        if !assign_compatible(&expected, &actual) {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} writes {:?} into testbench field `{field}` declared {:?}",
+                                    self.fid.0, self.bid.0, actual, expected
+                                ),
+                            });
+                        }
+                    }
                 }
                 Stmt::TbQueuePush { field, value } => {
                     self.check_tb_queue(field);

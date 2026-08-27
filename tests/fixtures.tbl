@@ -70,6 +70,7 @@ extern_fn_ref_test      | Top            | top_counter.sv         |     | extern
 relation_inlining_test  | Top            | top_counter.sv         |
 tseq_scalar_test        | Top            | top_counter.sv         |
 tseq_fixed_vec_test     | Top            | top_counter.sv         |
+promoted_let_runtime_init_test | Top      | top_counter.sv         |
 fsm_counter_test        | FsmCounter     | fsm_counter.sv         |
 clk_div_counter_test    | ClkDivCounter  | clk_div_counter.sv clk_divider.sv |
 synchronizer_basic_test | FlagSync       | synchronizer_basic.sv  | async_fifo_domains.harc
