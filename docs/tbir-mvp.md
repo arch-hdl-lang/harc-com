@@ -9412,8 +9412,22 @@ former `transaction` group lives in
      record, and state fixed vectors whose scalar expression type is
      intentionally absent; they retain v1's measured emits-uncompilable grade.
      The equivalence fixture observes both a matching local address and an
-     unmatched local address under both emitters. Runtime-address
-     `record_write` remains the adjacent follow-up batch.
+     unmatched local address under both emitters.
+
+154. **Runtime-address passive `record_write` (2026-08-27).**
+
+     `regs.record_write(addr, data)` now retains non-constant scalar address
+     and data expressions in `Stmt::RecordWrite`. Emission evaluates each
+     argument once in source order, decodes register offsets in declaration
+     order, masks the observed data to the selected register width, and makes
+     an unmatched address a no-op. On callback-bearing bindings the same
+     runtime decoder is enclosed by the per-binding recursion-depth guard and
+     dispatches the selected register callback with the observed data; the
+     owner testbench binding remains the single source of callback metadata.
+     Lowering and verification structurally reject aggregate arguments,
+     including whole fixed vectors whose scalar expression type is absent.
+     Registered equivalence fixtures cover matched and unmatched writes plus
+     a runtime-selected callback dispatch under both emitters.
 
 ## Next steps
 

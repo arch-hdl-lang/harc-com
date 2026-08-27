@@ -23492,10 +23492,11 @@ fn regblock_record_corpus_lowers_with_callback() {
     let prog = lower_with_stdlib_bus("regblock_record_test.harc", "BusAxiLite.arch")
         .expect("regblock record callback lowers");
     let dump = format!("{prog}");
-    // The MM2S_SA write routes through RecordWriteCb with the callback fn.
+    // The runtime-address MM2S_SA write carries the decoder; emission
+    // resolves its callback from the owner testbench binding.
     assert!(
-        dump.contains("RecordWriteCb(%regs.MM2S_SA") && dump.contains("cb=fn"),
-        "expected a RecordWriteCb dispatching the MM2S_SA callback: {dump}"
+        dump.contains("RecordWrite(%regs, regs") && dump.contains("runtime_mm2s_addr"),
+        "expected a runtime RecordWrite dispatching through the binding: {dump}"
     );
     // The binding records the callback in its schema.
     assert!(
@@ -23509,13 +23510,59 @@ fn regblock_record_corpus_lowers_with_callback() {
         dump.contains("TestHook") && dump.contains("RecordWriteCb(%regs.MM2S_LEN"),
         "expected the callback body's mirror write into MM2S_LEN: {dump}"
     );
+
+    let mut bad_callback_field = prog.clone();
+    let tbid = bad_callback_field.tests[0].testbench;
+    bad_callback_field.testbenches[tbid.index()].regblock_bindings[0].callbacks[0].0 =
+        "missing".to_string();
+    let errs = verify::verify_program(&bad_callback_field)
+        .expect_err("a callback for a missing register must fail verification");
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("invalid or duplicate callback register `missing`")
+        )),
+        "{errs:?}"
+    );
+
+    let mut bad_callback_fid = prog.clone();
+    let tbid = bad_callback_fid.tests[0].testbench;
+    bad_callback_fid.testbenches[tbid.index()].regblock_bindings[0].callbacks[0].1 =
+        ir::FunctionId(u32::MAX);
+    let errs = verify::verify_program(&bad_callback_fid)
+        .expect_err("a callback with a missing function must fail verification");
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("callback references missing fn")
+        )),
+        "{errs:?}"
+    );
+
+    let mut bad_callback_local = prog;
+    let tbid = bad_callback_local.tests[0].testbench;
+    let callback = bad_callback_local.testbenches[tbid.index()].regblock_bindings[0].callbacks[0].1;
+    bad_callback_local.functions[callback.index()].locals[0].ty =
+        ir::IrType::Record(ir::RecordId(0));
+    let errs = verify::verify_program(&bad_callback_local)
+        .expect_err("a callback whose parameter local disagrees with its ABI must fail verification");
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("callback fn") && what.contains("invalid kind")
+        )),
+        "{errs:?}"
+    );
 }
 
 /// The passive `record_write`/`record_read` API — WITHOUT a per-register
 /// callback — fully lowers: a constant-address `record_write` decodes to
-/// a masked mirror `RecordFieldWrite`; constant `record_read` becomes a
-/// mirror field read and runtime-address `record_read` carries the
-/// regblock's source-ordered decoder in `RecordRead`.
+/// a masked mirror `RecordFieldWrite`; runtime-address reads and writes
+/// carry the regblock's source-ordered decoder in `RecordRead` and
+/// `RecordWrite` respectively.
 #[test]
 fn regblock_record_api_lowers() {
     let prog = lower_with_stdlib_bus("regblock_record_api_test.harc", "BusAxiLite.arch")
@@ -23536,6 +23583,11 @@ fn regblock_record_api_lowers() {
         2,
         "expected matched and unmatched runtime record_read decoders: {dump}"
     );
+    assert_eq!(
+        dump.matches("RecordWrite(").count(),
+        2,
+        "expected matched and unmatched runtime record_write decoders: {dump}"
+    );
     let run = &prog.functions[prog.tests[0].run.index()];
     for dest in run.blocks.iter().flat_map(|b| &b.stmts).filter_map(|s| {
         match s {
@@ -23555,6 +23607,24 @@ fn regblock_record_api_lowers() {
         .expect_err("an aggregate runtime address must not reach invalid TBIR C++");
     let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
     assert!(msg.contains("whole-vector") || msg.contains("non-scalar address"), "{msg}");
+
+    for aggregate_write in [
+        "regs.record_write(holder.values, 64)",
+        "regs.record_write(runtime_write_addr, holder.values)",
+    ] {
+        let source = fixture("regblock_record_api_test.harc").replacen(
+            "regs.record_write(runtime_write_addr, 64)",
+            aggregate_write,
+            1,
+        );
+        let err = lower_with_stdlib_bus_src(&source)
+            .expect_err("an aggregate runtime write argument must not reach invalid TBIR C++");
+        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+        assert!(
+            msg.contains("whole-vector") || msg.contains("non-scalar argument"),
+            "{msg}"
+        );
+    }
 
     let mut bad_regblock = prog.clone();
     let stmt = bad_regblock
@@ -23593,7 +23663,7 @@ fn regblock_record_api_lowers() {
     verify::verify_program(&bad_dest)
         .expect_err("an aggregate RecordRead destination must fail verification");
 
-    let mut bad_addr = prog;
+    let mut bad_addr = prog.clone();
     let function = &mut bad_addr.functions[bad_addr.tests[0].run.index()];
     let addr = function
         .blocks
@@ -23615,6 +23685,82 @@ fn regblock_record_api_lowers() {
             e,
             verify::VerifyError::BadProgramRef { what }
                 if what.contains("invalid RecordRead destination/address/regblock/local")
+        )),
+        "{errs:?}"
+    );
+
+    let mut bad_write_value = prog.clone();
+    let value = bad_write_value
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find_map(|s| match s {
+            ir::Stmt::RecordWrite { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("runtime RecordWrite exists");
+    *value = ir::Expr::ComponentField {
+        base: ir::ComponentBase::Path(vec!["holder".to_string()]),
+        field: "values".to_string(),
+    };
+    let errs = verify::verify_program(&bad_write_value)
+        .expect_err("a whole component vector RecordWrite value must fail verification");
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("invalid RecordWrite address/value/binding/regblock/local")
+        )),
+        "{errs:?}"
+    );
+
+    let mut bad_write_cross_binding = prog.clone();
+    let tbid = bad_write_cross_binding.tests[0].testbench;
+    let mut alias = bad_write_cross_binding.testbenches[tbid.index()].regblock_bindings[0].clone();
+    alias.field = "regs_alias".to_string();
+    bad_write_cross_binding.testbenches[tbid.index()]
+        .regblock_bindings
+        .push(alias);
+    let write = bad_write_cross_binding
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find(|s| matches!(s, ir::Stmt::RecordWrite { .. }))
+        .expect("runtime RecordWrite exists");
+    if let ir::Stmt::RecordWrite { binding, .. } = write {
+        *binding = "regs_alias".to_string();
+    }
+    let errs = verify::verify_program(&bad_write_cross_binding)
+        .expect_err("a RecordWrite may not pair one binding with another binding's mirror");
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("invalid RecordWrite address/value/binding/regblock/local")
+        )),
+        "{errs:?}"
+    );
+
+    let mut bad_write_binding = prog;
+    let write = bad_write_binding
+        .functions
+        .iter_mut()
+        .flat_map(|f| &mut f.blocks)
+        .flat_map(|b| &mut b.stmts)
+        .find(|s| matches!(s, ir::Stmt::RecordWrite { .. }))
+        .expect("runtime RecordWrite exists");
+    if let ir::Stmt::RecordWrite { binding, .. } = write {
+        *binding = "missing".to_string();
+    }
+    let errs = verify::verify_program(&bad_write_binding)
+        .expect_err("a RecordWrite with a missing binding must fail verification");
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("invalid RecordWrite address/value/binding/regblock/local")
         )),
         "{errs:?}"
     );

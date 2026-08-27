@@ -1417,6 +1417,63 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 });
             }
         }
+        let mut regblock_binding_names = HashSet::new();
+        for binding in &tb.regblock_bindings {
+            if !regblock_binding_names.insert(&binding.field) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} declares regblock binding `{}` more than once",
+                        binding.field
+                    ),
+                });
+            }
+            let Some(regblock) = prog.regblocks.get(binding.regblock.index()) else {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} regblock binding `{}` references missing rb{}",
+                        binding.field, binding.regblock.0
+                    ),
+                });
+                continue;
+            };
+            let mut callback_registers = HashSet::new();
+            for (register, callback) in &binding.callbacks {
+                if !callback_registers.insert(register)
+                    || !regblock.registers.iter().any(|reg| reg.name == *register)
+                {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "tb{ti} regblock binding `{}` has invalid or duplicate callback register `{register}`",
+                            binding.field
+                        ),
+                    });
+                }
+                match prog.functions.get(callback.index()) {
+                    Some(func)
+                        if func.kind == FunctionKind::TestHook
+                            && func.owner == Some(TestbenchId(ti as u32))
+                            && func.params.len() == 1
+                            && func.params[0].ty == IrType::UInt(None)
+                            && func
+                                .locals
+                                .first()
+                                .is_some_and(|local| local.ty == func.params[0].ty)
+                            && func.ret.is_none() => {}
+                    Some(func) => errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "tb{ti} regblock binding `{}` callback fn{} has invalid kind {:?}, owner {:?}, or signature",
+                            binding.field, callback.0, func.kind, func.owner
+                        ),
+                    }),
+                    None => errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "tb{ti} regblock binding `{}` callback references missing fn{}",
+                            binding.field, callback.0
+                        ),
+                    }),
+                }
+            }
+        }
         for (field, xid) in &tb.transactor_fields {
             if !transactor_binding_names.insert(field) {
                 errs.push(VerifyError::BadProgramRef {
@@ -3799,6 +3856,24 @@ impl Checker<'_> {
         )
     }
 
+    fn expr_is_record_api_scalar(&self, expr: &Expr) -> bool {
+        let is_collection = self
+            .expr_whole_collection_shape(expr)
+            .is_ok_and(|shape| shape.is_some());
+        !is_collection
+            && !matches!(
+                self.aggregate_assignment_expr_type(expr),
+                Some(
+                    IrType::Record(_)
+                        | IrType::RecordSeq(_)
+                        | IrType::Seq(_)
+                        | IrType::FixedVec { .. }
+                        | IrType::Component(_)
+                        | IrType::Event(_)
+                )
+            )
+    }
+
     fn report_bad_whole_vec_use(&mut self, detail: String) {
         self.errs.push(VerifyError::BadProgramRef {
             what: format!(
@@ -3997,14 +4072,56 @@ impl Checker<'_> {
                         .regblocks
                         .get(regblock.index())
                         .is_some_and(|rb| {
-                            self.func.locals.get(local.index()).is_some_and(|l| {
-                                l.ty == IrType::Record(rb.record)
-                            })
+                            self.func
+                                .locals
+                                .get(local.index())
+                                .is_some_and(|l| l.ty == IrType::Record(rb.record))
                         });
                     if !dest_valid || !addr_valid || !refs_valid {
                         self.errs.push(VerifyError::BadProgramRef {
                             what: format!(
                                 "invalid RecordRead destination/address/regblock/local in fn{}",
+                                self.fid.0
+                            ),
+                        });
+                    }
+                }
+                Stmt::RecordWrite {
+                    local,
+                    binding,
+                    regblock,
+                    addr,
+                    value,
+                } => {
+                    self.check_local(*local);
+                    self.check_expr(addr, false, "RecordWrite address");
+                    self.check_expr(value, false, "RecordWrite value");
+                    let refs_valid = self
+                        .prog
+                        .regblocks
+                        .get(regblock.index())
+                        .is_some_and(|rb| {
+                            self.func.locals.get(local.index()).is_some_and(|l| {
+                                l.name == *binding && l.ty == IrType::Record(rb.record)
+                            })
+                        });
+                    let binding_valid = self
+                        .func
+                        .owner
+                        .and_then(|owner| self.prog.testbenches.get(owner.index()))
+                        .is_some_and(|tb| {
+                            tb.regblock_bindings.iter().any(|b| {
+                                b.field == *binding && b.regblock == *regblock
+                            })
+                        });
+                    if !refs_valid
+                        || !binding_valid
+                        || !self.expr_is_record_api_scalar(addr)
+                        || !self.expr_is_record_api_scalar(value)
+                    {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "invalid RecordWrite address/value/binding/regblock/local in fn{}",
                                 self.fid.0
                             ),
                         });
@@ -7036,6 +7153,19 @@ fn check_def_before_use(
                     }
                     check_e(addr, &defined, errs);
                     bit_set(&mut defined, dest.index());
+                }
+                Stmt::RecordWrite {
+                    local, addr, value, ..
+                } => {
+                    if local.index() < nlocals && !bit_get(&defined, local.index()) {
+                        errs.push(VerifyError::LocalUseBeforeDef {
+                            func: fid,
+                            block: bid,
+                            local: *local,
+                        });
+                    }
+                    check_e(addr, &defined, errs);
+                    check_e(value, &defined, errs);
                 }
                 Stmt::RecordFieldWrite { local, value, .. }
                 | Stmt::RecordWriteCb { local, value, .. } => {

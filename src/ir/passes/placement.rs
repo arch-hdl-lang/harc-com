@@ -296,6 +296,11 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 host_service_only = false;
                 visit_expr(addr, &mut accesses, &mut transactor);
             }
+            Stmt::RecordWrite { addr, value, .. } => {
+                host_service_only = false;
+                visit_expr(addr, &mut accesses, &mut transactor);
+                visit_expr(value, &mut accesses, &mut transactor);
+            }
             Stmt::RecordFieldWrite {
                 mid_indices,
                 index,

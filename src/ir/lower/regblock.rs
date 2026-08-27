@@ -848,15 +848,11 @@ impl super::FuncBuilder<'_> {
     /// Returns `Ok(true)` when `e` is a `record_write` call on a regblock
     /// binding (and lowers it), `Ok(false)` when it is not.
     ///
-    /// Lowering: with a compile-time-constant `addr`, decode it to the
-    /// matching register at lowering time and emit a single masked mirror
-    /// `RecordFieldWrite` (`mirror.REG = data & mask`). No callback
-    /// dispatch — the per-register `on regs.REG` callback is a `[&]`-
-    /// capturing closure over run-scope locals, which the function-per-
-    /// CFG IR cannot express (rejected precisely upstream, like the
-    /// `axilite_hooks` pre/post method hooks). A non-constant `addr` (a
-    /// runtime decode chain) and an `addr` that matches no register are
-    /// rejected precisely.
+    /// A compile-time-constant `addr` decodes directly to one masked mirror
+    /// write. A runtime address lowers to `RecordWrite`, which carries the
+    /// regblock decoder and owner-binding callback metadata through TB-IR.
+    /// A constant address matching no register is rejected precisely; an
+    /// unmatched runtime address performs no mirror update, matching v1.
     pub(crate) fn try_lower_record_write(
         &mut self,
         e: &crate::ast::Expr,
@@ -888,6 +884,30 @@ impl super::FuncBuilder<'_> {
             &["addr".to_string(), "data".to_string()],
             "a `record_write(...)` call",
         )?;
+        if self.const_eval_index(call_arg(&args[0])).is_none() {
+            let Some(mirror) = self.lookup(&binding) else {
+                return Err(LowerError::Invalid(format!(
+                    "regblock binding `{binding}` is not in scope at its record_write site"
+                )));
+            };
+            let addr = self.lower_expr_no_ports(call_arg(&args[0]))?;
+            let value = self.lower_expr_no_ports(call_arg(&args[1]))?;
+            if self.record_api_non_scalar(&addr) || self.record_api_non_scalar(&value) {
+                return Err(not_implemented(
+                    &format!("`{binding}.record_write(...)` with a non-scalar argument"),
+                    "v1 casts both arguments to `uint64_t`, which does not compile for an aggregate value",
+                    V1Status::EmitsUncompilable,
+                ));
+            }
+            self.push(Stmt::RecordWrite {
+                local: mirror,
+                binding: binding.clone(),
+                regblock: self.ctx.regblock_bindings[&binding].regblock,
+                addr,
+                value,
+            });
+            return Ok(true);
+        }
         let reg = self.resolve_record_api_reg(&binding, "record_write", call_arg(&args[0]))?;
         let Some(mirror) = self.lookup(&binding) else {
             return Err(LowerError::Invalid(format!(
@@ -984,21 +1004,7 @@ impl super::FuncBuilder<'_> {
         self.set_local_type(id, IrType::UInt(None));
         let Some(addr_val) = self.const_eval_index(call_arg(&args[0])) else {
             let addr = self.lower_expr_no_ports(call_arg(&args[0]))?;
-            let aggregate_addr = self.record_id_of_expr(&addr).is_some()
-                || self.ir_whole_vec_type(&addr).is_some()
-                || matches!(addr, Expr::ComponentValue { .. })
-                || matches!(
-                    self.expr_type(&addr),
-                    Some(
-                        IrType::Record(_)
-                            | IrType::RecordSeq(_)
-                            | IrType::Seq(_)
-                            | IrType::FixedVec { .. }
-                            | IrType::Component(_)
-                            | IrType::Event(_)
-                    )
-                );
-            if aggregate_addr {
+            if self.record_api_non_scalar(&addr) {
                 return Err(not_implemented(
                     &format!("`{binding}.record_read(...)` with a non-scalar address"),
                     "v1 casts the aggregate address to `uint64_t`, which does not compile",
@@ -1065,6 +1071,26 @@ impl super::FuncBuilder<'_> {
                      offset in the regblock"
                 ))
             })
+    }
+
+    /// Structural aggregate classifier for passive record-API arguments.
+    /// Some whole fixed-vector/component forms intentionally have no scalar
+    /// `expr_type`, so absence of a type is not evidence that a cast is safe.
+    fn record_api_non_scalar(&self, value: &Expr) -> bool {
+        self.record_id_of_expr(value).is_some()
+            || self.ir_whole_vec_type(value).is_some()
+            || matches!(value, Expr::ComponentValue { .. })
+            || matches!(
+                self.expr_type(value),
+                Some(
+                    IrType::Record(_)
+                        | IrType::RecordSeq(_)
+                        | IrType::Seq(_)
+                        | IrType::FixedVec { .. }
+                        | IrType::Component(_)
+                        | IrType::Event(_)
+                )
+            )
     }
 
     /// `Some((binding, method, args))` when `e` is a `<binding>.<method>(

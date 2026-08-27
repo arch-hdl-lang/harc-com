@@ -93,7 +93,10 @@ impl RegblockRecordApiTest for RegblockRecordApiTb
         // The address decode is owned by the codegen — no `if addr == ...`
         // ladder here.
         regs.record_write(0x18, 305419896)    // 0x12345678 -> MM2S_SA
-        regs.record_write(0x20, 64)           // -> S2MM_SA
+        let runtime_write_addr = 0x20
+        let missing_write_addr = 0x24
+        regs.record_write(runtime_write_addr, 64) // -> S2MM_SA
+        regs.record_write(missing_write_addr, 999) // unmatched: no mirror changes
         regs.record_write(0x28, 4096)         // -> MM2S_LEN
 
         // Read the shadow back by address — pure mirror, no bus read.

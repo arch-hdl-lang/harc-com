@@ -86,7 +86,8 @@ impl RegblockRecordTest for RegblockRecordTb
 
         // Observe two bus writes passively (e.g. forwarded from a bus
         // monitor). No bus traffic is issued; only the mirror updates.
-        regs.record_write(0x18, 305419896)    // 0x12345678 -> MM2S_SA
+        let runtime_mm2s_addr = 0x18
+        regs.record_write(runtime_mm2s_addr, 305419896) // runtime decode + callback
         regs.record_write(0x20, 64)           // -> S2MM_SA
 
         // Read the shadow back by address — pure mirror, no bus read.
