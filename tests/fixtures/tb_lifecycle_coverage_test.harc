@@ -1,0 +1,74 @@
+// #619 M4 hardening Phase C: a reusable testbench with native out-of-line
+// lifecycle plus ordinary functional coverage. The shared setup/check stay
+// coverage-side-table-free and emit once; each bound test owns its covergroup
+// report in the per-test check. Used by direct, DPI co-sim, VCD, MT, and
+// --coverage-json gates.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+covergroup LifecycleInteractionCov @(posedge dut.clk)
+    cp_count : cover dut.count_out
+        bins
+            zero = {0}
+            nonzero = {[1..8]}
+        end bins
+end covergroup LifecycleInteractionCov
+
+testbench LifecycleCoverageTb
+    dut : Top
+    cov : LifecycleInteractionCov
+    expected : uint<32> default 0
+
+    setup
+        dut.rst = 1
+        dut.en = 0
+    end setup
+
+    check
+        assert dut.count_out == expected
+            else fail("lifecycle coverage: count=${dut.count_out} exp=${expected}")
+        log(info, "shared lifecycle coverage check passed")
+    end check
+end testbench LifecycleCoverageTb
+
+impl LifecycleCoverageTwo for LifecycleCoverageTb
+    clock clk = SysDomain
+
+    run
+        wait 2 cycles
+        dut.rst = 0
+        dut.en = 1
+        wait 2 cycles
+        dut.en = 0
+        expected = 2
+        wait 1 cycle
+    end run
+
+    check
+        cov.report()
+        assert cov.cp_count.zero > 0 else fail("zero coverage hole")
+        assert cov.cp_count.nonzero > 0 else fail("nonzero coverage hole")
+    end check
+end impl LifecycleCoverageTwo
+
+impl LifecycleCoverageFour for LifecycleCoverageTb
+    clock clk = SysDomain
+
+    run
+        wait 2 cycles
+        dut.rst = 0
+        dut.en = 1
+        wait 4 cycles
+        dut.en = 0
+        expected = 4
+        wait 1 cycle
+    end run
+
+    check
+        cov.report()
+        assert cov.cp_count.zero > 0 else fail("zero coverage hole")
+        assert cov.cp_count.nonzero > 0 else fail("nonzero coverage hole")
+    end check
+end impl LifecycleCoverageFour

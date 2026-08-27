@@ -17,7 +17,11 @@ generator reproduces the shape that matters instead: a double-digit shard
 count, test bodies big enough that emitting a shard is real work, and
 suite-global scaffolding (constrained transaction records plus a
 `randomize` site per test) that exercises the solver problem table and
-randomize snippets reused across shards.
+randomize snippets reused across shards. Every generated test also binds the
+same reusable testbench, whose shared setup/check lifecycle bodies are emitted
+once in the common translation unit. The script's shared-body incremental edit
+changes that lifecycle implementation, so the reported reuse directly measures
+the #619 M4 de-duplication path rather than using record constraints as a proxy.
 
 Not wired into CI — it takes minutes and writes hundreds of MB.
 

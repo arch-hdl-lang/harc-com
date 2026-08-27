@@ -1,0 +1,31 @@
+// #619 M4 hardening Phase B: exercise the source-level fatal surface directly
+// in a shared lifecycle. `log(fatal, ...)` lowers to a fatal `Stmt::Log` plus
+// an ordinary Return (not the parser-unreachable `Terminator::Fatal`), so the
+// check is safe to emit out of line. Both registry rows deliberately fail and
+// must produce identical v1/tbir traces and verdicts. A classifier unit test
+// separately pins conservative fallback for a synthetic Terminator::Fatal.
+
+testbench FatalLifecycleTb
+    dut : Top
+
+    setup
+        dut.rst = 0
+        dut.en = 0
+    end setup
+
+    check
+        log(fatal, "deliberate fatal from shared lifecycle")
+    end check
+end testbench FatalLifecycleTb
+
+impl FatalLcA for FatalLifecycleTb
+    run
+        dut.en = 0
+    end run
+end impl FatalLcA
+
+impl FatalLcB for FatalLifecycleTb
+    run
+        dut.en = 0
+    end run
+end impl FatalLcB

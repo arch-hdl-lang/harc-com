@@ -1,0 +1,49 @@
+// #619 M4 hardening Phase B: a wall-clock wait in a shared lifecycle lowers
+// to WaitTimePs and reaches the run coroutine's `now_ps` /
+// `eval_clocks_until` scheduler state. ShareScan may mint the lifecycle, but
+// the out-of-line classifier must keep `setup` re-inlined. Two impls prove
+// the fallback remains buildable and trace-equivalent.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench WallclockLifecycleTb
+    dut : Top
+    expected : uint<32> default 0
+
+    setup
+        dut.rst = 1
+        dut.en = 0
+        wait 10ns
+        dut.rst = 0
+    end setup
+
+    check
+        assert dut.count_out == expected
+            else fail("wall-clock lifecycle: count=${dut.count_out} exp=${expected}")
+        log(info, "wall-clock lifecycle fallback passed")
+    end check
+end testbench WallclockLifecycleTb
+
+impl WallclockLcTwo for WallclockLifecycleTb
+    clock clk = SysDomain
+
+    run
+        dut.en = 1
+        wait 2 cycles
+        dut.en = 0
+        expected = 2
+    end run
+end impl WallclockLcTwo
+
+impl WallclockLcFour for WallclockLifecycleTb
+    clock clk = SysDomain
+
+    run
+        dut.en = 1
+        wait 4 cycles
+        dut.en = 0
+        expected = 4
+    end run
+end impl WallclockLcFour

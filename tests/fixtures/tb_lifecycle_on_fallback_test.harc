@@ -1,0 +1,40 @@
+// #619 M4 hardening Phase B: a statement-position `on <event>` handler in a
+// reusable-testbench lifecycle is per-test-context-dependent. ShareScan must
+// reject sharing for the whole testbench. The setup emits through the local
+// event so the fallback is exercised at runtime, not only parsed.
+
+testbench OnLifecycleTb
+    dut : Top
+    seen : uint<32> default 0
+
+    setup
+        let ev : event<uint<8>>
+        on ev(v)
+            seen = seen + v
+        end on
+        emit ev(2)
+        wait 1 cycle
+        assert seen == 2
+            else fail("lifecycle on-handler saw ${seen}, expected 2")
+    end setup
+
+    check
+        assert seen == 2
+            else fail("lifecycle on-handler state was lost: ${seen}")
+        log(info, "on-handler lifecycle ShareScan fallback passed")
+    end check
+end testbench OnLifecycleTb
+
+impl OnLcA for OnLifecycleTb
+    run
+        dut.rst = 0
+        dut.en = 0
+    end run
+end impl OnLcA
+
+impl OnLcB for OnLifecycleTb
+    run
+        dut.rst = 0
+        dut.en = 0
+    end run
+end impl OnLcB

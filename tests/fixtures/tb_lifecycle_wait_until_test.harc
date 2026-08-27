@@ -1,0 +1,57 @@
+// #619 M4 hardening Phase B: both wait-until terminators are legal in a
+// shared reusable-testbench lifecycle and must classify as Coro. `setup`
+// exercises the no-timeout form and actually suspends while the counter
+// advances; `check` exercises the timeout form and also suspends before the
+// predicate fires. Both bodies are emitted once and called by two impls.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench WaitUntilLifecycleTb
+    dut : Top
+    expected : uint<32> default 0
+
+    setup
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        dut.en = 1
+        wait until dut.count_out == 2
+        dut.en = 0
+    end setup
+
+    check
+        dut.en = 1
+        wait until dut.count_out == expected + 2 timeout 8 cycles
+            fail("shared lifecycle wait-until timed out")
+        dut.en = 0
+        expected = expected + 2
+        assert dut.count_out == expected
+            else fail("wait-until check: count=${dut.count_out} exp=${expected}")
+        log(info, "shared wait-until lifecycle passed")
+    end check
+end testbench WaitUntilLifecycleTb
+
+impl WaitUntilLcThree for WaitUntilLifecycleTb
+    clock clk = SysDomain
+
+    run
+        dut.en = 1
+        wait 3 cycles
+        dut.en = 0
+        expected = 5
+    end run
+end impl WaitUntilLcThree
+
+impl WaitUntilLcFive for WaitUntilLifecycleTb
+    clock clk = SysDomain
+
+    run
+        dut.en = 1
+        wait 5 cycles
+        dut.en = 0
+        expected = 7
+    end run
+end impl WaitUntilLcFive

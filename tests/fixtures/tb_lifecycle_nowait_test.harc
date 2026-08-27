@@ -1,6 +1,7 @@
 // #619 M4b: a reusable testbench whose `setup` AND `check` lifecycle
 // bodies are NON-SUSPENDING (pure field writes / asserts / log, no
-// `wait`). Bound by two impls, so under HARC_TBIR_NATIVE_LIFECYCLE the
+// `wait`), including `teardown`. Bound by two impls, so under
+// HARC_TBIR_NATIVE_LIFECYCLE the
 // shared bodies are emitted OUT-OF-LINE once (a real call), not
 // re-inlined per test. The v1==tbir trace-diff proves the out-of-line
 // parameter passing is equivalence-clean.
@@ -27,6 +28,15 @@ testbench CounterNoWaitTb
             else fail("shared final check: count_out=${dut.count_out}, expected=${expected}")
         log(info, "shared non-suspending check passed")
     end check
+
+    // Non-suspending teardown (Plain variant). This is intentionally a
+    // real body rather than an empty phase so ownership tests can prove the
+    // teardown definition is emitted once and both impls call it.
+    teardown
+        assert seen_setup == 1
+            else fail("shared setup marker was lost before teardown")
+        log(info, "shared non-suspending teardown passed")
+    end teardown
 end testbench CounterNoWaitTb
 
 impl NoWaitBumpTwo for CounterNoWaitTb

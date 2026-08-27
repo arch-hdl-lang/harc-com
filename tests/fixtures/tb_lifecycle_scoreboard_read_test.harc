@@ -43,8 +43,14 @@ testbench SbLifecycleTb
         source.observed -> direct.accept
     end connect
 
-    // Shared check reading the testbench-owned scoreboard field.
+    // Shared check reading the testbench-owned scoreboard field from both
+    // statements and expression-bearing terminators. The untimed and timed
+    // any-of waits used to escape the statement-only out-of-line scan and
+    // emit bare `direct` inside an unreachable lifecycle coroutine.
     check
+        wait until direct.count == expected
+        wait until any of direct.count == expected, false timeout 1 cycles
+            fail("scoreboard wait unexpectedly timed out")
         assert direct.count == expected
             else fail("sb count=${direct.count} exp=${expected}")
     end check

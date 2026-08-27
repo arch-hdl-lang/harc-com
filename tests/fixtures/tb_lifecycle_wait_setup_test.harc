@@ -4,7 +4,8 @@
 // a harc_rt::HarcThread coroutine driven by the run coroutine via the
 // parent-drives-child loop; v1 inlines it per test. The v1==tbir
 // trace-diff proves first-resume timing and per-cycle event order match
-// across the coroutine boundary. Bound by two impls.
+// across the coroutine boundary. A suspending `teardown` adds the same
+// proof at the final lifecycle boundary. Bound by two impls.
 
 testbench WaitSetupTb
     dut : Top
@@ -24,6 +25,15 @@ testbench WaitSetupTb
         assert dut.count_out == expected
             else fail("wait-setup check: count=${dut.count_out} exp=${expected}")
     end check
+
+    // Suspending teardown (Coro variant). `en` is already low, so the extra
+    // scheduler round-trip must not change the final counter value.
+    teardown
+        wait 1 cycle
+        assert dut.count_out == expected
+            else fail("wait-teardown changed count: count=${dut.count_out} exp=${expected}")
+        log(info, "shared suspending teardown passed")
+    end teardown
 end testbench WaitSetupTb
 
 impl WaitSetupSix for WaitSetupTb
