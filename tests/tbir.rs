@@ -42478,13 +42478,12 @@ end impl T"#;
 /// testbench-field INDEX. In a STATEMENT context (`dut.en = mem[xt.idx()]`,
 /// `let z = mem[xt.idx()]`) the call hoists to a `Stmt::TransactorCall`
 /// exactly as the write path does, lowers, verifies, and compiles like v1.
-/// In a `wait until` predicate it cannot hoist (the predicate re-evaluates
-/// every cycle), so it earns the SAME honest refusal a bare call there
-/// does — never a verifier `BadTransactorCall` crash on the un-hoisted
-/// edge. Regression guard for the `hoist_transactor_calls` /
+/// In a `wait until` predicate it remains inline so the bound instance is
+/// invoked on every scheduler attempt, just as v1 does. Regression guard for
+/// the `hoist_transactor_calls` /
 /// `expr_has_transactor_edge` walkers, which must both see the new node.
 #[test]
-fn a_transactor_call_in_a_tb_vec_index_hoists_or_is_refused_like_v1() {
+fn a_transactor_call_in_a_tb_vec_index_hoists_or_re_evaluates_like_v1() {
     let mk = |body: &str| {
         format!(
             r#"transactor Xt
@@ -42522,16 +42521,135 @@ end impl T"#
             .unwrap_or_else(|e| panic!("`{body}` must verify (call hoisted): {e:?}"));
     }
 
-    // `wait until` predicate: the call cannot hoist. Same honest refusal a
-    // bare call earns — an `Unsupported` (v1 does compile the re-eval loop),
-    // NOT a verifier crash.
-    let err = lower_src(&mk("wait until mem[xt.idx()] == 1"))
-        .expect_err("a transactor call in a wait-until predicate is refused");
-    let msg = assert_unsupported(&err);
+    // `wait until` predicate: the call cannot hoist because it must run on
+    // every retry. It remains an expression edge inside the vector index.
+    let src = mk("mem[3] = 1\n        wait until mem[xt.idx()] == 1");
+    let prog = lower_src(&src).expect("a bound transactor call re-evaluates in the predicate");
+    verify::verify_program(&prog).expect("bound predicate call verifies");
+    let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+        .expect("bound predicate call emits");
     assert!(
-        msg.contains("wait until"),
-        "must be the wait-until-predicate refusal, not a verifier crash: {msg}"
+        cpp.contains("Xt_idx()"),
+        "the bound call must remain inside the emitted predicate: {cpp}"
     );
+
+    let cpp = emit_cpp_src(&fixture("transactor_wait_bound_predicate_test.harc"));
+    assert!(
+        cpp.contains(
+            "CounterPredicate_reached(pred, harc_rt::harc_read(dut->count_out))"
+        ),
+        "the direct bound predicate must forward instance state and re-read its DUT argument: \
+         {cpp}"
+    );
+}
+
+#[test]
+fn bound_transactor_wait_predicate_verifier_and_bus_boundary() {
+    let src = fixture("transactor_wait_bound_predicate_test.harc");
+    let prog = lower_src(&src).expect("bound predicate fixture lowers");
+    verify::verify_program(&prog).expect("bound predicate fixture verifies");
+    let run_id = prog.tests[0].run;
+
+    fn wait_pred_mut(prog: &mut ir::TbProgram, fid: ir::FunctionId) -> &mut ir::Expr {
+        prog.functions[fid.index()]
+            .blocks
+            .iter_mut()
+            .find_map(|block| match &mut block.terminator {
+                ir::Terminator::WaitUntil { preds, .. } => Some(&mut preds[0].expr),
+                _ => None,
+            })
+            .expect("wait predicate")
+    }
+
+    let mut broken = prog.clone();
+    if let ir::Expr::Call(ir::CallTarget::TransactorMethod { bus_field, .. }, _) =
+        wait_pred_mut(&mut broken, run_id)
+    {
+        *bus_field = "missing".to_string();
+    }
+    verify::verify_program(&broken).expect_err("unknown bound instance must be rejected");
+
+    let mut broken = prog.clone();
+    if let ir::Expr::Call(ir::CallTarget::TransactorMethod { method, .. }, _) =
+        wait_pred_mut(&mut broken, run_id)
+    {
+        *method = "missing".to_string();
+    }
+    verify::verify_program(&broken).expect_err("unknown bound method must be rejected");
+
+    let mut broken = prog.clone();
+    if let ir::Expr::Call(_, args) = wait_pred_mut(&mut broken, run_id) {
+        args.clear();
+    }
+    verify::verify_program(&broken).expect_err("bound predicate arity must be checked");
+
+    let mut broken = prog.clone();
+    if let ir::Expr::Call(_, args) = wait_pred_mut(&mut broken, run_id) {
+        args[0] = ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::UInt(Some(16)),
+        };
+    }
+    verify::verify_program(&broken).expect_err("bound predicate argument type must be checked");
+
+    let mut broken = prog.clone();
+    broken.testbenches[0]
+        .passive_transactor_fields
+        .insert("pred".to_string());
+    verify::verify_program(&broken)
+        .expect_err("a passive instance cannot call an active-only predicate method");
+
+    let mut broken = prog.clone();
+    broken.testbenches[0].unbound_state_actors.clear();
+    verify::verify_program(&broken)
+        .expect_err("a stateful predicate instance requires receiver storage");
+
+    let aggregate_src = r#"
+transactor Xt
+    dut : Top
+    values : Vec<uint<8>, 2>
+    when active
+        hookable snapshot() -> Vec<uint<8>, 2>
+            return values
+        end snapshot
+    end when
+end transactor Xt
+
+testbench Tb
+    dut : Top
+    xt : Xt active
+end testbench Tb
+
+impl T for Tb
+    run
+        xt.dut = dut
+        wait until xt.snapshot()
+    end run
+end impl T
+"#;
+    let err = lower_src(aggregate_src)
+        .expect_err("an aggregate-returning bound predicate must be rejected before emission");
+    assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+
+    let bus_src = r#"
+bus MemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus MemBus
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    let mem : MemBus = bind dut
+    run
+        wait until mem.read(1) == 0
+    end run
+end impl T
+"#;
+    let err = lower_src(bus_src).expect_err("a TLM bus call cannot run in a predicate closure");
+    let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+    assert!(msg.contains("bus method calls"), "{msg}");
 }
 
 /// A signed scalar STATE field wider than 64 bits now LOWERS and

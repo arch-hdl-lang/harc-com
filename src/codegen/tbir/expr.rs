@@ -829,16 +829,53 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                 // `std::vector<Record>` assigned into a RecordSeq local.
                 CallTarget::Tseq(n) => n.clone(),
                 CallTarget::TransactorMethod { bus_field, method } => {
-                    // Call edges never emit from expression position:
-                    // bus-bound edges emit only as a whole Assign RHS
-                    // (func.rs `emit_transactor_call`), transactor-bound
-                    // edges only as `Stmt::TransactorCall`. Reaching here
-                    // means the verifier's invariant was bypassed.
-                    return Err(EmitError(format!(
-                        "tbir: transactor call edge `{bus_field}.{method}` in expression \
-                         position — verifier pins it to Assign-RHS / TransactorCall \
-                        (lowering/pass bug)"
-                    )));
+                    let prog = cx.prog.ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: transactor call edge `{bus_field}.{method}` has no program \
+                             context"
+                        ))
+                    })?;
+                    let (schema, state_storage) = cx
+                        .func
+                        .owner
+                        .and_then(|owner| prog.testbenches.get(owner.index()))
+                        .and_then(|tb| {
+                            tb.transactor_fields
+                                .iter()
+                                .find(|(field, _)| field == bus_field)
+                                .map(|(_, xid)| {
+                                    let storage = tb
+                                        .unbound_state_actors
+                                        .iter()
+                                        .find(|actor| actor.field == *bus_field)
+                                        .map(|actor| actor.storage.clone());
+                                    (prog.transactor(*xid), storage)
+                                })
+                        })
+                        .ok_or_else(|| {
+                            EmitError(format!(
+                                "tbir: expression-valued transactor call \
+                                 `{bus_field}.{method}` does not resolve through the owner \
+                                 testbench"
+                            ))
+                        })?;
+                    let mut rendered = Vec::with_capacity(args.len() + 1);
+                    if super::func::uses_state_receiver(schema) {
+                        rendered.push(state_storage.ok_or_else(|| {
+                            EmitError(format!(
+                                "tbir: stateful expression-valued transactor call \
+                                 `{bus_field}.{method}` has no receiver storage"
+                            ))
+                        })?);
+                    }
+                    for arg in args {
+                        rendered.push(expr_cpp(cx, arg)?);
+                    }
+                    return Ok(format!(
+                        "{}_{method}({})",
+                        schema.name,
+                        rendered.join(", ")
+                    ));
                 }
                 CallTarget::TransactorSelfMethod { transactor, method } => {
                     let mut rendered = Vec::with_capacity(args.len() + 1);

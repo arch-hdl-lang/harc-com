@@ -4390,6 +4390,28 @@ impl FuncBuilder<'_> {
                 schema.name
             )));
         }
+        if self.in_reevaluated_predicate
+            && matches!(
+                m.ret_ty,
+                Some(
+                    IrType::Record(_)
+                        | IrType::Seq(_)
+                        | IrType::RecordSeq(_)
+                        | IrType::FixedVec { .. }
+                )
+            )
+        {
+            return Err(not_implemented(
+                &format!(
+                    "aggregate-returning transactor method `{}.{method}` in a `wait until` \
+                     predicate",
+                    schema.name
+                ),
+                "v1 accepts the aggregate as a truth value but emits C++ that does not compile; \
+                 use a method that returns bool or an integer",
+                V1Status::EmitsUncompilable,
+            ));
+        }
         // v1 drops argument names and binds by position, so a name in
         // its own position is inert and only a reordered one swaps the
         // values (measured: `axil_write(data = t.value, addr = t.addr)`

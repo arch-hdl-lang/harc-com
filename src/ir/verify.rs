@@ -1164,7 +1164,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     bid: func.entry,
                     errs: &mut errs,
                     temporal_slots_ok: false,
-                    transactor_self_expr_ok: false,
+                    transactor_predicate_expr_ok: false,
                 };
                 checker.check_truth_expr(&handler.trigger, true, "component cycle-handler trigger");
             }
@@ -1694,6 +1694,19 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 });
             }
         }
+        for (field, xid) in &tb.transactor_fields {
+            let requires_state_storage = prog
+                .transactors
+                .get(xid.index())
+                .is_some_and(|schema| !schema.state_fields.is_empty());
+            if requires_state_storage && !actor_names.contains(field) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} stateful transactor field `{field}` has no receiver storage"
+                    ),
+                });
+            }
+        }
         for binding in &tb.component_fields {
             if !component_binding_names.insert(&binding.field) {
                 errs.push(VerifyError::BadProgramRef {
@@ -1870,7 +1883,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 bid: func.entry,
                 errs: &mut errs,
                 temporal_slots_ok: false,
-                transactor_self_expr_ok: false,
+                transactor_predicate_expr_ok: false,
             };
             checker.check_truth_expr(&service.trigger, true, "testbench cycle-service trigger");
         }
@@ -2700,7 +2713,7 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
             bid,
             errs: &mut errs,
             temporal_slots_ok: false,
-            transactor_self_expr_ok: false,
+            transactor_predicate_expr_ok: false,
         };
         ck.check_block(b);
     }
@@ -2728,10 +2741,11 @@ struct Checker<'a> {
     /// execute in the registering function's context. Their temporal
     /// slots are valid only while explicitly walking those side tables.
     temporal_slots_ok: bool,
-    /// A sibling transactor call is expression-valued only inside a
-    /// re-evaluated wait predicate. Every statement/value landing keeps the
-    /// ordinary hoist-to-`TransactorSelfCall` seam.
-    transactor_self_expr_ok: bool,
+    /// A sibling or testbench-instance transactor call is expression-valued
+    /// only inside a re-evaluated wait predicate. Every ordinary value
+    /// landing keeps the statement-level call seam; bus/TLM bindings are
+    /// rejected even while this flag is set.
+    transactor_predicate_expr_ok: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2742,10 +2756,10 @@ enum WholeCollectionShape {
 
 impl Checker<'_> {
     fn check_wait_truth_expr(&mut self, expr: &Expr, context: &'static str) {
-        let previous = self.transactor_self_expr_ok;
-        self.transactor_self_expr_ok = true;
+        let previous = self.transactor_predicate_expr_ok;
+        self.transactor_predicate_expr_ok = true;
         self.check_truth_expr(expr, true, context);
-        self.transactor_self_expr_ok = previous;
+        self.transactor_predicate_expr_ok = previous;
     }
 
     fn check_truth_expr(&mut self, expr: &Expr, ports_ok: bool, context: &'static str) {
@@ -4981,7 +4995,7 @@ impl Checker<'_> {
                     if let Some(d) = dest {
                         self.check_local(*d);
                     }
-                    self.check_transactor_call(*dest, call);
+                    self.check_transactor_call(*dest, call, false, false);
                 }
                 Stmt::TransactorSelfCall { dest, call } => {
                     if let Some(d) = dest {
@@ -6150,9 +6164,15 @@ impl Checker<'_> {
 
     /// The `Stmt::TransactorCall` payload: must be a `TransactorMethod`
     /// call edge whose `bus_field`/`method` resolve through the owner
-    /// testbench's transactor fields. Args follow the no-inline-ports
-    /// rule (they are hoisted at lowering, like `Assign` values).
-    fn check_transactor_call(&mut self, dest: Option<LocalId>, call: &Expr) {
+    /// testbench's transactor fields. Statement calls require hoisted args;
+    /// re-evaluated wait predicates explicitly allow inline port reads.
+    fn check_transactor_call(
+        &mut self,
+        dest: Option<LocalId>,
+        call: &Expr,
+        ports_ok: bool,
+        require_truth_return: bool,
+    ) {
         let (fid, bid) = (self.fid, self.bid);
         let bad = move |detail: String| VerifyError::BadTransactorCall {
             func: fid,
@@ -6203,11 +6223,26 @@ impl Checker<'_> {
             )));
             return;
         };
+        if resolved.active_only && tb.passive_transactor_fields.contains(bus_field) {
+            self.errs.push(bad(format!(
+                "transactor method `{}.{method}` is active-only but field `{bus_field}` is \
+                 passive",
+                schema.name
+            )));
+        }
+        if args.len() != resolved.param_names.len() {
+            self.errs.push(bad(format!(
+                "transactor method `{}.{method}` takes {} argument(s), call passes {}",
+                schema.name,
+                resolved.param_names.len(),
+                args.len()
+            )));
+        }
         for (i, arg) in args.iter().enumerate() {
             let expected = resolved.param_tys.get(i);
             self.check_expr_inner(
                 arg,
-                false,
+                ports_ok,
                 "TransactorCall arg",
                 matches!(expected, Some(IrType::FixedVec { .. })),
             );
@@ -6234,6 +6269,19 @@ impl Checker<'_> {
                     None => {}
                 }
             }
+        }
+        if require_truth_return
+            && !matches!(
+                resolved.ret_ty,
+                Some(IrType::UInt(_) | IrType::SInt(_) | IrType::Bool)
+            )
+        {
+            self.errs.push(bad(format!(
+                "transactor method `{}.{method}` must return a scalar truth value in a wait \
+                 predicate, got {:?}",
+                schema.name,
+                resolved.ret_ty
+            )));
         }
         if let Some(dest) = dest {
             let actual = self.func.locals.get(dest.index()).map(|local| &local.ty);
@@ -6855,17 +6903,21 @@ impl Checker<'_> {
                 // value. A sibling edge has one additional sanctioned
                 // landing: inside a re-evaluated wait predicate.
                 if let CallTarget::TransactorMethod { bus_field, method } = target {
-                    self.errs.push(VerifyError::BadTransactorCall {
-                        func: self.fid,
-                        block: self.bid,
-                        detail: format!(
-                            "`{bus_field}.{method}` call edge in a disallowed position \
-                             ({context}) — must be the entire RHS of an Assign (bus) \
-                             or the payload of a Stmt::TransactorCall (transactor)"
-                        ),
-                    });
+                    if self.transactor_predicate_expr_ok {
+                        self.check_transactor_call(None, e, ports_ok, true);
+                    } else {
+                        self.errs.push(VerifyError::BadTransactorCall {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!(
+                                "`{bus_field}.{method}` call edge in a disallowed position \
+                                 ({context}) — must be the entire RHS of an Assign (bus) \
+                                 or the payload of a Stmt::TransactorCall (transactor)"
+                            ),
+                        });
+                    }
                 }
-                if !self.transactor_self_expr_ok {
+                if !self.transactor_predicate_expr_ok {
                     if let CallTarget::TransactorSelfMethod { transactor, method } = target {
                         self.errs.push(VerifyError::BadTransactorCall {
                             func: self.fid,

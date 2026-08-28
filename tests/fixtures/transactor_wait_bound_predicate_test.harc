@@ -1,0 +1,39 @@
+// A value-returning method on a testbench transactor instance remains inside
+// a `wait until` predicate. The changing DUT argument and persistent target
+// state make every retry observable.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor CounterPredicate
+    dut : Top
+    target : uint<8> default 4
+
+    when active
+        hookable reached(value: uint<8>) -> bool
+            return value >= target
+        end reached
+    end when
+end transactor CounterPredicate
+
+testbench TransactorWaitBoundTb
+    dut : Top
+    pred : CounterPredicate active
+end testbench TransactorWaitBoundTb
+
+impl TransactorWaitBoundPredicateTest for TransactorWaitBoundTb
+    clock clk = SysDomain
+
+    run
+        pred.dut = dut
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        dut.en = 1
+        wait until pred.reached(dut.count_out)
+        assert dut.count_out >= 4 else fail("bound predicate resumed at ${dut.count_out}")
+        log(info, "PASS: bound transactor predicate was re-evaluated")
+    end run
+end impl TransactorWaitBoundPredicateTest
