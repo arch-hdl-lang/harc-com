@@ -118,6 +118,9 @@ family of rejections over a one-site exception. Current implementation order:
   emits, connects, verifier checks, and C++ callback coercion.
 - [x] Unused untyped/uninitialized `let` placeholders, matching v1's inert
   declaration semantics while keeping later reads/writes as use-site errors.
+- [x] Passive event-driven transactor fields, retaining always-on state while
+  activation-aware lowering blocks `when active` member access and omits its
+  handlers, lifecycle services, and connect endpoints from registration.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -126,8 +129,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 118 remaining constructor call sites (119 textual matches including
-the `unsupported` helper definition) as an inventory, not 119 separate tasks.
+Treat the 116 remaining constructor call sites (117 textual matches including
+the `unsupported` helper definition) as an inventory, not 117 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -398,6 +401,11 @@ not applicable before requesting review:
    typed-declaration fallback, leaving the raw inventory at 119 textual matches
    (118 constructors plus the helper definition). Typed declarations still
    retain that subset diagnostic rather than being erased as placeholders.
+   Passive event-driven transactor fields remove two early rejection
+   constructors, reducing the raw inventory to 117 textual matches (116
+   constructors plus the helper definition). Their component binding carries
+   `Passive`; existing activation checks gate member access and generated
+   registration.
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

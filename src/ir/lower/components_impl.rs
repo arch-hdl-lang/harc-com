@@ -447,20 +447,14 @@ pub(crate) fn transactor_is_event_driven(t: &TransactorDecl) -> bool {
 
 /// True when a consumer's subscribing `on <ev>` handler lives ONLY under
 /// `when active`, so it registers for an `active` instance and for no
-/// other. Such an instance bound `passive` (or mode-less, where the mode
-/// is not inherited as `active`) is inert in the one way that matters:
-/// nothing subscribes to its `in event`, so an `emit <inst>.<ev>(..)`
-/// runs its fan-out loop over an empty vector and the transaction is
-/// dropped on the floor.
-///
-/// That is what the emitter produced for `t : T passive` here — the
-/// `for (auto& _s : t.req) _s(1);` loop with no `push_back` anywhere —
-/// and no gate objected, because the analysis-source mode gates accept
-/// `passive` and run ahead of the event-driven one.
+/// other. A passive binding is legal and preserves the transactor's always-on
+/// surface. If its input event is always-on, an emit reaches an empty fan-out;
+/// if the event itself is active-only, access through the passive binding is
+/// rejected by activation-aware member resolution.
 ///
 /// A consumer whose `on` handler sits in the ordinary body is NOT this:
 /// it registers regardless of mode, the emitter wires it on a passive
-/// instance, and it keeps accepting every mode the analysis-source
+/// instance, and it keeps accepting every explicit mode the analysis-source
 /// policy allows.
 pub(crate) fn transactor_is_active_only_consumer(t: &TransactorDecl) -> bool {
     if !transactor_is_event_driven(t) {

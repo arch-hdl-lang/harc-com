@@ -1718,9 +1718,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // The subset of composite-component types that are event-driven
     // *transactors* (`in event<T>` + `on <ev>` consumer BFM). They route
     // to a `ComponentSchema` but, being transactors, accept an
-    // `active`/`passive` instance mode at a binding site (the mode just
-    // selects whether the `when active` body is included — always, in
-    // this subset, so `active` is required and `passive` rejected).
+    // explicit `active`/`passive` instance mode at a binding site. A passive
+    // instance retains the always-on surface; active-only member access stays
+    // rejected and active-only handler registration is omitted.
     let event_driven_transactor_names: HashSet<String> = file
         .items
         .iter()
@@ -2782,34 +2782,15 @@ fn validate_testbench_component(
                     }
                     // Ahead of the analysis-source gates, and ONLY for the
                     // types they would otherwise claim: an analysis source
-                    // that is also an active-only consumer. Those gates
-                    // accept `passive`, which leaves such an instance with
-                    // no subscriber on its `in event`.
-                    //
-                    // Narrow on both axes deliberately. A consumer that is
-                    // NOT an analysis source (it holds a DUT handle, say)
-                    // already falls to the event-driven gate below, whose
-                    // wording #612 tuned against v1's own behaviour, and
-                    // preempting it here would replace that with this
-                    // arm's. And only `passive` is claimed: a mode-LESS
-                    // field is a program error that v1 refuses too, so it
-                    // belongs to the gate that says so, not to this one.
+                    // that is also an active-only consumer. Both explicit
+                    // modes are legal. A passive instance retains its
+                    // always-on surface while activation-aware lowering
+                    // blocks the `when active` event and registration omits
+                    // its handler.
                     if active_only_consumer_names.contains(simple)
                         && (mode_sensitive_analysis_source_names.contains(simple)
                             || always_on_analysis_source_names.contains(simple))
                     {
-                        if matches!(mode, Some(TransactorMode::Passive)) {
-                            return Err(unsupported(
-                                &format!(
-                                    "a passive event-driven transactor field `{}.{} : \
-                                     {simple} passive` whose `on` handler is declared inside \
-                                     `when active`",
-                                    c.name.name, f.name.name
-                                ),
-                                "the handler registers only on an `active` instance, so an \
-                                 `emit` into this instance's `in event` reaches no subscriber",
-                            ));
-                        }
                         continue;
                     }
                     if mode_sensitive_analysis_source_names.contains(simple) {
@@ -2878,46 +2859,13 @@ fn validate_testbench_component(
                     }
                     // An event-driven transactor field (`drv : SeqXactor
                     // active`) routes to a `ComponentSchema` but is still a
-                    // transactor: it requires an explicit `active` mode (a
-                    // `passive` instance has no `when active` body — its
-                    // `on` handler never registers, so it can't consume).
+                    // transactor: it requires an explicit mode. A passive
+                    // instance is still useful through its always-on state;
+                    // activation-aware lowering blocks its `when active`
+                    // surface and registration omits its handler.
                     if event_driven_transactor_names.contains(simple) {
                         match mode {
-                            Some(TransactorMode::Active) => continue,
-                            Some(TransactorMode::Passive) => {
-                                // `Unsupported` is right — v1 runs both
-                                // shapes of this and runs them
-                                // correctly — but the detail took one
-                                // of them for the whole construct.
-                                //
-                                //   * handler inside `when active` —
-                                //     v1 omits the registration on a
-                                //     passive instance, which is the
-                                //     language's own rule.
-                                //   * handler in the ALWAYS-ON body —
-                                //     v1 registers it, and its output
-                                //     is byte-identical to the `active`
-                                //     program. The handler fires.
-                                //
-                                // So "only registers on an `active`
-                                // instance" was false for the second,
-                                // and it is the sentence the reader
-                                // acts on. What is actually true of
-                                // both is narrower: TB-IR does not
-                                // lower a passive instance of this
-                                // shape at all.
-                                return Err(unsupported(
-                                    &format!(
-                                        "a passive event-driven transactor field `{}.{} : \
-                                         {simple} passive`",
-                                        c.name.name, f.name.name
-                                    ),
-                                    "TB-IR lowers the consumer only as an `active` \
-                                     instance; v1 runs a passive one, registering an \
-                                     always-on `on` handler and omitting a `when \
-                                     active`-scoped one",
-                                ));
-                            }
+                            Some(TransactorMode::Active | TransactorMode::Passive) => continue,
                             None => {
                                 // MEASURED: v1 refuses this too, with
                                 // "transactor field `_tb.drv :
@@ -2927,14 +2875,6 @@ fn validate_testbench_component(
                                 // is a program error under both
                                 // backends.
                                 //
-                                // The `Passive` arm above is NOT the
-                                // same and stays `Unsupported`: v1 emits
-                                // that program and honours it correctly,
-                                // dropping the `when active` handler
-                                // registration exactly as the language
-                                // says. It is a legal program TB-IR does
-                                // not lower, which is what `Unsupported`
-                                // is for.
                                 return Err(LowerError::Invalid(format!(
                                     "event-driven transactor field `{}.{} : {simple}` needs \
                                      an `active`/`passive` mode annotation",
