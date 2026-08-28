@@ -116,6 +116,8 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Boolean component and test-scope event payloads, preserving `bool` as
   distinct from `uint<1>` through handler locals, subscriber signatures,
   emits, connects, verifier checks, and C++ callback coercion.
+- [x] Unused untyped/uninitialized `let` placeholders, matching v1's inert
+  declaration semantics while keeping later reads/writes as use-site errors.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -392,6 +394,10 @@ not applicable before requesting review:
    unsupported non-scalar fields share it. Nested bus expressions and sized
    cover widths were also reclassified because v1 rejects or silently
    mis-lowers them.
+   Unused untyped/uninitialized `let` placeholders route around the shared
+   typed-declaration fallback, leaving the raw inventory at 119 textual matches
+   (118 constructors plus the helper definition). Typed declarations still
+   retain that subset diagnostic rather than being erased as placeholders.
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

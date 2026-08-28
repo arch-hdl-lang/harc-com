@@ -28906,13 +28906,12 @@ end impl T"#,
     );
 }
 
-/// An uninitialized `let x` with no type keeps its `--codegen v1`
-/// suggestion. v1 emits only a comment for the declaration, so whether
-/// its output compiles depends on whether the name is later USED — and
-/// the rejection fires at the declaration, before that is known.
+/// An unused uninitialized `let x` with no type is a source-level
+/// placeholder. v1 emits only a comment for it; TB-IR emits no local.
+/// A later use is still rejected at that use site as an unresolved name.
 #[test]
-fn an_untyped_uninitialized_let_keeps_its_v1_suggestion() {
-    let err = lower_src(
+fn an_unused_untyped_uninitialized_let_is_inert() {
+    let prog = lower_src(
         r#"testbench Tb
     dut : Top
 end testbench Tb
@@ -28923,12 +28922,41 @@ impl T for Tb
     end run
 end impl T"#,
     )
-    .unwrap_err();
-    let msg = assert_unsupported(&err);
+    .expect("an unused placeholder lowers");
+    verify::verify_program(&prog).expect("the placeholder emits no unverifiable local");
+    let run = prog
+        .functions
+        .iter()
+        .find(|f| matches!(f.kind, ir::FunctionKind::Run { .. }))
+        .expect("run function");
     assert!(
-        msg.contains("uninitialized `let x` without a scalar type"),
-        "{msg}"
+        run.locals.iter().all(|local| local.name != "x"),
+        "an inert placeholder must not acquire an arbitrary IR type"
     );
+
+    let typed = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let x : int
+    end run
+end test T"#,
+    )
+    .expect_err("an unsupported typed declaration must not be erased");
+    assert_unsupported(&typed);
+
+    let err = lower_src(
+        r#"test T
+    let dut : Top
+    run
+        let x
+        x = 1
+    end run
+end test T"#,
+    )
+    .expect_err("using the placeholder still fails");
+    let msg = format!("{err}");
+    assert!(msg.contains("x"), "the use-site diagnostic names `x`: {msg}");
 }
 
 // ---------------------------------------------------------------------
