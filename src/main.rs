@@ -2443,45 +2443,45 @@ fn cmd_sim(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("harc_tb");
+    let top_for_scan = top
+        .clone()
+        .or_else(|| harc::codegen::cpp_tb::dut_type_name(&codegen_source));
     // On the `--sv` (Verilator) path, scan the SV DUT for ports that
     // flatten to a packed multi-lane vector (`Vec<Bus, N>` / multi-lane
     // bus ports) and record their per-lane bit-width. The TB codegen
-    // uses this to lower `dut.<port>[i]` lane accesses to bit-extract /
-    // bit-deposit against Verilator's packed scalar — a raw C++ array
-    // subscript only works against the ARCH native sim's array port.
-    // Empty on the `--dut` path (no SV to scan, and direct indexing is
-    // already correct there).
-    let vec_lane_widths = if !sv.is_empty() {
-        let top_for_scan = top
-            .clone()
-            .or_else(|| harc::codegen::cpp_tb::dut_type_name(&codegen_source));
-        match top_for_scan {
-            Some(t) => harc::codegen::cpp_tb::vec_lane_widths_from_sv(&sv, &t),
+    // uses this to lower `dut.<port>[i]` lane accesses through the
+    // backend-neutral bit-extract / lane-read helper.
+    let mut vec_lane_widths = if !sv.is_empty() {
+        match top_for_scan.as_deref() {
+            Some(t) => harc::codegen::cpp_tb::vec_lane_widths_from_sv(&sv, t),
             None => std::collections::HashMap::new(),
         }
     } else {
         std::collections::HashMap::new()
     };
+    // Native ARCH scalar ports are C++ integers, not arrays. Treat an
+    // indexed scalar (`UInt<N>[i]`) as packed one-bit lanes so both v1 and
+    // TBIR route the read through `harc_vec_lane_read<1>` instead of emitting
+    // invalid `dut->port[i]` C++. True unpacked Vec ports are intentionally
+    // absent from this scalar-only table and retain direct array indexing.
+    let arch_scalar_port_widths = match top_for_scan.as_deref() {
+        Some(t) => harc::codegen::cpp_tb::dut_port_widths_from_files(&dut_iface, t),
+        None => std::collections::HashMap::new(),
+    };
+    harc::codegen::cpp_tb::add_arch_scalar_bit_lanes(
+        &mut vec_lane_widths,
+        &arch_scalar_port_widths,
+    );
     let mut dut_port_widths = if !sv.is_empty() {
-        let top_for_scan = top
-            .clone()
-            .or_else(|| harc::codegen::cpp_tb::dut_type_name(&codegen_source));
-        match top_for_scan {
-            Some(t) => harc::codegen::cpp_tb::dut_port_widths_from_sv(&sv, &t),
+        match top_for_scan.as_deref() {
+            Some(t) => harc::codegen::cpp_tb::dut_port_widths_from_sv(&sv, t),
             None => std::collections::HashMap::new(),
         }
     } else {
         std::collections::HashMap::new()
     };
-    if let Some(top_for_scan) = top
-        .clone()
-        .or_else(|| harc::codegen::cpp_tb::dut_type_name(&codegen_source))
-    {
-        for (name, width) in
-            harc::codegen::cpp_tb::dut_port_widths_from_files(&dut_iface, &top_for_scan)
-        {
-            dut_port_widths.entry(name).or_insert(width);
-        }
+    for (name, width) in arch_scalar_port_widths {
+        dut_port_widths.entry(name).or_insert(width);
     }
     // Ingest DUT-port-level bus param overrides from the DUT `.arch`/`.archi`
     // interface (the authoritative source post arch#567). When a DUT module
