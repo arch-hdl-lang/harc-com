@@ -355,6 +355,10 @@ not applicable before requesting review:
    whole-vector read/copy gate while widening the existing helper ABI; the
    shared nested-vector fence remains, so this slice also leaves the raw
    textual inventory unchanged.
+   Fixed-vector reusable testbench methods now share that exact one-dimensional
+   aggregate boundary for parameters, returns, inferred result locals, and
+   CFG-inlined return-slot initialization. Nested signatures remain fenced, so
+   this slice also leaves the raw textual inventory unchanged.
    Runtime-address passive `record_read` now carries the regblock decoder in
    `Stmt::RecordRead`, and runtime-address passive `record_write` carries the
    symmetric decoder plus owner-binding callback dispatch in

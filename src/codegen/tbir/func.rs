@@ -1416,6 +1416,10 @@ pub(super) fn emit_helper_function(
                     // C++. Construct through the local's declared type.
                     writeln!(out, "{pad3}{name} = decltype({name}){{}};").ok();
                 }
+                Stmt::AggregateInit(local) => {
+                    let name = &names[local.index()];
+                    writeln!(out, "{pad3}{name} = decltype({name}){{}};").ok();
+                }
                 other => {
                     return Err(EmitError(format!(
                         "tbir: pure helper `{}` contains a non-Assign statement ({other:?}) — \
@@ -1800,6 +1804,10 @@ fn emit_stmt(
                 ))
             })?;
             writeln!(out, "{pad}{name} = {}{{}};", rec.name).ok();
+        }
+        Stmt::AggregateInit(l) => {
+            let name = &names[l.index()];
+            writeln!(out, "{pad}{name} = decltype({name}){{}};").ok();
         }
         Stmt::TransactorCall { dest, call } => {
             let Expr::Call(CallTarget::TransactorMethod { bus_field, method }, args) = call else {

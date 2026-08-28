@@ -292,6 +292,9 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
             Stmt::RecordInit(_, _) => {
                 host_service_only = false;
             }
+            Stmt::AggregateInit(_) => {
+                host_service_only = false;
+            }
             Stmt::RecordRead { addr, .. } => {
                 host_service_only = false;
                 visit_expr(addr, &mut accesses, &mut transactor);

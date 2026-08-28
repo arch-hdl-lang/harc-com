@@ -615,7 +615,30 @@ impl FuncBuilder<'_> {
                     V1Status::EmitsUncompilable,
                 ));
             } else {
-                let v = self.lower_expr_no_ports(e)?;
+                let param_ty = testbench_method_signature_type(
+                    name,
+                    &format!("parameter `{}`", p.name.name),
+                    p.ty.as_ref(),
+                    &self.ctx.record_ids,
+                )?;
+                let v = if matches!(param_ty, IrType::FixedVec { .. }) {
+                    let value = self.whole_vec_value_rhs(e)?.ok_or_else(|| {
+                        LowerError::Invalid(format!(
+                            "parameter `{}` of testbench method `{name}` requires a whole fixed-vector value",
+                            p.name.name
+                        ))
+                    })?;
+                    if self.ir_whole_vec_type(&value).as_ref() != Some(&param_ty) {
+                        return Err(LowerError::Invalid(format!(
+                            "parameter `{}` of testbench method `{name}` expects {param_ty:?}, got {:?}",
+                            p.name.name,
+                            self.ir_whole_vec_type(&value).unwrap_or(IrType::Unknown)
+                        )));
+                    }
+                    value
+                } else {
+                    self.lower_expr_no_ports(e)?
+                };
                 // The testbench-method spelling of the slot rule.
                 // `ir_type_of_param` is already in hand two lines up, so
                 // this needed no new type table — the note that deferred
@@ -634,7 +657,12 @@ impl FuncBuilder<'_> {
         let dest = self.fresh_temp();
         let mut ret_ty = IrType::Unknown;
         if decl.return_ty.is_some() {
-            ret_ty = ir_type_of_with_records(decl.return_ty.as_ref(), &self.ctx.record_ids);
+            ret_ty = testbench_method_signature_type(
+                name,
+                "return type",
+                decl.return_ty.as_ref(),
+                &self.ctx.record_ids,
+            )?;
             self.set_local_type(dest, ret_ty.clone());
         }
         self.push_return_default(dest, &ret_ty);
@@ -659,7 +687,15 @@ impl FuncBuilder<'_> {
         for (p, b) in decl.params.iter().zip(bound) {
             if let Bound::Val(e) = b {
                 let id = self.declare(&p.name.name);
-                self.set_local_type(id, ir_type_of_param(p.ty.as_ref(), self.ctx));
+                self.set_local_type(
+                    id,
+                    testbench_method_signature_type(
+                        name,
+                        &format!("parameter `{}`", p.name.name),
+                        p.ty.as_ref(),
+                        &self.ctx.record_ids,
+                    )?,
+                );
                 self.push(Stmt::Assign(id, e));
             }
         }
@@ -688,7 +724,23 @@ impl FuncBuilder<'_> {
                 if let Some(port) = self.as_port_ref(e)? {
                     self.push(Stmt::DutRead(dest, port));
                 } else {
-                    let ir = self.lower_expr_no_ports(e)?;
+                    let expected = self.local_type(dest).clone();
+                    let ir = if let IrType::FixedVec { elem, len } = &expected {
+                        let shape = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
+                            .map(|class| (*len, class));
+                        match shape {
+                            Some(shape) => self.whole_vec_copy_rhs(shape, e)?,
+                            None => None,
+                        }
+                        .ok_or_else(|| {
+                            LowerError::Invalid(
+                                "fixed-vector testbench method return requires a matching whole-vector value"
+                                    .to_string(),
+                            )
+                        })?
+                    } else {
+                        self.lower_expr_no_ports(e)?
+                    };
                     self.push(Stmt::Assign(dest, ir));
                 }
             }
@@ -739,16 +791,16 @@ impl FuncBuilder<'_> {
     }
 
     fn push_return_default(&mut self, dest: crate::ir::LocalId, ty: &IrType) {
-        if let IrType::Record(rid) = ty {
-            self.push(Stmt::RecordInit(dest, *rid));
-        } else {
-            self.push(Stmt::Assign(
+        match ty {
+            IrType::Record(rid) => self.push(Stmt::RecordInit(dest, *rid)),
+            IrType::FixedVec { .. } => self.push(Stmt::AggregateInit(dest)),
+            _ => self.push(Stmt::Assign(
                 dest,
                 Expr::Literal {
                     value: 0,
                     ty: IrType::Unknown,
                 },
-            ));
+            )),
         }
     }
 }
@@ -903,6 +955,29 @@ pub(crate) fn ir_type_of_with_records(
 
 fn ir_type_of_param(ty: Option<&TypeExpr>, ctx: &super::LowerCtx) -> IrType {
     ir_type_of_with_records(ty, &ctx.record_ids)
+}
+
+fn testbench_method_signature_type(
+    method: &str,
+    what: &str,
+    ty: Option<&TypeExpr>,
+    record_ids: &HashMap<String, RecordId>,
+) -> Result<IrType, LowerError> {
+    if let Some(fixed @ IrType::FixedVec { .. }) = ty.and_then(|ty| {
+        super::components::fixed_vec_ir_type_with_records(ty, record_ids)
+    }) {
+        if matches!(
+            &fixed,
+            IrType::FixedVec { elem, .. } if matches!(elem.as_ref(), IrType::FixedVec { .. })
+        ) {
+            return Err(unsupported(
+                &format!("testbench method `{method}` {what} with a nested fixed-vector type"),
+                "nested fixed-vector method signatures await recursive whole-vector copy lowering",
+            ));
+        }
+        return Ok(fixed);
+    }
+    Ok(ir_type_of_with_records(ty, record_ids))
 }
 // ── Conservative purity / call-graph scan ───────────────────────────
 

@@ -21200,6 +21200,191 @@ end impl TbRecordReturnTest
     );
 }
 
+#[test]
+fn fixed_vector_testbench_method_signatures_are_typed_end_to_end() {
+    let src = include_str!("fixtures/fixed_vec_testbench_method_test.harc");
+    let prog = lower_src(src).expect("fixed-vector testbench methods lower");
+    verify::verify_program(&prog).expect("fixed-vector testbench methods verify");
+    let run = prog.function(prog.tests[0].run);
+    let vec_ty = ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::UInt(Some(8))),
+        len: 2,
+    };
+    assert!(
+        run.locals
+            .iter()
+            .filter(|local| local.ty == vec_ty)
+            .count()
+            >= 5,
+        "arguments, parameters, return temp, and inferred result retain the exact vector type:\n{run}"
+    );
+    assert!(
+        run.blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .any(|stmt| matches!(stmt, ir::Stmt::AggregateInit(local) if run.locals[local.index()].ty == vec_ty)),
+        "the inlined vector return slot is aggregate-initialized:\n{run}"
+    );
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("decltype(__t0){}") && cpp.contains("std::array<uint64_t, 2>"),
+        "the emitted method path uses a default-constructed std::array return slot:\n{cpp}"
+    );
+    let mut corrupt = prog.clone();
+    let run_id = corrupt.tests[0].run;
+    let scalar = corrupt
+        .function(run_id)
+        .locals
+        .iter()
+        .position(|local| !matches!(local.ty, ir::IrType::FixedVec { .. } | ir::IrType::Record(_)))
+        .map(|index| ir::LocalId(index as u32))
+        .expect("fixture has a scalar local");
+    let init = corrupt.functions[run_id.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find(|stmt| matches!(stmt, ir::Stmt::AggregateInit(_)))
+        .expect("fixture has aggregate init");
+    *init = ir::Stmt::AggregateInit(scalar);
+    assert!(
+        verify::verify_program(&corrupt).is_err(),
+        "AggregateInit on a scalar local must fail verification"
+    );
+    let init_local = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::AggregateInit(local) => Some(*local),
+            _ => None,
+        })
+        .expect("fixture has aggregate init");
+    for (bad_ty, label) in [
+        (
+            ir::IrType::FixedVec {
+                elem: Box::new(ir::IrType::UInt(Some(8))),
+                len: 0,
+            },
+            "zero length",
+        ),
+        (
+            ir::IrType::FixedVec {
+                elem: Box::new(ir::IrType::Record(ir::RecordId(999))),
+                len: 2,
+            },
+            "missing record",
+        ),
+        (
+            ir::IrType::FixedVec {
+                elem: Box::new(ir::IrType::FixedVec {
+                    elem: Box::new(ir::IrType::UInt(Some(8))),
+                    len: 2,
+                }),
+                len: 2,
+            },
+            "nested vector",
+        ),
+    ] {
+        let mut malformed = prog.clone();
+        malformed.functions[run_id.index()].locals[init_local.index()].ty = bad_ty;
+        assert!(
+            verify::verify_program(&malformed).is_err(),
+            "AggregateInit with {label} metadata must fail verification"
+        );
+    }
+    let annotated = src.replace(
+        "let echoed = echo_vec(values)",
+        "let echoed : Vec<uint<8>, 2> = echo_vec(values)",
+    );
+    let annotated_prog = lower_src(&annotated).expect("matching vector result annotation lowers");
+    verify::verify_program(&annotated_prog).expect("matching vector result annotation verifies");
+    let bad_annotation = src.replace(
+        "let echoed = echo_vec(values)",
+        "let echoed : Vec<uint<8>, 3> = echo_vec(values)",
+    );
+    assert_invalid(
+        &lower_src(&bad_annotation).expect_err("mismatched vector result annotation is invalid"),
+    );
+
+    let record_src = r#"
+transaction Beat
+    data : uint<8> default 0
+end transaction Beat
+
+struct BeatTable
+    beats : Vec<Beat, 2>
+end struct BeatTable
+
+testbench RecordVecMethodTb
+    dut : Top
+
+    function echo(items: Vec<Beat, 2>) -> Vec<Beat, 2>
+        return items
+    end function echo
+end testbench RecordVecMethodTb
+
+impl RecordVecMethodTest for RecordVecMethodTb
+    run
+        let table : BeatTable
+        let echoed = echo(table.beats)
+        let copied : BeatTable
+        copied.beats = echoed
+    end run
+end impl RecordVecMethodTest
+"#;
+    let record_prog = lower_src(record_src).expect("record-element vector method lowers");
+    verify::verify_program(&record_prog).expect("record-element vector method verifies");
+    let record_run = record_prog.function(record_prog.tests[0].run);
+    assert!(record_run.locals.iter().any(|local| matches!(
+        &local.ty,
+        ir::IrType::FixedVec { elem, len: 2 }
+            if matches!(elem.as_ref(), ir::IrType::Record(ir::RecordId(0)))
+    )));
+
+    let mismatch = src.replace(
+        "function echo_vec(items: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>",
+        "function echo_vec(items: Vec<uint<8>, 3>) -> Vec<uint<8>, 2>",
+    );
+    assert_invalid(&lower_src(&mismatch).expect_err("vector argument length mismatch is invalid"));
+
+    let component_base = include_str!("fixtures/component_fixed_vec_test.harc");
+    let scalar_component_mismatch = component_base
+        .replace(
+            "    dut : Top\n",
+            "    dut : Top\n\n    function accept_bytes(items: Vec<uint<8>, 4>) -> bool\n        return true\n    end function accept_bytes\n",
+        )
+        .replace("    run\n", "    run\n        let bad = accept_bytes(left.words)\n");
+    assert_invalid(
+        &lower_src(&scalar_component_mismatch)
+            .expect_err("direct component vector element mismatch is invalid"),
+    );
+
+    let record_component_mismatch = component_base
+        .replacen(
+            "struct TableKid\n",
+            "struct OtherKid\n    value : uint<8>\nend struct OtherKid\n\nstruct TableKid\n",
+            1,
+        )
+        .replace(
+            "    dut : Top\n",
+            "    dut : Top\n\n    function accept_others(items: Vec<OtherKid, 4>) -> bool\n        return true\n    end function accept_others\n",
+        )
+        .replace(
+            "    run\n",
+            "    run\n        let bad = accept_others(left.bundle.kids)\n",
+        );
+    assert_invalid(
+        &lower_src(&record_component_mismatch)
+            .expect_err("record-vector leaf identity mismatch is invalid"),
+    );
+
+    let nested = src.replace(
+        "items: Vec<uint<8>, 2>",
+        "items: Vec<Vec<uint<8>, 2>, 2>",
+    );
+    assert_unsupported(&lower_src(&nested).expect_err("nested method signatures stay fenced"));
+}
+
 fn assert_no_record_zero_assign(func: &ir::TbFunction) {
     for block in &func.blocks {
         for stmt in &block.stmts {
