@@ -17584,6 +17584,10 @@ fn fixed_vector_transactor_params_are_typed_end_to_end() {
         elem: Box::new(ir::IrType::UInt(Some(8))),
         len: 3,
     };
+    let nested = ir::IrType::FixedVec {
+        elem: Box::new(expected.clone()),
+        len: 2,
+    };
     for (name, expected_params) in [
         ("consume", vec![expected.clone(), expected.clone()]),
         (
@@ -17614,6 +17618,9 @@ fn fixed_vector_transactor_params_are_typed_end_to_end() {
             Some(expected.clone())
         );
     }
+    let echo_grid = schema.method("echo_grid").unwrap();
+    assert_eq!(echo_grid.param_tys, vec![nested.clone()]);
+    assert_eq!(echo_grid.ret_ty, Some(nested.clone()));
 
     let run = prog.function(prog.tests[0].run);
     for name in ["snapshot", "echoed"] {
@@ -17626,6 +17633,14 @@ fn fixed_vector_transactor_params_are_typed_end_to_end() {
             "untyped `{name}` inherits the fixed-vector return type"
         );
     }
+    assert_eq!(
+        run.locals
+            .iter()
+            .find(|local| local.name == "echoed_grid")
+            .map(|local| local.ty.clone()),
+        Some(nested.clone()),
+        "untyped nested result inherits the complete fixed-vector type"
+    );
     assert!(run.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
         matches!(stmt, ir::Stmt::TransactorCall { call: ir::Expr::Call(_, args), .. }
             if matches!(args.as_slice(), [ir::Expr::TbField(a), ir::Expr::TbField(b), ir::Expr::TbField(c)]
@@ -17647,6 +17662,11 @@ fn fixed_vector_transactor_params_are_typed_end_to_end() {
         cpp.contains("std::function<std::array<uint64_t, 2>(_VecParamSink_state&)> VecParamSink_snapshot;")
             && cpp.contains("VecParamSink_snapshot = [&](_VecParamSink_state& self_state) -> std::array<uint64_t, 2>")
             && cpp.contains("std::function<std::array<uint64_t, 2>(_VecParamSink_state&, std::array<uint64_t, 2>)> VecParamSink_echo;"),
+        "{cpp}"
+    );
+    assert!(
+        cpp.contains("std::function<std::array<std::array<uint64_t, 2>, 2>(_VecParamSink_state&, std::array<std::array<uint64_t, 2>, 2>)> VecParamSink_echo_grid;")
+            && cpp.contains("VecParamSink_echo_grid = [&](_VecParamSink_state& self_state, std::array<std::array<uint64_t, 2>, 2> values) -> std::array<std::array<uint64_t, 2>, 2>"),
         "{cpp}"
     );
 
@@ -17801,14 +17821,16 @@ end impl RecordVecTest"#;
     );
 
     let nested_return = record_return.replace("Vec<Beat, 2>", "Vec<Vec<Beat, 2>, 2>");
-    let err = lower_src(&nested_return)
-        .expect_err("nested fixed-vector transactor returns stay explicitly fenced");
-    let msg = assert_unsupported(&err);
+    let nested_record_prog =
+        lower_src(&nested_return).expect("nested record-vector transactor return lowers");
+    verify::verify_program(&nested_record_prog)
+        .expect("nested record-vector transactor return verifies");
+    let nested_record_cpp = emit_cpp_src(&nested_return);
     assert!(
-        msg.contains("RecordVecSource.snapshot")
-            && msg.contains("nested fixed-vector type")
-            && msg.contains("recursive whole-vector copy lowering"),
-        "{msg}"
+        nested_record_cpp.contains(
+            "std::function<std::array<std::array<Beat, 2>, 2>(_RecordVecSource_state&)>"
+        ),
+        "{nested_record_cpp}"
     );
 
     let bound_src = r#"use BusAxiLite
@@ -17843,17 +17865,19 @@ end impl BoundVecTest"#;
             })
     }));
 
-    let nested_bound_return = bound_src.replace(
-        "hookable echo(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>",
-        "hookable echo(values: Vec<uint<8>, 2>) -> Vec<Vec<uint<8>, 2>, 2>",
-    );
-    let err = lower_with_stdlib_bus_src(&nested_bound_return)
-        .expect_err("bound nested fixed-vector returns stay explicitly fenced");
-    let msg = assert_unsupported(&err);
-    assert!(
-        msg.contains("BoundVecParam.echo") && msg.contains("nested fixed-vector type"),
-        "{msg}"
-    );
+    let nested_bound_return =
+        bound_src.replace("Vec<uint<8>, 2>", "Vec<Vec<uint<8>, 2>, 2>");
+    let nested_bound = lower_with_stdlib_bus_src(&nested_bound_return)
+        .expect("bound nested fixed-vector parameters and returns lower");
+    verify::verify_program(&nested_bound)
+        .expect("bound nested fixed-vector parameters and returns verify");
+    assert!(nested_bound.transactors.iter().any(|schema| {
+        schema.name == "BoundVecParam"
+            && schema.method("echo").is_some_and(|method| {
+                method.param_tys == vec![nested.clone()]
+                    && method.ret_ty == Some(nested.clone())
+            })
+    }));
 }
 
 #[test]
