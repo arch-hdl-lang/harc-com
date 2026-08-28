@@ -5297,23 +5297,16 @@ end test MonTest
     assert!(msg.contains("activate"), "{msg}");
 }
 
-/// A consumer whose `on` handler is active-only cannot be bound
-/// `passive`: nothing would subscribe to its `in event`, so the `emit`
-/// runs its fan-out over an empty vector and the transaction vanishes.
-///
-/// The emitted C++ for the rejected form was the whole diagnosis — a
-/// `for (auto& _s : t.req) _s(1);` loop with no `push_back` anywhere.
-/// The analysis-source mode gates accept `passive` and run ahead of the
-/// event-driven one, and a consumer that also declares an `out event` is
-/// an analysis source, so they claimed the type first; this gate runs
-/// before them.
+/// A consumer whose `on` handler is active-only may be bound passive: its
+/// always-on `in event` remains emit-able, but nothing subscribes, so the
+/// fan-out over the empty vector is a legal no-op. This matches v1.
 ///
 /// The `out event` axis is covered both ways because it decides which
 /// gate would otherwise claim the type, and the always-on rows are the
 /// control: an `on` handler in the ordinary body registers for EVERY
 /// mode, so `passive` keeps working there and must not be swept up.
 #[test]
-fn an_active_only_consumer_rejects_every_mode_but_active() {
+fn an_active_only_consumer_registers_only_when_active() {
     let consumer = |direction: &str, out_event: bool, active_only: bool, mode: &str| {
         let obs = if out_event {
             "    obs : out event<uint<8>>\n"
@@ -5364,12 +5357,23 @@ end impl MTest
                 "direction={direction} out_event={out_event}: the active instance subscribes"
             );
 
-            let err = lower_src(&consumer(direction, out_event, true, "passive"))
-                .expect_err("a passive active-only consumer must be rejected");
-            let msg = assert_unsupported(&err);
+            let src = consumer(direction, out_event, true, "passive");
+            let prog = lower_src(&src).unwrap_or_else(|e| {
+                panic!(
+                    "direction={direction} out_event={out_event}: passive lowers: {e:?}"
+                )
+            });
+            verify::verify_program(&prog).expect("verifies");
+            let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+                .expect("emits");
             assert!(
-                msg.contains("when active") && msg.contains("no subscriber"),
-                "direction={direction} out_event={out_event}: the diagnostic should say why: {msg}"
+                !cpp.contains("req.push_back"),
+                "direction={direction} out_event={out_event}: passive must omit the active-only subscriber"
+            );
+            let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits passive");
+            assert!(
+                !v1.contains("req.push_back"),
+                "direction={direction} out_event={out_event}: v1 must omit the active-only subscriber"
             );
 
             // Control: an always-on handler registers on every mode, so
@@ -38429,8 +38433,8 @@ fn a_bound_to_instance_mode_annotation_splits_missing_from_wrong() {
     );
 }
 
-/// The event-driven flavour of the mode-less transactor FIELD, and the
-/// `passive` sibling that does NOT change with it.
+/// The event-driven flavour of the mode-less transactor FIELD, and its
+/// now-supported passive sibling.
 ///
 /// | field | v1 |
 /// |---|---|
@@ -38439,9 +38443,8 @@ fn a_bound_to_instance_mode_annotation_splits_missing_from_wrong() {
 /// | `c : Consumer passive`, handler in the ALWAYS-ON body | emits, and correctly KEEPS it — byte-identical to `active` |
 ///
 /// So the two halves of one construct part company: a missing
-/// annotation is a program error under both backends, and a `passive`
-/// one is a legal program v1 runs faithfully and TB-IR does not lower.
-/// The second keeps its suggestion for exactly that reason.
+/// annotation is a program error under both backends, while a `passive`
+/// one is legal and both backends preserve only its always-on surface.
 ///
 /// The third row is why the arm's detail no longer claims the handler
 /// "only registers on an `active` instance" — true of the `when
@@ -38461,14 +38464,14 @@ fn a_mode_less_transactor_field_is_a_program_error_but_a_passive_one_is_not() {
         .find("testbench EventDrivenTransactorTb")
         .expect("fixture shape changed");
     let (head, tail) = base.split_at(tb_at);
-    const FIELD: &str = "    drv : CounterDrv active";
+    const FIELD: &str = "    drv         : CounterDrv active";
     assert!(tail.contains(FIELD), "fixture shape changed");
     let with = |repl: &str| format!("{head}{}", tail.replacen(FIELD, repl, 1));
 
     lower_src(&base).expect("the `active` control lowers");
 
     // No mode: `Invalid`, and v1 refuses too.
-    let modeless = with("    drv : CounterDrv");
+    let modeless = with("    drv         : CounterDrv");
     let msg = assert_invalid(&lower_src(&modeless).unwrap_err());
     assert!(
         msg.contains("needs an `active`/`passive` mode annotation"),
@@ -38477,27 +38480,72 @@ fn a_mode_less_transactor_field_is_a_program_error_but_a_passive_one_is_not() {
     let v1 = cpp_tb::emit(&merged_src(&modeless)).expect_err("v1 refuses it too");
     assert!(format!("{v1}").contains("has no mode"), "{v1}");
 
-    // Passive: still `Unsupported`, because v1 really does run it —
-    // and runs it RIGHT. The `on req` handler lives inside `when
-    // active`, so v1 omitting its registration on a passive instance is
-    // the language's own rule, not a mis-lowering.
-    let passive = with("    drv : CounterDrv passive");
-    let msg = assert_unsupported(&lower_src(&passive).unwrap_err());
-    assert!(
-        msg.contains("passive event-driven transactor field"),
-        "{msg}"
+    // Passive: use only the always-on state. The active-only event is
+    // deliberately absent from the run body, and neither backend may
+    // register its handler.
+    let passive = r#"domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor Consumer
+    seen : uint<32> default 7
+
+    when active
+        req : in event<uint<8>>
+        on req(n)
+            seen = seen + n
+        end on
+    end when
+end transactor Consumer
+
+testbench ConsTb
+    dut : Top
+    c   : Consumer passive
+end testbench ConsTb
+
+impl ConsTest for ConsTb
+    clock clk = SysDomain
+    run
+        assert c.seen == 7 else fail("seen=${c.seen}")
+    end run
+end impl ConsTest"#;
+    let prog = lower_src(passive).expect("the passive event-driven field lowers");
+    verify::verify_program(&prog).expect("the passive event-driven field verifies");
+    assert_eq!(
+        prog.testbenches[0].component_fields[0].mode,
+        Some(ir::ComponentInstanceMode::Passive)
     );
-    let v1 = cpp_tb::emit(&merged_src(&passive)).expect("v1 emits the passive program");
+    let tbir = emit_cpp_src(passive);
+    assert!(tbir.contains("Consumer c;"), "{tbir}");
+    assert!(!tbir.contains("c.req.push_back("), "{tbir}");
+
+    let v1 = cpp_tb::emit(&merged_src(passive)).expect("v1 emits the passive program");
     assert!(
-        !v1.contains("_tb.drv.req.push_back("),
+        !v1.contains("_tb.c.req.push_back("),
         "v1 must omit the `when active` handler registration on a passive instance"
     );
-    // Anti-vacuity: the active program does register it.
+    // Anti-vacuity: the active spelling registers it in both backends.
+    let active = passive.replace("Consumer passive", "Consumer active");
     assert!(
-        cpp_tb::emit(&merged_src(&base))
+        emit_cpp_src(&active).contains("c.req.push_back("),
+        "the TB-IR active control must register the handler"
+    );
+    assert!(
+        cpp_tb::emit(&merged_src(&active))
             .expect("v1 emits")
-            .contains("_tb.drv.req.push_back("),
-        "the active control must register the handler, or the check above is empty"
+            .contains("_tb.c.req.push_back("),
+        "the v1 active control must register the handler"
+    );
+
+    // Enabling the binding must not make its active-only surface reachable.
+    let passive_emit = passive.replace(
+        "assert c.seen == 7 else fail(\"seen=${c.seen}\")",
+        "emit c.req(1)",
+    );
+    let msg = assert_invalid(&lower_src(&passive_emit).unwrap_err());
+    assert!(
+        msg.contains("req") && msg.contains("passive") && msg.contains("active-only"),
+        "{msg}"
     );
 
     // The OTHER shape under the same arm, and the reason its detail no

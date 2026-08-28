@@ -9,7 +9,7 @@ fn lower_src(src: &str) -> Result<ir::TbProgram, lower::LowerError> {
 }
 
 #[test]
-fn unrelated_always_on_handler_does_not_mask_dead_active_only_input() {
+fn passive_multi_input_consumer_retains_each_handlers_activation() {
     let passive = r#"
 transactor T
     req1 : in event<uint<8>>
@@ -40,17 +40,18 @@ impl MultiInputTest for Tb
 end impl MultiInputTest
 "#;
 
-    let err = lower_src(passive)
-        .expect_err("req1's always-on subscriber must not hide req2's passive dead emit");
-    assert!(
-        matches!(err, lower::LowerError::Unsupported { .. }),
-        "expected the event-driven passive-binding diagnostic, got {err:?}"
+    let prog = lower_src(passive).expect("the passive binding is legal like v1");
+    verify::verify_program(&prog).expect("passive program verifies");
+    assert_eq!(
+        prog.testbenches[0].component_fields[0].mode,
+        Some(ir::ComponentInstanceMode::Passive)
     );
-    let msg = err.to_string();
-    assert!(
-        msg.contains("when active") && msg.contains("no subscriber"),
-        "{msg}"
-    );
+    let handlers = &prog.components[0].on_handlers;
+    assert_eq!(handlers.len(), 2);
+    assert_eq!(handlers[0].event, "req1");
+    assert_eq!(handlers[0].activation, ir::Activation::Always);
+    assert_eq!(handlers[1].event, "req2");
+    assert_eq!(handlers[1].activation, ir::Activation::ActiveOnly);
 
     let active = passive.replace("t : T passive", "t : T active");
     let prog = lower_src(&active).expect("the same multi-input consumer is valid when active");

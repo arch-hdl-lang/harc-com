@@ -66,9 +66,10 @@ env DrvEnv
 end env DrvEnv
 
 testbench EventDrivenTransactorTb
-    dut : Top
-    drv : CounterDrv active
-    env : DrvEnv
+    dut         : Top
+    drv         : CounterDrv active
+    passive_drv : CounterDrv passive
+    env         : DrvEnv
 end testbench EventDrivenTransactorTb
 
 impl EventDrivenTransactorTest for EventDrivenTransactorTb
@@ -78,6 +79,11 @@ impl EventDrivenTransactorTest for EventDrivenTransactorTb
         log(info, "event-driven transactor: direct emit + connect bridge")
         drv.dut = dut
         env.drv.dut = dut
+
+        // A passive event-driven field keeps its always-on state but does
+        // not expose or register the `when active` request handler.
+        assert passive_drv.fires == 0
+            else fail("passive: fires=${passive_drv.fires}, expected 0")
 
         dut.rst = 1
         dut.en = 0
