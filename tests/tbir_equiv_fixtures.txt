@@ -384,5 +384,6 @@ component_cycle_post_eval_test | Top | top_counter.sv | - | pass
 component_event_directions_test | Top | top_counter.sv | - | pass
 wide_transactor_return_test | Top | top_counter.sv | top_counter.arch | pass
 fixed_vec_transactor_param_test | Top | top_counter.sv | top_counter.arch | pass
+fixed_vec_pure_helper_test | Top | top_counter.sv | top_counter.arch | pass
 nested_record_vec_schema_test | Top | top_counter.sv | - | pass
 enum_variant_scope_test | Top | top_counter.sv | top_counter.arch | pass

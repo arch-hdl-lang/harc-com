@@ -139,10 +139,15 @@ pub(crate) fn lower_pure_helper<'a>(
     side_tables: &'a RefCell<SideTables>,
 ) -> Result<TbFunction, LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
-    b.scalar_helper_abi = true;
+    b.pure_helper_abi = true;
     let mut params = Vec::with_capacity(decl.params.len());
     for p in &decl.params {
-        let ty = ir_type_of_with_records(p.ty.as_ref(), &ctx.record_ids);
+        let ty = pure_helper_signature_type(
+            &decl.name.name,
+            &format!("parameter `{}`", p.name.name),
+            p.ty.as_ref(),
+            &ctx.record_ids,
+        )?;
         let local = b.declare(&p.name.name);
         b.set_local_type(local, ty.clone());
         params.push(TypedParam {
@@ -151,7 +156,12 @@ pub(crate) fn lower_pure_helper<'a>(
         });
     }
     if decl.return_ty.is_some() {
-        let ret_ty = ir_type_of_with_records(decl.return_ty.as_ref(), &ctx.record_ids);
+        let ret_ty = pure_helper_signature_type(
+            &decl.name.name,
+            "return type",
+            decl.return_ty.as_ref(),
+            &ctx.record_ids,
+        )?;
         if matches!(ret_ty, IrType::Record(_)) {
             return Err(not_implemented(
                 &format!("record return from pure helper `{}`", decl.name.name),
@@ -215,7 +225,30 @@ impl FuncBuilder<'_> {
         if entry.pure {
             let mut lowered = Vec::with_capacity(arg_exprs.len());
             for (p, e) in decl.params.iter().zip(arg_exprs) {
-                let v = self.lower_expr(e)?;
+                let param_ty = pure_helper_signature_type(
+                    name,
+                    &format!("parameter `{}`", p.name.name),
+                    p.ty.as_ref(),
+                    &self.ctx.record_ids,
+                )?;
+                let v = if matches!(param_ty, IrType::FixedVec { .. }) {
+                    let value = self.whole_vec_value_rhs(e)?.ok_or_else(|| {
+                        LowerError::Invalid(format!(
+                            "parameter `{}` of helper `{name}` requires a matching whole-vector value",
+                            p.name.name
+                        ))
+                    })?;
+                    if self.ir_whole_vec_type(&value).as_ref() != Some(&param_ty) {
+                        return Err(LowerError::Invalid(format!(
+                            "parameter `{}` of helper `{name}` expects {param_ty:?}, got {:?}",
+                            p.name.name,
+                            self.ir_whole_vec_type(&value).unwrap_or(IrType::Unknown)
+                        )));
+                    }
+                    value
+                } else {
+                    self.lower_expr(e)?
+                };
                 if self.record_id_of_expr(&v).is_some() {
                     return Err(not_implemented(
                         &format!(
@@ -230,7 +263,12 @@ impl FuncBuilder<'_> {
                 self.check_param_slot(&v, p, &format!("helper `{name}`"))?;
                 lowered.push(v);
             }
-            let ret = ir_type_of_with_records(decl.return_ty.as_ref(), &self.ctx.record_ids);
+            let ret = pure_helper_signature_type(
+                name,
+                "return type",
+                decl.return_ty.as_ref(),
+                &self.ctx.record_ids,
+            )?;
             return Ok(Expr::Call(
                 CallTarget::Helper {
                     name: name.to_string(),
@@ -365,7 +403,18 @@ impl FuncBuilder<'_> {
         owner: &str,
     ) -> Result<(), LowerError> {
         let want = slot_ir_type(p.ty.as_ref(), &self.ctx.record_ids);
-        self.check_slot_ir(v, &want, &format!("parameter `{}` of {owner}", p.name.name))
+        let what = format!("parameter `{}` of {owner}", p.name.name);
+        self.check_slot_ir(v, &want, &what)?;
+        if matches!(want, IrType::FixedVec { .. }) {
+            if let Some(actual @ IrType::FixedVec { .. }) = self.expr_type(v) {
+                if actual != want {
+                    return Err(LowerError::Invalid(format!(
+                        "{what} expects {want:?}, got {actual:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Lower a call to an `extern function name(...) -> ret` (spec §9).
@@ -665,12 +714,17 @@ impl FuncBuilder<'_> {
                 } else {
                     self.lower_expr_no_ports(e)?
                 };
-                if self.scalar_helper_abi {
+                if self.pure_helper_abi {
                     if self.record_id_of_expr(&ir).is_some() {
+                        let construct = if matches!(expected, IrType::FixedVec { .. }) {
+                            "record value returned from a fixed-vector-valued pure helper"
+                        } else {
+                            "record value returned from a scalar-valued pure helper"
+                        };
                         return Err(not_implemented(
-                            "record value returned from a scalar-valued pure helper",
-                            "pure helpers use the scalar C++ return ABI; v1 also emits the \
-                             scalar return type and fails to compile the record return value",
+                            construct,
+                            "the pure-helper C++ return ABI follows the declaration; v1 also \
+                             emits that return type and fails to compile the bare record value",
                             V1Status::EmitsUncompilable,
                         ));
                     }
@@ -791,6 +845,11 @@ pub(crate) fn slot_ir_type(
     if let Some(seq) = tseq_ir_type(ty, record_ids) {
         return seq;
     }
+    if let Some(fixed) = ty.and_then(|ty| {
+        super::components::fixed_vec_ir_type_with_records(ty, record_ids)
+    }) {
+        return fixed;
+    }
     if let Some(TypeExpr::Builtin { name, .. }) = ty {
         match name {
             BuiltinTy::Int => return IrType::SInt(None),
@@ -799,6 +858,33 @@ pub(crate) fn slot_ir_type(
         }
     }
     ir_type_of_with_records(ty, record_ids)
+}
+
+/// Resolve the by-value ABI shared by standalone pure-helper declarations
+/// and calls. Scalar and declared-record behavior is unchanged; a
+/// one-dimensional fixed vector uses the aggregate `std::array` carrier.
+/// Nested vectors stay fenced until helper returns can recursively copy them.
+fn pure_helper_signature_type(
+    helper: &str,
+    what: &str,
+    ty: Option<&TypeExpr>,
+    record_ids: &HashMap<String, RecordId>,
+) -> Result<IrType, LowerError> {
+    if let Some(fixed @ IrType::FixedVec { .. }) = ty.and_then(|ty| {
+        super::components::fixed_vec_ir_type_with_records(ty, record_ids)
+    }) {
+        if matches!(
+            &fixed,
+            IrType::FixedVec { elem, .. } if matches!(elem.as_ref(), IrType::FixedVec { .. })
+        ) {
+            return Err(unsupported(
+                &format!("pure helper `{helper}` {what} with a nested fixed-vector type"),
+                "nested fixed-vector helper signatures await recursive whole-vector copy lowering",
+            ));
+        }
+        return Ok(fixed);
+    }
+    Ok(ir_type_of_with_records(ty, record_ids))
 }
 
 pub(crate) fn ir_type_of_with_records(

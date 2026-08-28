@@ -16598,6 +16598,245 @@ end test PureHelperUntypedRecordArgTest
 }
 
 #[test]
+fn fixed_vector_pure_helper_signatures_are_typed_end_to_end() {
+    let src = fixture("fixed_vec_pure_helper_test.harc");
+    let prog = lower_src(&src).expect("fixed-vector pure helpers lower");
+    verify::verify_program(&prog).expect("fixed-vector pure helpers verify");
+
+    let vec_ty = ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::UInt(Some(8))),
+        len: 2,
+    };
+    let echo = prog
+        .functions
+        .iter()
+        .find(|func| func.kind == ir::FunctionKind::Helper && func.name == "echo_vec")
+        .expect("echo helper exists");
+    assert_eq!(echo.params[0].ty, vec_ty);
+    assert_eq!(echo.locals[0].ty, vec_ty);
+    assert_eq!(
+        echo.ret.map(|ret| echo.locals[ret.index()].ty.clone()),
+        Some(vec_ty.clone())
+    );
+    let matches = prog
+        .functions
+        .iter()
+        .find(|func| func.kind == ir::FunctionKind::Helper && func.name == "vec_matches")
+        .expect("comparison helper exists");
+    assert_eq!(
+        matches
+            .params
+            .iter()
+            .map(|param| param.ty.clone())
+            .collect::<Vec<_>>(),
+        vec![vec_ty.clone(), vec_ty.clone()]
+    );
+
+    let run = prog.function(prog.tests[0].run);
+    assert_eq!(
+        run.locals
+            .iter()
+            .find(|local| local.name == "echoed")
+            .map(|local| local.ty.clone()),
+        Some(vec_ty.clone()),
+        "an untyped call-result local inherits the helper's aggregate return type"
+    );
+
+    let cpp = emit_cpp_src(&src);
+    assert!(
+        cpp.contains("static std::array<uint64_t, 2> harc_helper_echo_vec(std::array<uint64_t, 2> values);")
+            && cpp.contains("static uint64_t harc_helper_vec_matches(std::array<uint64_t, 2> values, std::array<uint64_t, 2> expected);")
+            && cpp.contains("std::array<uint64_t, 2> __ret{};")
+            && cpp.contains("default: return {};"),
+        "{cpp}"
+    );
+
+    let wrong_shape = src
+        .replace(
+            "expected : Vec<uint<8>, 2>",
+            "expected : Vec<uint<8>, 3>",
+        )
+        .replace("expected[1] = 7", "expected[1] = 7\n        expected[2] = 9");
+    let err = lower_src(&wrong_shape)
+        .expect_err("a different fixed-vector shape cannot enter a helper parameter");
+    assert!(assert_invalid(&err).contains("expects FixedVec"), "{err}");
+
+    let bad_return = src
+        .replace(
+            "function echo_vec(values: Vec<uint<8>, 2>)",
+            "function echo_vec(values: Vec<uint<8>, 2>, spare: Vec<uint<8>, 3>)",
+        )
+        .replace("return values", "return spare");
+    let err = lower_src(&bad_return)
+        .expect_err("a different vector shape cannot satisfy the helper return");
+    assert!(assert_invalid(&err).contains("matching whole-vector value"), "{err}");
+
+    let nested_param = src.replace(
+        "function echo_vec(values: Vec<uint<8>, 2>)",
+        "function echo_vec(values: Vec<Vec<uint<8>, 2>, 2>)",
+    );
+    let msg = assert_unsupported(&lower_src(&nested_param).unwrap_err());
+    assert!(
+        msg.contains("pure helper `echo_vec` parameter `values`")
+            && msg.contains("nested fixed-vector type"),
+        "{msg}"
+    );
+    let nested_return = src.replace(
+        "-> Vec<uint<8>, 2>\n    return values",
+        "-> Vec<Vec<uint<8>, 2>, 2>\n    return values",
+    );
+    let msg = assert_unsupported(&lower_src(&nested_return).unwrap_err());
+    assert!(
+        msg.contains("pure helper `echo_vec` return type")
+            && msg.contains("nested fixed-vector type"),
+        "{msg}"
+    );
+
+    let record_vec = r#"transaction Beat
+    value : uint<8>
+end transaction Beat
+
+function echo_beats(values: Vec<Beat, 2>) -> Vec<Beat, 2>
+    return values
+end function echo_beats
+
+testbench RecordVecPureHelperTb
+    dut : Top
+end testbench RecordVecPureHelperTb
+
+impl RecordVecPureHelperTest for RecordVecPureHelperTb
+    run
+        wait 1 cycle
+    end run
+end impl RecordVecPureHelperTest"#;
+    let record_prog = lower_src(record_vec).expect("record-vector pure helper lowers");
+    verify::verify_program(&record_prog).expect("record-vector pure helper verifies");
+    let record_cpp = emit_cpp_src(record_vec);
+    assert!(
+        record_cpp.contains(
+            "static std::array<Beat, 2> harc_helper_echo_beats(std::array<Beat, 2> values);"
+        ),
+        "{record_cpp}"
+    );
+
+    let component_field_args = format!(
+        "function same_words(values: Vec<uint<64>, 4>) -> bool\n    return values == values\nend function same_words\n\n{}",
+        fixture("component_fixed_vec_test.harc").replace(
+            "    run\n",
+            "    run\n        assert same_words(left.words)\n",
+        )
+    );
+    let component_field_prog = lower_src(&component_field_args)
+        .expect("direct component whole-vector helper argument lowers");
+    verify::verify_program(&component_field_prog)
+        .expect("direct component whole-vector helper argument verifies");
+    let component_field_cpp = emit_cpp_src(&component_field_args);
+    assert!(
+        component_field_cpp.contains("harc_helper_same_words(left.words)"),
+        "{component_field_cpp}"
+    );
+
+    let record_field_args = format!(
+        "function same_data(values: Vec<uint<32>, 4>) -> bool\n    return values == values\nend function same_data\n\n{}",
+        fixture("record_vec_field_copy_test.harc").replace(
+            "        src.data[3] = 0x44444444\n",
+            "        src.data[3] = 0x44444444\n        assert same_data(src.data)\n",
+        )
+    );
+    let record_field_prog =
+        lower_src(&record_field_args).expect("record whole-vector helper argument lowers");
+    verify::verify_program(&record_field_prog)
+        .expect("record whole-vector helper argument verifies");
+    let record_field_cpp = emit_cpp_src(&record_field_args);
+    assert!(
+        record_field_cpp.contains("harc_helper_same_data(src.data)"),
+        "{record_field_cpp}"
+    );
+
+    let mut broken = prog.clone();
+    let helper = broken
+        .functions
+        .iter_mut()
+        .find(|func| func.kind == ir::FunctionKind::Helper && func.name == "echo_vec")
+        .unwrap();
+    helper.params[0].ty = ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::Record(ir::RecordId(999))),
+        len: 2,
+    };
+    helper.locals[0].ty = helper.params[0].ty.clone();
+    verify::verify_program(&broken)
+        .expect_err("pure-helper fixed-vector ABIs reject missing record references");
+
+    let mut missing_helper = prog.clone();
+    let run = missing_helper.tests[0].run;
+    let call = missing_helper.functions[run.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::Call(target, args)) => Some((target, args)),
+            _ => None,
+        })
+        .expect("run contains an ordinary helper call");
+    let ir::CallTarget::Helper { name, .. } = call.0 else {
+        panic!("ordinary call targets a helper")
+    };
+    *name = "missing_echo".to_string();
+    let errs = verify::verify_program(&missing_helper)
+        .expect_err("ordinary helper calls must resolve their helper");
+    assert!(
+        errs.iter().any(|err| err.to_string().contains("missing helper")),
+        "{errs:?}"
+    );
+
+    let mut bad_arity = prog.clone();
+    let run = bad_arity.tests[0].run;
+    let args = bad_arity.functions[run.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::Helper { .. }, args)) => {
+                Some(args)
+            }
+            _ => None,
+        })
+        .expect("run contains an ordinary helper call");
+    args.clear();
+    let errs = verify::verify_program(&bad_arity)
+        .expect_err("ordinary helper calls must retain exact arity");
+    assert!(
+        errs.iter().any(|err| err.to_string().contains("arity mismatch")),
+        "{errs:?}"
+    );
+
+    let mut bad_ret = prog.clone();
+    let run = bad_ret.tests[0].run;
+    let target = bad_ret.functions[run.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::Call(target @ ir::CallTarget::Helper { .. }, _)) => {
+                Some(target)
+            }
+            _ => None,
+        })
+        .expect("run contains an ordinary helper call");
+    let ir::CallTarget::Helper { ret, .. } = target else {
+        unreachable!()
+    };
+    *ret = ir::IrType::UInt(Some(16));
+    let errs = verify::verify_program(&bad_ret)
+        .expect_err("ordinary helper calls must retain return metadata");
+    assert!(
+        errs.iter()
+            .any(|err| err.to_string().contains("return metadata mismatch")),
+        "{errs:?}"
+    );
+}
+
+#[test]
 fn helper_call_with_dut_access_is_unsupported() {
     let src = r#"
 test HelperTest

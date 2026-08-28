@@ -589,6 +589,21 @@ impl super::FuncBuilder<'_> {
         dst_shape: (usize, String),
         value: &crate::ast::Expr,
     ) -> Result<Option<Expr>, LowerError> {
+        let Some(e) = self.whole_vec_value_rhs(value)? else {
+            return Ok(None);
+        };
+        if self.ir_whole_vec_shape(&e) != Some(dst_shape) {
+            return Ok(None);
+        }
+        Ok(Some(e))
+    }
+
+    /// Lower one path-shaped whole-vector value with the read permission
+    /// enabled, retaining its exact `IrType` for ABI slot validation.
+    pub(crate) fn whole_vec_value_rhs(
+        &mut self,
+        value: &crate::ast::Expr,
+    ) -> Result<Option<Expr>, LowerError> {
         // A PATH expression only — `Ident`, `.field`, `[i]`, parens.
         // The permission below is granted for the whole RHS, and a path
         // has no other sub-expression that could take it: `foo(r.data)`
@@ -612,9 +627,6 @@ impl super::FuncBuilder<'_> {
         // once, so `b.tbl[0].data` — which v1 copies happily — can be
         // asked about after the fact instead of being refused for its
         // spelling.
-        if self.ir_whole_vec_shape(&e) != Some(dst_shape) {
-            return Ok(None);
-        }
         Ok(Some(e))
     }
 
