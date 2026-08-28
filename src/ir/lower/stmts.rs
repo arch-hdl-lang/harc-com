@@ -4490,6 +4490,26 @@ impl FuncBuilder<'_> {
                 "transactor method `{transactor}.{name}` returns no value"
             )));
         }
+        if self.in_reevaluated_predicate
+            && matches!(
+                ret_ty,
+                Some(
+                    IrType::Record(_)
+                        | IrType::Seq(_)
+                        | IrType::RecordSeq(_)
+                        | IrType::FixedVec { .. }
+                )
+            )
+        {
+            return Err(not_implemented(
+                &format!(
+                    "aggregate-returning transactor sibling method `{transactor}.{name}` in a `wait until` predicate"
+                ),
+                "v1 accepts the aggregate as a truth value but emits C++ that does not compile; \
+                 use a sibling method that returns bool or an integer",
+                V1Status::EmitsUncompilable,
+            ));
+        }
         if callee_active_only && !self.self_transactor_method_active_only {
             let caller = self
                 .current_body_name
@@ -4551,13 +4571,21 @@ impl FuncBuilder<'_> {
         expected: &IrType,
     ) -> Result<Expr, LowerError> {
         if !matches!(expected, IrType::FixedVec { .. }) {
-            return self.lower_expr_no_ports(value);
+            return if self.in_reevaluated_predicate {
+                self.lower_expr(value)
+            } else {
+                self.lower_expr_no_ports(value)
+            };
         }
         let saved = self.vec_read_ok;
         let saved_span = self.vec_read_span;
         self.vec_read_ok = true;
         self.vec_read_span = Some(super::exprs::unparen_expr(value).span);
-        let lowered = self.lower_expr_no_ports(value);
+        let lowered = if self.in_reevaluated_predicate {
+            self.lower_expr(value)
+        } else {
+            self.lower_expr_no_ports(value)
+        };
         self.vec_read_ok = saved;
         self.vec_read_span = saved_span;
         lowered

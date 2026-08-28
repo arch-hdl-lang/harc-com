@@ -1,0 +1,44 @@
+// A value-returning sibling transactor method remains inside a `wait until`
+// predicate so it is re-evaluated each cycle. Persistent state exercises the
+// explicit self-state receiver on the expression-valued call path.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor CounterWaiter
+    dut : Top
+    target : uint<8>
+
+    when active
+        hookable reached(value: uint<8>) -> bool
+            return value >= target
+        end reached
+
+        hookable wait_for(value: uint<8>)
+            target = value
+            wait until reached(dut.count_out)
+        end wait_for
+    end when
+end transactor CounterWaiter
+
+testbench TransactorWaitSelfTb
+    dut : Top
+    waiter : CounterWaiter active
+end testbench TransactorWaitSelfTb
+
+impl TransactorWaitSelfPredicateTest for TransactorWaitSelfTb
+    clock clk = SysDomain
+
+    run
+        waiter.dut = dut
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        dut.en = 1
+        waiter.wait_for(4)
+        assert dut.count_out >= 4 else fail("wait predicate resumed at ${dut.count_out}")
+        log(info, "PASS: sibling transactor predicate was re-evaluated")
+    end run
+end impl TransactorWaitSelfPredicateTest

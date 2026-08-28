@@ -7246,6 +7246,10 @@ pub(crate) struct FuncBuilder<'a> {
     /// clock-qualified waits and timed `wait until` — are rejected
     /// here.
     pub(crate) in_transactor_method: bool,
+    /// True while lowering a `wait until` predicate. Sibling-method
+    /// arguments in this context must retain inline DUT reads because the
+    /// predicate is evaluated again on every scheduler attempt.
+    pub(crate) in_reevaluated_predicate: bool,
     /// Name of the DUT-poking transactor whose method body is currently
     /// being lowered. Used to resolve bare sibling method calls like
     /// `idle()` inside `write()`.
@@ -7729,6 +7733,7 @@ impl<'a> FuncBuilder<'a> {
             vec_read_ok: false,
             vec_read_span: None,
             in_transactor_method: false,
+            in_reevaluated_predicate: false,
             self_transactor: None,
             self_transactor_methods: HashMap::new(),
             self_transactor_method_active_only: false,

@@ -841,7 +841,14 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                     )));
                 }
                 CallTarget::TransactorSelfMethod { transactor, method } => {
-                    format!("{transactor}_{method}")
+                    let mut rendered = Vec::with_capacity(args.len() + 1);
+                    if let Some(receiver) = cx.state_receiver {
+                        rendered.push(receiver.to_string());
+                    }
+                    for arg in args {
+                        rendered.push(expr_cpp(cx, arg)?);
+                    }
+                    return Ok(format!("{transactor}_{method}({})", rendered.join(", ")));
                 }
             };
             let mut rendered = Vec::with_capacity(args.len());
