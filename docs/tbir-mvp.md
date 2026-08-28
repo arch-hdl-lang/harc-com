@@ -9521,6 +9521,17 @@ former `transaction` group lives in
      `std::array` carriers. The registered method fixture copies and compares
      a two-dimensional byte grid under both emitters.
 
+162. **Nested fixed-vector transactor method returns (2026-08-28).**
+
+     Unbound and bus-bound initiator transactor methods now return recursive
+     fixed-vector values through the same aggregate-aware signature resolver
+     used for parameters. Method schemas, return slots, direct call
+     destinations, and generated `std::function`/lambda signatures retain
+     every array dimension and declared-record leaf. The registered
+     transactor fixture echoes and compares a two-dimensional byte grid under
+     both emitters; lowering tests additionally cover nested record leaves and
+     the bus-bound declaration path. Recursive dynamic lists remain excluded.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

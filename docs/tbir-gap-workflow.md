@@ -121,8 +121,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 117 remaining constructor call sites (118 textual matches including
-the `unsupported` helper definition) as an inventory, not 118 separate tasks.
+Treat the 118 remaining constructor call sites (119 textual matches including
+the `unsupported` helper definition) as an inventory, not 119 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -366,6 +366,10 @@ not applicable before requesting review:
    Nested fixed-vector reusable testbench methods then reuse the recursive
    whole-value class and aggregate initializer, removing their signature fence
    without changing the raw textual inventory.
+   Nested fixed-vector transactor method returns now reuse the same recursive
+   whole-value class for unbound and bound-initiator method ABIs. This removes
+   the dedicated return-signature fence and reduces the raw inventory by one,
+   to 119 textual matches (118 constructors plus the helper definition).
    Runtime-address passive `record_read` now carries the regblock decoder in
    `Stmt::RecordRead`, and runtime-address passive `record_write` carries the
    symmetric decoder plus owner-binding callback dispatch in

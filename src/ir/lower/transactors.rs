@@ -2062,9 +2062,9 @@ fn check_method_return_ty(
 }
 
 /// Resolve a transactor method return through the aggregate-aware parameter
-/// path. One-dimensional fixed vectors are by-value `std::array` results;
-/// nested vectors remain fenced until return lowering can recursively copy
-/// their elements. All other spellings retain the scalar gate.
+/// path. Fixed vectors are by-value `std::array` results, including recursive
+/// nested arrays now that whole-vector copies classify nested element
+/// carriers. All other spellings retain the scalar gate.
 fn method_return_ir_type(
     tname: &str,
     mname: &str,
@@ -2078,17 +2078,6 @@ fn method_return_ir_type(
     if let Some(fixed @ IrType::FixedVec { .. }) =
         super::components::fixed_vec_ir_type_with_records(ty, record_ids)
     {
-        if matches!(
-            &fixed,
-            IrType::FixedVec { elem, .. } if matches!(elem.as_ref(), IrType::FixedVec { .. })
-        ) {
-            return Err(unsupported(
-                &format!(
-                    "transactor method `{tname}.{mname}` {what} with a nested fixed-vector type"
-                ),
-                "nested fixed-vector method returns await recursive whole-vector copy lowering",
-            ));
-        }
         return Ok(Some(fixed));
     }
     check_method_return_ty(tname, mname, what, Some(ty))?;
