@@ -711,6 +711,7 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             field,
             offset,
             value,
+            mask: _,
             callback,
         } => {
             let cb = match callback {

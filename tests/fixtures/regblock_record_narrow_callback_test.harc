@@ -1,0 +1,97 @@
+// RAL passive record API — a per-register write callback must observe
+// the RAW written `data`, not the value masked to the (narrow) register
+// width. Regression for the const-address `record_write` path, which
+// pre-fix delivered the callback a value masked to the register width
+// while v1 and the runtime-address path both pass the unmasked value
+// (docs/ral-support.md §3.2: the handler body "sees the written data").
+//
+// The divergence is only observable when the target register is
+// NARROWER than the written value: CTRL is 8 bits, so a write of 0x1FF
+// truncates to 0xFF in the mirror cell, but the callback — whose `data`
+// param is the full bus-width observed value — must still see 0x1FF and
+// forward it whole into the 32-bit SHADOW register. Pre-fix TB-IR
+// (const address) forwarded 0xFF; v1 forwarded 0x1FF; trace-diff caught
+// the mismatch. This fixture pins v1 == tbir.
+//
+// The passive API issues no bus traffic, so the DUT register widths are
+// irrelevant here — CTRL/SHADOW are pure host mirror state.
+
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            bus.aw.addr = addr
+            bus.aw.valid = 1
+            bus.w.send(data, 15)
+            bus.aw.valid = 0
+            wait 1 cycle
+        end write
+
+        hookable read(addr: uint<8>) -> uint<32>
+            bus.ar.addr = addr
+            bus.ar.valid = 1
+            let r = bus.r.recv()
+            bus.ar.valid = 0
+            wait 1 cycle
+            return r.data
+        end read
+    end when
+end transactor AxilHelper
+
+regblock NarrowRegs via AxilHelper width 32
+    register CTRL   @ 0x18 width 8 access rw
+    register SHADOW @ 0x28 access rw
+end regblock NarrowRegs
+
+testbench RegblockRecordNarrowCbTb
+    dut : AxiLiteRegs
+end testbench RegblockRecordNarrowCbTb
+
+impl RegblockRecordNarrowCbTest for RegblockRecordNarrowCbTb
+    let axil   : BusAxiLite = bind dut
+    let helper : AxilHelper active = bind axil
+    let regs   : NarrowRegs = bind helper
+
+    // On a CTRL write, forward the observed value whole into SHADOW. The
+    // body sees the RAW `data`, so the forward must carry every bit that
+    // was written to CTRL — including the bits above CTRL's 8-bit width.
+    on regs.CTRL
+        regs.record_write(0x28, data)
+    end on
+
+    run
+        dut.rst = 1
+        axil.aw.valid = 0
+        axil.w.valid = 0
+        axil.b.ready = 1
+        axil.ar.valid = 0
+        axil.r.ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Const-address write of a value wider than CTRL's 8 bits.
+        regs.record_write(0x18, 0x1FF)
+
+        let ctrl   = regs.record_read(0x18)   // mirror cell: masked to 8 bits
+        let shadow = regs.record_read(0x28)   // callback forwarded RAW data
+
+        assert ctrl == 0xFF
+            else fail("CTRL mirror should mask to 8 bits (got 0x${ctrl:08x})")
+        assert shadow == 0x1FF
+            else fail("callback must see UNMASKED data (got 0x${shadow:08x})")
+
+        log(info, "PASS: narrow-register write callback observes unmasked data")
+    end run
+end impl RegblockRecordNarrowCbTest

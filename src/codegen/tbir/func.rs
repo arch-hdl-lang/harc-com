@@ -1995,6 +1995,7 @@ fn emit_stmt(
             field,
             offset,
             value,
+            mask,
             callback,
         } => {
             // Passive RAL `record_write` with a per-register write callback
@@ -2019,7 +2020,9 @@ fn emit_stmt(
             .ok();
             writeln!(out, "{p2}{binding}_cb_depth++;").ok();
             writeln!(out, "{p2}uint64_t _rec_data = (uint64_t)({v});").ok();
-            writeln!(out, "{p2}{name}.{field} = _rec_data;").ok();
+            // Mask only the mirror store; the callback sees the raw value
+            // (v1 / runtime `RecordWrite` parity — see `RecordWriteCb` doc).
+            writeln!(out, "{p2}{name}.{field} = _rec_data & 0x{mask:x}ull;").ok();
             if let Some(fid) = callback {
                 let cb_name = &prog.function(*fid).name;
                 writeln!(out, "{p2}{cb_name}(_rec_data);").ok();

@@ -335,6 +335,7 @@ tlm_pairing_arch_burst_initiator_test | TlmPairingArchBurstInitiator | TlmPairin
 bind_remap_test | axil_amba | axil_amba.sv | - | pass
 axilite_hooks_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 regblock_record_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
+regblock_record_narrow_callback_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 regblock_record_recursion_test | AxiLiteRegs | AxiLiteRegs.sv | - | fail
 queue_empty_pop_test | Top | top_counter.sv | - | fail
 aes_cipher_top_test | AesCipherTop | aes_cipher_top.sv aes_key_expand_128.sv xtime.sv | - | pass
