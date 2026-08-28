@@ -39,6 +39,7 @@ transactor CamStateXactor
     last_first  : uint<4>  default 0
     last_any    : bool     default false
     probe_count : uint<32> default 0
+    grid        : Vec<Vec<uint<8>, 2>, 2>
 
     when active
         // Insert (idx, key) via write port 1, single cycle.
@@ -66,6 +67,15 @@ transactor CamStateXactor
             probe_count = probe_count + 1
         end do_probe
 
+        // Recursive fixed-vector state retains every index in both the
+        // method body and the test-scope readback path.
+        hookable remember_grid(a: uint<8>, b: uint<8>)
+            grid[0][1] = a
+            grid[1][0] = b
+            assert grid[0][1] == a else fail("nested state grid first lane changed")
+            assert grid[1][0] == b else fail("nested state grid second lane changed")
+        end remember_grid
+
         // Reset pulse.
         hookable reset_dut()
             dut.rst = 1
@@ -89,6 +99,12 @@ impl TransactorStateFieldTest for TransactorStateFieldTb
     run
         log(info, "transactor scalar state-field round-trip (unbound BFM)")
         xact.dut = dut
+
+        xact.remember_grid(13, 29)
+        assert xact.grid[0][1] == 13
+            else fail("nested state grid[0][1] changed")
+        assert xact.grid[1][0] == 29
+            else fail("nested state grid[1][0] changed")
 
         xact.reset_dut()
         wait 1 cycle

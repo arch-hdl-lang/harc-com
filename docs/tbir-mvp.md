@@ -9532,6 +9532,19 @@ former `transaction` group lives in
      both emitters; lowering tests additionally cover nested record leaves and
      the bus-bound declaration path. Recursive dynamic lists remain excluded.
 
+163. **Nested fixed-vector persistent transactor-state elements
+     (2026-08-28).**
+
+     Persistent fixed-vector state on unbound, bound-target, and
+     bound-initiator transactors now supports element reads and writes through
+     every recursive vector dimension. The existing state record-field IR
+     retains outer direct-vector selections as empty-path mid indices, the
+     verifier checks each index type and dimension bound, and TBIR emits the
+     complete nested `std::array` access. The registered unbound-transactor
+     state fixture writes, reads, and checks a two-dimensional byte grid under
+     both emitters. Partial inner-array values and recursive dynamic lists
+     remain excluded.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

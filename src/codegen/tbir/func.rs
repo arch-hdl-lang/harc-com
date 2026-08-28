@@ -2113,7 +2113,11 @@ fn emit_stmt(
                         "tbir: fixed-vector state write `{field}` lacks an index"
                     )));
                 };
-                format!("{recv}[{}]", expr_cpp(cx, index)?)
+                let mut access = recv;
+                for (_, mid) in mid_indices {
+                    access.push_str(&format!("[{}]", expr_cpp(cx, mid)?));
+                }
+                format!("{access}[{}]", expr_cpp(cx, index)?)
             } else {
                 super::expr::record_access_cpp(
                     cx,
