@@ -1372,6 +1372,16 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     ),
                 });
             }
+            if let Some(ty @ IrType::FixedVec { .. }) = &method.ret_ty {
+                if !component_fixed_vec_elem_valid(ty, prog.records.len()) {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "transactor x{xi} method `{}` has invalid fixed-vector return type {ty:?}",
+                            method.name
+                        ),
+                    });
+                }
+            }
         }
         for method in &x.target_methods {
             let Some(function) = prog.functions.get(method.function.index()) else {

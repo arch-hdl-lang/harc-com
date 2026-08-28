@@ -13,6 +13,14 @@ transactor VecParamSink
         hookable relay(values: Vec<uint<8>, 2>, expected: Vec<uint<8>, 2>, spare: Vec<uint<8>, 3>)
             consume(values, expected)
         end relay
+
+        hookable snapshot() -> Vec<uint<8>, 2>
+            return remembered
+        end snapshot
+
+        hookable echo(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
+            return values
+        end echo
     end when
 end transactor VecParamSink
 
@@ -32,6 +40,9 @@ impl FixedVecTransactorParamTest for FixedVecTransactorParamTb
         expected[0] = 3
         expected[1] = 7
         sink.relay(values, expected, wrong_shape)
+        let snapshot = sink.snapshot()
+        let echoed = sink.echo(snapshot)
+        assert echoed == snapshot else fail("fixed-vector return changed")
         assert sink.remembered[1] == 7 else fail("fixed-vector state did not persist")
         wait 1 cycle
         assert dut.count_out == 1 else fail("fixed-vector transactor call did not run")

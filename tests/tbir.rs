@@ -17364,8 +17364,29 @@ fn fixed_vector_transactor_params_are_typed_end_to_end() {
             method.param_tys
         );
     }
+    for name in ["snapshot", "echo"] {
+        let method = schema.method(name).unwrap();
+        assert_eq!(method.ret_ty, Some(expected.clone()));
+        let function = prog.function(method.function);
+        assert_eq!(
+            function
+                .ret
+                .map(|ret| function.locals[ret.index()].ty.clone()),
+            Some(expected.clone())
+        );
+    }
 
     let run = prog.function(prog.tests[0].run);
+    for name in ["snapshot", "echoed"] {
+        assert_eq!(
+            run.locals
+                .iter()
+                .find(|local| local.name == name)
+                .map(|local| local.ty.clone()),
+            Some(expected.clone()),
+            "untyped `{name}` inherits the fixed-vector return type"
+        );
+    }
     assert!(run.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
         matches!(stmt, ir::Stmt::TransactorCall { call: ir::Expr::Call(_, args), .. }
             if matches!(args.as_slice(), [ir::Expr::TbField(a), ir::Expr::TbField(b), ir::Expr::TbField(c)]
@@ -17381,6 +17402,12 @@ fn fixed_vector_transactor_params_are_typed_end_to_end() {
     assert!(
         cpp.contains("std::function<void(_VecParamSink_state&, std::array<uint64_t, 2>, std::array<uint64_t, 2>, std::array<uint64_t, 3>)> VecParamSink_relay;")
             && cpp.contains("VecParamSink_relay = [&](_VecParamSink_state& self_state, std::array<uint64_t, 2> values, std::array<uint64_t, 2> expected, std::array<uint64_t, 3> spare) -> void"),
+        "{cpp}"
+    );
+    assert!(
+        cpp.contains("std::function<std::array<uint64_t, 2>(_VecParamSink_state&)> VecParamSink_snapshot;")
+            && cpp.contains("VecParamSink_snapshot = [&](_VecParamSink_state& self_state) -> std::array<uint64_t, 2>")
+            && cpp.contains("std::function<std::array<uint64_t, 2>(_VecParamSink_state&, std::array<uint64_t, 2>)> VecParamSink_echo;"),
         "{cpp}"
     );
 
@@ -17455,11 +17482,104 @@ fn fixed_vector_transactor_params_are_typed_end_to_end() {
     verify::verify_program(&broken_sibling_shape)
         .expect_err("a different fixed-vector shape cannot enter a sibling call slot");
 
-    let bound = r#"use BusAxiLite
+    let mut broken_return = prog.clone();
+    let snapshot = broken_return.transactors[0]
+        .methods
+        .iter_mut()
+        .find(|method| method.name == "snapshot")
+        .unwrap();
+    snapshot.ret_ty = Some(ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::Record(ir::RecordId(999))),
+        len: 2,
+    });
+    verify::verify_program(&broken_return)
+        .expect_err("fixed-vector return schemas reject missing record types");
+
+    let mut unknown_return_dest = prog.clone();
+    let run = unknown_return_dest.tests[0].run;
+    let dest = unknown_return_dest.functions[run.index()]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorCall {
+                dest: Some(dest),
+                call:
+                    ir::Expr::Call(
+                        ir::CallTarget::TransactorMethod { method, .. },
+                        _,
+                    ),
+            } if method == "snapshot" => Some(*dest),
+            _ => None,
+        })
+        .expect("snapshot result is captured");
+    unknown_return_dest.functions[run.index()].locals[dest.index()].ty = ir::IrType::Unknown;
+    let errs = verify::verify_program(&unknown_return_dest)
+        .expect_err("fixed-vector returns cannot target an Unknown local");
+    assert!(
+        format!("{errs:?}").contains("returns FixedVec")
+            && format!("{errs:?}").contains("destination is Unknown"),
+        "{errs:?}"
+    );
+
+    let bad_return = src.replace("return remembered", "return 1");
+    let err = lower_src(&bad_return).expect_err("a scalar cannot satisfy a vector return");
+    assert!(
+        assert_invalid(&err).contains("matching whole-vector value"),
+        "{err}"
+    );
+
+    let record_return = r#"transaction Beat
+    value : uint<8>
+end transaction Beat
+transactor RecordVecSource
+    dut : Top
+    values : Vec<Beat, 2>
+    when active
+        hookable snapshot() -> Vec<Beat, 2>
+            return values
+        end snapshot
+    end when
+end transactor RecordVecSource
+testbench RecordVecTb
+    dut : Top
+    source : RecordVecSource active
+end testbench RecordVecTb
+impl RecordVecTest for RecordVecTb
+    run
+        source.dut = dut
+        let got = source.snapshot()
+        assert got == got
+        wait 1 cycle
+    end run
+end impl RecordVecTest"#;
+    let record_prog = lower_src(record_return).expect("record-vector transactor return lowers");
+    verify::verify_program(&record_prog).expect("record-vector transactor return verifies");
+    let record_cpp = emit_cpp_src(record_return);
+    assert!(
+        record_cpp.contains("std::function<std::array<Beat, 2>(_RecordVecSource_state&)>"),
+        "{record_cpp}"
+    );
+
+    let nested_return = record_return.replace("Vec<Beat, 2>", "Vec<Vec<Beat, 2>, 2>");
+    let err = lower_src(&nested_return)
+        .expect_err("nested fixed-vector transactor returns stay explicitly fenced");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("RecordVecSource.snapshot")
+            && msg.contains("nested fixed-vector type")
+            && msg.contains("recursive whole-vector copy lowering"),
+        "{msg}"
+    );
+
+    let bound_src = r#"use BusAxiLite
 transactor BoundVecParam bound to BusAxiLite
     when active
         hookable send(values: Vec<uint<8>, 2>)
         end send
+        hookable echo(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
+            return values
+        end echo
     end when
 end transactor BoundVecParam
 testbench BoundVecTb
@@ -17470,15 +17590,31 @@ impl BoundVecTest for BoundVecTb
         wait 1 cycle
     end run
 end impl BoundVecTest"#;
-    let bound = lower_with_stdlib_bus_src(bound)
+    let bound = lower_with_stdlib_bus_src(bound_src)
         .expect("bound-initiator fixed-vector parameter declaration lowers");
     verify::verify_program(&bound).expect("bound-initiator fixed-vector parameter verifies");
     assert!(bound.transactors.iter().any(|schema| {
         schema.name == "BoundVecParam"
-            && schema.method("send").is_some_and(|method| {
+            && schema
+                .method("send")
+                .is_some_and(|method| method.param_tys == vec![expected.clone()])
+            && schema.method("echo").is_some_and(|method| {
                 method.param_tys == vec![expected.clone()]
+                    && method.ret_ty == Some(expected.clone())
             })
     }));
+
+    let nested_bound_return = bound_src.replace(
+        "hookable echo(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>",
+        "hookable echo(values: Vec<uint<8>, 2>) -> Vec<Vec<uint<8>, 2>, 2>",
+    );
+    let err = lower_with_stdlib_bus_src(&nested_bound_return)
+        .expect_err("bound nested fixed-vector returns stay explicitly fenced");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("BoundVecParam.echo") && msg.contains("nested fixed-vector type"),
+        "{msg}"
+    );
 }
 
 #[test]

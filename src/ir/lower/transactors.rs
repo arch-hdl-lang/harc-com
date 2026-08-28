@@ -492,6 +492,13 @@ pub(crate) fn lower_transactor(
             .iter()
             .map(|p| method_param_ir_type(tname, &mname, p, &method_ctx.record_ids))
             .collect::<Result<Vec<_>, _>>()?;
+        let ret_ty = method_return_ir_type(
+            tname,
+            &mname,
+            "return type",
+            h.return_ty.as_ref(),
+            &method_ctx.record_ids,
+        )?;
         if sibling_methods
             .insert(
                 mname.clone(),
@@ -501,9 +508,7 @@ pub(crate) fn lower_transactor(
                         .map(|p| p.name.name.clone())
                         .collect::<Vec<_>>(),
                     param_tys,
-                    h.return_ty.as_ref().map(|ty| {
-                        super::helpers::ir_type_of_with_records(Some(ty), &method_ctx.record_ids)
-                    }),
+                    ret_ty,
                     *active_only,
                 ),
             )
@@ -516,7 +521,13 @@ pub(crate) fn lower_transactor(
     }
     for (h, active_only) in methods_ast {
         let mname = &h.name.name;
-        check_method_return_ty(tname, mname, "return type", h.return_ty.as_ref())?;
+        let ret_ty = method_return_ir_type(
+            tname,
+            mname,
+            "return type",
+            h.return_ty.as_ref(),
+            &method_ctx.record_ids,
+        )?;
 
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
         let mut b = FuncBuilder::new(&method_ctx, helper_registry, side_tables);
@@ -541,10 +552,6 @@ pub(crate) fn lower_transactor(
                 ty,
             });
         }
-        let ret_ty = h
-            .return_ty
-            .as_ref()
-            .map(|ty| super::helpers::ir_type_of(Some(ty)));
         if let Some(ty) = ret_ty.clone() {
             let ret = b.declare("__ret");
             b.set_local_type(ret, ty);
@@ -1540,6 +1547,13 @@ fn lower_bound_initiator_transactor(
             .iter()
             .map(|p| method_param_ir_type(tname, &mname, p, &method_ctx.record_ids))
             .collect::<Result<Vec<_>, _>>()?;
+        let ret_ty = method_return_ir_type(
+            tname,
+            &mname,
+            "return type",
+            h.return_ty.as_ref(),
+            &method_ctx.record_ids,
+        )?;
         if sibling_methods
             .insert(
                 mname.clone(),
@@ -1549,9 +1563,7 @@ fn lower_bound_initiator_transactor(
                         .map(|p| p.name.name.clone())
                         .collect::<Vec<_>>(),
                     param_tys,
-                    h.return_ty.as_ref().map(|ty| {
-                        super::helpers::ir_type_of_with_records(Some(ty), &method_ctx.record_ids)
-                    }),
+                    ret_ty,
                     *active_only,
                 ),
             )
@@ -1564,7 +1576,13 @@ fn lower_bound_initiator_transactor(
     }
     for (h, active_only) in methods_ast {
         let mname = &h.name.name;
-        check_method_return_ty(tname, mname, "return type", h.return_ty.as_ref())?;
+        let ret_ty = method_return_ir_type(
+            tname,
+            mname,
+            "return type",
+            h.return_ty.as_ref(),
+            &method_ctx.record_ids,
+        )?;
 
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
         let mut b = FuncBuilder::new(&method_ctx, helper_registry, side_tables);
@@ -1589,10 +1607,6 @@ fn lower_bound_initiator_transactor(
                 ty,
             });
         }
-        let ret_ty = h
-            .return_ty
-            .as_ref()
-            .map(|ty| super::helpers::ir_type_of(Some(ty)));
         if let Some(ty) = ret_ty.clone() {
             let ret = b.declare("__ret");
             b.set_local_type(ret, ty);
@@ -2045,6 +2059,43 @@ fn check_method_return_ty(
     ty: Option<&TypeExpr>,
 ) -> Result<(), LowerError> {
     check_scalar_ty_max(tname, mname, what, ty, u32::MAX)
+}
+
+/// Resolve a transactor method return through the aggregate-aware parameter
+/// path. One-dimensional fixed vectors are by-value `std::array` results;
+/// nested vectors remain fenced until return lowering can recursively copy
+/// their elements. All other spellings retain the scalar gate.
+fn method_return_ir_type(
+    tname: &str,
+    mname: &str,
+    what: &str,
+    ty: Option<&TypeExpr>,
+    record_ids: &HashMap<String, ir::RecordId>,
+) -> Result<Option<IrType>, LowerError> {
+    let Some(ty) = ty else {
+        return Ok(None);
+    };
+    if let Some(fixed @ IrType::FixedVec { .. }) =
+        super::components::fixed_vec_ir_type_with_records(ty, record_ids)
+    {
+        if matches!(
+            &fixed,
+            IrType::FixedVec { elem, .. } if matches!(elem.as_ref(), IrType::FixedVec { .. })
+        ) {
+            return Err(unsupported(
+                &format!(
+                    "transactor method `{tname}.{mname}` {what} with a nested fixed-vector type"
+                ),
+                "nested fixed-vector method returns await recursive whole-vector copy lowering",
+            ));
+        }
+        return Ok(Some(fixed));
+    }
+    check_method_return_ty(tname, mname, what, Some(ty))?;
+    Ok(Some(super::helpers::ir_type_of_with_records(
+        Some(ty),
+        record_ids,
+    )))
 }
 
 /// Shared scalar-type gate parameterized by the maximum allowed bit width
