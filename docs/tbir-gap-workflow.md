@@ -355,6 +355,10 @@ not applicable before requesting review:
    whole-vector read/copy gate while widening the existing helper ABI; the
    shared nested-vector fence remains, so this slice also leaves the raw
    textual inventory unchanged.
+   Nested fixed-vector pure-helper signatures remove that helper-specific
+   fence and recursively validate/render the already-carried aggregate type;
+   the testbench-method and transactor signature fences remain, so this slice
+   leaves the raw textual inventory unchanged.
    Fixed-vector reusable testbench methods now share that exact one-dimensional
    aggregate boundary for parameters, returns, inferred result locals, and
    CFG-inlined return-slot initialization. Nested signatures remain fenced, so

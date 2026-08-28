@@ -16671,25 +16671,25 @@ fn fixed_vector_pure_helper_signatures_are_typed_end_to_end() {
         .expect_err("a different vector shape cannot satisfy the helper return");
     assert!(assert_invalid(&err).contains("matching whole-vector value"), "{err}");
 
-    let nested_param = src.replace(
-        "function echo_vec(values: Vec<uint<8>, 2>)",
-        "function echo_vec(values: Vec<Vec<uint<8>, 2>, 2>)",
+    let nested_ty = ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::FixedVec {
+            elem: Box::new(ir::IrType::UInt(Some(8))),
+            len: 2,
+        }),
+        len: 2,
+    };
+    let echo_grid = prog
+        .functions
+        .iter()
+        .find(|func| func.kind == ir::FunctionKind::Helper && func.name == "echo_grid")
+        .expect("nested-vector helper exists");
+    assert_eq!(echo_grid.params[0].ty, nested_ty);
+    assert_eq!(
+        echo_grid.ret.map(|ret| echo_grid.locals[ret.index()].ty.clone()),
+        Some(nested_ty.clone())
     );
-    let msg = assert_unsupported(&lower_src(&nested_param).unwrap_err());
     assert!(
-        msg.contains("pure helper `echo_vec` parameter `values`")
-            && msg.contains("nested fixed-vector type"),
-        "{msg}"
-    );
-    let nested_return = src.replace(
-        "-> Vec<uint<8>, 2>\n    return values",
-        "-> Vec<Vec<uint<8>, 2>, 2>\n    return values",
-    );
-    let msg = assert_unsupported(&lower_src(&nested_return).unwrap_err());
-    assert!(
-        msg.contains("pure helper `echo_vec` return type")
-            && msg.contains("nested fixed-vector type"),
-        "{msg}"
+        cpp.contains("static std::array<std::array<uint64_t, 2>, 2> harc_helper_echo_grid(std::array<std::array<uint64_t, 2>, 2> values);")
     );
 
     let record_vec = r#"transaction Beat
@@ -41761,16 +41761,19 @@ end impl T"#
         assert!(msg.contains("out of range"), "{msg}");
     }
 
-    // A `default`, a whole-vec copy, and a three-level index stay refused —
-    // each is out of the supported subset or this batch's cut line. Record
-    // leaves are now valid component storage and are covered separately.
+    // Whole-vector copies now use the recursive aggregate equivalence class,
+    // so a same-shaped nested array copies exactly like a one-dimensional
+    // one. A `default` and a three-level index remain outside the subset.
+    let copy = scope(
+        "v : Vec<Vec<uint<8>, 2>, 2>\n    w : Vec<Vec<uint<8>, 2>, 2>",
+        "v = w",
+    );
+    let copy_prog = lower_src(&copy).expect("same-shaped nested vector copy lowers");
+    verify::verify_program(&copy_prog).expect("nested vector copy verifies");
+    assert!(emit_cpp_src(&copy).contains("self.v = self.w;"));
+
     let refused = [
         ("", "v : Vec<Vec<uint<8>, 2>, 2> default {}", "n = n + 1"),
-        (
-            "",
-            "v : Vec<Vec<uint<8>, 2>, 2>\n    w : Vec<Vec<uint<8>, 2>, 2>",
-            "v = w",
-        ),
         ("", "v : Vec<Vec<Vec<uint<8>, 2>, 2>, 2>", "v[0][1][0] = x"),
     ];
     for (prefix, field, body) in refused {

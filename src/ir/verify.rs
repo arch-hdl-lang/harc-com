@@ -423,12 +423,20 @@ fn cover_scalar_type(ty: &IrType) -> bool {
 
 fn helper_abi_type_valid(ty: &IrType, record_count: usize) -> bool {
     match ty {
-        IrType::FixedVec { elem, len } if *len != 0 => match elem.as_ref() {
-            IrType::Record(record) => record.index() < record_count,
-            IrType::FixedVec { .. } => false,
-            scalar => fixed_vec_elem_valid(scalar),
-        },
+        IrType::FixedVec { elem, len } if *len != 0 => {
+            helper_fixed_vec_elem_valid(elem, record_count)
+        }
         other => cover_scalar_type(other),
+    }
+}
+
+fn helper_fixed_vec_elem_valid(ty: &IrType, record_count: usize) -> bool {
+    match ty {
+        IrType::Record(record) => record.index() < record_count,
+        IrType::FixedVec { elem, len } => {
+            *len != 0 && helper_fixed_vec_elem_valid(elem, record_count)
+        }
+        scalar => fixed_vec_elem_valid(scalar),
     }
 }
 
