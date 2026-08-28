@@ -406,6 +406,12 @@ not applicable before requesting review:
    constructors plus the helper definition). Their component binding carries
    `Passive`; existing activation checks gate member access and generated
    registration.
+   Named statement-position periodic periods now retain and re-evaluate their
+   side-effect-free typed expression after the surrounding impl locals are
+   initialized. This
+   retires a `not_implemented` classification rather than an `unsupported(`
+   constructor, so the raw inventory remains 117 textual matches (116
+   constructors plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

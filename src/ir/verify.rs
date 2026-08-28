@@ -4963,8 +4963,27 @@ impl Checker<'_> {
                         detail: format!("references missing cycle handler h{}", h.0),
                     }),
                     Some(schema) => {
-                        if let CycleHandlerKind::Trigger { trigger, .. } = &schema.kind {
-                            self.check_truth_expr(trigger, true, "cycle-handler trigger");
+                        match &schema.kind {
+                            CycleHandlerKind::Trigger { trigger, .. } => {
+                                self.check_truth_expr(trigger, true, "cycle-handler trigger");
+                            }
+                            CycleHandlerKind::Periodic { period } => {
+                                self.check_expr(period, true, "cycle-handler period");
+                                let ty = self.aggregate_assignment_expr_type(period);
+                                if !matches!(
+                                    ty,
+                                    Some(IrType::UInt(_) | IrType::SInt(_) | IrType::Unknown)
+                                ) {
+                                    self.errs.push(VerifyError::BadConcurrentCheck {
+                                        func: self.fid,
+                                        block: self.bid,
+                                        detail: format!(
+                                            "cycle handler h{} period has non-integer type {ty:?}",
+                                            h.0
+                                        ),
+                                    });
+                                }
+                            }
                         }
                         match self.prog.functions.get(schema.function.index()) {
                                 Some(f)
@@ -7857,12 +7876,15 @@ fn check_def_before_use(
                     }
                 }
                 Stmt::CycleHandler(id) => {
-                    if let Some(CycleHandlerSchema {
-                        kind: CycleHandlerKind::Trigger { trigger, .. },
-                        ..
-                    }) = prog.cycle_handlers.get(id.index())
-                    {
-                        check_e(trigger, &defined, errs);
+                    if let Some(schema) = prog.cycle_handlers.get(id.index()) {
+                        match &schema.kind {
+                            CycleHandlerKind::Trigger { trigger, .. } => {
+                                check_e(trigger, &defined, errs)
+                            }
+                            CycleHandlerKind::Periodic { period } => {
+                                check_e(period, &defined, errs)
+                            }
+                        }
                     }
                 }
                 // The channel local is DEFINED by its declaration (the
