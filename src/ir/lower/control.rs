@@ -576,36 +576,18 @@ impl FuncBuilder<'_> {
             // every cycle inside the predicate closure. The source
             // text rides along for the timeout breakdown, rendered by
             // the same pretty-printer v1's diagnostics use.
-            let expr = self.lower_expr(c)?;
+            let previous = self.in_reevaluated_predicate;
+            self.in_reevaluated_predicate = true;
+            let lowered = self.lower_expr(c);
+            self.in_reevaluated_predicate = previous;
+            let expr = lowered?;
             self.validate_truth_expr(&expr, "wait-until predicate")?;
-            // A transactor method call cannot live in a `wait until`
-            // predicate: the scheduler re-evaluates the predicate every
-            // cycle, but the call advances simulated time (and may have
-            // side effects) — running it per re-evaluation is nonsensical.
-            // Reject precisely (hoisting would run it exactly once, the
-            // wrong semantics).
-            // Reached by exactly one spelling: a bare call to a SIBLING
-            // HOOKABLE inside a transactor's own `when active` block
-            // (`wait until ready()`). The check runs only after
-            // `lower_expr` succeeds, and every other route that could
-            // carry a transactor edge into a predicate is refused before
-            // it — a cross-transactor call and a plain helper call each
-            // hit their own arm in `exprs.rs`/helpers, a non-DUT field
-            // access hits the records arm, and a regblock read lowers
-            // fine because `RegRead` is not a transactor edge.
-            //
-            // `Unsupported` is correct for that spelling: v1 emits
-            // `while (!(Xt_ready(self))) tick();`, which is what
-            // re-evaluating a predicate means, and it works.
-            //
-            // The caveat, and why a split may be wanted later: if the
-            // callee itself BLOCKS, v1 emits the same loop while
-            // `Xt_ready` contains `for (int _w = 0; _w < 1; _w++)
-            // tick();` — so time advances inside the callee AND again in
-            // the loop. It compiles and runs; the timing is not what the
-            // source reads like. Splitting on that needs the callee's
-            // body, which lowering does not have at this point.
-            if super::exprs::expr_has_transactor_edge(&expr) {
+            // A sibling transactor method call is a synchronous C++ call
+            // and remains inline so the scheduler re-evaluates it on every
+            // predicate attempt, matching v1. Bus-/instance-bound calls use
+            // the statement-level handshake/call seam and still cannot live
+            // in this closure (hoisting would evaluate only once).
+            if super::exprs::expr_has_bound_transactor_edge(&expr) {
                 return Err(unsupported(
                     "a transactor method call inside a `wait until` predicate",
                     "the predicate is re-evaluated every cycle, so a call that advances time \

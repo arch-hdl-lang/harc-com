@@ -289,6 +289,7 @@ sequencer_connect_test | Top | top_counter.sv | top_counter.arch | pass
 tseq_basic_test | Top | top_counter.sv | top_counter.arch | pass
 tseq_scalar_test | Top | top_counter.sv | top_counter.arch | pass
 tseq_fixed_vec_test | Top | top_counter.sv | top_counter.arch | pass
+transactor_wait_self_predicate_test | Top | top_counter.sv | top_counter.arch | pass
 promoted_let_runtime_init_test | Top | top_counter.sv | top_counter.arch | pass
 sequencer_tseq_scalar_param_test | Top | top_counter.sv | top_counter.arch | pass
 axilite_fuzz_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass | axilite_regs_test.harc | - | AxiLiteFuzzTest

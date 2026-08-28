@@ -20314,18 +20314,18 @@ end impl XtPassiveBackdoorTest
 }
 
 #[test]
-fn transactor_self_call_in_wait_until_predicate_is_rejected() {
+fn transactor_self_call_in_wait_until_predicate_is_re_evaluated() {
     let src = r#"
 transactor Xt
     dut : Top
 
     when active
-        hookable ready() -> uint<1>
-            return 1
+        hookable ready(value: uint<8>) -> uint<1>
+            return value >= 1
         end ready
 
         hookable wait_ready()
-            wait until ready()
+            wait until ready(dut.value)
         end wait_ready
     end when
 end transactor Xt
@@ -20342,11 +20342,121 @@ impl XtWaitUntilSelfCallTest for XtTb
     end run
 end impl XtWaitUntilSelfCallTest
 "#;
-    let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let prog = lower_src(src).expect("sibling call lowers in a wait predicate");
+    verify::verify_program(&prog).expect("sibling wait predicate verifies");
+    let wait_ready_id = prog.transactors[0]
+        .method("wait_ready")
+        .expect("wait_ready schema")
+        .function;
+    let wait_ready = prog.function(wait_ready_id);
+    let predicate = wait_ready
+        .blocks
+        .iter()
+        .find_map(|block| match &block.terminator {
+            ir::Terminator::WaitUntil { preds, .. } => Some(preds[0].expr.clone()),
+            _ => None,
+        })
+        .expect("wait-until predicate");
     assert!(
-        msg.contains("transactor method call inside a `wait until` predicate"),
-        "{msg}"
+        matches!(
+            predicate,
+            ir::Expr::Call(ir::CallTarget::TransactorSelfMethod { ref method, .. }, _)
+                if method == "ready"
+        ),
+        "the call must remain inline for per-cycle evaluation: {predicate:?}"
+    );
+
+    let ir::Expr::Call(_, args) = &predicate else {
+        unreachable!()
+    };
+    assert!(
+        matches!(args.as_slice(), [ir::Expr::Port(_)]),
+        "the DUT argument must remain inline for every predicate attempt: {predicate:?}"
+    );
+
+    // The same call edge remains illegal in an ordinary expression landing;
+    // only wait predicates opt into direct expression emission.
+    let mut broken = prog.clone();
+    let wait_ready = &mut broken.functions[wait_ready_id.index()];
+    let entry = wait_ready.entry;
+    wait_ready.blocks[entry.index()].terminator = ir::Terminator::Branch(predicate, entry, entry);
+    verify::verify_program(&broken)
+        .expect_err("a sibling call outside a wait predicate must still be rejected");
+
+    fn wait_pred_mut(prog: &mut ir::TbProgram, fid: ir::FunctionId) -> &mut ir::Expr {
+        prog.functions[fid.index()]
+            .blocks
+            .iter_mut()
+            .find_map(|block| match &mut block.terminator {
+                ir::Terminator::WaitUntil { preds, .. } => Some(&mut preds[0].expr),
+                _ => None,
+            })
+            .expect("wait predicate")
+    }
+
+    let mut broken = prog.clone();
+    if let ir::Expr::Call(ir::CallTarget::TransactorSelfMethod { transactor, .. }, _) =
+        wait_pred_mut(&mut broken, wait_ready_id)
+    {
+        *transactor = "Other".to_string();
+    }
+    verify::verify_program(&broken).expect_err("wrong sibling transactor must be rejected");
+
+    let mut broken = prog.clone();
+    if let ir::Expr::Call(ir::CallTarget::TransactorSelfMethod { method, .. }, _) =
+        wait_pred_mut(&mut broken, wait_ready_id)
+    {
+        *method = "missing".to_string();
+    }
+    verify::verify_program(&broken).expect_err("missing sibling method must be rejected");
+
+    let mut broken = prog.clone();
+    if let ir::Expr::Call(_, args) = wait_pred_mut(&mut broken, wait_ready_id) {
+        args.clear();
+    }
+    verify::verify_program(&broken).expect_err("sibling predicate arity must be checked");
+
+    let ready_index = prog.transactors[0]
+        .methods
+        .iter()
+        .position(|method| method.name == "ready")
+        .expect("ready method");
+    let mut broken = prog.clone();
+    if let ir::Expr::Call(_, args) = wait_pred_mut(&mut broken, wait_ready_id) {
+        args[0] = ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::UInt(Some(16)),
+        };
+    }
+    let errs = verify::verify_program(&broken)
+        .expect_err("sibling predicate argument type must be checked");
+    assert!(
+        format!("{errs:?}").contains("TransactorSelfCall")
+            || format!("{errs:?}").contains("parameter 1 expects"),
+        "the sibling-call argument checker should report the mismatch: {errs:?}"
+    );
+
+    let mut broken = prog.clone();
+    broken.transactors[0].methods[ready_index].ret_ty = None;
+    broken.transactors[0].methods[ready_index].has_ret = false;
+    verify::verify_program(&broken).expect_err("void sibling predicate must be rejected");
+
+    let mut broken = prog.clone();
+    broken.transactors[0].methods[ready_index].ret_ty = Some(ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::UInt(Some(8))),
+        len: 2,
+    });
+    verify::verify_program(&broken).expect_err("fixed-vector sibling predicate must be rejected");
+
+    let mut broken = prog.clone();
+    broken.transactors[0].methods[ready_index].ret_ty =
+        Some(ir::IrType::Record(ir::RecordId(0)));
+    verify::verify_program(&broken).expect_err("record sibling predicate must be rejected");
+
+    let cpp = emit_cpp_src(&fixture("transactor_wait_self_predicate_test.harc"));
+    assert!(
+        cpp.contains("CounterWaiter_reached(self_state, harc_rt::harc_read(dut->count_out))"),
+        "a sibling predicate forwards state and re-reads its DUT argument:\n{cpp}"
     );
 }
 
@@ -27741,17 +27851,18 @@ end impl T"#,
     );
 }
 
-/// A transactor-method call inside a runtime slice bound is still a call
-/// edge. `expr_has_transactor_edge` gates the `wait until` predicate on
-/// exactly that, and a walker missing the new node would let one through
-/// into a per-cycle predicate.
+/// A sibling call nested in a runtime slice bound stays inside the
+/// re-evaluated wait predicate. This covers the recursive expression walker,
+/// not only a call at the predicate root.
 #[test]
-fn a_transactor_call_in_a_slice_bound_is_still_a_call_edge() {
-    let err = lower_src(&fixture_with_transactor_call_in_slice_bound()).unwrap_err();
-    let msg = err.to_string();
+fn a_transactor_call_in_a_slice_bound_is_re_evaluated() {
+    let src = fixture_with_transactor_call_in_slice_bound();
+    let prog = lower_src(&src).expect("nested sibling predicate lowers");
+    verify::verify_program(&prog).expect("nested sibling predicate verifies");
+    let cpp = emit_cpp_src(&src);
     assert!(
-        msg.contains("transactor method call inside a `wait until` predicate"),
-        "a call edge hidden in a slice bound must still trip the predicate gate: {msg}"
+        cpp.contains("harc_bits") && cpp.contains("Xt_idx()"),
+        "the slice bound must call the sibling from the predicate closure:\n{cpp}"
     );
 }
 

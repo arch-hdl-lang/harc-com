@@ -9545,6 +9545,23 @@ former `transaction` group lives in
      both emitters. Partial inner-array values and recursive dynamic lists
      remain excluded.
 
+164. **Re-evaluated sibling transactor predicates (2026-08-28).**
+
+     A value-returning sibling method call inside a transactor method's
+     `wait until` predicate now remains an expression-valued
+     `TransactorSelfMethod` edge. The scheduler invokes it on every predicate
+     attempt, matching v1 instead of hoisting it once; stateful transactors
+     forward the current explicit state receiver, and DUT-port arguments stay
+     inline so each attempt re-samples them. The verifier resolves the call
+     against the owning transactor schema (name, method, arity, argument
+     types, and scalar truth-compatible return) and admits the edge only in
+     `WaitUntil` / `WaitUntilTimeout` predicates; every ordinary expression
+     landing stays on the statement-level call seam. As in v1, a sibling that
+     itself waits advances time synchronously before the outer predicate can
+     retry. A registered fixture passes a changing DUT port to a stateful
+     sibling predicate under both emitters. Bound-instance and bus/TLM calls
+     remain statement-level.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

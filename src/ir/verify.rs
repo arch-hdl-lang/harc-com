@@ -1164,6 +1164,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     bid: func.entry,
                     errs: &mut errs,
                     temporal_slots_ok: false,
+                    transactor_self_expr_ok: false,
                 };
                 checker.check_truth_expr(&handler.trigger, true, "component cycle-handler trigger");
             }
@@ -1869,6 +1870,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 bid: func.entry,
                 errs: &mut errs,
                 temporal_slots_ok: false,
+                transactor_self_expr_ok: false,
             };
             checker.check_truth_expr(&service.trigger, true, "testbench cycle-service trigger");
         }
@@ -2698,6 +2700,7 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
             bid,
             errs: &mut errs,
             temporal_slots_ok: false,
+            transactor_self_expr_ok: false,
         };
         ck.check_block(b);
     }
@@ -2725,6 +2728,10 @@ struct Checker<'a> {
     /// execute in the registering function's context. Their temporal
     /// slots are valid only while explicitly walking those side tables.
     temporal_slots_ok: bool,
+    /// A sibling transactor call is expression-valued only inside a
+    /// re-evaluated wait predicate. Every statement/value landing keeps the
+    /// ordinary hoist-to-`TransactorSelfCall` seam.
+    transactor_self_expr_ok: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2734,6 +2741,13 @@ enum WholeCollectionShape {
 }
 
 impl Checker<'_> {
+    fn check_wait_truth_expr(&mut self, expr: &Expr, context: &'static str) {
+        let previous = self.transactor_self_expr_ok;
+        self.transactor_self_expr_ok = true;
+        self.check_truth_expr(expr, true, context);
+        self.transactor_self_expr_ok = previous;
+    }
+
     fn check_truth_expr(&mut self, expr: &Expr, ports_ok: bool, context: &'static str) {
         self.check_expr(expr, ports_ok, context);
         let ty = self.aggregate_assignment_expr_type(expr);
@@ -4973,7 +4987,7 @@ impl Checker<'_> {
                     if let Some(d) = dest {
                         self.check_local(*d);
                     }
-                    self.check_transactor_self_call(*dest, call);
+                    self.check_transactor_self_call(*dest, call, false, false);
                 }
                 Stmt::FailDiag { guard, args } => {
                     if let Some(g) = guard {
@@ -5489,12 +5503,12 @@ impl Checker<'_> {
             Terminator::WaitTimePs(..) => {}
             Terminator::WaitUntil { preds, .. } => {
                 for p in preds {
-                    self.check_truth_expr(&p.expr, true, "WaitUntil pred");
+                    self.check_wait_truth_expr(&p.expr, "WaitUntil pred");
                 }
             }
             Terminator::WaitUntilTimeout { preds, cycles, .. } => {
                 for p in preds {
-                    self.check_truth_expr(&p.expr, true, "WaitUntilTimeout pred");
+                    self.check_wait_truth_expr(&p.expr, "WaitUntilTimeout pred");
                 }
                 self.check_expr(cycles, false, "WaitUntilTimeout cycles");
             }
@@ -6837,12 +6851,9 @@ impl Checker<'_> {
                         );
                     }
                 }
-                // Seam rule: a call edge is never an expression VALUE.
-                // It reaches the verifier only as the top-level Assign
-                // RHS (bus) or the root payload of `Stmt::TransactorCall`
-                // (transactor) — both consumed by `check_block` before
-                // recursing. Reaching one here means it is nested or in
-                // a disallowed statement position.
+                // Seam rule: a bound call edge is never an expression
+                // value. A sibling edge has one additional sanctioned
+                // landing: inside a re-evaluated wait predicate.
                 if let CallTarget::TransactorMethod { bus_field, method } = target {
                     self.errs.push(VerifyError::BadTransactorCall {
                         func: self.fid,
@@ -6854,16 +6865,20 @@ impl Checker<'_> {
                         ),
                     });
                 }
-                if let CallTarget::TransactorSelfMethod { transactor, method } = target {
-                    self.errs.push(VerifyError::BadTransactorCall {
-                        func: self.fid,
-                        block: self.bid,
-                        detail: format!(
-                            "`{transactor}.{method}` sibling call in a disallowed position \
-                             ({context}) — lowering must hoist it into a \
-                             Stmt::TransactorSelfCall"
-                        ),
-                    });
+                if !self.transactor_self_expr_ok {
+                    if let CallTarget::TransactorSelfMethod { transactor, method } = target {
+                        self.errs.push(VerifyError::BadTransactorCall {
+                            func: self.fid,
+                            block: self.bid,
+                            detail: format!(
+                                "`{transactor}.{method}` sibling call in a disallowed position \
+                                 ({context}) — lowering must hoist it into a \
+                                 Stmt::TransactorSelfCall"
+                            ),
+                        });
+                    }
+                } else if matches!(target, CallTarget::TransactorSelfMethod { .. }) {
+                    self.check_transactor_self_call(None, e, ports_ok, true);
                 }
                 if let CallTarget::Tseq(name) = target {
                     self.errs.push(VerifyError::BadProgramRef {
@@ -6959,7 +6974,13 @@ impl Checker<'_> {
     /// testbench-field call edges, so they are only legal in a
     /// `TransactorBody` and resolve against that body's transactor
     /// schema.
-    fn check_transactor_self_call(&mut self, dest: Option<LocalId>, call: &Expr) {
+    fn check_transactor_self_call(
+        &mut self,
+        dest: Option<LocalId>,
+        call: &Expr,
+        ports_ok: bool,
+        require_truth_return: bool,
+    ) {
         let (fid, bid) = (self.fid, self.bid);
         let bad = move |detail: String| VerifyError::BadTransactorCall {
             func: fid,
@@ -7008,7 +7029,7 @@ impl Checker<'_> {
             let expected = m.param_tys.get(i);
             self.check_expr_inner(
                 arg,
-                false,
+                ports_ok,
                 "TransactorSelfCall arg",
                 matches!(expected, Some(IrType::FixedVec { .. })),
             );
@@ -7035,6 +7056,19 @@ impl Checker<'_> {
                     None => {}
                 }
             }
+        }
+        if require_truth_return
+            && !matches!(
+                m.ret_ty,
+                Some(IrType::UInt(_) | IrType::SInt(_) | IrType::Bool)
+            )
+        {
+            self.errs.push(bad(format!(
+                "transactor method `{}.{method}` must return a scalar truth value in a wait \
+                 predicate, got {:?}",
+                schema.name,
+                m.ret_ty
+            )));
         }
         if let Some(dest) = dest {
             let actual = self.func.locals.get(dest.index()).map(|local| &local.ty);
@@ -7333,6 +7367,7 @@ fn expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option<IrType> {
         Expr::Literal { ty, .. } => Some(ty.clone()),
         Expr::WideLiteral(words) => Some(IrType::UInt(Some(wide_literal_bits(words)))),
         Expr::Local(l) => func.locals.get(l.index()).map(|t| t.ty.clone()),
+        Expr::Port(port) => Some(IrType::UInt(port.width)),
         Expr::SeqIndex { seq, .. } => match func.locals.get(seq.index()).map(|local| &local.ty) {
             Some(IrType::RecordSeq(record)) => Some(IrType::Record(*record)),
             Some(IrType::Seq(elem)) => Some((**elem).clone()),
