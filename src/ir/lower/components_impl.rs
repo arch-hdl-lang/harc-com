@@ -2906,8 +2906,10 @@ pub(crate) fn connect_payload_matches_ir_type(payload: &EventPayload, ty: &IrTyp
 /// `N = ceil(width / 32)`. `N` is at least 5 for any wide scalar, so
 /// widening the wide class into the same ordering needs no offset.
 ///
-/// A widthless scalar and a `bool` both rank 0: tbir renders each
-/// `uint64_t` in a parameter position.
+/// A widthless integer and a `bool` both rank 0: the integer renders as
+/// `uint64_t` and the boolean as `bool`. The bridge policy deliberately
+/// permits C++ scalar conversions within this native-carrier tier, including
+/// boolean truth conversion.
 fn scalar_storage_rank(ty: &IrType) -> u32 {
     match ty {
         IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > super::BUILTIN_SCALAR_BITS => {
@@ -3222,14 +3224,10 @@ pub(crate) fn lower_event_payload(
                     return Ok(EventPayload::Record(*rid));
                 }
             }
-            // The DECLARED width travels into the schema now. `Bool`
-            // collapses to `width: None`, which is right but not for
-            // the reason this comment first gave ("matching the `bool`
-            // member both backends emit"): measured, tbir emits
-            // `std::function<void(uint64_t)>` for an `event<bool>` and
-            // only v1 emits `void(bool)`. `width: Some(1)` would mean
-            // `uint<1>`, which is a different declared type, so `None`
-            // is the only honest thing the pair can say here.
+            // The declared scalar identity travels into the schema. In
+            // particular, `bool` is not represented as `uint<1>`: both are
+            // one bit, but only the former uses a C++ `bool` callback and
+            // coerces emitted values to 0/1 at the delivery boundary.
             if let Some(IrType::FixedVec { elem, len }) =
                 fixed_vec_elem_ir_type_with_records(ty, record_ids)
             {
@@ -3239,14 +3237,17 @@ pub(crate) fn lower_event_payload(
                 Some(IrType::SInt(width)) => Ok(EventPayload::Scalar {
                     signed: true,
                     width,
+                    boolean: false,
                 }),
                 Some(IrType::UInt(width)) => Ok(EventPayload::Scalar {
                     signed: false,
                     width,
+                    boolean: false,
                 }),
                 Some(IrType::Bool) => Ok(EventPayload::Scalar {
                     signed: false,
                     width: None,
+                    boolean: true,
                 }),
                 _ => Err(reject_named(type_arg_simple_name(ty).unwrap_or("<expr>"))),
             }
@@ -3278,6 +3279,7 @@ pub(crate) fn lower_event_payload(
         None => Ok(EventPayload::Scalar {
             signed: false,
             width: None,
+            boolean: false,
         }),
     }
 }
@@ -5177,6 +5179,7 @@ impl super::FuncBuilder<'_> {
                         .is_err()
                     {
                         let want = match payload {
+                            EventPayload::Scalar { boolean: true, .. } => "bool".to_string(),
                             EventPayload::Scalar { signed: true, .. } => "sint".to_string(),
                             EventPayload::Scalar { signed: false, .. } => "uint".to_string(),
                             EventPayload::Record(r) => self.ctx.records[r.index()].name.clone(),

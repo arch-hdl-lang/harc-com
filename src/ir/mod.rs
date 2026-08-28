@@ -1381,13 +1381,14 @@ pub enum ComponentFieldKind {
 
 /// The payload carried by an `event<T>` analysis port (and the matching
 /// subscriber-closure / `on`-handler argument). Mirrors v1's
-/// `payload_type_for_arg`: a scalar widens to `uint64_t`/`int64_t`; a
+/// `payload_type_for_arg`: integer scalars use their width-aware carrier,
+/// `bool` remains `bool`; a
 /// user-named `transaction`/`struct` payload is carried by value as the
 /// record struct (`std::function<void(<RecordName>)>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventPayload {
     /// `event<uint<8>>` / `event<sint<…>>` / `event<bool>` — a scalar
-    /// payload: its signedness and its declared width.
+    /// payload: its signedness, declared width, and boolean identity.
     ///
     /// This was `Scalar { signed: bool }`, which could say `int64_t` or
     /// `uint64_t` and nothing else — so an `event<uint<1024>>` had no
@@ -1404,7 +1405,14 @@ pub enum EventPayload {
     /// whole `IrType`. This scalar variant keeps the compact fields because
     /// `IrType::Event(EventPayload)` makes an unboxed `IrType` here recursive;
     /// aggregate payloads below use a box to break that cycle.
-    Scalar { signed: bool, width: Option<u32> },
+    Scalar {
+        signed: bool,
+        width: Option<u32>,
+        /// Distinguishes source `bool` from `uint<1>`. Both are one-bit
+        /// values, but v1 carries a boolean event through a C++ `bool`
+        /// callback and therefore coerces every emitted value to 0/1.
+        boolean: bool,
+    },
     /// `event<Vec<T, N>>` — a fixed-size vector value. The boxed element
     /// breaks the `IrType::Event(EventPayload)` recursion while retaining the
     /// complete aggregate element shape (including another fixed vector).
@@ -1421,7 +1429,13 @@ impl EventPayload {
     /// width; it keeps the declared width now.
     pub fn scalar_ir_type(&self) -> Option<IrType> {
         match self {
-            EventPayload::Scalar { signed, width } => Some(if *signed {
+            EventPayload::Scalar {
+                signed,
+                width,
+                boolean,
+            } => Some(if *boolean {
+                IrType::Bool
+            } else if *signed {
                 IrType::SInt(*width)
             } else {
                 IrType::UInt(*width)
