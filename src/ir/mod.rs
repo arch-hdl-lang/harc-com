@@ -2254,8 +2254,10 @@ pub enum Stmt {
     /// bound-to target transactor's persistent whole-record state field.
     /// `instance` names the bound testbench-field instance (placeholder in
     /// a method body, filled at test-binding), `field` the record state
-    /// field, `path` the nested field chain to the written leaf (length ≥
-    /// 1; e.g. `["addr"]`, or `["a","b"]` for a nested struct). Emission
+    /// field, `path` the nested field chain to the written leaf. An empty
+    /// path denotes a direct fixed-vector state element, with outer recursive
+    /// selections retained as position-zero `mid_indices`. Record-state paths
+    /// have length ≥ 1 (e.g. `["addr"]`, or `["a","b"]`). Emission
     /// produces `<instance>.<field>.<path…> = <value>`. The value is
     /// port-hoisted like `Assign`. Mirrors `Stmt::RecordFieldWrite` but
     /// against the per-instance state struct instead of a `LocalId`.
@@ -2857,7 +2859,9 @@ pub enum Expr {
     /// `responder.last.data` from the test. `instance` names the bound
     /// testbench-field instance (placeholder in a method body, filled at
     /// test-binding), `field` the record state field, `path` the nested
-    /// field chain to the read leaf (length ≥ 1). Emission produces
+    /// field chain to the read leaf. An empty path denotes a direct
+    /// fixed-vector state element, with outer recursive selections retained
+    /// as position-zero `mid_indices`. Emission produces
     /// `<instance>.<field>.<path…>`. Host state — allowed wherever a
     /// `Local` is. Mirrors `Expr::RecordField` but against the per-
     /// instance state struct instead of a `LocalId`.

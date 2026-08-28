@@ -332,7 +332,11 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                         "tbir: fixed-vector state access `{field}` lacks an index"
                     )));
                 };
-                format!("{recv}[{}]", expr_cpp(cx, index)?)
+                let mut access = recv;
+                for (_, mid) in mid_indices {
+                    access.push_str(&format!("[{}]", expr_cpp(cx, mid)?));
+                }
+                format!("{access}[{}]", expr_cpp(cx, index)?)
             } else {
                 record_access_cpp(
                     cx,

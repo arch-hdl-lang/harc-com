@@ -127,6 +127,17 @@ pub(crate) struct TransactorStateRecordChain {
     pub leaf_ty: IrType,
 }
 
+/// A fully-selected direct fixed-vector state element (`lanes[i]` or
+/// `matrix[i][j]`). Outer selections use the existing empty-path
+/// `mid_indices` representation; `index` is the final selection.
+pub(crate) struct TransactorStateVecElement {
+    pub instance: String,
+    pub field: String,
+    pub mid_indices: Vec<(usize, Expr)>,
+    pub index: Expr,
+    pub elem_ty: IrType,
+}
+
 pub(crate) struct IndexedComponentRecordChain {
     pub base: crate::ir::ComponentBase,
     pub field: String,
@@ -1859,25 +1870,13 @@ impl FuncBuilder<'_> {
                         }
                     }
                 }
-                if let Some((instance, field, ty)) = self.as_transactor_state_fixed_vec(target) {
-                    let IrType::FixedVec { elem, len } = ty else {
-                        unreachable!("fixed-vector state resolver returned another type")
-                    };
-                    if matches!(*elem, IrType::FixedVec { .. }) {
-                        return Err(not_implemented(
-                            &format!("nested fixed-vector state field `{field}` element value"),
-                            "select through every fixed-vector dimension",
-                            V1Status::EmitsUncompilable,
-                        ));
-                    }
-                    let index = self.lower_expr(index)?;
-                    check_literal_vec_index_bounds(&field, &index, len)?;
+                if let Some(selected) = self.as_transactor_state_fixed_vec_element(e)? {
                     return Ok(Expr::TransactorStateRecordField {
-                        instance,
-                        field,
+                        instance: selected.instance,
+                        field: selected.field,
                         path: Vec::new(),
-                        mid_indices: Vec::new(),
-                        index: Some(Box::new(index)),
+                        mid_indices: selected.mid_indices,
+                        index: Some(Box::new(selected.index)),
                     });
                 }
                 if let Some(mut chain) = self.as_transactor_state_record_field(target)? {
@@ -2638,6 +2637,16 @@ impl FuncBuilder<'_> {
                 mid_indices,
                 index,
             } => {
+                // A direct fixed-vector state element uses this same IR with
+                // an empty record path. `expr_type` already walks every
+                // nested selection against the FixedVec schema; ask it so
+                // record assignment/equality lanes see the declared leaf.
+                if path.is_empty() {
+                    return match self.expr_type(e) {
+                        Some(IrType::Record(record)) => Some(record),
+                        _ => None,
+                    };
+                }
                 let kind = if instance.is_empty() {
                     self.target_state_fields.get(field)
                 } else {
@@ -3268,10 +3277,16 @@ impl FuncBuilder<'_> {
                     crate::ir::StateFieldKind::Record { record } => {
                         self.record_path_value_type(*record, path, mid_indices, index.is_some())
                     }
-                    crate::ir::StateFieldKind::FixedVec {
-                        ty: IrType::FixedVec { elem, .. },
-                    } if path.is_empty() && mid_indices.is_empty() && index.is_some() => {
-                        Some((**elem).clone())
+                    crate::ir::StateFieldKind::FixedVec { ty }
+                        if path.is_empty() && index.is_some() => {
+                        let mut selected = ty;
+                        for _ in 0..=mid_indices.len() {
+                            let IrType::FixedVec { elem, .. } = selected else {
+                                return None;
+                            };
+                            selected = elem;
+                        }
+                        Some(selected.clone())
                     }
                     _ => None,
                 }
@@ -4616,6 +4631,59 @@ impl FuncBuilder<'_> {
             crate::ir::StateFieldKind::FixedVec { ty } => Some((instance, field, ty)),
             _ => None,
         }
+    }
+
+    /// Resolve a direct state-vector access through every declared fixed
+    /// dimension. Partial selections remain aggregate values and stay fenced;
+    /// this path produces only scalar or record elements.
+    pub(crate) fn as_transactor_state_fixed_vec_element(
+        &mut self,
+        e: &AstExpr,
+    ) -> Result<Option<TransactorStateVecElement>, LowerError> {
+        let mut raw_indices = Vec::new();
+        let mut base = e;
+        while let ExprKind::Index { target, index } = &*base.kind {
+            raw_indices.push(index);
+            base = target;
+        }
+        if raw_indices.is_empty() {
+            return Ok(None);
+        }
+        raw_indices.reverse();
+        let Some((instance, field, mut selected_ty)) =
+            self.as_transactor_state_fixed_vec(base)
+        else {
+            return Ok(None);
+        };
+        let mut indices = Vec::with_capacity(raw_indices.len());
+        for raw in raw_indices {
+            let IrType::FixedVec { elem, len } = selected_ty else {
+                return Err(not_implemented(
+                    &format!("indexing past fixed-vector state field `{field}`"),
+                    "select no more than the field's declared fixed-vector dimensions",
+                    V1Status::EmitsUncompilable,
+                ));
+            };
+            let index = self.lower_record_path_index(raw)?;
+            check_literal_vec_index_bounds(&field, &index, len)?;
+            indices.push(index);
+            selected_ty = *elem;
+        }
+        if matches!(selected_ty, IrType::FixedVec { .. }) {
+            return Err(not_implemented(
+                &format!("partial nested fixed-vector state field `{field}` element value"),
+                "select through every fixed-vector dimension",
+                V1Status::EmitsUncompilable,
+            ));
+        }
+        let index = indices.pop().expect("at least one state-vector index");
+        Ok(Some(TransactorStateVecElement {
+            instance,
+            field,
+            mid_indices: indices.into_iter().map(|index| (0, index)).collect(),
+            index,
+            elem_ty: selected_ty,
+        }))
     }
 
     /// Resolve an AST field-access chain onto a SUB-FIELD of a bound-to

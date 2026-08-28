@@ -3295,27 +3295,21 @@ impl FuncBuilder<'_> {
         // depth (`s.a.b[i] = v`). Resolve the field chain, then lower the
         // index and value into an indexed `RecordFieldWrite`.
         if let ExprKind::Index { target: it, index } = &*target.kind {
-            if let Some((instance, field, ty)) = self.as_transactor_state_fixed_vec(it) {
-                let IrType::FixedVec { elem, len } = ty else {
-                    unreachable!("fixed-vector state resolver returned another type")
-                };
-                if matches!(*elem, IrType::FixedVec { .. }) {
-                    return Err(not_implemented(
-                        &format!("nested fixed-vector state field `{field}` element write"),
-                        "select through every fixed-vector dimension",
-                        V1Status::EmitsUncompilable,
-                    ));
-                }
-                let index = self.lower_expr_no_ports(index)?;
-                super::exprs::check_literal_vec_index_bounds(&field, &index, len)?;
+            if let Some(selected) = self.as_transactor_state_fixed_vec_element(target)? {
+                let mid_indices = selected
+                    .mid_indices
+                    .into_iter()
+                    .map(|(position, index)| (position, self.hoist_ports(index)))
+                    .collect();
+                let index = self.hoist_ports(selected.index);
                 let value = self.lower_expr_no_ports(value)?;
-                match elem.as_ref() {
+                match &selected.elem_ty {
                     IrType::Record(expected) => {
                         if self.record_id_of_expr(&value) != Some(*expected) {
                             return Err(self.record_assign_mismatch(
                                 &value,
                                 *expected,
-                                format!("element of fixed-vector state field `{field}`"),
+                                format!("element of fixed-vector state field `{}`", selected.field),
                                 "assign a value of the vector's declared record element type",
                             ));
                         }
@@ -3323,20 +3317,20 @@ impl FuncBuilder<'_> {
                     expected => {
                         self.reject_record_into_scalar(
                             &value,
-                            &format!("element of fixed-vector state field `{field}`"),
+                            &format!("element of fixed-vector state field `{}`", selected.field),
                         )?;
                         self.check_owner_scalar_field_write(
                             &value,
                             expected,
-                            &format!("element of fixed-vector state field `{field}`"),
+                            &format!("element of fixed-vector state field `{}`", selected.field),
                         )?;
                     }
                 }
                 self.push(Stmt::TransactorStateRecordFieldWrite {
-                    instance,
-                    field,
+                    instance: selected.instance,
+                    field: selected.field,
                     path: Vec::new(),
-                    mid_indices: Vec::new(),
+                    mid_indices,
                     index: Some(index),
                     value,
                 });

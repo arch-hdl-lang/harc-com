@@ -3782,9 +3782,9 @@ impl Checker<'_> {
         index: Option<&Expr>,
     ) -> Result<Option<(usize, String)>, String> {
         if path.is_empty() {
-            if !mid_indices.is_empty() {
+            if mid_indices.iter().any(|(position, _)| *position != 0) {
                 return Err(format!(
-                    "fixed-vector state field `{instance}.{field}` has record-path indices"
+                    "fixed-vector state field `{instance}.{field}` has malformed nested index positions"
                 ));
             }
             let StateFieldKind::FixedVec { ty } =
@@ -3794,31 +3794,42 @@ impl Checker<'_> {
                     "transactor state field `{instance}.{field}` has an empty record path"
                 ));
             };
-            let IrType::FixedVec { elem, len } = ty else {
-                return Err(format!(
-                    "transactor state field `{instance}.{field}` has malformed vector metadata"
-                ));
-            };
             let Some(idx) = index else {
                 return Err(format!(
                     "fixed-vector state field `{instance}.{field}` empty-path access lacks an index"
                 ));
             };
-            if !matches!(
-                self.aggregate_assignment_expr_type(idx),
-                Some(IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::Unknown)
-            ) {
-                return Err(format!(
-                    "fixed-vector state field `{instance}.{field}` has a non-scalar index"
-                ));
+            let mut selected = ty;
+            for current in mid_indices
+                .iter()
+                .map(|(_, expr)| expr)
+                .chain(std::iter::once(idx))
+            {
+                let IrType::FixedVec { elem, len } = selected else {
+                    return Err(format!(
+                        "fixed-vector state field `{instance}.{field}` has too many indices"
+                    ));
+                };
+                if !matches!(
+                    self.aggregate_assignment_expr_type(current),
+                    Some(IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::Unknown)
+                ) {
+                    return Err(format!(
+                        "fixed-vector state field `{instance}.{field}` has a non-scalar index"
+                    ));
+                }
+                if matches!(current, Expr::Literal { value, .. } if *value as usize >= *len) {
+                    return Err(format!(
+                        "fixed-vector state field `{instance}.{field}` index is out of bounds for length {len}"
+                    ));
+                }
+                selected = elem;
             }
-            if matches!(idx, Expr::Literal { value, .. } if *value as usize >= *len) {
-                return Err(format!(
-                    "fixed-vector state field `{instance}.{field}` index is out of bounds for length {len}"
-                ));
-            }
-            let _ = elem;
-            return Ok(None);
+            return Ok(match selected {
+                IrType::FixedVec { elem, len } => crate::codegen::cpp_tb::ir_vec_elem_class(elem)
+                    .map(|class| (*len, class)),
+                _ => None,
+            });
         }
         let record = self.transactor_state_record(instance, field)?;
         let segments: Vec<&str> = path.iter().map(String::as_str).collect();
@@ -3921,7 +3932,14 @@ impl Checker<'_> {
             else {
                 return None;
             };
-            let IrType::FixedVec { elem, .. } = ty else {
+            let mut selected = ty;
+            for _ in mid_indices {
+                let IrType::FixedVec { elem, .. } = selected else {
+                    return None;
+                };
+                selected = elem;
+            }
+            let IrType::FixedVec { elem, .. } = selected else {
                 return None;
             };
             return Some((**elem).clone());

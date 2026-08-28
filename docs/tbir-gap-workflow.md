@@ -108,11 +108,11 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Wide scalar transactor method returns, retaining the declared signedness
   and width through return slots, method schemas, call destinations, sibling
   calls, and exact `_harc_u128`/`HarcWide<N>` C++ signatures.
-- [x] One-dimensional fixed-vector persistent transactor state across unbound,
+- [x] Fixed-vector persistent transactor state across unbound,
   bound-target, and bound-initiator owners, including exact recursive element
   metadata, whole-array copies, indexed reads/writes, verifier checks, and
-  per-instance `std::array` storage. Recursive state-vector element access is
-  an explicit follow-up boundary; recursive dynamic lists remain excluded.
+  per-instance `std::array` storage. Element access retains every recursive
+  fixed-vector index; recursive dynamic lists remain excluded.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -370,6 +370,12 @@ not applicable before requesting review:
    whole-value class for unbound and bound-initiator method ABIs. This removes
    the dedicated return-signature fence and reduces the raw inventory by one,
    to 119 textual matches (118 constructors plus the helper definition).
+   Nested fixed-vector persistent transactor-state elements now retain each
+   outer selection in the existing state record-field access nodes, with
+   recursive verifier bounds/type checks and nested `std::array` emission.
+   The retired read/write fences were `not_implemented` classifications, so
+   this slice leaves the raw `unsupported(` inventory unchanged at 119
+   textual matches (118 constructors plus the helper definition).
    Runtime-address passive `record_read` now carries the regblock decoder in
    `Stmt::RecordRead`, and runtime-address passive `record_write` carries the
    symmetric decoder plus owner-binding callback dispatch in

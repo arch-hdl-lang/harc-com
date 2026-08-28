@@ -12027,13 +12027,15 @@ bus TlmMemBus
 end bus TlmMemBus
 transactor TlmMemTarget bound to TlmMemBus
     lanes : Vec<uint<8>, 4>
+    matrix : Vec<Vec<uint<8>, 2>, 3>
     shadow : Vec<uint<8>, 4>
     cursor : uint<8> default 0
     bundle : Bundle
     thread bus.read(addr: uint<8>)
         lanes[cursor] = addr
+        matrix[cursor][1] = addr
         shadow = lanes
-        return lanes[cursor]
+        return matrix[cursor][1]
     end thread
 end transactor TlmMemTarget
 testbench Tb
@@ -12046,11 +12048,13 @@ impl T for Tb
     run
         target.cursor = 1
         target.lanes[1] = 9
+        target.matrix[1][0] = 11
         target.shadow = target.lanes
         target.shadow = source.values
         target.shadow = source.wide_values
         target.shadow = target.bundle.data
         assert target.lanes[1] == 9
+        assert target.matrix[1][0] == 11
         wait 2 cycles
     end run
 end impl T"#;
@@ -12058,6 +12062,10 @@ end impl T"#;
     verify::verify_program(&prog).expect("fixed-vector target state verifies");
     let cpp = emit_cpp_src(target);
     assert!(cpp.contains("std::array<uint64_t, 4> lanes{};"), "{cpp}");
+    assert!(
+        cpp.contains("std::array<std::array<uint64_t, 2>, 3> matrix{};"),
+        "{cpp}"
+    );
     assert!(cpp.contains("target.lanes[target.cursor] = addr;"), "{cpp}");
     assert!(cpp.contains("target.shadow = target.lanes;"), "{cpp}");
     assert!(cpp.contains("target.shadow = source.values;"), "{cpp}");
@@ -12067,6 +12075,8 @@ end impl T"#;
     );
     assert!(cpp.contains("target.shadow = target.bundle.data;"), "{cpp}");
     assert!(cpp.contains("target.lanes[1] = 9;"), "{cpp}");
+    assert!(cpp.contains("target.matrix[1][0] = 11;"), "{cpp}");
+    assert!(cpp.contains("target.matrix[target.cursor][1] = addr;"), "{cpp}");
     assert!(cpp.contains("target.cursor = 1;"), "{cpp}");
     assert!(
         cpp_tb::emit(&merged_src(target))
@@ -12308,6 +12318,49 @@ end impl T"#;
         "empty-path state-vector reads require an index"
     );
 
+    let mut malformed_nested_position = prog.clone();
+    let nested_write = malformed_nested_position
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find(|stmt| {
+            matches!(stmt, ir::Stmt::TransactorStateRecordFieldWrite { field, mid_indices, .. }
+                if field == "matrix" && !mid_indices.is_empty())
+        })
+        .expect("fixture contains a nested state-vector element write");
+    let ir::Stmt::TransactorStateRecordFieldWrite { mid_indices, .. } = nested_write else {
+        unreachable!()
+    };
+    mid_indices[0].0 = 1;
+    assert!(
+        verify::verify_program(&malformed_nested_position).is_err(),
+        "direct nested state-vector indices use the empty-path position"
+    );
+
+    let mut out_of_bounds_nested_index = prog.clone();
+    let nested_write = out_of_bounds_nested_index
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find(|stmt| {
+            matches!(stmt, ir::Stmt::TransactorStateRecordFieldWrite { field, mid_indices, .. }
+                if field == "matrix" && !mid_indices.is_empty())
+        })
+        .expect("fixture contains a nested state-vector element write");
+    let ir::Stmt::TransactorStateRecordFieldWrite { mid_indices, .. } = nested_write else {
+        unreachable!()
+    };
+    mid_indices[0].1 = ir::Expr::Literal {
+        value: 3,
+        ty: ir::IrType::Unknown,
+    };
+    assert!(
+        verify::verify_program(&out_of_bounds_nested_index).is_err(),
+        "every nested state-vector dimension is bounds checked"
+    );
+
     let wrong_record_element = r#"
 struct A
     value : uint<8>
@@ -12317,10 +12370,11 @@ struct B
 end struct B
 transactor X
     dut : Top
-    values : Vec<A, 2>
+    values : Vec<Vec<A, 2>, 2>
     when active
         hookable put(value: B)
-            values[0] = value
+            values[0][1] = value
+            assert values[0][1] == value
         end put
     end when
 end transactor X
@@ -12333,19 +12387,91 @@ impl T for Tb
         wait 1 cycle
     end run
 end impl T"#;
+    let matching_record_element = wrong_record_element.replace("value: B", "value: A");
+    let nested_record_prog = lower_src(&matching_record_element)
+        .expect("nested state vector accepts its declared record leaf");
+    verify::verify_program(&nested_record_prog)
+        .expect("nested record-leaf state vector verifies");
+    assert!(
+        emit_cpp_src(&matching_record_element).contains("values[0][1] = value;"),
+        "every nested selection reaches the record element write"
+    );
     assert!(
         lower_src(wrong_record_element).is_err(),
         "a state vector rejects the wrong record element type during lowering"
     );
 
+    let port_indexed_write = r#"
+transactor PortIndexed
+    dut : Top
+    grid : Vec<Vec<uint<8>, 2>, 2>
+    when active
+        hookable capture()
+            grid[dut.count_out][dut.count_out] = dut.count_out
+        end capture
+    end when
+end transactor PortIndexed
+testbench Tb
+    dut : Top
+    x : PortIndexed active
+end testbench Tb
+impl T for Tb
+    run
+        x.dut = dut
+        wait 1 cycle
+    end run
+end impl T"#;
+    let port_prog = lower_src(port_indexed_write)
+        .expect("DUT-port nested state indices and value lower");
+    verify::verify_program(&port_prog)
+        .expect("DUT-port nested state indices and value are hoisted before verification");
+    let capture = port_prog.function(
+        port_prog.transactors[0]
+            .method("capture")
+            .expect("capture method")
+            .function,
+    );
+    let stmts: Vec<_> = capture
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .collect();
+    let write_pos = stmts
+        .iter()
+        .position(|stmt| {
+            matches!(stmt, ir::Stmt::TransactorStateRecordFieldWrite { field, .. }
+                if field == "grid")
+        })
+        .expect("nested state write is present");
+    let [ir::Stmt::DutRead(outer, _), ir::Stmt::DutRead(inner, _), ir::Stmt::DutRead(rhs, _)] =
+        stmts[write_pos - 3..write_pos]
+    else {
+        panic!("outer index, inner index, and RHS must be snapshotted in source order")
+    };
+    let ir::Stmt::TransactorStateRecordFieldWrite {
+        mid_indices,
+        index: Some(index),
+        value,
+        ..
+    } = stmts[write_pos]
+    else {
+        unreachable!()
+    };
+    assert!(
+        matches!(mid_indices.as_slice(), [(0, ir::Expr::Local(local))] if local == outer)
+            && matches!(index, ir::Expr::Local(local) if local == inner)
+            && matches!(value, ir::Expr::Local(local) if local == rhs),
+        "the nested write consumes the three ordered DUT snapshots"
+    );
+
     let unbound = r#"
 transactor Poker
     dut : Top
-    lanes : Vec<uint<8>, 4>
+    lanes : Vec<Vec<uint<8>, 2>, 2>
     when active
         hookable poke()
-            lanes[0] = 7
-            assert lanes[0] == 7
+            lanes[0][1] = 7
+            assert lanes[0][1] == 7
         end poke
     end when
 end transactor Poker
@@ -12362,15 +12488,16 @@ impl T for Tb
 end impl T"#;
     let prog = lower_src(unbound).expect("fixed-vector unbound state lowers");
     verify::verify_program(&prog).expect("fixed-vector unbound state verifies");
-    assert!(emit_cpp_src(unbound).contains("std::array<uint64_t, 4> lanes{};"));
+    assert!(emit_cpp_src(unbound)
+        .contains("std::array<std::array<uint64_t, 2>, 2> lanes{};"));
 
     let initiator = r#"
 use BusAxiLite
 transactor AxilHelper bound to BusAxiLite
-    lanes : Vec<uint<8>, 4>
+    lanes : Vec<Vec<uint<8>, 2>, 2>
     hookable poke()
-        lanes[0] = 3
-        assert lanes[0] == 3
+        lanes[0][1] = 3
+        assert lanes[0][1] == 3
     end poke
 end transactor AxilHelper
 testbench Tb
