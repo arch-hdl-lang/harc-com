@@ -1228,15 +1228,25 @@ impl FuncBuilder<'_> {
                     V1Status::EmitsUncompilable,
                 ));
             }
-            // Stays an `Unsupported`: v1 emits a COMMENT for the
-            // declaration (`// let x (no type / no value)`), so whether
-            // its output compiles depends on whether the name is ever
-            // USED — an unused `let x` builds fine there, a later
-            // `x = 1` does not. The rejection fires at the declaration,
-            // before that is known, so it cannot claim either outcome.
+            if l.ty.is_none() {
+                // v1 emits no declaration for an untyped, uninitialized
+                // `let x`; it is only a source-level placeholder. Mirror
+                // that behavior by lowering it to no IR. If `x` is
+                // subsequently used, the ordinary unresolved-local
+                // diagnostic fires at the use site, where we can explain
+                // the actual error precisely.
+                return Ok(());
+            }
+            // A typed declaration that did not match any supported type
+            // above is not an inert placeholder. Keep the subset boundary:
+            // dropping it could also drop semantic registration (for
+            // example, a covergroup-typed local).
             return Err(unsupported(
-                &format!("uninitialized `let {}` without a scalar type", l.name.name),
-                "declare it with a scalar type (`let x: uint<N>;`) or give an initializer",
+                &format!(
+                    "uninitialized `let {}` without a supported scalar, record, event, or fixed-vector type",
+                    l.name.name
+                ),
+                "use a supported explicit type or give the declaration an initializer",
             ));
         };
         // Explicit scalar bit-width of the declaration, tracked on

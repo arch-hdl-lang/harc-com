@@ -9,6 +9,11 @@ end testbench BitsliceUninitTb
 
 impl BitsliceUninitTest for BitsliceUninitTb
     run
+        // Untyped and uninitialized placeholders are inert under v1;
+        // TB-IR must accept the same unused declaration without inventing
+        // a storage type for it.
+        let intentionally_unused
+
         // ── constant bit-slice `x[hi:lo]` ──────────────────────────
         let v : uint<32> = 0xDEADBEEF
         let lo8  = v[7:0]
