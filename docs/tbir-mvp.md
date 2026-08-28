@@ -9512,6 +9512,15 @@ former `transaction` group lives in
      registered pure-helper fixture now copies and compares a two-dimensional
      byte grid under both emitters. Recursive dynamic lists remain excluded.
 
+161. **Nested fixed-vector reusable testbench methods (2026-08-28).**
+
+     Reusable testbench `function`/`hookable` methods now accept and return
+     nested fixed vectors. Their CFG-inlined parameter locals, aggregate-init
+     return slots, explicit returns, and inferred call destinations retain the
+     full recursive `IrType::FixedVec`; the emitted locals use nested
+     `std::array` carriers. The registered method fixture copies and compares
+     a two-dimensional byte grid under both emitters.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

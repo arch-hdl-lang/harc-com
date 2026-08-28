@@ -2,6 +2,8 @@ testbench FixedVecMethodTb
     dut : Top
     values : Vec<uint<8>, 2>
     expected : Vec<uint<8>, 2>
+    grid : Vec<Vec<uint<8>, 2>, 2>
+    expected_grid : Vec<Vec<uint<8>, 2>, 2>
 
     function echo_vec(items: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
         return items
@@ -10,6 +12,14 @@ testbench FixedVecMethodTb
     function vec_matches(items: Vec<uint<8>, 2>, want: Vec<uint<8>, 2>) -> bool
         return items == want
     end function vec_matches
+
+    function echo_grid(items: Vec<Vec<uint<8>, 2>, 2>) -> Vec<Vec<uint<8>, 2>, 2>
+        return items
+    end function echo_grid
+
+    function grid_matches(items: Vec<Vec<uint<8>, 2>, 2>, want: Vec<Vec<uint<8>, 2>, 2>) -> bool
+        return items == want
+    end function grid_matches
 end testbench FixedVecMethodTb
 
 impl FixedVecMethodTest for FixedVecMethodTb
@@ -20,6 +30,17 @@ impl FixedVecMethodTest for FixedVecMethodTb
         expected[1] = 9
         let echoed = echo_vec(values)
         assert vec_matches(echoed, expected) else fail("fixed-vector testbench-method ABI changed")
+        grid[0][0] = 2
+        grid[0][1] = 4
+        grid[1][0] = 6
+        grid[1][1] = 8
+        expected_grid[0][0] = 2
+        expected_grid[0][1] = 4
+        expected_grid[1][0] = 6
+        expected_grid[1][1] = 8
+        let echoed_grid = echo_grid(grid)
+        assert grid_matches(echoed_grid, expected_grid)
+            else fail("nested fixed-vector testbench-method ABI changed")
         wait 1 cycle
     end run
 end impl FixedVecMethodTest

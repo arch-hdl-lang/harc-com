@@ -21278,18 +21278,30 @@ fn fixed_vector_testbench_method_signatures_are_typed_end_to_end() {
             ir::IrType::FixedVec {
                 elem: Box::new(ir::IrType::FixedVec {
                     elem: Box::new(ir::IrType::UInt(Some(8))),
+                    len: 0,
+                }),
+                len: 2,
+            },
+            "nested zero length",
+        ),
+        (
+            ir::IrType::FixedVec {
+                elem: Box::new(ir::IrType::FixedVec {
+                    elem: Box::new(ir::IrType::Record(ir::RecordId(999))),
                     len: 2,
                 }),
                 len: 2,
             },
-            "nested vector",
+            "nested missing record",
         ),
     ] {
         let mut malformed = prog.clone();
         malformed.functions[run_id.index()].locals[init_local.index()].ty = bad_ty;
+        let errs = verify::verify_program(&malformed)
+            .expect_err("malformed recursive AggregateInit metadata must fail verification");
         assert!(
-            verify::verify_program(&malformed).is_err(),
-            "AggregateInit with {label} metadata must fail verification"
+            errs.iter().any(|err| err.to_string().contains("AggregateInit")),
+            "AggregateInit with {label} metadata must report its own verifier error: {errs:?}"
         );
     }
     let annotated = src.replace(
@@ -21378,11 +21390,18 @@ end impl RecordVecMethodTest
             .expect_err("record-vector leaf identity mismatch is invalid"),
     );
 
-    let nested = src.replace(
-        "items: Vec<uint<8>, 2>",
-        "items: Vec<Vec<uint<8>, 2>, 2>",
+    let nested_ty = ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::FixedVec {
+            elem: Box::new(ir::IrType::UInt(Some(8))),
+            len: 2,
+        }),
+        len: 2,
+    };
+    assert!(
+        run.locals.iter().filter(|local| local.ty == nested_ty).count() >= 5,
+        "nested arguments, parameters, return temp, and inferred result retain their type:\n{run}"
     );
-    assert_unsupported(&lower_src(&nested).expect_err("nested method signatures stay fenced"));
+    assert!(cpp.contains("std::array<std::array<uint64_t, 2>, 2>"));
 }
 
 fn assert_no_record_zero_assign(func: &ir::TbFunction) {
