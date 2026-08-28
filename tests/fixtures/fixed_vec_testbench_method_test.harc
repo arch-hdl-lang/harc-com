@@ -1,0 +1,25 @@
+testbench FixedVecMethodTb
+    dut : Top
+    values : Vec<uint<8>, 2>
+    expected : Vec<uint<8>, 2>
+
+    function echo_vec(items: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
+        return items
+    end function echo_vec
+
+    function vec_matches(items: Vec<uint<8>, 2>, want: Vec<uint<8>, 2>) -> bool
+        return items == want
+    end function vec_matches
+end testbench FixedVecMethodTb
+
+impl FixedVecMethodTest for FixedVecMethodTb
+    run
+        values[0] = 4
+        values[1] = 9
+        expected[0] = 4
+        expected[1] = 9
+        let echoed = echo_vec(values)
+        assert vec_matches(echoed, expected) else fail("fixed-vector testbench-method ABI changed")
+        wait 1 cycle
+    end run
+end impl FixedVecMethodTest

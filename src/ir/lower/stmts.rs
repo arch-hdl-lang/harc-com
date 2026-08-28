@@ -6008,12 +6008,12 @@ impl FuncBuilder<'_> {
         // the program `Invalid` — while v1 emits
         // `auto r = Tb_make_result(_tb, 7);` and compiles.
         let ret_record = self.record_id_of_expr(&v);
-        // NO sequence arm here, deliberately, and the first attempt at
-        // this batch wrote one that could never fire. A testbench
-        // method's return temp is typed by `ir_type_of_with_records`,
-        // which answers `Unknown` for `TSeq<T>` — so there is no
-        // sequence type to carry, and code reading `expr_type` for one
-        // is dead.
+        let ret_fixed = self.expr_type(&v).and_then(|ty| {
+            matches!(ty, IrType::FixedVec { .. }).then(|| ty.clone())
+        });
+        // NO sequence arm here, deliberately. Testbench signature typing
+        // retains fixed vectors and records, but still answers `Unknown`
+        // for `TSeq<T>`, so there is no sequence type to carry.
         //
         // That is a real gap, and it is OLDER than the slot rule: the
         // whole inlined chain is untyped, parameter included, so tbir
@@ -6047,6 +6047,23 @@ impl FuncBuilder<'_> {
         let id = self.declare(&l.name.name);
         if let Some(rid) = ret_record {
             self.set_local_type(id, IrType::Record(rid));
+        } else if let Some(ty) = ret_fixed {
+            if let Some(declared) = l.ty.as_ref().and_then(|ty| {
+                super::components::fixed_vec_ir_type_with_records(ty, &self.ctx.record_ids)
+            }) {
+                if declared != ty {
+                    return Err(LowerError::Invalid(format!(
+                        "`let {}` fixed-vector annotation does not match the testbench method return",
+                        l.name.name
+                    )));
+                }
+            } else if l.ty.is_some() {
+                return Err(LowerError::Invalid(format!(
+                    "`let {}` is declared with a non-vector type and initialised from a fixed vector",
+                    l.name.name
+                )));
+            }
+            self.set_local_type(id, ty);
         }
         self.push(Stmt::Assign(id, v));
         Ok(true)

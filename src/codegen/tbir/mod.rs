@@ -1791,7 +1791,7 @@ fn stmt_has_probe(s: &ir::Stmt) -> bool {
         EventEmit { args, .. } => args.iter().any(expr_has_probe),
         EventSubscribe { .. } | MethodHookSubscribe { .. } => false,
         PropertyCheck(_) | CoverCheck(_) | CycleHandler(_) => false,
-        RecordInit(_, _) | CovReport(_) => false,
+        RecordInit(_, _) | AggregateInit(_) | CovReport(_) => false,
     }
 }
 
@@ -2092,7 +2092,7 @@ fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
         EventEmit { args, .. } => args.iter().for_each(|a| for_each_port_in_expr(a, f)),
         EventSubscribe { .. } | MethodHookSubscribe { .. } => {}
         PropertyCheck(_) | CoverCheck(_) | CycleHandler(_) => {}
-        RecordInit(_, _) | CovReport(_) => {}
+        RecordInit(_, _) | AggregateInit(_) | CovReport(_) => {}
     }
 }
 

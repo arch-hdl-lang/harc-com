@@ -4202,6 +4202,25 @@ impl Checker<'_> {
                         });
                     }
                 }
+                Stmt::AggregateInit(l) => {
+                    self.check_local(*l);
+                    if self
+                        .func
+                        .locals
+                        .get(l.index())
+                        .is_some_and(|tl| {
+                            !matches!(tl.ty, IrType::FixedVec { .. })
+                                || !helper_abi_type_valid(&tl.ty, self.prog.records.len())
+                        })
+                    {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} AggregateInit target is not a fixed vector",
+                                self.fid.0, self.bid.0
+                            ),
+                        });
+                    }
+                }
                 Stmt::RecordFieldWrite {
                     local,
                     field,
@@ -7552,7 +7571,7 @@ fn check_def_before_use(
                     check_e(e, &defined, errs);
                     bit_set(&mut defined, l.index());
                 }
-                Stmt::DutRead(l, _) | Stmt::RecordInit(l, _) => {
+                Stmt::DutRead(l, _) | Stmt::RecordInit(l, _) | Stmt::AggregateInit(l) => {
                     bit_set(&mut defined, l.index());
                 }
                 Stmt::RecordRead {

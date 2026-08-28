@@ -191,4 +191,5 @@ component_wide_scalar_state_test | Top | top_counter.sv    |
 wide_transactor_return_test | Top | top_counter.sv    |
 fixed_vec_transactor_param_test | Top | top_counter.sv |
 fixed_vec_pure_helper_test | Top | top_counter.sv |
+fixed_vec_testbench_method_test | Top | top_counter.sv |
 enum_variant_scope_test | Top            | top_counter.sv         |

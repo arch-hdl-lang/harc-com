@@ -8322,6 +8322,7 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 }
                 ir::Stmt::DutRead(_, _)
                 | ir::Stmt::RecordInit(_, _)
+                | ir::Stmt::AggregateInit(_)
                 | ir::Stmt::CovReport(_)
                 // Concurrent-check bodies are program-level schemas, not
                 // per-instance method state — no transactor instance to find.
@@ -8597,6 +8598,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 }
                 ir::Stmt::DutRead(_, _)
                 | ir::Stmt::RecordInit(_, _)
+                | ir::Stmt::AggregateInit(_)
                 | ir::Stmt::CovReport(_)
                 // Concurrent-check bodies carry no transactor-state
                 // placeholder to fill (see the finder above).
@@ -8937,6 +8939,7 @@ fn fill_initiator_bus_prefix(
                         }
                     }
                     Stmt::RecordInit(_, _)
+                    | Stmt::AggregateInit(_)
                     | Stmt::CovReport(_)
                     // A concurrent check registered inside an initiator
                     // BFM body would carry the placeholder bus prefix, but

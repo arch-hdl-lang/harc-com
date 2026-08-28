@@ -664,6 +664,7 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         ),
         Stmt::ProbeRelease(p) => format!("ProbeRelease({})", port_str(Some(func), p)),
         Stmt::RecordInit(l, r) => format!("RecordInit({}, r{})", local_str(func, *l), r.0),
+        Stmt::AggregateInit(l) => format!("AggregateInit({})", local_str(func, *l)),
         Stmt::RecordFieldWrite {
             local,
             field,

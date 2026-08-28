@@ -454,7 +454,10 @@ impl FuncBuilder<'_> {
                     continue; // the element bind itself
                 }
                 let writes = match s {
-                    Stmt::Assign(l, _) | Stmt::DutRead(l, _) | Stmt::RecordInit(l, _) => {
+                    Stmt::Assign(l, _)
+                    | Stmt::DutRead(l, _)
+                    | Stmt::RecordInit(l, _)
+                    | Stmt::AggregateInit(l) => {
                         *l == bound
                     }
                     Stmt::RecordFieldWrite { local, .. } | Stmt::RecordWriteCb { local, .. } => {

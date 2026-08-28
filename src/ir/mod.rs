@@ -2129,6 +2129,10 @@ pub enum Stmt {
     /// the source `let` position — a `let t : Txn` inside a loop body
     /// re-runs the field defaults every iteration.
     RecordInit(LocalId, RecordId),
+    /// Re-default-construct an aggregate local whose complete type is carried
+    /// by the local table. Currently used for fixed-vector return slots on
+    /// CFG-inlined testbench methods.
+    AggregateInit(LocalId),
     /// `t.field = value` on a record-typed local. The value is
     /// port-hoisted like `Assign` (no inline DUT reads). `index: Some(e)`
     /// writes a `Vec<T, N>` field element (`rec.data[e] = value`); `None`

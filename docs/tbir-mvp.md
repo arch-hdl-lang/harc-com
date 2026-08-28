@@ -9489,6 +9489,17 @@ former `transaction` group lives in
      remain explicitly fenced until recursive whole-vector copy lowering is
      available.
 
+159. **Fixed-vector reusable testbench-method signatures (2026-08-27).**
+     Testbench `function`/`hookable` methods that are CFG-inlined into run and
+     check functions now accept and return one-dimensional fixed vectors with
+     their exact scalar or record element type and length. Whole-vector
+     arguments and returns pass through the shared aggregate value/copy gate;
+     untyped result locals inherit the complete `IrType::FixedVec`. A new
+     aggregate-init statement models the default-constructed inlined return
+     slot without assigning scalar zero to `std::array`. The registered
+     `fixed_vec_testbench_method_test` fixture is trace-equivalent under v1 and
+     TBIR. Nested fixed-vector method signatures remain explicitly fenced.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
