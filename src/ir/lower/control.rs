@@ -582,12 +582,14 @@ impl FuncBuilder<'_> {
             self.in_reevaluated_predicate = previous;
             let expr = lowered?;
             self.validate_truth_expr(&expr, "wait-until predicate")?;
-            // A sibling transactor method call is a synchronous C++ call
-            // and remains inline so the scheduler re-evaluates it on every
-            // predicate attempt, matching v1. Bus-/instance-bound calls use
-            // the statement-level handshake/call seam and still cannot live
-            // in this closure (hoisting would evaluate only once).
-            if super::exprs::expr_has_bound_transactor_edge(&expr) {
+            // A sibling or testbench-instance transactor method call is a
+            // synchronous C++ call and remains inline so the scheduler
+            // re-evaluates it on every predicate attempt, matching v1. Bus
+            // calls use the statement-level handshake seam and still cannot
+            // live in this closure (hoisting would evaluate only once).
+            if super::exprs::expr_has_bound_transactor_edge(&expr, &|field| {
+                self.ctx.bus_bindings.contains_key(field)
+            }) {
                 return Err(unsupported(
                     "a transactor method call inside a `wait until` predicate",
                     "the predicate is re-evaluated every cycle, so a call that advances time \

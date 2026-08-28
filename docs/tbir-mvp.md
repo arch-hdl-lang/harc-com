@@ -9559,8 +9559,21 @@ former `transaction` group lives in
      landing stays on the statement-level call seam. As in v1, a sibling that
      itself waits advances time synchronously before the outer predicate can
      retry. A registered fixture passes a changing DUT port to a stateful
-     sibling predicate under both emitters. Bound-instance and bus/TLM calls
-     remain statement-level.
+     sibling predicate under both emitters. Bus/TLM calls remain
+     statement-level.
+
+165. **Re-evaluated testbench-instance transactor predicates (2026-08-28).**
+
+     A value-returning call through a testbench transactor field can now remain
+     inline inside `wait until`, including when nested in a fixed-vector index.
+     The backend resolves the field to its transactor schema, forwards the
+     per-instance state receiver when required, and re-evaluates live DUT-port
+     arguments on every attempt. The verifier resolves the owning testbench,
+     instance, method, arity, argument types, and scalar truth return before
+     emission. Bus/TLM bindings retain their statement-level handshake seam
+     and remain excluded from predicate closures. A registered fixture waits
+     on a changing DUT counter through a stateful bound predicate and is
+     trace-diffed against v1.
 
 ## Next steps
 

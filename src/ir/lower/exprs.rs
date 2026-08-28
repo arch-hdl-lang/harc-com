@@ -3237,6 +3237,11 @@ impl FuncBuilder<'_> {
                 | crate::ir::CallTarget::ExternFn { ret, .. },
                 _,
             ) => Some(ret.clone()),
+            Expr::Call(
+                crate::ir::CallTarget::TransactorMethod { .. }
+                | crate::ir::CallTarget::TransactorSelfMethod { .. },
+                _,
+            ) => self.transactor_call_ret_ty(e),
             Expr::ComponentIdle { .. } | Expr::TransactorIdle { .. } => Some(IrType::Bool),
             Expr::DynamicListQuery {
                 query: crate::ir::DynamicListQuery::Size,
@@ -6001,28 +6006,38 @@ pub(crate) fn parse_sized_int_literal_with_width(s: &str) -> Option<(u32, u64)> 
     Some((width, value))
 }
 
-/// True when `e` contains a bus-/instance-bound transactor call edge. A
-/// synchronous sibling call is directly expressible in a re-evaluated
-/// predicate, but a bound call still needs the statement-level call seam.
-pub(crate) fn expr_has_bound_transactor_edge(e: &Expr) -> bool {
+/// True when `e` contains a transactor call edge selected by `is_bound`.
+/// Re-evaluated predicates pass the bus-binding table here: synchronous
+/// sibling and testbench-instance methods can remain inline, while a bus/TLM
+/// handshake still needs the statement-level call seam.
+pub(crate) fn expr_has_bound_transactor_edge<F>(e: &Expr, is_bound: &F) -> bool
+where
+    F: Fn(&str) -> bool,
+{
     match e {
-        Expr::Call(crate::ir::CallTarget::TransactorMethod { .. }, _) => true,
+        Expr::Call(
+            crate::ir::CallTarget::TransactorMethod { bus_field, .. },
+            _,
+        ) => is_bound(bus_field),
         Expr::Call(crate::ir::CallTarget::TransactorSelfMethod { .. }, _) => false,
-        Expr::Call(_, args) => args.iter().any(expr_has_bound_transactor_edge),
+        Expr::Call(_, args) => args
+            .iter()
+            .any(|arg| expr_has_bound_transactor_edge(arg, is_bound)),
         Expr::Binary(_, a, b) => {
-            expr_has_bound_transactor_edge(a) || expr_has_bound_transactor_edge(b)
+            expr_has_bound_transactor_edge(a, is_bound)
+                || expr_has_bound_transactor_edge(b, is_bound)
         }
-        Expr::Unary(_, a) => expr_has_bound_transactor_edge(a),
+        Expr::Unary(_, a) => expr_has_bound_transactor_edge(a, is_bound),
         Expr::Ternary(c, t, f) => {
-            expr_has_bound_transactor_edge(c)
-                || expr_has_bound_transactor_edge(t)
-                || expr_has_bound_transactor_edge(f)
+            expr_has_bound_transactor_edge(c, is_bound)
+                || expr_has_bound_transactor_edge(t, is_bound)
+                || expr_has_bound_transactor_edge(f, is_bound)
         }
-        Expr::WidthCast { inner, .. } => expr_has_bound_transactor_edge(inner),
+        Expr::WidthCast { inner, .. } => expr_has_bound_transactor_edge(inner, is_bound),
         Expr::ComponentIdle { n, .. } | Expr::TransactorIdle { n, .. } => {
-            expr_has_bound_transactor_edge(n)
+            expr_has_bound_transactor_edge(n, is_bound)
         }
-        Expr::SeqIndex { index, .. } => expr_has_bound_transactor_edge(index),
+        Expr::SeqIndex { index, .. } => expr_has_bound_transactor_edge(index, is_bound),
         // A transactor call nested in a fixed-vector element INDEX
         // (`mem[xt.idx()]` / `sb.v[xt.idx()]`) reaches a `wait until`
         // predicate wrapped in a vec node, not bare. Without recursing
@@ -6036,20 +6051,20 @@ pub(crate) fn expr_has_bound_transactor_edge(e: &Expr) -> bool {
         | Expr::ComponentVecElement {
             index, inner_index, ..
         } => {
-            expr_has_bound_transactor_edge(index)
+            expr_has_bound_transactor_edge(index, is_bound)
                 || inner_index
                     .as_deref()
-                    .is_some_and(expr_has_bound_transactor_edge)
+                    .is_some_and(|inner| expr_has_bound_transactor_edge(inner, is_bound))
         }
-        Expr::BitSlice { target, .. } => expr_has_bound_transactor_edge(target),
+        Expr::BitSlice { target, .. } => expr_has_bound_transactor_edge(target, is_bound),
         Expr::BitSliceDyn { target, hi, lo } => {
-            expr_has_bound_transactor_edge(target)
-                || expr_has_bound_transactor_edge(hi)
-                || expr_has_bound_transactor_edge(lo)
+            expr_has_bound_transactor_edge(target, is_bound)
+                || expr_has_bound_transactor_edge(hi, is_bound)
+                || expr_has_bound_transactor_edge(lo, is_bound)
         }
         Expr::CovHookParam {
             index: Some(index), ..
-        } => expr_has_bound_transactor_edge(index),
+        } => expr_has_bound_transactor_edge(index, is_bound),
         _ => false,
     }
 }
