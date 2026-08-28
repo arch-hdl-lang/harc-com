@@ -113,6 +113,9 @@ family of rejections over a one-site exception. Current implementation order:
   metadata, whole-array copies, indexed reads/writes, verifier checks, and
   per-instance `std::array` storage. Element access retains every recursive
   fixed-vector index; recursive dynamic lists remain excluded.
+- [x] Boolean component and test-scope event payloads, preserving `bool` as
+  distinct from `uint<1>` through handler locals, subscriber signatures,
+  emits, connects, verifier checks, and C++ callback coercion.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -376,6 +379,9 @@ not applicable before requesting review:
    The retired read/write fences were `not_implemented` classifications, so
    this slice leaves the raw `unsupported(` inventory unchanged at 119
    textual matches (118 constructors plus the helper definition).
+   Boolean event payload identity then closes a runtime-semantic v1/TBIR gap
+   through the existing event schema rather than removing a constructor, so
+   the raw inventory remains 119 textual matches.
    Runtime-address passive `record_read` now carries the regblock decoder in
    `Stmt::RecordRead`, and runtime-address passive `record_write` carries the
    symmetric decoder plus owner-binding callback dispatch in

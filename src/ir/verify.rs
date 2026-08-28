@@ -1075,6 +1075,63 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 }
             }
         }
+        for handler in &component.on_handlers {
+            let field_payload = component.field(&handler.event).and_then(|field| {
+                if let ComponentFieldKind::Event { payload } = &field.kind {
+                    Some(payload)
+                } else {
+                    None
+                }
+            });
+            let Some(field_payload) = field_payload else {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "component c{ci} `{}` on handler names non-event field `{}`",
+                        component.name, handler.event
+                    ),
+                });
+                continue;
+            };
+            if field_payload != &handler.arg_payload {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "component c{ci} `{}` on handler `{}` payload disagrees with its event field",
+                        component.name, handler.event
+                    ),
+                });
+            }
+            if let Err(detail) = verify_event_payload_ref(prog, &handler.arg_payload) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "component c{ci} `{}` on handler `{}` {detail}",
+                        component.name, handler.event
+                    ),
+                });
+            }
+            if let Some(function) = prog.functions.get(handler.function.index()) {
+                let params: Vec<_> = function.params.iter().map(|p| p.ty.clone()).collect();
+                let locals: Vec<_> = function
+                    .locals
+                    .iter()
+                    .take(function.params.len())
+                    .map(|local| local.ty.clone())
+                    .collect();
+                let expected = vec![handler.arg_payload.value_ir_type()];
+                if params != expected || locals != expected {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "component c{ci} `{}` on handler `{}` payload {:?} disagrees with fn{} parameters {:?} or parameter locals {:?}",
+                            component.name,
+                            handler.event,
+                            handler.arg_payload,
+                            handler.function.0,
+                            params,
+                            locals
+                        ),
+                    });
+                }
+            }
+        }
         for edge in &component.connects {
             if let Err(detail) =
                 verify_component_connect(prog, ComponentId(ci as u32), edge)
@@ -2252,15 +2309,7 @@ fn event_payload_accepts_value_type(payload: &EventPayload, ty: &IrType) -> bool
 }
 
 fn event_payload_handler_matches_type(payload: &EventPayload, ty: &IrType) -> bool {
-    match (payload, ty) {
-        (EventPayload::Scalar { signed: true, .. }, IrType::SInt(_)) => true,
-        (EventPayload::Scalar { signed: false, .. }, IrType::UInt(_) | IrType::Bool) => true,
-        (EventPayload::Record(source), IrType::Record(sink)) => *source == *sink,
-        (EventPayload::FixedVec { .. }, IrType::FixedVec { .. }) => {
-            payload.value_ir_type() == *ty
-        }
-        _ => false,
-    }
+    payload.value_ir_type() == *ty
 }
 
 fn verify_event_payload_ref(prog: &TbProgram, payload: &EventPayload) -> Result<(), String> {

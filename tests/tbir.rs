@@ -12577,6 +12577,72 @@ end test T
     );
 }
 
+#[test]
+fn boolean_event_payload_identity_is_verified() {
+    let src = r#"
+env BoolHub
+    flag : in event<bool>
+    on flag(v)
+        assert v == true
+    end on
+end env BoolHub
+
+test T
+    let dut : Top
+    let hub : BoolHub
+    run
+        emit hub.flag(2)
+    end run
+end test T
+"#;
+    let prog = lower_src(src).expect("boolean event lowers");
+    verify::verify_program(&prog).expect("boolean event verifies");
+    let payload = prog.components[0]
+        .fields
+        .iter()
+        .find(|field| field.name == "flag")
+        .and_then(|field| match &field.kind {
+            ir::ComponentFieldKind::Event { payload } => Some(payload),
+            _ => None,
+        })
+        .expect("flag event field");
+    assert_eq!(payload.value_ir_type(), ir::IrType::Bool);
+    let ir::EventPayload::Scalar { boolean, .. } = payload else {
+        panic!("flag has a scalar payload")
+    };
+    assert!(*boolean, "flag retains boolean identity");
+
+    let handler = prog.components[0].on_handlers[0].function;
+    for corrupt in ["field payload", "function parameter", "parameter local"] {
+        let mut broken = prog.clone();
+        match corrupt {
+            "field payload" => {
+                let field = broken.components[0]
+                    .fields
+                    .iter_mut()
+                    .find(|field| field.name == "flag")
+                    .expect("flag field");
+                let ir::ComponentFieldKind::Event { payload } = &mut field.kind else {
+                    panic!("flag is an event")
+                };
+                let ir::EventPayload::Scalar { boolean, .. } = payload else {
+                    panic!("flag has a scalar payload")
+                };
+                *boolean = false;
+            }
+            "function parameter" => {
+                broken.functions[handler.index()].params[0].ty = ir::IrType::UInt(Some(8));
+            }
+            "parameter local" => {
+                broken.functions[handler.index()].locals[0].ty = ir::IrType::UInt(Some(8));
+            }
+            _ => unreachable!(),
+        }
+        verify::verify_program(&broken)
+            .expect_err(&format!("corrupted boolean event {corrupt} must not verify"));
+    }
+}
+
 /// The two record-traversal arms that had no cell of their own.
 ///
 /// `indexing the non-`Vec` record field` had its verdict flipped to
@@ -15118,7 +15184,7 @@ end impl T"#;
     let err = lower_src(&mixed_event)
         .expect_err("a scalar local event cannot accept a mixed record payload");
     assert!(
-        assert_invalid(&err).contains("channel carries `event<uint>`"),
+        assert_invalid(&err).contains("channel carries `event<bool>`"),
         "mixed scalar/record local-event payload gets a source diagnostic: {err}"
     );
     let record_query = event_prog
@@ -39018,6 +39084,7 @@ fn component_event_subscription_metadata_is_verified() {
             *payload = ir::EventPayload::Scalar {
                 signed: false,
                 width: None,
+                boolean: false,
             }
         }
         _ => panic!("fixture subscription must target a component event"),
@@ -41051,15 +41118,9 @@ end impl TWe
 "#
         )
     };
-    // (payload, what tbir emits, what v1 emits). The two agree
-    // everywhere except `bool`, which is NOT this batch's doing and is
-    // recorded rather than quietly asserted away: v1 gives a bool
-    // payload `std::function<void(bool)>` and tbir gives
-    // `void(uint64_t)`. Both compile, so no differential space can see
-    // it; the observable difference is that `emit ev(2)` notifies with
-    // `true` under v1 and `2` here. Closing it needs the payload
-    // schema to be able to SAY bool — `{ signed, width }` cannot, since
-    // `width: Some(1)` means `uint<1>`, which v1 renders `uint64_t`.
+    // (payload, what both emitters render). `bool` deliberately remains
+    // distinct from `uint<1>`: its callback parameter is C++ `bool`, so
+    // an emitted value such as 2 is coerced to true before delivery.
     for (ty, member, v1_member) in [
         (
             "uint<8>",
@@ -41073,7 +41134,7 @@ end impl TWe
         ),
         (
             "bool",
-            "std::vector<std::function<void(uint64_t)>> ev;",
+            "std::vector<std::function<void(bool)>> ev;",
             "std::vector<std::function<void(bool)>> ev;",
         ),
         (
@@ -41595,6 +41656,7 @@ fn the_verifier_backstops_the_connect_payload_width_rule() {
         *payload = ir::EventPayload::Scalar {
             signed: false,
             width: Some(1024),
+            boolean: false,
         };
     };
 

@@ -6,6 +6,7 @@
 env EventHub
     inbound : in event<uint<8>>
     duplex  : inout event<uint<8>>
+    flag    : in event<bool>
     total   : uint<32> default 0
 
     on inbound(v)
@@ -14,6 +15,10 @@ env EventHub
 
     on duplex(v)
         total = total + v * 10
+    end on
+
+    on flag(v)
+        total = total + v * 100
     end on
 end env EventHub
 
@@ -33,15 +38,23 @@ test ComponentEventDirectionsTest
     let consumer : DuplexConsumer active
 
     run
+        let local_flag : event<bool>
+        on local_flag(v)
+            assert v == true
+                else fail("test-scope bool event did not coerce its payload to true")
+        end on
+
         consumer.dut = dut
         emit hub.inbound(2)
         emit hub.duplex(3)
+        emit hub.flag(2)
         emit consumer.duplex(5)
+        emit local_flag(7)
 
-        assert hub.total == 32
-            else fail("component directional events produced total=${hub.total}, expected 32")
+        assert hub.total == 132
+            else fail("component directional events produced total=${hub.total}, expected 132")
         assert consumer.total == 5
             else fail("inout transactor event produced total=${consumer.total}, expected 5")
-        log(info, "PASS: component in/inout event channels delivered every payload")
+        log(info, "PASS: component and local event channels delivered typed payloads")
     end run
 end test ComponentEventDirectionsTest

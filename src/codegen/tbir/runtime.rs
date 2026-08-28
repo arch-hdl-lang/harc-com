@@ -440,9 +440,9 @@ pub(super) fn scoreboard_struct(
 }
 
 /// The C++ payload type carried by an `event<T>` subscriber closure.
-/// Mirrors v1's `payload_type_for_arg`: a scalar widens to
-/// `uint64_t`/`int64_t`; a value-record payload is the record struct
-/// (carried by value).
+/// Mirrors v1's `payload_type_for_arg`: integer scalars use their
+/// width-aware carrier, `bool` remains `bool`, and a value-record payload
+/// is the record struct (carried by value).
 pub(super) fn event_payload_cty(
     p: &crate::ir::EventPayload,
     records: &[crate::ir::RecordSchema],
