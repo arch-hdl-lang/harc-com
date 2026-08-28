@@ -7206,7 +7206,7 @@ pub(crate) struct FuncBuilder<'a> {
     pub(crate) helper_ret: Option<LocalId>,
     /// True only for an out-of-line file helper, whose generated C++ ABI is
     /// scalar even when source type metadata is otherwise unknown.
-    pub(crate) scalar_helper_abi: bool,
+    pub(crate) pure_helper_abi: bool,
     /// True while lowering `${...}` captures of a log/fail message —
     /// impure helper calls cannot inline there (messages evaluate
     /// lazily at the failure site).
@@ -7724,7 +7724,7 @@ impl<'a> FuncBuilder<'a> {
             inline_frames: Vec::new(),
             tb_record_locals: HashMap::new(),
             helper_ret: None,
-            scalar_helper_abi: false,
+            pure_helper_abi: false,
             in_fmt_args: false,
             vec_read_ok: false,
             vec_read_span: None,

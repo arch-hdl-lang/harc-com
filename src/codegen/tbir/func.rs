@@ -1262,19 +1262,22 @@ pub(super) fn emit_tseq(
 /// both signedness and declared widths, including `_harc_u128` and
 /// `HarcWide<N>` values. A separate 64-bit-only helper mapping truncated
 /// wide arguments and returns before the helper body could observe them.
-fn helper_local_cty(ty: &crate::ir::IrType) -> String {
-    super::local_scalar_cty(ty)
+fn helper_local_cty(ty: &crate::ir::IrType, records: &[RecordSchema]) -> String {
+    match ty {
+        IrType::FixedVec { .. } => super::aggregate_value_cty(ty, records),
+        _ => super::local_scalar_cty(ty),
+    }
 }
 
 /// Return type for a helper: the declared type of its return slot, or
 /// `void` when it has none. Kept identical between the prototype and the
 /// definition so the two C++ signatures match.
-fn helper_ret_cty(func: &TbFunction) -> String {
+fn helper_ret_cty(func: &TbFunction, records: &[RecordSchema]) -> String {
     match func.ret {
         Some(r) => func
             .locals
             .get(r.index())
-            .map(|l| helper_local_cty(&l.ty))
+            .map(|l| helper_local_cty(&l.ty, records))
             .unwrap_or_else(|| "uint64_t".to_string()),
         None => "void".to_string(),
     }
@@ -1283,7 +1286,11 @@ fn helper_ret_cty(func: &TbFunction) -> String {
 /// Comma-joined parameter list for a helper's C++ signature. The first
 /// `params.len()` locals ARE the parameters (TB-IR convention), so each
 /// param's declared type comes from `func.locals[i].ty`.
-fn helper_param_list(func: &TbFunction, names: &[String]) -> String {
+fn helper_param_list(
+    func: &TbFunction,
+    names: &[String],
+    records: &[RecordSchema],
+) -> String {
     names[..func.params.len()]
         .iter()
         .enumerate()
@@ -1291,7 +1298,7 @@ fn helper_param_list(func: &TbFunction, names: &[String]) -> String {
             let cty = func
                 .locals
                 .get(i)
-                .map(|l| helper_local_cty(&l.ty))
+                .map(|l| helper_local_cty(&l.ty, records))
                 .unwrap_or_else(|| "uint64_t".to_string());
             format!("{cty} {n}")
         })
@@ -1301,10 +1308,14 @@ fn helper_param_list(func: &TbFunction, names: &[String]) -> String {
 
 /// Forward declaration for a lowered pure helper, so source-order
 /// emission supports helper-to-helper calls in any order.
-pub(super) fn emit_helper_prototype(out: &mut String, func: &TbFunction) {
+pub(super) fn emit_helper_prototype(
+    out: &mut String,
+    func: &TbFunction,
+    records: &[RecordSchema],
+) {
     let names = cpp_local_names(func);
-    let ret_ty = helper_ret_cty(func);
-    let params = helper_param_list(func, &names);
+    let ret_ty = helper_ret_cty(func, records);
+    let params = helper_param_list(func, &names, records);
     writeln!(
         out,
         "static {ret_ty} {}({params});",
@@ -1314,7 +1325,7 @@ pub(super) fn emit_helper_prototype(out: &mut String, func: &TbFunction) {
 }
 
 /// Emit one `FunctionKind::Helper` function (a lowered *pure* helper)
-/// as a file-scope C++ function. Pure helpers contain only scalar
+/// as a file-scope C++ function. Pure helpers contain only value
 /// computation — no DUT access, no logging, no suspension — so the
 /// loop-switch body is restricted to `Assign` statements and
 /// `Jump`/`Branch`/`Return` terminators; anything else is a lowering
@@ -1323,8 +1334,8 @@ pub(super) fn emit_helper_prototype(out: &mut String, func: &TbFunction) {
 /// Signature convention: the first `params.len()` locals ARE the
 /// parameters (TB-IR convention), so they emit as parameters and are
 /// not re-declared in the body. Parameters, internal locals, and the
-/// return slot use the ordinary TBIR scalar mapping so declared
-/// signedness and widths are preserved across the helper ABI.
+/// return slot use the ordinary TBIR scalar mapping or the aggregate
+/// `std::array` carrier so their complete types survive the helper ABI.
 pub(super) fn emit_helper_function(
     out: &mut String,
     prog: &TbProgram,
@@ -1348,8 +1359,8 @@ pub(super) fn emit_helper_function(
     };
     let nparams = func.params.len();
 
-    let ret_ty = helper_ret_cty(func);
-    let params = helper_param_list(func, &names);
+    let ret_ty = helper_ret_cty(func, &prog.records);
+    let params = helper_param_list(func, &names, &prog.records);
     writeln!(
         out,
         "static {ret_ty} {}({params}) {{",
@@ -1369,8 +1380,12 @@ pub(super) fn emit_helper_function(
                 // type name before this hoisted declaration.
                 writeln!(out, "{INDENT}::{} {name}{{}}; (void){name};", schema.name).ok();
             }
+            IrType::FixedVec { .. } => {
+                let cty = helper_local_cty(&local.ty, &prog.records);
+                writeln!(out, "{INDENT}{cty} {name}{{}}; (void){name};").ok();
+            }
             _ => {
-                let cty = helper_local_cty(&local.ty);
+                let cty = helper_local_cty(&local.ty, &prog.records);
                 writeln!(out, "{INDENT}{cty} {name} = 0; (void){name};").ok();
             }
         }
@@ -1442,7 +1457,7 @@ pub(super) fn emit_helper_function(
         writeln!(out, "{pad2}}}").ok();
     }
     match func.ret {
-        Some(_) => writeln!(out, "{pad2}default: return 0;").ok(),
+        Some(_) => writeln!(out, "{pad2}default: return {{}};").ok(),
         None => writeln!(out, "{pad2}default: return;").ok(),
     };
     writeln!(out, "{INDENT}{INDENT}}}").ok();

@@ -421,7 +421,23 @@ fn cover_scalar_type(ty: &IrType) -> bool {
     )
 }
 
+fn helper_abi_type_valid(ty: &IrType, record_count: usize) -> bool {
+    match ty {
+        IrType::FixedVec { elem, len } if *len != 0 => match elem.as_ref() {
+            IrType::Record(record) => record.index() < record_count,
+            IrType::FixedVec { .. } => false,
+            scalar => fixed_vec_elem_valid(scalar),
+        },
+        other => cover_scalar_type(other),
+    }
+}
+
 fn cover_call_compatible(expected: &IrType, actual: &IrType) -> bool {
+    if matches!(expected, IrType::FixedVec { .. })
+        || matches!(actual, IrType::FixedVec { .. })
+    {
+        return expected == actual;
+    }
     cover_scalar_type(expected)
         && cover_scalar_type(actual)
         && (matches!(expected, IrType::Unknown)
@@ -559,8 +575,10 @@ fn check_cover_expr(
                     ),
                     errs,
                 ),
-                Some(actual) if !cover_scalar_type(actual) => bad(
-                    format!("helper `{name}` return must be scalar, got {actual:?}"),
+                Some(actual) if !helper_abi_type_valid(actual, prog.records.len()) => bad(
+                    format!(
+                        "helper `{name}` return must use the scalar or fixed-vector ABI, got {actual:?}"
+                    ),
                     errs,
                 ),
                 Some(_) => {}
@@ -2471,10 +2489,10 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
     }
 
     // Pure helpers emit as file-scope C++ functions whose params and return
-    // use the scalar helper ABI. Internal record locals are permitted, but a
-    // pass must not drift a parameter's mirrored local type or route a record
-    // through the signature/return slot: codegen deliberately maps only the
-    // ABI boundary through `local_scalar_cty`.
+    // use the scalar-or-one-dimensional-fixed-vector helper ABI. Internal
+    // record locals are permitted, but a pass must not drift a parameter's
+    // mirrored local type or route a bare record/nested vector through the
+    // signature/return slot.
     if func.kind == FunctionKind::Helper {
         if func.params.len() > func.locals.len() {
             errs.push(VerifyError::BadProgramRef {
@@ -2495,10 +2513,10 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
                         fid.0, func.name, index, param.ty, local.ty
                     ),
                 }),
-                Some(local) if !cover_scalar_type(&local.ty) => {
+                Some(local) if !helper_abi_type_valid(&local.ty, prog.records.len()) => {
                     errs.push(VerifyError::BadProgramRef {
                         what: format!(
-                            "fn{} helper `{}` param {} must use the scalar helper ABI, got {:?}",
+                            "fn{} helper `{}` param {} must use the scalar helper ABI or fixed-vector extension, got {:?}",
                             fid.0, func.name, index, local.ty
                         ),
                     });
@@ -2508,10 +2526,10 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
         }
         if let Some(ret) = func.ret {
             match func.locals.get(ret.index()) {
-                Some(local) if !cover_scalar_type(&local.ty) => {
+                Some(local) if !helper_abi_type_valid(&local.ty, prog.records.len()) => {
                     errs.push(VerifyError::BadProgramRef {
                         what: format!(
-                            "fn{} helper `{}` return %{} must use the scalar helper ABI, got {:?}",
+                            "fn{} helper `{}` return %{} must use the scalar helper ABI or fixed-vector extension, got {:?}",
                             fid.0, func.name, ret.0, local.ty
                         ),
                     });
@@ -6621,36 +6639,108 @@ impl Checker<'_> {
                 self.check_expr(index, ports_ok, context);
             }
             Expr::Call(target, args) => {
-                if let CallTarget::Helper { name, .. } = target {
-                    if let Some(helper) = self.prog.functions.iter().find(|function| {
+                let helper_schema = if let CallTarget::Helper { name, ret } = target {
+                    self.prog
+                        .functions
+                        .iter()
+                        .find(|function| {
                         function.kind == FunctionKind::Helper && function.name == *name
-                    }) {
-                        for (index, (arg, param)) in
-                            args.iter().zip(&helper.params).enumerate()
-                        {
-                            let actual = self
-                                .aggregate_assignment_expr_type(arg)
-                                .unwrap_or(IrType::Unknown);
-                            if (matches!(
-                                &param.ty,
-                                IrType::FixedVec { .. } | IrType::Seq(_) | IrType::RecordSeq(_)
-                            ) || matches!(
-                                &actual,
-                                IrType::FixedVec { .. } | IrType::Seq(_) | IrType::RecordSeq(_)
-                            )) && param.ty != actual
-                            {
+                        })
+                        .map(|helper| {
+                            let params = helper
+                                .params
+                                .iter()
+                                .map(|param| param.ty.clone())
+                                .collect::<Vec<_>>();
+                            let actual_ret = helper
+                                .ret
+                                .and_then(|local| helper.locals.get(local.index()))
+                                .map(|local| local.ty.clone());
+                            (params, actual_ret)
+                        })
+                        .or_else(|| {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} helper call references missing helper `{name}`",
+                                    self.fid.0, self.bid.0
+                                ),
+                            });
+                            None
+                        })
+                        .map(|(params, actual_ret)| {
+                            if params.len() != args.len() {
                                 self.errs.push(VerifyError::BadProgramRef {
                                     what: format!(
-                                        "fn{} b{} helper `{name}` argument {} expects {:?}, got {:?}",
+                                        "fn{} b{} helper `{name}` arity mismatch: function has {}, call carries {}",
                                         self.fid.0,
                                         self.bid.0,
-                                        index + 1,
-                                        param.ty,
-                                        actual
+                                        params.len(),
+                                        args.len()
                                     ),
                                 });
                             }
+                            match actual_ret.as_ref() {
+                                Some(actual) if actual != ret => {
+                                    self.errs.push(VerifyError::BadProgramRef {
+                                        what: format!(
+                                            "fn{} b{} helper `{name}` return metadata mismatch: function has {actual:?}, call carries {ret:?}",
+                                            self.fid.0, self.bid.0
+                                        ),
+                                    });
+                                }
+                                None if !matches!(ret, IrType::Unknown) => {
+                                    self.errs.push(VerifyError::BadProgramRef {
+                                        what: format!(
+                                            "fn{} b{} void helper `{name}` call carries return type {ret:?}",
+                                            self.fid.0, self.bid.0
+                                        ),
+                                    });
+                                }
+                                _ => {}
+                            }
+                            (params, actual_ret)
+                        })
+                } else {
+                    None
+                };
+                if let (CallTarget::Helper { name, .. }, Some((params, _))) =
+                    (target, helper_schema.as_ref())
+                {
+                    for (index, (arg, param_ty)) in args.iter().zip(params).enumerate() {
+                        let actual = if matches!(param_ty, IrType::FixedVec { .. }) {
+                                self.expr_whole_vec_type(arg)
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(IrType::Unknown)
+                        } else {
+                            self.aggregate_assignment_expr_type(arg)
+                                .unwrap_or(IrType::Unknown)
+                        };
+                        if (matches!(
+                            param_ty,
+                            IrType::FixedVec { .. } | IrType::Seq(_) | IrType::RecordSeq(_)
+                        ) || matches!(
+                            &actual,
+                            IrType::FixedVec { .. } | IrType::Seq(_) | IrType::RecordSeq(_)
+                        )) && *param_ty != actual
+                        {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} helper `{name}` argument {} expects {:?}, got {:?}",
+                                    self.fid.0,
+                                    self.bid.0,
+                                    index + 1,
+                                    param_ty,
+                                    actual
+                                ),
+                            });
                         }
+                        self.check_expr_inner(
+                            arg,
+                            ports_ok,
+                            context,
+                            matches!(param_ty, IrType::FixedVec { .. }),
+                        );
                     }
                 }
                 // Seam rule: a call edge is never an expression VALUE.
@@ -6690,8 +6780,10 @@ impl Checker<'_> {
                         ),
                     });
                 }
-                for a in args {
-                    self.check_expr(a, ports_ok, context);
+                if helper_schema.is_none() {
+                    for a in args {
+                        self.check_expr(a, ports_ok, context);
+                    }
                 }
             }
         }

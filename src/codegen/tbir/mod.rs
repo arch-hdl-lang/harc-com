@@ -451,7 +451,7 @@ fn emit_selected_tests(
         .filter(|f| f.kind == ir::FunctionKind::Helper)
         .collect();
     for h in &helpers {
-        func::emit_helper_prototype(&mut out, h);
+        func::emit_helper_prototype(&mut out, h, &prog.records);
     }
     if !helpers.is_empty() {
         writeln!(out).ok();
@@ -895,7 +895,7 @@ pub fn separate_category_bytes(
             .filter(|f| f.kind == ir::FunctionKind::Helper)
             .collect();
         for h in &helpers {
-            func::emit_helper_prototype(&mut out, h);
+            func::emit_helper_prototype(&mut out, h, &prog.records);
         }
         for h in &helpers {
             let _ = func::emit_helper_function(&mut out, prog, h);
@@ -1039,7 +1039,7 @@ pub fn emit_separate_interface_with_prefix(
         .filter(|f| f.kind == ir::FunctionKind::Helper)
         .collect();
     for h in &helpers {
-        func::emit_helper_prototype(&mut out, h);
+        func::emit_helper_prototype(&mut out, h, &prog.records);
     }
     if !helpers.is_empty() {
         writeln!(out).ok();

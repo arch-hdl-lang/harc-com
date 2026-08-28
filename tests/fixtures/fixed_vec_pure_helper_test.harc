@@ -1,0 +1,25 @@
+function echo_vec(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
+    return values
+end function echo_vec
+
+function vec_matches(values: Vec<uint<8>, 2>, expected: Vec<uint<8>, 2>) -> bool
+    return values == expected
+end function vec_matches
+
+testbench FixedVecPureHelperTb
+    dut : Top
+    values : Vec<uint<8>, 2>
+    expected : Vec<uint<8>, 2>
+end testbench FixedVecPureHelperTb
+
+impl FixedVecPureHelperTest for FixedVecPureHelperTb
+    run
+        values[0] = 3
+        values[1] = 7
+        expected[0] = 3
+        expected[1] = 7
+        let echoed = echo_vec(values)
+        assert vec_matches(echoed, expected) else fail("fixed-vector pure-helper ABI changed")
+        wait 1 cycle
+    end run
+end impl FixedVecPureHelperTest

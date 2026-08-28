@@ -9473,6 +9473,22 @@ former `transaction` group lives in
      explicitly fenced until recursive whole-vector copy lowering is
      available; recursive dynamic-list returns also remain outside this batch.
 
+158. **Fixed-vector pure-helper parameters and returns (2026-08-27).**
+
+     Standalone pure helpers may now pass and return one-dimensional
+     `Vec<T, N>` values with scalar or declared-record elements. Declaration
+     lowering, call metadata, mirrored parameter locals, return slots, and
+     untyped result locals retain the exact `IrType::FixedVec`; whole-vector
+     arguments and returns use the shared exact-shape read gate. The helper
+     C++ ABI renders `std::array` in prototypes and definitions, value-
+     initializes aggregate locals, and uses an aggregate-safe unreachable
+     return. Verification admits only the scalar or one-dimensional vector
+     helper ABI and validates record references and call shapes. The
+     registered `fixed_vec_pure_helper_test` fixture exercises vector echo and
+     comparison helpers under both emitters. Nested fixed-vector signatures
+     remain explicitly fenced until recursive whole-vector copy lowering is
+     available.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

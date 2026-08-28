@@ -1506,6 +1506,16 @@ impl FuncBuilder<'_> {
             // 'Beat' to 'uint64_t' in assignment". (v1 emitted
             // `int64_t c = self.src.cur;`, uncompilable the same way.)
             .or_else(|| self.record_id_of_expr(&e).map(IrType::Record));
+        let helper_aggregate_ty = match &e {
+            Expr::Call(
+                crate::ir::CallTarget::Helper {
+                    ret: ty @ IrType::FixedVec { .. },
+                    ..
+                },
+                _,
+            ) => Some(ty.clone()),
+            _ => None,
+        };
         // …but a record RHS under a DECLARED SCALAR type is a
         // disagreement, not an inference. `record_ty` wins the `.or`
         // chain below, so without this the annotation is discarded
@@ -1587,6 +1597,7 @@ impl FuncBuilder<'_> {
             self.let_widths.insert(id, w);
         }
         if let Some(ty) = record_ty
+            .or(helper_aggregate_ty)
             .or(declared_scalar_ty)
             .or(wide_scalar_ty)
             .or(signed_scalar_ty)
