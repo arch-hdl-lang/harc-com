@@ -914,26 +914,16 @@ pub(crate) fn slot_ir_type(
 
 /// Resolve the by-value ABI shared by standalone pure-helper declarations
 /// and calls. Scalar and declared-record behavior is unchanged; a
-/// one-dimensional fixed vector uses the aggregate `std::array` carrier.
-/// Nested vectors stay fenced until helper returns can recursively copy them.
+/// fixed vector uses the recursive aggregate `std::array` carrier.
 fn pure_helper_signature_type(
-    helper: &str,
-    what: &str,
+    _helper: &str,
+    _what: &str,
     ty: Option<&TypeExpr>,
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<IrType, LowerError> {
     if let Some(fixed @ IrType::FixedVec { .. }) = ty.and_then(|ty| {
         super::components::fixed_vec_ir_type_with_records(ty, record_ids)
     }) {
-        if matches!(
-            &fixed,
-            IrType::FixedVec { elem, .. } if matches!(elem.as_ref(), IrType::FixedVec { .. })
-        ) {
-            return Err(unsupported(
-                &format!("pure helper `{helper}` {what} with a nested fixed-vector type"),
-                "nested fixed-vector helper signatures await recursive whole-vector copy lowering",
-            ));
-        }
         return Ok(fixed);
     }
     Ok(ir_type_of_with_records(ty, record_ids))

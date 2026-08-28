@@ -6,10 +6,20 @@ function vec_matches(values: Vec<uint<8>, 2>, expected: Vec<uint<8>, 2>) -> bool
     return values == expected
 end function vec_matches
 
+function echo_grid(values: Vec<Vec<uint<8>, 2>, 2>) -> Vec<Vec<uint<8>, 2>, 2>
+    return values
+end function echo_grid
+
+function grid_matches(values: Vec<Vec<uint<8>, 2>, 2>, expected: Vec<Vec<uint<8>, 2>, 2>) -> bool
+    return values == expected
+end function grid_matches
+
 testbench FixedVecPureHelperTb
     dut : Top
     values : Vec<uint<8>, 2>
     expected : Vec<uint<8>, 2>
+    grid : Vec<Vec<uint<8>, 2>, 2>
+    expected_grid : Vec<Vec<uint<8>, 2>, 2>
 end testbench FixedVecPureHelperTb
 
 impl FixedVecPureHelperTest for FixedVecPureHelperTb
@@ -20,6 +30,17 @@ impl FixedVecPureHelperTest for FixedVecPureHelperTb
         expected[1] = 7
         let echoed = echo_vec(values)
         assert vec_matches(echoed, expected) else fail("fixed-vector pure-helper ABI changed")
+        grid[0][0] = 1
+        grid[0][1] = 2
+        grid[1][0] = 3
+        grid[1][1] = 4
+        expected_grid[0][0] = 1
+        expected_grid[0][1] = 2
+        expected_grid[1][0] = 3
+        expected_grid[1][1] = 4
+        let echoed_grid = echo_grid(grid)
+        assert grid_matches(echoed_grid, expected_grid)
+            else fail("nested fixed-vector pure-helper ABI changed")
         wait 1 cycle
     end run
 end impl FixedVecPureHelperTest

@@ -23270,6 +23270,10 @@ pub(crate) fn ir_vec_elem_class(t: &crate::ir::IrType) -> Option<String> {
         IrType::SInt(w) => Some(cpp_sint_for_width(*w)),
         IrType::Bool => Some("bool".into()),
         IrType::Record(rid) => Some(format!("record#{}", rid.index())),
+        IrType::FixedVec { elem, len } => Some(format!(
+            "std::array<{}, {len}>",
+            ir_vec_elem_class(elem)?
+        )),
         _ => None,
     }
 }

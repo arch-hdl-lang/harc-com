@@ -9500,6 +9500,18 @@ former `transaction` group lives in
      `fixed_vec_testbench_method_test` fixture is trace-equivalent under v1 and
      TBIR. Nested fixed-vector method signatures remain explicitly fenced.
 
+160. **Nested fixed-vector values and pure-helper signatures (2026-08-28).**
+
+     Whole-vector equality and copies now classify recursive fixed-vector
+     element carriers, closing the shared value seam for same-shaped nested
+     arrays. Standalone pure helpers consequently preserve nested fixed-vector
+     parameters and returns through the existing `IrType::FixedVec` ABI.
+     Whole-value argument and return checks compare every dimension, helper
+     prototypes and definitions emit recursive `std::array` carriers, and the
+     verifier recursively validates nonzero lengths and record leaves. The
+     registered pure-helper fixture now copies and compares a two-dimensional
+     byte grid under both emitters. Recursive dynamic lists remain excluded.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
