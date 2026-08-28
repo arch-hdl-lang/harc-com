@@ -363,6 +363,9 @@ not applicable before requesting review:
    aggregate boundary for parameters, returns, inferred result locals, and
    CFG-inlined return-slot initialization. Nested signatures remain fenced, so
    this slice also leaves the raw textual inventory unchanged.
+   Nested fixed-vector reusable testbench methods then reuse the recursive
+   whole-value class and aggregate initializer, removing their signature fence
+   without changing the raw textual inventory.
    Runtime-address passive `record_read` now carries the regblock decoder in
    `Stmt::RecordRead`, and runtime-address passive `record_write` carries the
    symmetric decoder plus owner-binding callback dispatch in

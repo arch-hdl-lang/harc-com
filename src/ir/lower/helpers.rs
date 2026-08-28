@@ -948,23 +948,14 @@ fn ir_type_of_param(ty: Option<&TypeExpr>, ctx: &super::LowerCtx) -> IrType {
 }
 
 fn testbench_method_signature_type(
-    method: &str,
-    what: &str,
+    _method: &str,
+    _what: &str,
     ty: Option<&TypeExpr>,
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<IrType, LowerError> {
     if let Some(fixed @ IrType::FixedVec { .. }) = ty.and_then(|ty| {
         super::components::fixed_vec_ir_type_with_records(ty, record_ids)
     }) {
-        if matches!(
-            &fixed,
-            IrType::FixedVec { elem, .. } if matches!(elem.as_ref(), IrType::FixedVec { .. })
-        ) {
-            return Err(unsupported(
-                &format!("testbench method `{method}` {what} with a nested fixed-vector type"),
-                "nested fixed-vector method signatures await recursive whole-vector copy lowering",
-            ));
-        }
         return Ok(fixed);
     }
     Ok(ir_type_of_with_records(ty, record_ids))
