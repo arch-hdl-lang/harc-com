@@ -9457,6 +9457,22 @@ former `transaction` group lives in
      record-element vectors and malformed return IR. Recursive dynamic-list
      returns remain outside this batch.
 
+157. **Fixed-vector transactor method returns (2026-08-27).**
+
+     Unbound and bus-bound initiator transactor methods may now return
+     one-dimensional `Vec<T, N>` values with scalar or declared-record
+     elements. Return declarations use the fixed-vector resolver already
+     shared by transactor parameters, method schemas and
+     return slots retain the complete aggregate type, and direct plus sibling
+     call destinations inherit it. The existing aggregate method ABI emits
+     `std::array` through both the type-scoped `std::function` slot and method
+     lambda. Verification checks schema/function agreement, recursive record
+     references, whole-vector return assignments, and destination shape. The
+     registered fixed-vector transactor fixture covers state snapshots and
+     parameter echoes under both emitters. Nested fixed-vector returns remain
+     explicitly fenced until recursive whole-vector copy lowering is
+     available; recursive dynamic-list returns also remain outside this batch.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

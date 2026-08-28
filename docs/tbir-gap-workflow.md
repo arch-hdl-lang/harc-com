@@ -348,6 +348,9 @@ not applicable before requesting review:
    Fixed-vector component method returns reuse that aggregate decoder, the
    existing whole-vector copy gate, and the existing component-call statement;
    this slice therefore also leaves the raw textual inventory unchanged.
+   Fixed-vector transactor method returns reuse the corresponding transactor
+   parameter decoder, return-slot copy gate, and call statements, so this
+   slice likewise leaves the raw textual inventory unchanged.
    Runtime-address passive `record_read` now carries the regblock decoder in
    `Stmt::RecordRead`, and runtime-address passive `record_write` carries the
    symmetric decoder plus owner-binding callback dispatch in

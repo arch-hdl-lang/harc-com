@@ -3741,7 +3741,9 @@ pub(super) fn emit_method(
         writeln!(out, "{pad2}}}").ok();
     }
     match func.ret {
-        Some(_) => writeln!(out, "{pad2}default: return 0;").ok(),
+        // Value-initialization works for scalar, record, and fixed-vector
+        // returns; a literal zero cannot initialize `std::array`.
+        Some(_) => writeln!(out, "{pad2}default: return {{}};").ok(),
         None => writeln!(out, "{pad2}default: return;").ok(),
     };
     writeln!(out, "{pad2}}}").ok(); // switch
