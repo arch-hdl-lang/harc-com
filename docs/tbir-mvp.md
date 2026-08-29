@@ -9619,6 +9619,23 @@ former `transaction` group lives in
      This is intentionally a TBIR-first migration improvement and therefore
      has unit/compiler coverage rather than a v1 trace-equivalence row.
 
+169. **Composed fixed-vector helper values (2026-08-28).**
+
+     A pure helper call returning `Vec<T, N>` may now flow directly into a
+     fixed-vector helper or testbench-method argument and directly satisfy a
+     fixed-vector helper or method return. The call already carried its exact
+     recursive `IrType::FixedVec` return metadata; lowering now admits that
+     typed expression through the shared whole-vector value gate, and the
+     verifier recognizes the same metadata when validating aggregate call
+     slots. No new IR or emitter special case is needed, so nested calls keep
+     source evaluation order and emit as ordinary nested C++ calls. A
+     mismatched element type or length remains `Invalid`, matching v1's C++
+     type failure. The registered pure-helper fixture exercises direct
+     argument and return composition under both emitters with trace parity.
+     Four dedicated fallback constructors disappear, reducing the raw
+     inventory to 117 textual matches (116 constructors plus the shared
+     helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

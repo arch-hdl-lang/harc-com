@@ -363,6 +363,10 @@ not applicable before requesting review:
    whole-vector read/copy gate while widening the existing helper ABI; the
    shared nested-vector fence remains, so this slice also leaves the raw
    textual inventory unchanged.
+   Composed fixed-vector helper results then reuse that same typed call
+   metadata in aggregate argument and return positions. This removes four
+   dedicated composition fallbacks, leaving 117 textual matches (116
+   constructors plus the helper definition).
    Nested fixed-vector pure-helper signatures remove that helper-specific
    fence and recursively validate/render the already-carried aggregate type;
    the testbench-method and transactor signature fences remain, so this slice

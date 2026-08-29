@@ -184,50 +184,37 @@ pub(crate) fn lower_pure_helper<'a>(
 }
 
 impl FuncBuilder<'_> {
-    /// Is `e` a call to a helper whose declared return type is a fixed
-    /// vector of EXACTLY `expected`'s shape? (harc#745 Finding 2.)
-    ///
-    /// This is the one non-path whole-vector RHS v1 composes into
-    /// well-typed C++ — the callee returns a `std::array` that drops
-    /// straight into another `std::array` slot of the same shape — so it
-    /// is a TB-IR gap (`unsupported`, v1 is the honest fallback), NOT a
-    /// program error.
-    ///
-    /// The shape MUST match `expected`. A composed call whose element
-    /// type or length differs (`echo2() -> Vec<_, 2>` into a `Vec<_, 4>`
-    /// slot) is a mismatch v1 also fails to compile, so it stays
-    /// `Invalid` rather than being pointed at a v1 that cannot help — the
-    /// same honesty rule that keeps a scalar `return 1` `Invalid`.
-    /// (`fixed_vec_ir_type_with_records` also decodes scalars, so a
-    /// scalar-returning helper call never satisfies the `FixedVec`
-    /// equality either.)
-    fn is_fixed_vec_helper_call(&self, e: &AstExpr, expected: &IrType) -> bool {
-        if !matches!(expected, IrType::FixedVec { .. }) {
-            return false;
-        }
+    /// Return the exact recursive fixed-vector type of a pure helper call.
+    /// Parentheses are transparent; impure helpers are excluded because
+    /// their CFG-inlined result is not an ordinary composable call value.
+    /// The receiving argument/return slot compares this type with its own
+    /// expected type after lowering, preserving the existing mismatch error.
+    pub(crate) fn fixed_vec_helper_call_type(&self, e: &AstExpr) -> Option<IrType> {
         let mut cur = e;
         loop {
             match &*cur.kind {
                 ExprKind::Paren(inner) => cur = inner,
                 ExprKind::Call { callee, .. } => {
                     let ExprKind::Ident(name) = &*callee.kind else {
-                        return false;
+                        return None;
                     };
-                    return self.helpers.get(&name.name).is_some_and(|entry| {
-                        entry
-                            .decl
-                            .return_ty
-                            .as_ref()
-                            .and_then(|ty| {
-                                super::components::fixed_vec_ir_type_with_records(
-                                    ty,
-                                    &self.ctx.record_ids,
-                                )
-                            })
-                            .is_some_and(|ty| &ty == expected)
-                    });
+                    let entry = self.helpers.get(&name.name)?;
+                    if !entry.pure {
+                        return None;
+                    }
+                    return entry
+                        .decl
+                        .return_ty
+                        .as_ref()
+                        .and_then(|ty| {
+                            super::components::fixed_vec_ir_type_with_records(
+                                ty,
+                                &self.ctx.record_ids,
+                            )
+                        })
+                        .filter(|ty| matches!(ty, IrType::FixedVec { .. }));
                 }
-                _ => return false,
+                _ => return None,
             }
         }
     }
@@ -280,32 +267,11 @@ impl FuncBuilder<'_> {
                     &self.ctx.record_ids,
                 )?;
                 let v = if matches!(param_ty, IrType::FixedVec { .. }) {
-                    // `whole_vec_value_rhs` returns `None` for a NON-PATH
-                    // argument. A fixed-vector-returning helper call there
-                    // (`f(echo_vec(v))`) is one v1 composes into well-typed
-                    // C++, so it is a TB-IR gap (`unsupported`, v1 is the
-                    // honest fallback), not the `Invalid` program error that
-                    // would violate the tbir-mvp rule "`Invalid` runs on NO
-                    // backend" (harc#745 Finding 2). Any other non-path — a
-                    // scalar, an arithmetic expression — is a genuine
-                    // mismatch v1 also refuses, and stays `Invalid`.
                     let value = self.whole_vec_value_rhs(e)?.ok_or_else(|| {
-                        if self.is_fixed_vec_helper_call(e, &param_ty) {
-                            unsupported(
-                                &format!(
-                                    "a composed fixed-vector value for parameter `{}` of helper `{name}`",
-                                    p.name.name
-                                ),
-                                "this position needs a named whole-vector path (a testbench field \
-                                 or element chain); a fixed-vector call result is not yet hoisted \
-                                 into one",
-                            )
-                        } else {
-                            LowerError::Invalid(format!(
-                                "parameter `{}` of helper `{name}` requires a matching whole-vector value",
-                                p.name.name
-                            ))
-                        }
+                        LowerError::Invalid(format!(
+                            "parameter `{}` of helper `{name}` requires a matching whole-vector value",
+                            p.name.name
+                        ))
                     })?;
                     if self.ir_whole_vec_type(&value).as_ref() != Some(&param_ty) {
                         return Err(LowerError::Invalid(format!(
@@ -691,28 +657,11 @@ impl FuncBuilder<'_> {
                     &self.ctx.record_ids,
                 )?;
                 let v = if matches!(param_ty, IrType::FixedVec { .. }) {
-                    // Same split as the helper-parameter sibling above
-                    // (harc#745 Finding 2): a composed fixed-vector value
-                    // such as `m(echo_vec(v))` is a tbir gap v1 compiles
-                    // (`unsupported`); any other non-path is a genuine
-                    // mismatch v1 also refuses (`Invalid`).
                     let value = self.whole_vec_value_rhs(e)?.ok_or_else(|| {
-                        if self.is_fixed_vec_helper_call(e, &param_ty) {
-                            unsupported(
-                                &format!(
-                                    "a composed fixed-vector value for parameter `{}` of testbench method `{name}`",
-                                    p.name.name
-                                ),
-                                "this position needs a named whole-vector path (a testbench field \
-                                 or element chain); a fixed-vector call result is not yet hoisted \
-                                 into one",
-                            )
-                        } else {
-                            LowerError::Invalid(format!(
-                                "parameter `{}` of testbench method `{name}` requires a whole fixed-vector value",
-                                p.name.name
-                            ))
-                        }
+                        LowerError::Invalid(format!(
+                            "parameter `{}` of testbench method `{name}` requires a whole fixed-vector value",
+                            p.name.name
+                        ))
                     })?;
                     if self.ir_whole_vec_type(&value).as_ref() != Some(&param_ty) {
                         return Err(LowerError::Invalid(format!(
@@ -819,29 +768,10 @@ impl FuncBuilder<'_> {
                             None => None,
                         }
                         .ok_or_else(|| {
-                            // `whole_vec_copy_rhs` declines a composed
-                            // fixed-vector call (`return echo_vec(v)`), a
-                            // path of the wrong shape, and a scalar alike.
-                            // Only the first is one v1 compiles (the return
-                            // type is a `std::array`), so it is a TB-IR gap
-                            // (`unsupported`, v1 is the honest fallback);
-                            // classifying it as `Invalid` broke the
-                            // tbir-mvp rule that `Invalid` runs on NO
-                            // backend (harc#745 Finding 2). Every other
-                            // shape stays a program error (`Invalid`).
-                            if self.is_fixed_vec_helper_call(e, &expected) {
-                                unsupported(
-                                    "a composed fixed-vector testbench method return",
-                                    "the return value must be a named whole-vector path (a \
-                                     testbench field or element chain); a fixed-vector call \
-                                     result is not yet hoisted into one",
-                                )
-                            } else {
-                                LowerError::Invalid(
-                                    "fixed-vector testbench method return requires a matching whole-vector value"
-                                        .to_string(),
-                                )
-                            }
+                            LowerError::Invalid(
+                                "fixed-vector testbench method return requires a matching whole-vector value"
+                                    .to_string(),
+                            )
                         })?
                     } else {
                         self.lower_expr_no_ports(e)?
@@ -863,24 +793,10 @@ impl FuncBuilder<'_> {
                         None => None,
                     };
                     value.ok_or_else(|| {
-                        // Same split as the testbench-method return a few
-                        // lines up (harc#745 Finding 2): a composed
-                        // fixed-vector helper-call return is a tbir gap v1
-                        // compiles (`unsupported`); a mismatched-shape path
-                        // or a scalar is a real program error (`Invalid`).
-                        if self.is_fixed_vec_helper_call(e, &expected) {
-                            unsupported(
-                                "a composed fixed-vector helper return",
-                                "the return value must be a named whole-vector path (a testbench \
-                                 field or element chain); a fixed-vector call result is not yet \
-                                 hoisted into one",
-                            )
-                        } else {
-                            LowerError::Invalid(
-                                "fixed-vector method return requires a matching whole-vector value"
-                                    .to_string(),
-                            )
-                        }
+                        LowerError::Invalid(
+                            "fixed-vector method return requires a matching whole-vector value"
+                                .to_string(),
+                        )
                     })?
                 } else {
                     self.lower_expr_no_ports(e)?

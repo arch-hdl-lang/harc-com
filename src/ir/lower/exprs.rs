@@ -609,27 +609,36 @@ impl super::FuncBuilder<'_> {
         Ok(Some(e))
     }
 
-    /// Lower one path-shaped whole-vector value with the read permission
-    /// enabled, retaining its exact `IrType` for ABI slot validation.
+    /// Lower one whole-vector value, retaining its exact `IrType` for ABI
+    /// slot validation. Named paths use the guarded aggregate-read lane;
+    /// pure helper calls are already typed aggregate expressions and may be
+    /// composed directly into another helper argument or method return.
     pub(crate) fn whole_vec_value_rhs(
         &mut self,
         value: &crate::ast::Expr,
     ) -> Result<Option<Expr>, LowerError> {
-        // A PATH expression only — `Ident`, `.field`, `[i]`, parens.
-        // The permission below is granted for the whole RHS, and a path
-        // has no other sub-expression that could take it: `foo(r.data)`
-        // would otherwise lower a whole-`Vec` read into a call argument.
-        if !path_expr(value) {
+        let is_path = path_expr(value);
+        let helper_call_ty = self.fixed_vec_helper_call_type(value);
+        if !is_path && helper_call_ty.is_none() {
             return Ok(None);
         }
-        let saved = self.vec_read_ok;
-        let saved_span = self.vec_read_span;
-        self.vec_read_ok = true;
-        self.vec_read_span = Some(unparen_expr(value).span);
-        let e = self.lower_expr_no_ports(value);
-        self.vec_read_ok = saved;
-        self.vec_read_span = saved_span;
-        let e = e?;
+        let e = if is_path {
+            // The permission is granted only for a path, which has no other
+            // sub-expression that could accidentally inherit it.
+            let saved = self.vec_read_ok;
+            let saved_span = self.vec_read_span;
+            self.vec_read_ok = true;
+            self.vec_read_span = Some(unparen_expr(value).span);
+            let e = self.lower_expr_no_ports(value);
+            self.vec_read_ok = saved;
+            self.vec_read_span = saved_span;
+            e?
+        } else {
+            // The helper-call lowering validates each aggregate argument
+            // through this same function, so no broad vec-read permission is
+            // needed around the composed call expression.
+            self.lower_expr_no_ports(value)?
+        };
         // The shape comes from the LOWERED expression, not the AST.
         // The read-side pairing has to ask the AST (both operands are
         // lowered again afterwards, so resolving one speculatively would
@@ -705,6 +714,11 @@ impl super::FuncBuilder<'_> {
             Expr::Local(local) => {
                 let ty = self.local_type(*local).clone();
                 return matches!(ty, IrType::FixedVec { .. }).then_some(ty);
+            }
+            Expr::Call(crate::ir::CallTarget::Helper { ret, .. }, _)
+                if matches!(ret, IrType::FixedVec { .. }) =>
+            {
+                return Some(ret.clone());
             }
             Expr::TbField(field) => {
                 let ty = self.ctx.tb_scalar_fields.get(field)?.clone();
