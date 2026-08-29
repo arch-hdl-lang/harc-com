@@ -1550,6 +1550,36 @@ impl FuncBuilder<'_> {
             ) => Some(ty.clone()),
             _ => None,
         };
+        // A `let` annotation must AGREE with a fixed-vector helper return,
+        // not be laundered away by it (harc#745 Finding 1). Mirrors the
+        // identical disagreement check the testbench-method vector-return
+        // path already runs (`try_lower_tb_method_let`, ~700 lines down):
+        // a fixed-vector annotation of a different shape, or any non-vector
+        // annotation, is a disagreement that belongs to neither backend.
+        // Without this the `helper_aggregate_ty` slot below wins the `.or`
+        // chain ahead of `declared_scalar_ty`, so `let x : uint<8> =
+        // echo_vec(v)` declared a `std::array<uint64_t, 2> x` local with NO
+        // diagnostic while v1 emitted `uint64_t x = echo_vec(...);`, which
+        // g++ refuses ("cannot convert `std::array<...>` to `uint64_t`").
+        // Classification matches the neighbouring #734 checks: a
+        // well-formed program under neither backend is `Invalid`.
+        if let Some(ret) = &helper_aggregate_ty {
+            if let Some(declared) = l.ty.as_ref().and_then(|ty| {
+                super::components::fixed_vec_ir_type_with_records(ty, &self.ctx.record_ids)
+            }) {
+                if &declared != ret {
+                    return Err(LowerError::Invalid(format!(
+                        "`let {}` fixed-vector annotation does not match the helper return",
+                        l.name.name
+                    )));
+                }
+            } else if l.ty.is_some() {
+                return Err(LowerError::Invalid(format!(
+                    "`let {}` is declared with a non-vector type and initialised from a fixed vector",
+                    l.name.name
+                )));
+            }
+        }
         // …but a record RHS under a DECLARED SCALAR type is a
         // disagreement, not an inference. `record_ty` wins the `.or`
         // chain below, so without this the annotation is discarded

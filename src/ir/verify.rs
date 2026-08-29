@@ -1695,6 +1695,17 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             }
         }
         for (field, xid) in &tb.transactor_fields {
+            // Keep this predicate in step with emission's
+            // `codegen::tbir::func::uses_state_receiver`
+            // (`!schema.state_fields.is_empty() && schema.bound_bus.is_none()`).
+            // The verifier is deliberately the WEAKER guard — it demands
+            // receiver storage for every stateful transactor, whereas
+            // emission only routes the state-receiver ABI through UNBOUND
+            // ones — so it never rejects a program emission would accept. If
+            // emission's rule tightens (e.g. bound stateful transactors also
+            // grow a receiver), this predicate must gain the same
+            // `bound_bus` condition or it will start flagging storage that
+            // emission no longer needs.
             let requires_state_storage = prog
                 .transactors
                 .get(xid.index())
