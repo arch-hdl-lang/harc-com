@@ -4069,6 +4069,9 @@ impl Checker<'_> {
     /// intentionally collapses scalar widths that share a C++ carrier;
     /// event schemas retain declared element width and signedness.
     fn expr_whole_vec_type(&self, expr: &Expr) -> Result<Option<IrType>, String> {
+        if let Expr::Call(CallTarget::Helper { ret, .. }, _) = expr {
+            return Ok(matches!(ret, IrType::FixedVec { .. }).then(|| ret.clone()));
+        }
         if let Expr::Local(local) = expr {
             return Ok(self
                 .func

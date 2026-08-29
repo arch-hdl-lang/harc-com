@@ -14,6 +14,10 @@ function grid_matches(values: Vec<Vec<uint<8>, 2>, 2>, expected: Vec<Vec<uint<8>
     return values == expected
 end function grid_matches
 
+function pass_vec(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
+    return echo_vec(values)
+end function pass_vec
+
 testbench FixedVecPureHelperTb
     dut : Top
     values : Vec<uint<8>, 2>
@@ -30,6 +34,11 @@ impl FixedVecPureHelperTest for FixedVecPureHelperTb
         expected[1] = 7
         let echoed = echo_vec(values)
         assert vec_matches(echoed, expected) else fail("fixed-vector pure-helper ABI changed")
+        assert vec_matches(echo_vec(values), expected)
+            else fail("composed fixed-vector helper argument changed")
+        let passed = pass_vec(values)
+        assert vec_matches(passed, expected)
+            else fail("composed fixed-vector helper return changed")
         grid[0][0] = 1
         grid[0][1] = 2
         grid[1][0] = 3

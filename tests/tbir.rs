@@ -17260,12 +17260,10 @@ end impl T"#;
 
 /// harc#745 Finding 2: a fixed-vector-returning call in fixed-vector
 /// ARGUMENT position (`vec_matches(echo_vec(v), v)`) is composed into
-/// well-typed C++ by v1, so refusing it as `Invalid` violated the
-/// tbir-mvp rule that `Invalid` means no backend runs it in ANY reachable
-/// configuration. It is a tbir gap, not a program error — `Unsupported`,
-/// which honestly names `--codegen v1` as the working fallback.
+/// well-typed C++ by v1. TBIR now retains the nested call's fixed-vector
+/// return metadata and accepts it through the same whole-vector value gate.
 #[test]
-fn composed_fixed_vector_into_helper_arg_is_unsupported_not_invalid() {
+fn composed_fixed_vector_into_helper_arg_lowers() {
     let src = r#"function echo_vec(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
     return values
 end function echo_vec
@@ -17285,16 +17283,19 @@ impl T for Tb
         wait 1 cycle
     end run
 end impl T"#;
-    let err = lower_src(src).expect_err("a composed fixed-vector arg is not yet supported");
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("composed fixed-vector value"), "{msg}");
+    let prog = lower_src(src).expect("a composed fixed-vector arg lowers");
+    verify::verify_program(&prog).expect("a composed fixed-vector arg verifies");
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("harc_helper_vec_matches(harc_helper_echo_vec(_tb.values), _tb.values)"),
+        "{cpp}"
+    );
 }
 
 /// harc#745 Finding 2 (return position): `return echo_vec(v)` where the
-/// helper returns a fixed vector is likewise a v1-composable tbir gap, not
-/// an `Invalid` program error.
+/// helper returns a fixed vector uses the same typed aggregate expression.
 #[test]
-fn composed_fixed_vector_helper_return_is_unsupported_not_invalid() {
+fn composed_fixed_vector_helper_return_lowers() {
     let src = r#"function echo_vec(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
     return values
 end function echo_vec
@@ -17314,16 +17315,15 @@ impl T for Tb
         wait 1 cycle
     end run
 end impl T"#;
-    let err = lower_src(src).expect_err("a composed fixed-vector return is not yet supported");
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("composed fixed-vector helper return"), "{msg}");
+    let prog = lower_src(src).expect("a composed fixed-vector return lowers");
+    verify::verify_program(&prog).expect("a composed fixed-vector return verifies");
+    let cpp = emit_cpp_src(src);
+    assert!(cpp.contains("__ret = harc_helper_echo_vec(values);"), "{cpp}");
 }
 
-/// harc#745 Finding 2, honesty guard (independent review F1): the
-/// composition is reclassified to `Unsupported` ONLY when its shape
-/// matches the destination. A helper returning `Vec<_, 2>` composed into
-/// a `Vec<_, 4>` slot is a mismatch v1 ALSO fails to compile, so pointing
-/// the user at `--codegen v1` would be dishonest — it must stay `Invalid`.
+/// harc#745 Finding 2, honesty guard (independent review F1): a helper
+/// returning `Vec<_, 2>` composed into a `Vec<_, 4>` slot is still a
+/// mismatch that v1 also fails to compile, so it stays `Invalid`.
 #[test]
 fn shape_mismatched_composed_fixed_vector_stays_invalid() {
     let src = r#"function echo2(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
@@ -17349,13 +17349,11 @@ end impl T"#;
     assert_invalid(&err);
 }
 
-/// harc#745 Finding 2, premise verification (independent review F2): the
-/// choice of `Unsupported` over `NotImplemented` is only honest if v1
-/// actually compiles the matched composition. Assert v1 emits C++ for it
-/// (the reachable proxy the parity harness uses), so the "v1 is the
-/// working fallback" claim is tested, not asserted by comment.
+/// harc#745 Finding 2, premise verification (independent review F2): keep
+/// the v1 control beside TBIR's positive lowering check so retirement
+/// compatibility remains measured rather than inferred.
 #[test]
-fn v1_composes_the_matched_fixed_vector_arg_that_tbir_defers() {
+fn both_backends_compose_the_matched_fixed_vector_arg() {
     let src = r#"function echo_vec(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
     return values
 end function echo_vec
@@ -17375,11 +17373,7 @@ impl T for Tb
         wait 1 cycle
     end run
 end impl T"#;
-    // tbir defers it as Unsupported (pointing at v1)...
-    let msg = assert_unsupported(&lower_src(src).expect_err("tbir defers the composition"));
-    assert!(msg.contains("--codegen v1"), "{msg}");
-    // ...and v1 genuinely emits it — the composed call is present verbatim,
-    // so the fallback the diagnostic promises actually exists.
+    lower_src(src).expect("tbir lowers the matched composition");
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the composition");
     assert!(
         v1.contains("vec_matches(echo_vec(_tb.values), _tb.values)"),
@@ -21914,6 +21908,11 @@ fn fixed_vector_testbench_method_signatures_are_typed_end_to_end() {
     assert!(
         cpp.contains("decltype(__t0){}") && cpp.contains("std::array<uint64_t, 2>"),
         "the emitted method path uses a default-constructed std::array return slot:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("items_3 = harc_helper_pure_echo_vec(_tb.values);")
+            && cpp.contains("__t3 = harc_helper_pure_echo_vec(items_4);"),
+        "testbench-method argument and return paths compose helper results:\n{cpp}"
     );
     let mut corrupt = prog.clone();
     let run_id = corrupt.tests[0].run;

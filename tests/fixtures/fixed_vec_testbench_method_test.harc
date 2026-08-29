@@ -1,3 +1,7 @@
+function pure_echo_vec(items: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
+    return items
+end function pure_echo_vec
+
 testbench FixedVecMethodTb
     dut : Top
     values : Vec<uint<8>, 2>
@@ -12,6 +16,10 @@ testbench FixedVecMethodTb
     function vec_matches(items: Vec<uint<8>, 2>, want: Vec<uint<8>, 2>) -> bool
         return items == want
     end function vec_matches
+
+    function pass_helper_result(items: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
+        return pure_echo_vec(items)
+    end function pass_helper_result
 
     function echo_grid(items: Vec<Vec<uint<8>, 2>, 2>) -> Vec<Vec<uint<8>, 2>, 2>
         return items
@@ -30,6 +38,11 @@ impl FixedVecMethodTest for FixedVecMethodTb
         expected[1] = 9
         let echoed = echo_vec(values)
         assert vec_matches(echoed, expected) else fail("fixed-vector testbench-method ABI changed")
+        assert vec_matches(pure_echo_vec(values), expected)
+            else fail("composed helper result in testbench-method argument changed")
+        let passed = pass_helper_result(values)
+        assert vec_matches(passed, expected)
+            else fail("composed helper result in testbench-method return changed")
         grid[0][0] = 2
         grid[0][1] = 4
         grid[1][0] = 6
