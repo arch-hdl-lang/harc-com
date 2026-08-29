@@ -292,6 +292,7 @@ tseq_scalar_test | Top | top_counter.sv | top_counter.arch | pass
 tseq_fixed_vec_test | Top | top_counter.sv | top_counter.arch | pass
 tb_method_tseq_test | Top | top_counter.sv | top_counter.arch | pass
 pure_helper_tseq_test | Top | top_counter.sv | top_counter.arch | pass
+inline_helper_tseq_test | Top | top_counter.sv | top_counter.arch | pass
 transactor_wait_self_predicate_test | Top | top_counter.sv | top_counter.arch | pass
 transactor_wait_bound_predicate_test | Top | top_counter.sv | top_counter.arch | pass
 promoted_let_runtime_init_test | Top | top_counter.sv | top_counter.arch | pass

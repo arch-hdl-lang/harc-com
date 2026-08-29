@@ -1,0 +1,58 @@
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    value : uint<8>
+end transaction Beat
+
+tseq MakeBeats() -> TSeq<Beat>
+    let a : Beat
+    a.value = 5
+    yield a
+    let b : Beat
+    b.value = 8
+    yield b
+end tseq MakeBeats
+
+tseq MakeNums() -> TSeq<uint<8>>
+    yield 4
+    yield 6
+end tseq MakeNums
+
+function echo_beats(dut: Top, items: TSeq<Beat>) -> TSeq<Beat>
+    let observed = dut.count_out
+    return items
+end function echo_beats
+
+function echo_nums(dut: Top, items: TSeq<uint<8>>) -> TSeq<uint<8>>
+    let observed = dut.count_out
+    return items
+end function echo_nums
+
+testbench InlineHelperTseqTb
+    dut : Top
+end testbench InlineHelperTseqTb
+
+impl InlineHelperTseqTest for InlineHelperTseqTb
+    clock clk = SysDomain
+    run
+        let beats = MakeBeats()
+        let echoed_beats = echo_beats(dut, beats)
+        let beat_sum : uint<16> = 0
+        for beat in echoed_beats
+            beat_sum = beat_sum + beat.value
+        end for
+
+        let nums = MakeNums()
+        let echoed_nums = (echo_nums(dut, nums))
+        let num_sum : uint<16> = 0
+        for num in echoed_nums
+            num_sum = num_sum + num
+        end for
+
+        assert beat_sum == 13 else fail("beat sum ${beat_sum}")
+        assert num_sum == 10 else fail("num sum ${num_sum}")
+        wait 1 cycles
+    end run
+end impl InlineHelperTseqTest

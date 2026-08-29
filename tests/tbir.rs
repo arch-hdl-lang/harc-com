@@ -22071,6 +22071,73 @@ fn pure_helper_tseq_signatures_are_typed_end_to_end() {
 }
 
 #[test]
+fn inlined_helper_tseq_signatures_are_typed_end_to_end() {
+    let src = include_str!("fixtures/inline_helper_tseq_test.harc");
+    let prog = lower_src(src).expect("inlined-helper TSeq signatures lower");
+    verify::verify_program(&prog).expect("inlined-helper TSeq signatures verify");
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.locals
+            .iter()
+            .filter(|local| matches!(local.ty, ir::IrType::RecordSeq(ir::RecordId(0))))
+            .count()
+            >= 4,
+        "record sequence argument, parameter, return and result remain typed:\n{run}"
+    );
+    assert!(
+        run.locals
+            .iter()
+            .filter(|local| matches!(&local.ty, ir::IrType::Seq(elem) if matches!(elem.as_ref(), ir::IrType::UInt(Some(8)))))
+            .count()
+            >= 4,
+        "scalar sequence argument, parameter, return and result remain typed:\n{run}"
+    );
+    assert!(
+        run.blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter(|stmt| matches!(stmt, ir::Stmt::AggregateInit(_)))
+            .count()
+            >= 2,
+        "inlined helper sequence returns are empty-vector initialized:\n{run}"
+    );
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::vector<Beat>") && cpp.contains("std::vector<uint64_t>"),
+        "inlined helper locals emit as vectors:\n{cpp}"
+    );
+    let annotated = src.replace(
+        "let echoed_nums = (echo_nums(dut, nums))",
+        "let echoed_nums : TSeq<uint<8>> = (echo_nums(dut, nums))",
+    );
+    let annotated_prog =
+        lower_src(&annotated).expect("parenthesized annotated inlined-helper result lowers");
+    verify::verify_program(&annotated_prog)
+        .expect("parenthesized annotated inlined-helper result verifies");
+
+    let bad_param = src.replace(
+        "function echo_nums(dut: Top, items: TSeq<uint<8>>) -> TSeq<uint<8>>",
+        "function echo_nums(dut: Top, items: TSeq<sint<8>>) -> TSeq<sint<8>>",
+    );
+    assert_invalid(&lower_src(&bad_param).expect_err("sequence parameter mismatch is invalid"));
+    let bad_return = src.replace(
+        "function echo_beats(dut: Top, items: TSeq<Beat>) -> TSeq<Beat>",
+        "function echo_beats(dut: Top, items: TSeq<Beat>) -> TSeq<uint<8>>",
+    );
+    assert_invalid(&lower_src(&bad_return).expect_err("sequence return mismatch is invalid"));
+    let bad_annotation = src.replace(
+        "let echoed_nums = (echo_nums(dut, nums))",
+        "let echoed_nums : TSeq<sint<8>> = (echo_nums(dut, nums))",
+    );
+    assert_invalid(&lower_src(&bad_annotation).expect_err("sequence annotation mismatch is invalid"));
+    let port_return = src.replace(
+        "return items\nend function echo_nums",
+        "return dut.count_out\nend function echo_nums",
+    );
+    assert_invalid(&lower_src(&port_return).expect_err("scalar port cannot satisfy TSeq return"));
+}
+
+#[test]
 fn fixed_vector_testbench_method_signatures_are_typed_end_to_end() {
     let src = include_str!("fixtures/fixed_vec_testbench_method_test.harc");
     let prog = lower_src(src).expect("fixed-vector testbench methods lower");

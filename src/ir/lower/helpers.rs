@@ -385,7 +385,10 @@ impl FuncBuilder<'_> {
         let dest = self.fresh_temp();
         let mut ret_ty = IrType::Unknown;
         if decl.return_ty.is_some() {
-            ret_ty = ir_type_of_with_records(decl.return_ty.as_ref(), &self.ctx.record_ids);
+            ret_ty = inlined_helper_signature_type(
+                decl.return_ty.as_ref(),
+                &self.ctx.record_ids,
+            );
             self.set_local_type(dest, ret_ty.clone());
         }
         self.push_return_default(dest, &ret_ty);
@@ -410,7 +413,10 @@ impl FuncBuilder<'_> {
         for (p, b) in decl.params.iter().zip(bound) {
             if let Bound::Val(e) = b {
                 let id = self.declare(&p.name.name);
-                self.set_local_type(id, ir_type_of_param(p.ty.as_ref(), self.ctx));
+                self.set_local_type(
+                    id,
+                    inlined_helper_signature_type(p.ty.as_ref(), &self.ctx.record_ids),
+                );
                 self.push(Stmt::Assign(id, e));
             }
         }
@@ -1008,6 +1014,13 @@ pub(crate) fn ir_type_of_with_records(
 
 fn ir_type_of_param(ty: Option<&TypeExpr>, ctx: &super::LowerCtx) -> IrType {
     ir_type_of_with_records(ty, &ctx.record_ids)
+}
+
+fn inlined_helper_signature_type(
+    ty: Option<&TypeExpr>,
+    record_ids: &HashMap<String, RecordId>,
+) -> IrType {
+    tseq_ir_type(ty, record_ids).unwrap_or_else(|| ir_type_of_with_records(ty, record_ids))
 }
 
 fn testbench_method_signature_type(

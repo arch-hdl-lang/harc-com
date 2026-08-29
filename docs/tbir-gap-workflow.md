@@ -381,6 +381,12 @@ not applicable before requesting review:
    a typed ABI gap without removing an `unsupported(` constructor, so the raw
    inventory remains 117 textual matches (116 constructors plus the helper
    definition).
+   DUT/synchronization-touching file helpers now retain those same sequence
+   types while CFG-inlined: parameters, aggregate-initialized return slots,
+   and inferred result locals carry `RecordSeq`/`Seq`, with exact mismatch
+   checks at each landing. This closes the adjacent inlined-helper gap without
+   removing an `unsupported(` constructor, so the raw inventory remains 117
+   textual matches (116 constructors plus the helper definition).
    Nested fixed-vector pure-helper signatures remove that helper-specific
    fence and recursively validate/render the already-carried aggregate type;
    the testbench-method and transactor signature fences remain, so this slice
