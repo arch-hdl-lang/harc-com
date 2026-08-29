@@ -9681,6 +9681,18 @@ former `transaction` group lives in
      No `unsupported(` constructor is retired, so the raw inventory stays at
      117 textual matches (116 constructors plus the shared helper definition).
 
+173. **Fixed-vector values through CFG-inlined file helpers (2026-08-29).**
+
+     File helpers that touch the DUT or synchronization state now retain exact
+     recursive `IrType::FixedVec` metadata on parameter locals, aggregate-init
+     return slots, explicit returns, and inferred call destinations. Whole
+     testbench vectors enter only exact-shape slots, nested dimensions and
+     declared-record leaves remain intact, and mismatched arguments, returns,
+     or result annotations fail during lowering. The registered fixture passes
+     one- and two-dimensional byte vectors through DUT-reading helpers under
+     v1/TBIR trace parity. This routes through shared aggregate fallbacks, so
+     the raw unsupported inventory remains 117 textual matches.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

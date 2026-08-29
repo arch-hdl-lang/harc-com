@@ -367,7 +367,28 @@ impl FuncBuilder<'_> {
                     V1Status::EmitsUncompilable,
                 ));
             } else {
-                let v = self.lower_expr_no_ports(e)?;
+                let param_ty = inlined_helper_signature_type(
+                    p.ty.as_ref(),
+                    &self.ctx.record_ids,
+                );
+                let v = if matches!(param_ty, IrType::FixedVec { .. }) {
+                    let value = self.whole_vec_value_rhs(e)?.ok_or_else(|| {
+                        LowerError::Invalid(format!(
+                            "parameter `{}` of helper `{name}` requires a matching whole-vector value",
+                            p.name.name
+                        ))
+                    })?;
+                    if self.ir_whole_vec_type(&value).as_ref() != Some(&param_ty) {
+                        return Err(LowerError::Invalid(format!(
+                            "parameter `{}` of helper `{name}` expects {param_ty:?}, got {:?}",
+                            p.name.name,
+                            self.ir_whole_vec_type(&value).unwrap_or(IrType::Unknown)
+                        )));
+                    }
+                    value
+                } else {
+                    self.lower_expr_no_ports(e)?
+                };
                 // The INLINED spelling is the one that mattered most:
                 // without this, `poke(b)` on a `x: uint<8>` parameter
                 // reached `verify_program`'s `TypeMismatch` and
@@ -766,7 +787,10 @@ impl FuncBuilder<'_> {
             if let Some(e) = value {
                 let expected = self.local_type(dest).clone();
                 if let Some(port) = self.as_port_ref(e)? {
-                    if matches!(expected, IrType::RecordSeq(_) | IrType::Seq(_)) {
+                    if matches!(
+                        expected,
+                        IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_)
+                    ) {
                         return Err(LowerError::Invalid(format!(
                             "testbench/helper method return expects {expected:?}, got a scalar DUT port"
                         )));
@@ -1020,7 +1044,15 @@ fn inlined_helper_signature_type(
     ty: Option<&TypeExpr>,
     record_ids: &HashMap<String, RecordId>,
 ) -> IrType {
-    tseq_ir_type(ty, record_ids).unwrap_or_else(|| ir_type_of_with_records(ty, record_ids))
+    if let Some(seq) = tseq_ir_type(ty, record_ids) {
+        return seq;
+    }
+    if let Some(fixed @ IrType::FixedVec { .. }) = ty.and_then(|ty| {
+        super::components::fixed_vec_ir_type_with_records(ty, record_ids)
+    }) {
+        return fixed;
+    }
+    ir_type_of_with_records(ty, record_ids)
 }
 
 fn testbench_method_signature_type(
