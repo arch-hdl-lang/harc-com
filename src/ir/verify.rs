@@ -4325,14 +4325,23 @@ impl Checker<'_> {
                         .func
                         .locals
                         .get(l.index())
-                        .is_some_and(|tl| {
-                            !matches!(tl.ty, IrType::FixedVec { .. })
-                                || !helper_abi_type_valid(&tl.ty, self.prog.records.len())
+                        .is_some_and(|tl| match &tl.ty {
+                            IrType::FixedVec { .. } => {
+                                !helper_abi_type_valid(&tl.ty, self.prog.records.len())
+                            }
+                            IrType::RecordSeq(record) => {
+                                record.index() >= self.prog.records.len()
+                            }
+                            IrType::Seq(elem) => !matches!(
+                                elem.as_ref(),
+                                IrType::UInt(_) | IrType::SInt(_) | IrType::Bool
+                            ),
+                            _ => true,
                         })
                     {
                         self.errs.push(VerifyError::BadProgramRef {
                             what: format!(
-                                "fn{} b{} AggregateInit target is not a fixed vector",
+                                "fn{} b{} AggregateInit target is not a valid aggregate",
                                 self.fid.0, self.bid.0
                             ),
                         });

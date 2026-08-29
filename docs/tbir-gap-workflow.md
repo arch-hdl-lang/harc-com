@@ -367,6 +367,13 @@ not applicable before requesting review:
    metadata in aggregate argument and return positions. This removes four
    dedicated composition fallbacks, leaving 117 textual matches (116
    constructors plus the helper definition).
+   CFG-inlined testbench methods now retain `TSeq<Record>` and scalar
+   `TSeq<T>` parameter, return-slot, and inferred-result types. Their empty
+   return slots use the shared aggregate initializer, and the verifier accepts
+   only valid sequence metadata. This closes the emitted-C++ gap recorded in
+   divergence 114 without removing an `unsupported(` constructor, so the raw
+   inventory remains 117 textual matches (116 constructors plus the helper
+   definition).
    Nested fixed-vector pure-helper signatures remove that helper-specific
    fence and recursively validate/render the already-carried aggregate type;
    the testbench-method and transactor signature fences remain, so this slice

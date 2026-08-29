@@ -9636,6 +9636,22 @@ former `transaction` group lives in
      inventory to 117 textual matches (116 constructors plus the shared
      helper definition).
 
+170. **Typed TSeq values through testbench methods (2026-08-28).**
+
+     CFG-inlined testbench methods now resolve `TSeq<Record>` and scalar
+     `TSeq<T>` declarations through the same sequence decoder already used by
+     component methods and slot checks. Parameters, return temporaries, and
+     inferred receiving locals therefore retain their `RecordSeq`/`Seq` type
+     instead of emitting as `uint64_t`. Empty return slots are initialized as
+     empty vectors through `AggregateInit`, whose verifier contract now covers
+     well-formed dynamic sequences as well as fixed vectors. The registered
+     fixture passes both sequence kinds through reusable testbench methods,
+     iterates the results, and checks their sums under v1/TBIR trace parity.
+     This closes the older emitted-C++ gap documented in divergence 114; it
+     does not retire an `unsupported(` constructor, so the raw inventory stays
+     at 117 textual matches (116 constructors plus the shared helper
+     definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
