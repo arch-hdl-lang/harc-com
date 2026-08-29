@@ -111,6 +111,30 @@ fn resolve_component_hook_target(
     )))
 }
 
+/// A literal spelling whose value can never be a live periodic cadence.
+/// Parentheses do not change the classification; any unary-minus integer
+/// literal is non-positive, including `-0`.
+fn period_literal_value(e: &AstExpr) -> Option<u64> {
+    match &*e.kind {
+        ExprKind::Int(s) => super::exprs::parse_int_literal_expr(e)
+            .or_else(|| super::exprs::parse_sized_int_literal(s)),
+        ExprKind::Paren(inner) => period_literal_value(inner),
+        _ => None,
+    }
+}
+
+fn is_non_positive_period_literal(e: &AstExpr) -> bool {
+    match &*e.kind {
+        ExprKind::Int(_) => matches!(period_literal_value(e), Some(0)),
+        ExprKind::Paren(inner) => is_non_positive_period_literal(inner),
+        ExprKind::Unary {
+            op: crate::ast::UnaryOp::Neg,
+            expr,
+        } => period_literal_value(expr).is_some(),
+        _ => false,
+    }
+}
+
 impl FuncBuilder<'_> {
     pub(crate) fn lower_stmt(&mut self, s: &AstStmt) -> Result<(), LowerError> {
         self.ensure_open_block();
@@ -5359,9 +5383,12 @@ impl FuncBuilder<'_> {
         }
 
         let kind = if h.periodic {
-            // `tb_periodic_literal` answers `None` for a NON-POSITIVE
-            // literal as well as a non-literal, so this arm has two
-            // inputs and they do not share a verdict source:
+            // A non-positive LITERAL remains outside the supported source
+            // subset: v1 emits a registration its own `period > 0` guard
+            // never fires. A runtime scalar expression is different here:
+            // statement-position registration occurs after the surrounding
+            // run/check locals have been declared, so the closure can capture
+            // and re-read them exactly like v1.
             //
             //   * a named period — v1 registers the closure where the
             //     statement is WRITTEN, after the impl's `let`s, so it
@@ -5376,21 +5403,34 @@ impl FuncBuilder<'_> {
             //     0 firings in 21 cycles. The program asked for a
             //     handler and got a no-op, silently.
             //
-            // Worst-under-arm, so the arm is `SilentlyMisLowers` even
-            // though the row that motivated its old `Unsupported` is
-            // still a genuine escape hatch. Splitting on
-            // `parse_int_literal_expr(..) == Some(0)` would recover it
-            // and is not done here — the detail names both instead.
-            let period = super::tb_periodic_literal(&h.event).ok_or_else(|| {
-                not_implemented(
-                    "an `on <N> cycles` handler with a non-literal or non-positive period",
-                    "`on 0 cycles` makes v1 emit a handler its own `period > 0` guard \
-                     never fires, so the registration is a silent no-op; a NAMED period \
-                     does work here, because a statement-position handler is registered \
-                     after the impl's `let` bindings",
+            if is_non_positive_period_literal(&h.event) {
+                return Err(not_implemented(
+                    "an `on <N> cycles` handler with a non-positive literal period",
+                    "a non-positive literal makes v1 emit a handler its own `period > 0` guard \
+                     never fires, so the registration is a silent no-op",
                     V1Status::SilentlyMisLowers,
-                )
-            })?;
+                ));
+            }
+            // The expression lives in a per-cycle closure but may capture
+            // locals already initialized at this statement position. Reuse
+            // the concurrent-expression escape guard: pure expressions and
+            // live port reads remain inline, while anything that pushes a
+            // statement or splits the CFG is rejected instead of being
+            // evaluated once and cached at registration.
+            let period = self.with_check_body(
+                &[],
+                "a statement-position periodic handler period",
+                |b| b.lower_expr(&h.event),
+            )?;
+            if !matches!(
+                self.expr_type(&period),
+                Some(IrType::UInt(_) | IrType::SInt(_) | IrType::Unknown) | None
+            ) {
+                return Err(LowerError::Invalid(
+                    "a statement-position periodic handler period must be an integer scalar"
+                        .to_string(),
+                ));
+            }
             CycleHandlerKind::Periodic { period }
         } else {
             // The trigger is re-evaluated every cycle inside the

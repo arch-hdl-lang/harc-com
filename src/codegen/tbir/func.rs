@@ -1688,10 +1688,14 @@ fn emit_cycle_handler(
         CycleHandlerKind::Periodic { period } => {
             // `last = 0` means the FIRST firing is at cycle `period`, not
             // cycle 0 — "every N cycles", not "now and every N cycles".
+            // Re-read the expression every cycle, matching v1 and allowing a
+            // captured statement local to change after registration.
+            let period = expr_cpp(cx, period)?;
             writeln!(out, "{pad1}static int64_t {tag}_last = 0;").ok();
+            writeln!(out, "{pad1}int64_t {tag}_period = (int64_t)({period});").ok();
             writeln!(
                 out,
-                "{pad1}if ((int64_t)cycle_count - {tag}_last >= {period}) {{"
+                "{pad1}if ({tag}_period > 0 && (int64_t)cycle_count - {tag}_last >= {tag}_period) {{"
             )
             .ok();
             writeln!(out, "{pad2}{tag}_last = (int64_t)cycle_count;").ok();

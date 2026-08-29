@@ -1830,8 +1830,9 @@ fn for_each_check_body_expr(prog: &TbProgram, mut f: impl FnMut(&ir::Expr)) {
     // registration closure, so its port reads are real program port
     // accesses even though `Stmt::CycleHandler` carries none itself.
     for h in &prog.cycle_handlers {
-        if let ir::CycleHandlerKind::Trigger { trigger, .. } = &h.kind {
-            f(trigger);
+        match &h.kind {
+            ir::CycleHandlerKind::Trigger { trigger, .. } => f(trigger),
+            ir::CycleHandlerKind::Periodic { period } => f(period),
         }
     }
 }

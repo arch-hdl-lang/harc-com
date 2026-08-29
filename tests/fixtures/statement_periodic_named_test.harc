@@ -1,0 +1,36 @@
+// A statement-position periodic handler whose period is a named impl local.
+// Unlike declaration-level periodic handlers, this registration is emitted
+// at its source position after impl locals have been initialized. The handler
+// must therefore use `period = 2`, not a same-named namespace constant.
+
+const per = 7
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+testbench StatementPeriodicNamedTb
+    dut : Top
+    fires : uint<32> default 0
+end testbench StatementPeriodicNamedTb
+
+impl StatementPeriodicNamedTest for StatementPeriodicNamedTb
+    clock clk = SysDomain
+    let per = 2
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        fires = 0
+
+        on per cycles
+            fires = fires + 1
+        end on
+
+        wait 8 cycles
+        assert fires == 4
+            else fail("named period fired ${fires} times, expected 4")
+        log(info, "PASS: named statement-position period fired ${fires} times")
+    end run
+end impl StatementPeriodicNamedTest

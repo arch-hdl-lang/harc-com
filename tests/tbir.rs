@@ -26389,8 +26389,10 @@ end test T"#;
         }
     ));
     assert!(matches!(
-        prog.cycle_handlers[1].kind,
-        ir::CycleHandlerKind::Periodic { period: 3 }
+        &prog.cycle_handlers[1].kind,
+        ir::CycleHandlerKind::Periodic {
+            period: ir::Expr::Literal { value: 3, .. }
+        }
     ));
     // Each body is its own zero-parameter TestHook function, so the
     // per-cycle closure can call it without capturing a block-scoped
@@ -26412,7 +26414,8 @@ end test T"#;
         "if (!_onh_0_prev && _onh_0_curr) {",
         "_onh_0_prev = _onh_0_curr;",
         "static int64_t _onh_1_last = 0;",
-        "if ((int64_t)cycle_count - _onh_1_last >= 3) {",
+        "int64_t _onh_1_period = (int64_t)(3);",
+        "if (_onh_1_period > 0 && (int64_t)cycle_count - _onh_1_last >= _onh_1_period) {",
     ] {
         assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
     }
@@ -26480,8 +26483,8 @@ end test T"#,
     );
 }
 
-/// Statement-position method hooks register at their runtime position;
-/// unsupported periodic periods still fail precisely.
+/// Statement-position method hooks and named periodic periods register at
+/// their runtime position.
 #[test]
 fn unsupported_on_shapes_are_rejected_precisely() {
     let hook_src = r#"transactor Drv
@@ -26524,18 +26527,8 @@ end impl T"#;
     end run
 end test T"#,
     )
-    .expect_err("a non-literal period must be rejected");
-    // `SilentlyMisLowers` rather than a v1 suggestion: the arm also
-    // catches `on 0 cycles`, where v1 emits a handler its own
-    // `period > 0` guard never fires. For the NAMED period written
-    // here v1 is a real escape hatch — see
-    // `a_statement_position_periodic_period_resolves_correctly_under_v1`,
-    // which measures both rows.
-    let msg = assert_not_implemented(&period, lower::V1Status::SilentlyMisLowers);
-    assert!(
-        msg.contains("non-literal or non-positive period"),
-        "got: {msg}"
-    );
+    .expect("a named statement-position period lowers");
+    verify::verify_program(&period).expect("named period verifies");
 }
 
 // ── Diagnostic honesty: `--codegen v1` only when v1 has it ───────────
@@ -38629,9 +38622,9 @@ end impl ConsTest"#;
 /// fires 10 times in 21 cycles at period 2, exactly right, because the
 /// `let` shadows the const at the point of use.
 ///
-/// So the arm keeps `Unsupported`: v1 implements it. Applying the other
-/// landings' verdict here by analogy would have been wrong, and the
-/// construct is identical — only the emission position differs.
+/// TB-IR now preserves that same registration-point behavior. Applying the
+/// other landings' verdict here by analogy would have been wrong, because the
+/// construct is identical but the emission position differs.
 #[test]
 fn a_statement_position_periodic_period_resolves_correctly_under_v1() {
     let src = |on: &str, extra: &str| {
@@ -38663,22 +38656,29 @@ end impl SpTest"#
     // The literal control lowers under TB-IR.
     lower_src(&src("2", "")).expect("the literal period lowers");
 
-    for (what, extra) in [
-        ("bare `let`", ""),
-        ("shadowed by a const", "const per = 7\n\n"),
+    for (what, extra, on) in [
+        ("bare `let`", "", "per"),
+        ("arithmetic over a `let`", "", "per + 0"),
+        ("shadowed by a const", "const per = 7\n\n", "per"),
     ] {
-        let s = src("per", extra);
-        // TB-IR refuses. The arm carries `SilentlyMisLowers` for the
-        // sake of its OTHER input (`on 0 cycles`, below); for the named
-        // period measured here v1 is a genuine escape hatch, which is
-        // what the rest of this test shows.
-        let msg = assert_not_implemented(
-            &lower_src(&s).unwrap_err(),
-            lower::V1Status::SilentlyMisLowers,
+        let s = src(on, extra);
+        let prog = lower_src(&s).unwrap_or_else(|e| panic!("{what}: TB-IR lowers: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("{what}: verifies: {e:?}"));
+        let tbir = tbir::emit(&prog, &merged_src(&s), &cpp_tb::EmitOpts::default())
+            .unwrap_or_else(|e| panic!("{what}: TB-IR emits: {e}"));
+        let tbir_lt = tbir
+            .find("per = 2;")
+            .unwrap_or_else(|| panic!("{what}: TB-IR must initialize the hoisted `let`"));
+        let tbir_used = tbir
+            .find("_onh_0_period = (int64_t)(")
+            .unwrap_or_else(|| panic!("{what}: TB-IR must emit the named period"));
+        assert!(
+            tbir[tbir_used..].lines().next().unwrap_or("").contains("per"),
+            "{what}: TB-IR period expression must retain the named local"
         );
         assert!(
-            msg.contains("non-literal or non-positive period"),
-            "{what}: {msg}"
+            tbir_lt < tbir_used,
+            "{what}: TB-IR must initialize the captured local before registration"
         );
 
         // And the reason the suggestion is honest: v1 emits the `let`
@@ -38689,8 +38689,12 @@ end impl SpTest"#
             .find("int64_t per = 2;")
             .unwrap_or_else(|| panic!("{what}: v1 must emit the `let`"));
         let used = v1
-            .find("_period = (int64_t)(per);")
+            .find("_period = (int64_t)(")
             .unwrap_or_else(|| panic!("{what}: v1 must emit the named period"));
+        assert!(
+            v1[used..].lines().next().unwrap_or("").contains("per"),
+            "{what}: v1 period expression must retain the named local"
+        );
         assert!(
             lt < used,
             "{what}: the `let` must precede the use here — that is the whole difference \
@@ -38713,9 +38717,37 @@ end impl SpTest"#
         .expect("v1 emits the named period");
     assert!(konst < lt && lt < used, "const, then `let`, then the use");
 
-    // The arm's OTHER input, and the reason it is not `Unsupported`
-    // despite everything above: `tb_periodic_literal` answers `None` for
-    // a non-positive literal too, so `on 0 cycles` lands here. v1 emits
+    // A live DUT-port period is also side-effect-free and must remain in the
+    // per-cycle expression (not be hoisted into a registration-time temp).
+    let port_period = src("dut.count_out", "");
+    let port_prog = lower_src(&port_period).expect("a live integer DUT-port period lowers");
+    verify::verify_program(&port_prog).expect("a live integer DUT-port period verifies");
+    let port_cpp = tbir::emit(
+        &port_prog,
+        &merged_src(&port_period),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("a live integer DUT-port period emits");
+    assert!(
+        port_cpp.contains("_onh_0_period = (int64_t)(harc_rt::harc_read(dut->count_out));"),
+        "the generated checker must re-read the live port: {port_cpp}"
+    );
+
+    // A call that needs a statement/CFG step cannot be cached at handler
+    // registration: v1 evaluates the written expression inside the checker.
+    let impure = format!(
+        "function settle() -> uint<8>\n    wait 1 cycle\n    return 2\nend function settle\n\n{}",
+        src("settle()", "")
+    );
+    let msg = assert_unsupported(
+        &lower_src(&impure).expect_err("a statement-producing period must be fenced"),
+    );
+    assert!(
+        msg.contains("period") && msg.contains("statement-level step"),
+        "{msg}"
+    );
+
+    // A non-positive literal remains rejected. v1 emits
     // the handler and its own `period > 0` guard never lets it fire —
     // built and run, 0 firings in 21 cycles. The program asked for a
     // handler and got a silent no-op.
@@ -38724,7 +38756,7 @@ end impl SpTest"#
         &lower_src(&zero).unwrap_err(),
         lower::V1Status::SilentlyMisLowers,
     );
-    assert!(msg.contains("non-positive period"), "{msg}");
+    assert!(msg.contains("non-positive literal period"), "{msg}");
     let v1 = cpp_tb::emit(&merged_src(&zero)).expect("v1 emits the zero-period handler");
     assert!(
         v1.contains("_period = (int64_t)(0);"),
@@ -38733,6 +38765,66 @@ end impl SpTest"#
     assert!(
         v1.contains("_period > 0 &&"),
         "and guards it, so the handler never runs"
+    );
+    for negative in ["-1", "(-2)", "4'd0", "-4'd1", "(-4'd2)"] {
+        let msg = assert_not_implemented(
+            &lower_src(&src(negative, "")).expect_err("negative literals are silent no-ops"),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains("non-positive literal period"), "{negative}: {msg}");
+    }
+
+    // Verifier backstop: a corrupted period expression cannot reference a
+    // local outside the owning run function's table.
+    let mut corrupt = lower_src(&src("per", "")).expect("control lowers");
+    let ir::CycleHandlerKind::Periodic { period } = &mut corrupt.cycle_handlers[0].kind else {
+        panic!("control is periodic")
+    };
+    *period = ir::Expr::Local(ir::LocalId(u32::MAX));
+    assert!(
+        verify::verify_program(&corrupt).is_err(),
+        "a corrupted periodic expression must fail verification"
+    );
+
+    let mut bool_period = lower_src(&src("per", "")).expect("control lowers");
+    let ir::CycleHandlerKind::Periodic { period } = &mut bool_period.cycle_handlers[0].kind else {
+        panic!("control is periodic")
+    };
+    *period = ir::Expr::Binary(
+        ir::BinOp::Eq,
+        Box::new(ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::UInt(Some(1)),
+        }),
+        Box::new(ir::Expr::Literal {
+            value: 1,
+            ty: ir::IrType::UInt(Some(1)),
+        }),
+    );
+    assert!(
+        verify::verify_program(&bool_period).is_err(),
+        "a boolean periodic expression must fail verification"
+    );
+
+    let mut aggregate_period = lower_src(&src("per", "")).expect("control lowers");
+    let period_local = match &aggregate_period.cycle_handlers[0].kind {
+        ir::CycleHandlerKind::Periodic {
+            period: ir::Expr::Local(local),
+        } => *local,
+        _ => panic!("control period is a local"),
+    };
+    let owner = aggregate_period
+        .functions
+        .iter_mut()
+        .find(|f| f.locals.get(period_local.index()).is_some_and(|l| l.name == "per"))
+        .expect("owning run function");
+    owner.locals[period_local.index()].ty = ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::UInt(Some(8))),
+        len: 2,
+    };
+    assert!(
+        verify::verify_program(&aggregate_period).is_err(),
+        "an aggregate periodic expression must fail verification"
     );
 }
 

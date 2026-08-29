@@ -188,11 +188,11 @@ pub enum CycleHandlerKind {
     /// `on <bool-expr> ... end on` — re-evaluate the predicate every
     /// primary-clock cycle and fire the body per `edge`.
     Trigger { trigger: Expr, edge: CycleEdge },
-    /// `on <N> cycles ... end on` — fire once every `period` primary-clock
-    /// cycles. The period is a positive integer literal in this subset;
-    /// v1 re-reads a variable period each cycle, which needs a host-state
-    /// read the registration closure does not carry here.
-    Periodic { period: u64 },
+    /// `on <N> cycles ... end on` — fire once every positive `period`
+    /// primary-clock cycles. Statement-position registration captures the
+    /// surrounding run/check frame, so the expression is re-read each cycle
+    /// exactly where v1 registers it.
+    Periodic { period: Expr },
 }
 
 /// Severity band of a concurrent property check — which log tag the

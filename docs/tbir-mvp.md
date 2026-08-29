@@ -9588,6 +9588,22 @@ former `transaction` group lives in
      a passive state-only sibling; v1/TBIR equivalence covers the result. A
      mode-less event-driven field remains a program error in both backends.
 
+167. **Named statement-position periodic periods (2026-08-28).**
+
+     A statement-position `on <period> cycles` handler may now use an integer
+     side-effect-free integer expression, including an impl local initialized
+     before registration or a live DUT-port read.
+     `CycleHandlerKind::Periodic` retains the typed expression instead of
+     collapsing it to a literal, verification checks its type and local uses,
+     and TBIR re-evaluates it at each scheduler visit with the same positive-
+     period guard as v1. Expressions that require a statement-level call or
+     CFG step remain fenced rather than being cached at registration. The
+     registered fixture shadows a file-scope constant
+     with `let period = 2`, proving both initialization order and cadence under
+     v1/TBIR trace equivalence. A non-positive literal remains rejected as a
+     silent-no-op v1 shape; declaration-level periodic expressions retain
+     their separate registration-order fences.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
