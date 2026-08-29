@@ -1549,7 +1549,22 @@ impl FuncBuilder<'_> {
                 _,
             ) => Some(ty.clone()),
             _ => None,
-        };
+        }
+        .or_else(|| {
+            let value = super::exprs::unparen_expr(value);
+            let ExprKind::Call { callee, .. } = &*value.kind else {
+                return None;
+            };
+            let ExprKind::Ident(name) = &*callee.kind else {
+                return None;
+            };
+            let entry = self.helpers.get(&name.name)?;
+            if entry.pure {
+                return None;
+            }
+            self.expr_type(&e)
+                .filter(|ty| matches!(ty, IrType::FixedVec { .. }))
+        });
         let helper_seq_ty = match &e {
             Expr::Call(
                 crate::ir::CallTarget::Helper {

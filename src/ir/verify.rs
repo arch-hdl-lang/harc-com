@@ -4317,7 +4317,29 @@ impl Checker<'_> {
                     }
                 }
                 Stmt::DutWrite(_, e) => self.check_expr(e, true, "DutWrite value"),
-                Stmt::DutRead(l, _) => self.check_local(*l),
+                Stmt::DutRead(l, _) => {
+                    self.check_local(*l);
+                    if let Some(expected) = self.func.locals.get(l.index()).map(|local| &local.ty)
+                    {
+                        if matches!(
+                            expected,
+                            IrType::Record(_)
+                                | IrType::RecordSeq(_)
+                                | IrType::Seq(_)
+                                | IrType::FixedVec { .. }
+                                | IrType::Component(_)
+                                | IrType::Event(_)
+                        ) {
+                            self.errs.push(VerifyError::TypeMismatch {
+                                func: self.fid,
+                                block: self.bid,
+                                local: *l,
+                                expected: expected.clone(),
+                                actual: IrType::Unknown,
+                            });
+                        }
+                    }
+                }
                 // `release dut.<probe>` carries no value and no local;
                 // the PortRef's access class is validated at lowering.
                 Stmt::ProbeRelease(_) => {}

@@ -121,6 +121,9 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Passive event-driven transactor fields, retaining always-on state while
   activation-aware lowering blocks `when active` member access and omits its
   handlers, lifecycle services, and connect endpoints from registration.
+- [x] Recursive fixed-vector parameters and returns through CFG-inlined file
+  helpers that touch the DUT or synchronization state, including exact
+  argument, return-slot, inferred-result, and verifier metadata.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call

@@ -22138,6 +22138,106 @@ fn inlined_helper_tseq_signatures_are_typed_end_to_end() {
 }
 
 #[test]
+fn inlined_helper_fixed_vec_signatures_are_typed_end_to_end() {
+    let src = include_str!("fixtures/inline_helper_fixed_vec_test.harc");
+    let prog = lower_src(src).expect("inlined-helper fixed-vector signatures lower");
+    verify::verify_program(&prog).expect("inlined-helper fixed-vector signatures verify");
+    let run = prog.function(prog.tests[0].run);
+    let vec_ty = ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::UInt(Some(8))),
+        len: 2,
+    };
+    let grid_ty = ir::IrType::FixedVec {
+        elem: Box::new(vec_ty.clone()),
+        len: 2,
+    };
+    assert!(
+        run.locals.iter().filter(|local| local.ty == vec_ty).count() >= 3,
+        "parameter, return and result retain the vector type:\n{run}"
+    );
+    assert!(
+        run.locals.iter().filter(|local| local.ty == grid_ty).count() >= 3,
+        "nested parameter, return and result retain the vector type:\n{run}"
+    );
+    assert!(
+        run.blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter(|stmt| matches!(stmt, ir::Stmt::AggregateInit(_)))
+            .count()
+            >= 2,
+        "inlined helper vector returns are aggregate initialized:\n{run}"
+    );
+    let aggregate_local = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::AggregateInit(local) if run.locals[local.index()].ty == vec_ty => {
+                Some(*local)
+            }
+            _ => None,
+        })
+        .expect("fixture has a vector aggregate-init slot");
+    let port = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::DutRead(_, port) => Some(port.clone()),
+            _ => None,
+        })
+        .expect("fixture has a DUT read");
+    let mut corrupt = prog.clone();
+    let corrupt_run = &mut corrupt.functions[corrupt.tests[0].run.index()];
+    let init = corrupt_run
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find(|stmt| matches!(stmt, ir::Stmt::AggregateInit(local) if *local == aggregate_local))
+        .expect("fixture has the selected aggregate init");
+    *init = ir::Stmt::DutRead(aggregate_local, port);
+    assert!(
+        verify::verify_program(&corrupt).is_err(),
+        "a scalar DUT read cannot define a fixed-vector local"
+    );
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::array<uint64_t, 2>")
+            && cpp.contains("std::array<std::array<uint64_t, 2>, 2>"),
+        "inlined helper locals emit exact array carriers:\n{cpp}"
+    );
+
+    let annotated = src.replace(
+        "let echoed_grid = (echo_grid(dut, grid))",
+        "let echoed_grid : Vec<Vec<uint<8>, 2>, 2> = (echo_grid(dut, grid))",
+    );
+    let annotated_prog = lower_src(&annotated).expect("annotated inlined-helper result lowers");
+    verify::verify_program(&annotated_prog).expect("annotated inlined-helper result verifies");
+
+    let bad_param = src.replace(
+        "function echo_vec(dut: Top, values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>",
+        "function echo_vec(dut: Top, values: Vec<uint<8>, 3>) -> Vec<uint<8>, 3>",
+    );
+    assert_invalid(&lower_src(&bad_param).expect_err("vector parameter mismatch is invalid"));
+    let bad_return = src.replace(
+        "function echo_vec(dut: Top, values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>",
+        "function echo_vec(dut: Top, values: Vec<uint<8>, 2>) -> Vec<uint<8>, 3>",
+    );
+    assert_invalid(&lower_src(&bad_return).expect_err("vector return mismatch is invalid"));
+    let bad_annotation = src.replace(
+        "let echoed = echo_vec(dut, values)",
+        "let echoed : Vec<uint<8>, 3> = echo_vec(dut, values)",
+    );
+    assert_invalid(&lower_src(&bad_annotation).expect_err("vector annotation mismatch is invalid"));
+    let port_return = src.replace(
+        "return values\nend function echo_vec",
+        "return dut.count_out\nend function echo_vec",
+    );
+    assert_invalid(&lower_src(&port_return).expect_err("scalar port cannot satisfy vector return"));
+}
+
+#[test]
 fn fixed_vector_testbench_method_signatures_are_typed_end_to_end() {
     let src = include_str!("fixtures/fixed_vec_testbench_method_test.harc");
     let prog = lower_src(src).expect("fixed-vector testbench methods lower");
