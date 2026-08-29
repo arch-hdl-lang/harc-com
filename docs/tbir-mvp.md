@@ -886,9 +886,10 @@ reason. Code locations are authoritative.
       unobservable; in port-allowed positions (assert conditions,
       format args, wait predicates) the ternary emits as `?:` with
       inline reads, byte-equivalent to v1.
-    - *`const` initializers* are restricted to plain integer literals
-      (v1 forwards arbitrary exprs into a C++ `constexpr`); wider
-      shapes are explicit rejections until needed.
+    - *`const` initializers* use a 64-bit integer evaluator for literals,
+      earlier constants and enum variants, scalar casts, unary/binary
+      operators, and one-expression pure scalar helper calls. Wider
+      shapes remain explicit rejections.
     - *Width methods* cover 1..=1024 bits (#434, #537): casts ≤ 64 bits
       target `uint64_t`, 65..128-bit casts target v1's `_harc_u128`
       (`cpp_uint_for_width`) — trunc via `harc_rt::harc_trunc_u128`,
@@ -9603,6 +9604,20 @@ former `transaction` group lives in
      v1/TBIR trace equivalence. A non-positive literal remains rejected as a
      silent-no-op v1 shape; declaration-level periodic expressions retain
      their separate registration-order fences.
+
+168. **Pure-helper calls in constant initializers (2026-08-28).**
+
+     File-scope `const` initializers may now call a declared pure scalar
+     helper whose body is exactly one `return <expr>` statement and whose
+     parameter and explicit return types fit the 64-bit scalar evaluator.
+     Constant arguments bind to the helper parameters, nested calls reuse the
+     same evaluator, and parameter/return/declaration types all receive the
+     existing width and signedness checks. Calls to impure, multi-statement,
+     unknown, or non-scalar helpers remain fenced. They no longer advertise
+     v1 as an escape hatch: v1 emits every constant before helper declarations,
+     so even a valid helper call produces uncompilable C++.
+     This is intentionally a TBIR-first migration improvement and therefore
+     has unit/compiler coverage rather than a v1 trace-equivalence row.
 
 ## Next steps
 

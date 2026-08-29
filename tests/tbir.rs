@@ -521,11 +521,11 @@ end test T"#,
     );
 }
 
-/// #521: a construct outside the constant-expression subset (here, a
-/// call) still gets the structured `Unsupported` rejection that
-/// suggests `--codegen v1`.
+/// A direct call that is not a declared pure helper is not a v1 escape
+/// hatch: v1 emits the call before any helper declaration, so the generated
+/// C++ does not compile.
 #[test]
-fn const_out_of_subset_initializer_is_unsupported() {
+fn const_unknown_call_initializer_does_not_suggest_v1() {
     let err = lower_src(
         r#"const BAD : uint<32> = some_call()
 
@@ -537,11 +537,149 @@ test T
 end test T"#,
     )
     .expect_err("non-constant const initializer must fail lowering");
-    let msg = assert_unsupported(&err);
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
     assert!(
         msg.contains("const BAD"),
         "rejection must name the offending const `BAD`; got: {msg}"
     );
+}
+
+/// TBIR evaluates one-expression pure scalar helpers in `const`
+/// initializers. Arguments, earlier constants, nested helper calls, declared
+/// signedness, and return-width checks all use the same constant evaluator as
+/// ordinary initializer expressions.
+#[test]
+fn pure_helper_calls_fold_in_const_initializers() {
+    let src = r#"function add(a: uint<8>, b: uint<8>) -> uint<8>
+    return a + b
+end function add
+
+function twice(x: uint<8>) -> uint<8>
+    return add(x, x)
+end function twice
+
+const BASE : uint<8> = add(2, 3)
+const DOUBLED : uint<8> = twice(BASE)
+const NAMED : uint<8> = add(a = 4, b = 5)
+
+test T
+    let dut : Top
+    run
+        assert BASE == 5 else fail("base")
+        assert DOUBLED == 10 else fail("double")
+        assert NAMED == 9 else fail("named")
+    end run
+end test T"#;
+    let prog = lower_src(src).expect("pure helper calls fold in const initializers");
+    verify::verify_program(&prog).expect("folded constants verify");
+    let text = format!("{prog}");
+    for folded in ["(5 == 5)", "(10 == 10)", "(9 == 9)"] {
+        assert!(text.contains(folded), "missing `{folded}` in:\n{text}");
+    }
+
+    let multi_stmt = src.replace(
+        "return a + b",
+        "let sum = a + b\n    return sum",
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&multi_stmt).expect_err("multi-statement helpers remain outside const folding"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("one `return <expr>` statement"), "{msg}");
+
+    let bad_arity = src.replace("add(2, 3)", "add(2)");
+    let msg = assert_invalid(&lower_src(&bad_arity).expect_err("arity is checked"));
+    assert!(msg.contains("takes 2 argument"), "{msg}");
+
+    let swapped_names = src.replace("add(a = 4, b = 5)", "add(b = 5, a = 4)");
+    let msg = assert_not_implemented(
+        &lower_src(&swapped_names).expect_err("swapped names are a positional-drop gap"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("argument names are dropped"), "{msg}");
+
+    let unknown_name = src.replace("add(a = 4, b = 5)", "add(nope = 4, b = 5)");
+    let msg = assert_invalid(&lower_src(&unknown_name).expect_err("unknown names are invalid"));
+    assert!(msg.contains("`nope` names no parameter"), "{msg}");
+
+    let wide_return = src.replace(
+        "function add(a: uint<8>, b: uint<8>) -> uint<8>",
+        "function add(a: uint<8>, b: uint<8>) -> uint<65>",
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&wide_return).expect_err("wide helper returns stay outside const folding"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("64-bit constant-evaluation domain"), "{msg}");
+
+    let recursive = r#"function recur(x: uint<8>) -> uint<8>
+    return recur(x)
+end function recur
+
+const BAD : uint<8> = recur(1)
+
+test T
+    let dut : Top
+    run
+    end run
+end test T"#;
+    let msg =
+        assert_invalid(&lower_src(recursive).expect_err("constant helper cycles are rejected"));
+    assert!(msg.contains("constant helper call cycle"), "{msg}");
+
+    for (label, helper) in [
+        (
+            "untyped parameter",
+            r#"function untyped_is_negative(x) -> bool
+    return x < 0
+end function untyped_is_negative
+
+const RESULT : bool = untyped_is_negative(-1)"#,
+        ),
+        (
+            "int parameter",
+            r#"function int_is_negative(x: int) -> bool
+    return x < 0
+end function int_is_negative
+
+const RESULT : bool = int_is_negative(-1)"#,
+        ),
+        (
+            "int return",
+            r#"function negative_int() -> int
+    return -1
+end function negative_int
+
+const RESULT : bool = negative_int() < 0"#,
+        ),
+        (
+            "time parameter",
+            r#"function time_is_negative(x: time) -> bool
+    return x < 0
+end function time_is_negative
+
+const RESULT : bool = time_is_negative(-1)"#,
+        ),
+        (
+            "time return",
+            r#"function negative_time() -> time
+    return -1
+end function negative_time
+
+const RESULT : bool = negative_time() < 0"#,
+        ),
+    ] {
+        let source = format!(
+            "{helper}\n\ntest T\n    let dut : Top\n    run\n        assert RESULT == false else fail(\"{label}\")\n    end run\nend test T"
+        );
+        let prog = lower_src(&source)
+            .unwrap_or_else(|err| panic!("{label} helper folds: {err}"));
+        let text = format!("{prog}");
+        assert!(
+            text.contains("(0 == 0)"),
+            "{label} must coerce to the unsigned helper ABI before comparison:\n{text}"
+        );
+    }
 }
 
 /// #521: signed constants fold with the declared signedness — `>>` on a
@@ -26701,11 +26839,10 @@ end test T"#
     }
 }
 
-/// The counterpart guarantee: a construct v1 DOES implement keeps the
-/// `Unsupported` shape and the `--codegen v1` suggestion, so the two
-/// classes stay meaningfully distinct.
+/// A call in a constant initializer is not advertised as a v1 escape hatch:
+/// v1 emits it before helper declarations and produces uncompilable C++.
 #[test]
-fn constructs_v1_implements_still_suggest_v1() {
+fn const_call_diagnostic_records_v1s_uncompilable_output() {
     let err = lower_src(
         r#"const BAD : uint<32> = some_call()
 
@@ -26717,7 +26854,7 @@ test T
 end test T"#,
     )
     .unwrap_err();
-    assert_unsupported(&err);
+    assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
 }
 
 // ── Test-scope event channels (spec §3.4) ────────────────────────────

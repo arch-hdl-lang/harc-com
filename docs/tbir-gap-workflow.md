@@ -412,6 +412,12 @@ not applicable before requesting review:
    retires a `not_implemented` classification rather than an `unsupported(`
    constructor, so the raw inventory remains 117 textual matches (116
    constructors plus the helper definition).
+   One-expression pure scalar helpers now fold when called from file-scope
+   constant initializers. Unknown, impure, and multi-statement call shapes are
+   classified as v1-uncompilable instead of preserving a false escape hatch.
+   This routes around the shared constant-expression constructor, so the raw
+   inventory remains 117 textual matches (116 constructors plus the helper
+   definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
