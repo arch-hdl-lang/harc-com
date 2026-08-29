@@ -58,9 +58,9 @@ mod transactors;
 mod tseqs;
 
 use crate::ast::{
-    AddrmapDecl, Block, BuiltinTy, BusDecl, ClockDecl, ComponentDecl, ComponentItem, ExprKind,
-    HookableMethod, Item, OnPhase, ScopeDecl, SourceFile, Stmt as AstStmt, StmtKind, TestDecl,
-    TestItem, TransactorMode, TypeExpr,
+    AddrmapDecl, Block, BuiltinTy, BusDecl, CallArg, ClockDecl, ComponentDecl, ComponentItem,
+    ExprKind, HookableMethod, Item, OnPhase, ScopeDecl, SourceFile, Stmt as AstStmt, StmtKind,
+    TestDecl, TestItem, TransactorMode, TypeExpr,
 };
 use crate::ir::{
     self, BasicBlock, BlockId, ClockSpec, ComponentSchema, ConstraintRef, ConstraintSite,
@@ -328,6 +328,111 @@ pub(crate) fn fold_const(
     consts: &HashMap<String, ConstVal>,
     self_name: &str,
 ) -> Result<ConstVal, ConstFoldErr> {
+    fold_const_inner(e, consts, self_name, None, &mut Vec::new())
+}
+
+fn fold_const_with_helpers(
+    e: &crate::ast::Expr,
+    consts: &HashMap<String, ConstVal>,
+    self_name: &str,
+    helpers: &helpers::HelperRegistry<'_>,
+) -> Result<ConstVal, ConstFoldErr> {
+    fold_const_inner(e, consts, self_name, Some(helpers), &mut Vec::new())
+}
+
+fn const_expr_contains_call(e: &crate::ast::Expr) -> bool {
+    match &*e.kind {
+        ExprKind::Call { .. } => true,
+        ExprKind::Paren(inner)
+        | ExprKind::Unary { expr: inner, .. }
+        | ExprKind::Cast { expr: inner, .. } => const_expr_contains_call(inner),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            const_expr_contains_call(lhs) || const_expr_contains_call(rhs)
+        }
+        ExprKind::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            const_expr_contains_call(cond)
+                || const_expr_contains_call(then_branch)
+                || const_expr_contains_call(else_branch)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a helper ABI type fits the constant evaluator's scalar,
+/// 64-bit domain. Untyped parameters use the ordinary helper ABI's
+/// scalar default; a return type must be explicit so a returned value
+/// has the same meaning when the helper is called outside a `const`.
+fn const_helper_scalar_type(ty: Option<&crate::ast::TypeExpr>, allow_untyped: bool) -> bool {
+    use crate::ast::{BuiltinTy, TypeArg, TypeExpr};
+    let Some(TypeExpr::Builtin { name, args, .. }) = ty else {
+        return allow_untyped && ty.is_none();
+    };
+    match name {
+        BuiltinTy::UInt
+        | BuiltinTy::UIntCap
+        | BuiltinTy::SInt
+        | BuiltinTy::SIntCap
+        | BuiltinTy::Bits => matches!(
+            args.as_slice(),
+            [TypeArg::Expr(width)]
+                if matches!(&*width.kind, ExprKind::Int(text)
+                    if text.replace('_', "").parse::<u32>().is_ok_and(|w| (1..=64).contains(&w)))
+        ),
+        BuiltinTy::Bool
+        | BuiltinTy::BoolLower
+        | BuiltinTy::Bit
+        | BuiltinTy::Int
+        | BuiltinTy::Time => args.is_empty(),
+        _ => false,
+    }
+}
+
+/// Apply the scalar conversion used at an ordinary pure-helper ABI
+/// boundary after validating the declared width. This differs from a
+/// file-scope const declaration: helper slots emit untyped, `int`, and
+/// `time` values as `uint64_t`, so signedness must not leak from the
+/// caller or return expression into subsequent constant folding.
+fn check_const_helper_abi_type(
+    ty: Option<&crate::ast::TypeExpr>,
+    value: ConstVal,
+) -> Result<ConstVal, String> {
+    use crate::ast::{BuiltinTy, TypeExpr};
+    let value = check_const_decl_type(ty, value)?;
+    let Some(TypeExpr::Builtin { name, .. }) = ty else {
+        return Ok(ConstVal {
+            bits: value.bits,
+            signed: false,
+        });
+    };
+    let signed = match name {
+        BuiltinTy::UInt
+        | BuiltinTy::UIntCap
+        | BuiltinTy::Bits
+        | BuiltinTy::Int
+        | BuiltinTy::Time
+        | BuiltinTy::Bool
+        | BuiltinTy::BoolLower
+        | BuiltinTy::Bit => false,
+        BuiltinTy::SInt | BuiltinTy::SIntCap => true,
+        _ => return Ok(value),
+    };
+    Ok(ConstVal {
+        bits: value.bits,
+        signed,
+    })
+}
+
+fn fold_const_inner(
+    e: &crate::ast::Expr,
+    consts: &HashMap<String, ConstVal>,
+    self_name: &str,
+    helpers: Option<&helpers::HelperRegistry<'_>>,
+    call_stack: &mut Vec<String>,
+) -> Result<ConstVal, ConstFoldErr> {
     use crate::ast::{BinaryOp, TypeExpr, UnaryOp};
     let boolean = |x: bool| {
         // Comparison / logical results promote like C++ `bool` → `int`.
@@ -337,7 +442,7 @@ pub(crate) fn fold_const(
         })
     };
     match &*e.kind {
-        ExprKind::Paren(inner) => fold_const(inner, consts, self_name),
+        ExprKind::Paren(inner) => fold_const_inner(inner, consts, self_name, helpers, call_stack),
         ExprKind::Int(s) => match exprs::parse_int_literal(s) {
             // Decimal literals above i64::MAX are unsigned, like C++.
             Some(v) => Ok(ConstVal {
@@ -388,7 +493,7 @@ pub(crate) fn fold_const(
                         .into(),
                 ));
             }
-            let v = fold_const(expr, consts, self_name)?;
+            let v = fold_const_inner(expr, consts, self_name, helpers, call_stack)?;
             let signed = matches!(
                 ty,
                 TypeExpr::Builtin {
@@ -402,7 +507,7 @@ pub(crate) fn fold_const(
             })
         }
         ExprKind::Unary { op, expr } => {
-            let v = fold_const(expr, consts, self_name)?;
+            let v = fold_const_inner(expr, consts, self_name, helpers, call_stack)?;
             match op {
                 UnaryOp::Neg => Ok(ConstVal {
                     bits: v.bits.wrapping_neg(),
@@ -417,8 +522,8 @@ pub(crate) fn fold_const(
             }
         }
         ExprKind::Binary { op, lhs, rhs } => {
-            let a = fold_const(lhs, consts, self_name)?;
-            let b = fold_const(rhs, consts, self_name)?;
+            let a = fold_const_inner(lhs, consts, self_name, helpers, call_stack)?;
+            let b = fold_const_inner(rhs, consts, self_name, helpers, call_stack)?;
             // C++ usual arithmetic conversions at rank 64: the result
             // (and the comparison/division domain) is signed only when
             // both operands are.
@@ -580,6 +685,129 @@ pub(crate) fn fold_const(
                     "the `{op:?}` operator in a constant expression"
                 ))),
             }
+        }
+        ExprKind::Call { callee, args } => {
+            let ExprKind::Ident(name) = &*callee.kind else {
+                return Err(ConstFoldErr::Unsupported(
+                    "only a direct call to a pure scalar helper can be evaluated in a `const`"
+                        .into(),
+                ));
+            };
+            let Some(registry) = helpers else {
+                return Err(ConstFoldErr::Unsupported(format!(
+                    "the call to `{}` is not part of this constant-expression subset",
+                    name.name
+                )));
+            };
+            let Some(entry) = registry.get(&name.name) else {
+                return Err(ConstFoldErr::Unsupported(format!(
+                    "`{}` is not a declared pure helper",
+                    name.name
+                )));
+            };
+            if !entry.pure {
+                return Err(ConstFoldErr::Unsupported(format!(
+                    "helper `{}` is not a pure scalar helper",
+                    name.name
+                )));
+            }
+            if !const_helper_scalar_type(entry.decl.return_ty.as_ref(), false)
+                || entry
+                    .decl
+                    .params
+                    .iter()
+                    .any(|param| !const_helper_scalar_type(param.ty.as_ref(), true))
+            {
+                return Err(ConstFoldErr::Unsupported(format!(
+                    "helper `{}` must use only scalar parameter and return types within the 64-bit constant-evaluation domain",
+                    name.name
+                )));
+            }
+            if args.len() != entry.decl.params.len() {
+                return Err(FoldInvalid(format!(
+                    "helper `{}` takes {} argument(s), call passes {}",
+                    name.name,
+                    entry.decl.params.len(),
+                    args.len()
+                )));
+            }
+            if call_stack.contains(&name.name) {
+                return Err(FoldInvalid(format!(
+                    "constant helper call cycle: {} -> {}",
+                    call_stack.join(" -> "),
+                    name.name
+                )));
+            }
+            let [stmt] = entry.decl.body.stmts.as_slice() else {
+                return Err(ConstFoldErr::Unsupported(format!(
+                    "pure helper `{}` must consist of one `return <expr>` statement to be used in a `const` initializer",
+                    name.name
+                )));
+            };
+            let StmtKind::Return(Some(ret_expr)) = &stmt.kind else {
+                return Err(ConstFoldErr::Unsupported(format!(
+                    "pure helper `{}` must consist of one `return <expr>` statement to be used in a `const` initializer",
+                    name.name
+                )));
+            };
+
+            let declared: Vec<&str> = entry
+                .decl
+                .params
+                .iter()
+                .map(|param| param.name.name.as_str())
+                .collect();
+            let mut unknown_name: Option<&str> = None;
+            let mut misplaced: Option<(&str, usize, usize)> = None;
+            for (index, arg) in args.iter().enumerate() {
+                let CallArg::Named { name: written, .. } = arg else {
+                    continue;
+                };
+                if declared.get(index).is_some_and(|name| *name == written.name) {
+                    continue;
+                }
+                if let Some(expected) = declared.iter().position(|name| *name == written.name) {
+                    misplaced.get_or_insert((written.name.as_str(), expected, index));
+                } else {
+                    unknown_name.get_or_insert(written.name.as_str());
+                }
+            }
+            // Match `reject_misplaced_named_args`: a real positional swap is
+            // the more serious verdict and wins over an unrelated typo.
+            if let Some((written, expected, found)) = misplaced {
+                return Err(ConstFoldErr::Unsupported(format!(
+                    "`{written}` is parameter {} of helper `{}` but was written in position {}; argument names are dropped and values bind strictly by position",
+                    expected + 1,
+                    name.name,
+                    found + 1,
+                )));
+            }
+            if let Some(written) = unknown_name {
+                return Err(FoldInvalid(format!(
+                    "`{written}` names no parameter of helper `{}` (expected {})",
+                    name.name,
+                    declared
+                        .iter()
+                        .map(|name| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )));
+            }
+
+            let mut env = consts.clone();
+            for (param, arg) in entry.decl.params.iter().zip(args) {
+                let arg = match arg {
+                    CallArg::Expr(value) | CallArg::Named { value, .. } => value,
+                };
+                let value = fold_const_inner(arg, consts, self_name, helpers, call_stack)?;
+                let value =
+                    check_const_helper_abi_type(param.ty.as_ref(), value).map_err(FoldInvalid)?;
+                env.insert(param.name.name.clone(), value);
+            }
+            call_stack.push(name.name.clone());
+            let value = fold_const_inner(ret_expr, &env, self_name, helpers, call_stack);
+            call_stack.pop();
+            check_const_helper_abi_type(entry.decl.return_ty.as_ref(), value?).map_err(FoldInvalid)
         }
         // Same `self_name` split as the unknown-name arm above: only a
         // `const` initializer is restricted to EARLIER names.
@@ -1088,6 +1316,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         }
     }
 
+    // Helper classification is also needed by callable `const`
+    // initializers below. Build it before the const table; the same registry
+    // is reused later for ordinary helper lowering and covergroup calls.
+    let helper_registry = helpers::HelperRegistry::build(&file)?;
+
     // File-scope named integer constants: `const NAME : Ty = <expr>`
     // (v1: `static constexpr <cty> NAME = <expr>;`) and `enum Color {
     // RED, ... }` variant names (v1: variant index, first definition
@@ -1106,11 +1339,25 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     for it in &file.items {
         match it {
             Item::Const(c) => {
-                let folded = fold_const(&c.value, &const_vals, &c.name.name)
+                let folded = fold_const_with_helpers(
+                    &c.value,
+                    &const_vals,
+                    &c.name.name,
+                    &helper_registry,
+                )
                     .and_then(|v| check_const_decl_type(c.ty.as_ref(), v).map_err(FoldInvalid));
                 let v = match folded {
                     Ok(v) => v,
                     Err(ConstFoldErr::Unsupported(detail)) => {
+                        if const_expr_contains_call(&c.value) {
+                            return Err(not_implemented(
+                                &format!("`const {}` initializer", c.name.name),
+                                format!(
+                                    "{detail}; v1 emits the call before helper declarations, so its generated C++ does not compile"
+                                ),
+                                V1Status::EmitsUncompilable,
+                            ));
+                        }
                         return Err(unsupported(
                             &format!("`const {}` initializer", c.name.name),
                             detail,
@@ -1238,11 +1485,6 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             _ => None,
         })
         .collect();
-
-    // Helper functions: categorize pure vs impure, reject recursion.
-    // Covergroup schemas need this early so hook-triggered coverpoints can
-    // sample pure helper calls over hook parameters.
-    let helper_registry = helpers::HelperRegistry::build(&file)?;
 
     // Covergroup schemas, in file order. All declarations lower (even
     // unreferenced ones — v1 emits a struct for each), so unsupported
