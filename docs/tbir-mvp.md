@@ -9720,6 +9720,20 @@ former `transaction` group lives in
      unsupported typed-local fallback, so the raw textual inventory remains
      117 matches (116 constructors plus the helper definition).
 
+176. **TSeq generator assignment into typed locals (2026-08-29).**
+
+     A `tseq` generator result can now be assigned to an already-declared
+     test-scope `TSeq<Record>` or scalar `TSeq<T>` local, including when the
+     call is parenthesized. Lowering checks the generator's exact sequence ABI
+     against the established destination type before emitting the existing
+     `CallTarget::Tseq` assignment edge; record/scalar or scalar-width
+     mismatches are source-level errors. Together with divergence 175 this
+     supports the full declare-empty-then-materialize workflow under TBIR.
+     v1 still mis-declares the typed empty local as `int64_t`, so this is a
+     TBIR-first retirement improvement. The call is routed before generic
+     helper-call rejection, leaving the raw unsupported inventory unchanged
+     by this batch.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

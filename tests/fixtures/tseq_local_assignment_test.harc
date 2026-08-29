@@ -1,0 +1,50 @@
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    value : uint<8>
+end transaction Beat
+
+tseq MakeBeats() -> TSeq<Beat>
+    let a : Beat
+    a.value = 4
+    yield a
+    let b : Beat
+    b.value = 7
+    yield b
+end tseq MakeBeats
+
+tseq MakeNums() -> TSeq<uint<8>>
+    yield 3
+    yield 5
+end tseq MakeNums
+
+testbench AssignedTseqTb
+    dut : Top
+end testbench AssignedTseqTb
+
+impl AssignedTseqTest for AssignedTseqTb
+    clock clk = SysDomain
+    run
+        let beats : TSeq<Beat>
+        let nums : TSeq<uint<8>>
+
+        beats = MakeBeats()
+        nums = (MakeNums())
+
+        let beat_sum : uint<16> = 0
+        for beat in beats
+            beat_sum = beat_sum + beat.value
+        end for
+
+        let num_sum : uint<16> = 0
+        for num in nums
+            num_sum = num_sum + num
+        end for
+
+        assert beat_sum == 11 else fail("beat sum ${beat_sum}")
+        assert num_sum == 8 else fail("num sum ${num_sum}")
+        wait 1 cycle
+    end run
+end impl AssignedTseqTest

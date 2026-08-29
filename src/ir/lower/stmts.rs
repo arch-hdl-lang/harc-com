@@ -3041,6 +3041,36 @@ impl FuncBuilder<'_> {
         }
         if let ExprKind::Ident(id) = &*target.kind {
             if let Some(local) = self.lookup(&id.name) {
+                // `beats = MakeBeats()` — materialize a tseq generator into
+                // an already-declared typed sequence local. Fresh-`let`
+                // generator calls are handled by `lower_let`; this is the
+                // declare-then-assign twin used by typed empty TSeq locals.
+                // Unwrap parentheses just as the other value-returning call
+                // lanes do, but keep the generator namespace check ahead of
+                // generic expression lowering (which intentionally rejects
+                // helper-shaped calls it cannot classify).
+                let tseq_value = super::exprs::unparen_expr(value);
+                if let ExprKind::Call { callee, args } = &*tseq_value.kind {
+                    if let ExprKind::Ident(name) = &*callee.kind {
+                        if let Some(actual) = self
+                            .ctx
+                            .tseqs
+                            .get(&name.name)
+                            .map(|(elem, _, _)| elem.seq_type())
+                        {
+                            let expected = self.local_type(local).clone();
+                            if expected != actual {
+                                return Err(LowerError::Invalid(format!(
+                                    "local `{}` is declared {:?}, but tseq `{}` returns {:?}",
+                                    id.name, expected, name.name, actual
+                                )));
+                            }
+                            let call = self.lower_tseq_call(&name.name, args)?;
+                            self.push(Stmt::Assign(local, call));
+                            return Ok(());
+                        }
+                    }
+                }
                 // `v = pending.pop()` on a direct testbench scalar queue.
                 // Unlike a generic expression, `pop()` is a mutating queue
                 // operation and therefore lowers directly to a statement
