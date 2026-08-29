@@ -9707,6 +9707,19 @@ former `transaction` group lives in
      No `unsupported(` constructor is retired, so the raw inventory remains
      117 textual matches (116 constructors plus the shared helper definition).
 
+175. **Typed empty TSeq locals (2026-08-29).**
+
+     An uninitialized test-scope `let xs : TSeq<T>` now creates a typed empty
+     dynamic sequence. Record elements lower to `RecordSeq`, scalar elements
+     lower to `Seq`, and both use `AggregateInit` so verification and C++
+     emission see an empty `std::vector` rather than a scalar zero. Empty
+     sequences can therefore participate in the existing counted iteration
+     path without special cases. This is a TBIR-first retirement improvement:
+     v1 emits these declarations as `int64_t` and its generated C++ fails when
+     `.size()` or indexing is used. The new path routes around the shared
+     unsupported typed-local fallback, so the raw textual inventory remains
+     117 matches (116 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

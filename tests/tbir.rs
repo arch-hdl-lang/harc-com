@@ -22153,6 +22153,50 @@ fn testbench_method_tseq_signatures_are_typed_end_to_end() {
 }
 
 #[test]
+fn uninitialized_tseq_locals_start_as_typed_empty_sequences() {
+    let src = include_str!("fixtures/tseq_empty_local_test.harc");
+
+    let prog = lower_src(src).expect("uninitialized TSeq locals lower");
+    verify::verify_program(&prog).expect("uninitialized TSeq locals verify");
+    let run = prog.function(prog.tests[0].run);
+    for (name, expected) in [
+        ("empty_beats", ir::IrType::RecordSeq(ir::RecordId(0))),
+        (
+            "empty_nums",
+            ir::IrType::Seq(Box::new(ir::IrType::UInt(Some(8)))),
+        ),
+    ] {
+        let local = run
+            .locals
+            .iter()
+            .position(|local| local.name == name)
+            .map(|index| ir::LocalId(index as u32))
+            .unwrap_or_else(|| panic!("missing `{name}` local"));
+        assert_eq!(run.locals[local.index()].ty, expected);
+        assert!(run.blocks.iter().flat_map(|block| &block.stmts).any(
+            |stmt| matches!(stmt, ir::Stmt::AggregateInit(found) if *found == local)
+        ));
+    }
+
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::vector<Beat> empty_beats{};")
+            && cpp.contains("std::vector<uint64_t> empty_nums{};"),
+        "typed empty sequences emit as vectors:\n{cpp}"
+    );
+
+    for bad in ["Missing", "Vec<uint<8>, 2>"] {
+        let malformed = src.replace("TSeq<uint<8>>", &format!("TSeq<{bad}>"));
+        let error = match lower_src(&malformed) {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported TSeq element `{bad}` must not lower"),
+        };
+        let message = assert_unsupported(&error);
+        assert!(message.contains("unsupported element type"), "{bad}: {message}");
+    }
+}
+
+#[test]
 fn pure_helper_tseq_signatures_are_typed_end_to_end() {
     let src = include_str!("fixtures/pure_helper_tseq_test.harc");
     let prog = lower_src(src).expect("pure-helper TSeq signatures lower");
