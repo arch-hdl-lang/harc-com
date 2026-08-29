@@ -440,8 +440,10 @@ impl FuncBuilder<'_> {
         let want = slot_ir_type(p.ty.as_ref(), &self.ctx.record_ids);
         let what = format!("parameter `{}` of {owner}", p.name.name);
         self.check_slot_ir(v, &want, &what)?;
-        if matches!(want, IrType::FixedVec { .. }) {
-            if let Some(actual @ IrType::FixedVec { .. }) = self.expr_type(v) {
+        if matches!(want, IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_)) {
+            if let Some(actual @ (IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_))) =
+                self.expr_type(v)
+            {
                 if actual != want {
                     return Err(LowerError::Invalid(format!(
                         "{what} expects {want:?}, got {actual:?}"
@@ -756,10 +758,15 @@ impl FuncBuilder<'_> {
         if let Some(frame) = self.inline_frames.last() {
             let (dest, cont) = (frame.ret_dest, frame.ret_cont);
             if let Some(e) = value {
+                let expected = self.local_type(dest).clone();
                 if let Some(port) = self.as_port_ref(e)? {
+                    if matches!(expected, IrType::RecordSeq(_) | IrType::Seq(_)) {
+                        return Err(LowerError::Invalid(format!(
+                            "testbench/helper method return expects {expected:?}, got a scalar DUT port"
+                        )));
+                    }
                     self.push(Stmt::DutRead(dest, port));
                 } else {
-                    let expected = self.local_type(dest).clone();
                     let ir = if let IrType::FixedVec { elem, len } = &expected {
                         let shape = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
                             .map(|class| (*len, class));
@@ -776,6 +783,14 @@ impl FuncBuilder<'_> {
                     } else {
                         self.lower_expr_no_ports(e)?
                     };
+                    if matches!(expected, IrType::RecordSeq(_) | IrType::Seq(_)) {
+                        let actual = self.expr_type(&ir).unwrap_or(IrType::Unknown);
+                        if actual != expected {
+                            return Err(LowerError::Invalid(format!(
+                                "testbench/helper method return expects {expected:?}, got {actual:?}"
+                            )));
+                        }
+                    }
                     self.push(Stmt::Assign(dest, ir));
                 }
             }
@@ -828,7 +843,9 @@ impl FuncBuilder<'_> {
     fn push_return_default(&mut self, dest: crate::ir::LocalId, ty: &IrType) {
         match ty {
             IrType::Record(rid) => self.push(Stmt::RecordInit(dest, *rid)),
-            IrType::FixedVec { .. } => self.push(Stmt::AggregateInit(dest)),
+            IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_) => {
+                self.push(Stmt::AggregateInit(dest))
+            }
             _ => self.push(Stmt::Assign(
                 dest,
                 Expr::Literal {
@@ -988,6 +1005,9 @@ fn testbench_method_signature_type(
     ty: Option<&TypeExpr>,
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<IrType, LowerError> {
+    if let Some(seq) = tseq_ir_type(ty, record_ids) {
+        return Ok(seq);
+    }
     if let Some(fixed @ IrType::FixedVec { .. }) = ty.and_then(|ty| {
         super::components::fixed_vec_ir_type_with_records(ty, record_ids)
     }) {

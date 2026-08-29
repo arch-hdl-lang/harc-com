@@ -21880,6 +21880,98 @@ end impl TbRecordReturnTest
 }
 
 #[test]
+fn testbench_method_tseq_signatures_are_typed_end_to_end() {
+    let src = include_str!("fixtures/tb_method_tseq_test.harc");
+    let prog = lower_src(src).expect("TSeq testbench methods lower");
+    verify::verify_program(&prog).expect("TSeq testbench methods verify");
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.locals
+            .iter()
+            .filter(|local| matches!(local.ty, ir::IrType::RecordSeq(ir::RecordId(0))))
+            .count()
+            >= 4,
+        "record sequence values retain their type:\n{run}"
+    );
+    assert!(
+        run.locals
+            .iter()
+            .filter(|local| matches!(&local.ty, ir::IrType::Seq(elem) if matches!(elem.as_ref(), ir::IrType::UInt(Some(8)))))
+            .count()
+            >= 4,
+        "scalar sequence values retain their type:\n{run}"
+    );
+    assert!(
+        run.blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter(|stmt| matches!(stmt, ir::Stmt::AggregateInit(_)))
+            .count()
+            >= 2,
+        "both sequence return slots are aggregate-initialized:\n{run}"
+    );
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::vector<Beat>") && cpp.contains("std::vector<uint64_t>"),
+        "emitted locals retain record and scalar sequence carriers:\n{cpp}"
+    );
+    let init_locals: Vec<_> = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .filter_map(|stmt| match stmt {
+            ir::Stmt::AggregateInit(local) => Some(*local),
+            _ => None,
+        })
+        .collect();
+    for (local, bad_ty) in [
+        (init_locals[0], ir::IrType::RecordSeq(ir::RecordId(999))),
+        (
+            init_locals[1],
+            ir::IrType::Seq(Box::new(ir::IrType::Record(ir::RecordId(0)))),
+        ),
+    ] {
+        let mut corrupt = prog.clone();
+        corrupt.functions[prog.tests[0].run.index()].locals[local.index()].ty = bad_ty;
+        let errors = verify::verify_program(&corrupt)
+            .expect_err("malformed sequence AggregateInit metadata is rejected");
+        assert!(
+            errors.iter().any(|error| error.to_string().contains("AggregateInit")),
+            "sequence AggregateInit reports its own verifier error: {errors:?}"
+        );
+    }
+    let mismatched = src.replace(
+        "let echoed_beats = echo_beats(beats)",
+        "let echoed_beats : TSeq<uint<8>> = echo_beats(beats)",
+    );
+    assert_invalid(
+        &lower_src(&mismatched).expect_err("mismatched TSeq result annotation is invalid"),
+    );
+    let bad_param = src.replace(
+        "function echo_nums(items: TSeq<uint<8>>) -> TSeq<uint<8>>",
+        "function echo_nums(items: TSeq<sint<8>>) -> TSeq<sint<8>>",
+    );
+    assert_invalid(
+        &lower_src(&bad_param).expect_err("mismatched TSeq parameter is invalid during lowering"),
+    );
+    let bad_return = src.replace(
+        "function echo_beats(items: TSeq<Beat>) -> TSeq<Beat>",
+        "function echo_beats(items: TSeq<Beat>) -> TSeq<uint<8>>",
+    );
+    assert_invalid(
+        &lower_src(&bad_return).expect_err("mismatched TSeq return is invalid during lowering"),
+    );
+    let port_return = src.replace(
+        "return items\n    end function echo_nums",
+        "return dut.count_out\n    end function echo_nums",
+    );
+    assert_invalid(
+        &lower_src(&port_return)
+            .expect_err("a scalar DUT port cannot satisfy a TSeq method return"),
+    );
+}
+
+#[test]
 fn fixed_vector_testbench_method_signatures_are_typed_end_to_end() {
     let src = include_str!("fixtures/fixed_vec_testbench_method_test.harc");
     let prog = lower_src(src).expect("fixed-vector testbench methods lower");

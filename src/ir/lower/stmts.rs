@@ -6135,20 +6135,9 @@ impl FuncBuilder<'_> {
         let ret_fixed = self.expr_type(&v).and_then(|ty| {
             matches!(ty, IrType::FixedVec { .. }).then(|| ty.clone())
         });
-        // NO sequence arm here, deliberately. Testbench signature typing
-        // retains fixed vectors and records, but still answers `Unknown`
-        // for `TSeq<T>`, so there is no sequence type to carry.
-        //
-        // That is a real gap, and it is OLDER than the slot rule: the
-        // whole inlined chain is untyped, parameter included, so tbir
-        // emits `uint64_t s = 0; uint64_t ys = 0;` and then `s = xs;`,
-        // which g++ refuses ("cannot convert `std::vector<Beat>` to
-        // `uint64_t`") while v1 compiles
-        // `[&](Tb& self, const std::vector<Beat>& s)`. Reproducible on
-        // the merge base, so it is not this rule's to fix — typing that
-        // chain changes the emitted C++ and wants its own measurement.
-        // Recorded in divergence 114; the `Unknown` rule keeps the slot
-        // check from adding a false rejection on top of it meanwhile.
+        let ret_seq = self.expr_type(&v).and_then(|ty| {
+            matches!(ty, IrType::RecordSeq(_) | IrType::Seq(_)).then(|| ty.clone())
+        });
         // No "…unless the annotation names that same record" escape,
         // because by construction the annotation here never can. A `let`
         // whose declared type names a record is claimed a thousand lines
@@ -6184,6 +6173,25 @@ impl FuncBuilder<'_> {
             } else if l.ty.is_some() {
                 return Err(LowerError::Invalid(format!(
                     "`let {}` is declared with a non-vector type and initialised from a fixed vector",
+                    l.name.name
+                )));
+            }
+            self.set_local_type(id, ty);
+        } else if let Some(ty) = ret_seq {
+            if let Some(declared) = l
+                .ty
+                .as_ref()
+                .and_then(|ty| super::helpers::tseq_ir_type(Some(ty), &self.ctx.record_ids))
+            {
+                if declared != ty {
+                    return Err(LowerError::Invalid(format!(
+                        "`let {}` TSeq annotation does not match the testbench method return",
+                        l.name.name
+                    )));
+                }
+            } else if l.ty.is_some() {
+                return Err(LowerError::Invalid(format!(
+                    "`let {}` is declared with a non-TSeq type and initialised from a TSeq",
                     l.name.name
                 )));
             }
