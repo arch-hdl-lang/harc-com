@@ -1210,6 +1210,25 @@ impl FuncBuilder<'_> {
             return Ok(());
         }
         let Some(value) = &l.value else {
+            // An explicitly typed transaction-sequence local begins as an
+            // empty dynamic sequence. This is the local analogue of a tseq
+            // accumulator/return slot and therefore uses AggregateInit rather
+            // than the scalar zero initializer below.
+            if let Some(seq) = super::helpers::tseq_ir_type(l.ty.as_ref(), &self.ctx.record_ids) {
+                if matches!(seq, IrType::RecordSeq(_) | IrType::Seq(_)) {
+                    let id = self.declare(&l.name.name);
+                    self.set_local_type(id, seq);
+                    self.push(Stmt::AggregateInit(id));
+                    return Ok(());
+                }
+                return Err(unsupported(
+                    &format!(
+                        "uninitialized `let {} : TSeq<...>` with an unsupported element type",
+                        l.name.name
+                    ),
+                    "a TSeq element must be a declared transaction/struct record or a scalar uint/sint/bool type",
+                ));
+            }
             // Uninitialized scalar `let x: uint<N>;` — the declare-then-
             // assign-in-loop idiom. The local is hoisted as `<cty> x = 0;`
             // by `declare_locals` (v1 emits `int64_t x = 0;`), so we just

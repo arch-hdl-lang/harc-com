@@ -1,0 +1,33 @@
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    value : uint<8>
+end transaction Beat
+
+testbench EmptyTseqTb
+    dut : Top
+end testbench EmptyTseqTb
+
+impl EmptyTseqTest for EmptyTseqTb
+    clock clk = SysDomain
+    run
+        let empty_beats : TSeq<Beat>
+        let empty_nums : TSeq<uint<8>>
+
+        let beat_sum : uint<16> = 0
+        for beat in empty_beats
+            beat_sum = beat_sum + beat.value
+        end for
+
+        let num_sum : uint<16> = 0
+        for num in empty_nums
+            num_sum = num_sum + num
+        end for
+
+        assert beat_sum == 0 else fail("beat sum ${beat_sum}")
+        assert num_sum == 0 else fail("num sum ${num_sum}")
+        wait 1 cycle
+    end run
+end impl EmptyTseqTest

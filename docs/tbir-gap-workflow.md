@@ -127,6 +127,8 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Record and scalar `TSeq<T>` returns through unbound and bus-bound
   initiator transactor methods, including exact call-result annotations and
   return-expression validation.
+- [x] Uninitialized test-scope `TSeq<Record>` and scalar `TSeq<T>` locals as
+  typed empty sequences (TBIR-first; v1 mis-emits these as scalar locals).
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -455,6 +457,13 @@ not applicable before requesting review:
    annotations and scalar return expressions fail during lowering. This
    routes through shared aggregate paths, so the raw inventory remains 117
    textual matches (116 constructors plus the helper definition).
+   Explicit uninitialized `TSeq<Record>` and scalar `TSeq<T>` locals now
+   begin as typed empty sequences through `AggregateInit`, so they can be
+   iterated safely and emit as `std::vector`. This is deliberately TBIR-first:
+   v1 declares the same source as `int64_t` and fails when sequence operations
+   are used. The shared unsupported constructor remains for other typed local
+   shapes, leaving the raw inventory at 117 textual matches (116 constructors
+   plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
