@@ -9667,6 +9667,20 @@ former `transaction` group lives in
      the raw inventory remains 117 textual matches (116 constructors plus the
      shared helper definition).
 
+172. **Typed TSeq values through CFG-inlined file helpers (2026-08-29).**
+
+     File helpers that touch the DUT or synchronization state are CFG-inlined
+     instead of emitted as standalone pure functions. Their declared
+     `TSeq<Record>` and scalar `TSeq<T>` parameters and returns now resolve
+     through the same sequence decoder as the pure-helper and testbench-method
+     paths. Parameter locals, empty return slots, and inferred receiving locals
+     retain exact `RecordSeq`/`Seq` metadata; argument, return, annotation, and
+     direct-DUT-port mismatches fail during lowering. The registered fixture
+     forces both sequence helpers into the impure path with DUT reads, iterates
+     both returned values, and checks their sums under v1/TBIR trace parity.
+     No `unsupported(` constructor is retired, so the raw inventory stays at
+     117 textual matches (116 constructors plus the shared helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

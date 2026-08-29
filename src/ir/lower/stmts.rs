@@ -1560,6 +1560,21 @@ impl FuncBuilder<'_> {
             ) => Some(ty.clone()),
             _ => None,
         };
+        let helper_seq_ty = helper_seq_ty.or_else(|| {
+            let value = super::exprs::unparen_expr(value);
+            let ExprKind::Call { callee, .. } = &*value.kind else {
+                return None;
+            };
+            let ExprKind::Ident(name) = &*callee.kind else {
+                return None;
+            };
+            let entry = self.helpers.get(&name.name)?;
+            if entry.pure {
+                return None;
+            }
+            self.expr_type(&e)
+                .filter(|ty| matches!(ty, IrType::RecordSeq(_) | IrType::Seq(_)))
+        });
         // A `let` annotation must AGREE with a fixed-vector helper return,
         // not be laundered away by it (harc#745 Finding 1). Mirrors the
         // identical disagreement check the testbench-method vector-return
