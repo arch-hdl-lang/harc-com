@@ -9693,6 +9693,20 @@ former `transaction` group lives in
      v1/TBIR trace parity. This routes through shared aggregate fallbacks, so
      the raw unsupported inventory remains 117 textual matches.
 
+174. **Typed TSeq returns from dedicated transactor methods (2026-08-29).**
+
+     Unbound DUT-poking and bus-bound initiator transactor methods now resolve
+     `TSeq<Record>` and scalar `TSeq<T>` return declarations through the same
+     sequence decoder already used for their parameters. Method schemas,
+     aggregate-initialized return slots, inferred call destinations, and C++
+     `std::function` signatures therefore retain exact `RecordSeq`/`Seq`
+     metadata. Typed result annotations must match the method ABI, and scalar
+     expressions can no longer enter sequence return slots. The registered
+     fixture passes and iterates both sequence kinds under v1/TBIR trace
+     parity; a declaration-only control covers the bus-bound initiator path.
+     No `unsupported(` constructor is retired, so the raw inventory remains
+     117 textual matches (116 constructors plus the shared helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

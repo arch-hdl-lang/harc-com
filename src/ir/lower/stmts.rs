@@ -1339,11 +1339,42 @@ impl FuncBuilder<'_> {
         }
         // `let v = xact.method(...)` — a transactor call edge with a
         // result destination.
-        if let ExprKind::Call { callee, args } = &*value.kind {
+        let transactor_value = super::exprs::unparen_expr(value);
+        if let ExprKind::Call { callee, args } = &*transactor_value.kind {
             if let Some(call) = self.lower_transactor_call(callee, args, true)? {
                 let id = self.declare(&l.name.name);
                 if let Some(ty) = self.transactor_call_ret_ty(&call) {
-                    self.set_local_type(id, ty);
+                    if matches!(ty, IrType::RecordSeq(_) | IrType::Seq(_)) {
+                        if let Some(declared) = l.ty.as_ref().and_then(|declared| {
+                            super::helpers::tseq_ir_type(Some(declared), &self.ctx.record_ids)
+                        }) {
+                            if declared != ty {
+                                return Err(LowerError::Invalid(format!(
+                                    "`let {}` TSeq annotation does not match the transactor method return",
+                                    l.name.name
+                                )));
+                            }
+                        } else if l.ty.is_some() {
+                            return Err(LowerError::Invalid(format!(
+                                "`let {}` is declared with a non-TSeq type and initialised from a TSeq",
+                                l.name.name
+                            )));
+                        }
+                    }
+                    if let Some(declared) = declared_scalar_ty.clone() {
+                        if !component_method_result_compatible(&declared, &ty) {
+                            return Err(LowerError::Invalid(format!(
+                                "`let {}` type {declared:?} is incompatible with transactor method return {ty:?}",
+                                l.name.name
+                            )));
+                        }
+                        if let Some(width) = declared_width {
+                            self.let_widths.insert(id, width);
+                        }
+                        self.set_local_type(id, declared);
+                    } else {
+                        self.set_local_type(id, ty);
+                    }
                 }
                 self.push(Stmt::TransactorCall {
                     dest: Some(id),
@@ -7005,6 +7036,13 @@ fn component_method_result_compatible(expected: &IrType, actual: &IrType) -> boo
     }
     if expected == actual {
         return true;
+    }
+    let widthless = |ty: &IrType| matches!(ty, IrType::UInt(None) | IrType::SInt(None));
+    if widthless(expected) || widthless(actual) {
+        let scalar = |ty: &IrType| {
+            matches!(ty, IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::Unknown)
+        };
+        return scalar(expected) && scalar(actual);
     }
     match (expected, actual) {
         (IrType::UInt(Some(ew)), IrType::UInt(Some(aw)))

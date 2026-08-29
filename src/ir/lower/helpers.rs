@@ -846,6 +846,14 @@ impl FuncBuilder<'_> {
                 } else {
                     self.lower_expr_no_ports(e)?
                 };
+                if matches!(expected, IrType::RecordSeq(_) | IrType::Seq(_)) {
+                    let actual = self.expr_type(&ir).unwrap_or(IrType::Unknown);
+                    if actual != expected {
+                        return Err(LowerError::Invalid(format!(
+                            "method/helper return expects {expected:?}, got {actual:?}"
+                        )));
+                    }
+                }
                 if self.pure_helper_abi {
                     if self.record_id_of_expr(&ir).is_some() {
                         let construct = if matches!(expected, IrType::FixedVec { .. }) {
@@ -861,14 +869,6 @@ impl FuncBuilder<'_> {
                         ));
                     }
                     self.check_slot_ir(&ir, &expected, "pure-helper return")?;
-                    if matches!(expected, IrType::RecordSeq(_) | IrType::Seq(_)) {
-                        let actual = self.expr_type(&ir).unwrap_or(IrType::Unknown);
-                        if actual != expected {
-                            return Err(LowerError::Invalid(format!(
-                                "pure-helper return expects {expected:?}, got {actual:?}"
-                            )));
-                        }
-                    }
                 }
                 self.push(Stmt::Assign(ret, ir));
             }
