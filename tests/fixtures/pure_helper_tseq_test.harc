@@ -1,0 +1,61 @@
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    value : uint<8>
+end transaction Beat
+
+tseq MakeBeats() -> TSeq<Beat>
+    let a : Beat
+    a.value = 6
+    yield a
+    let b : Beat
+    b.value = 9
+    yield b
+end tseq MakeBeats
+
+tseq MakeNums() -> TSeq<uint<8>>
+    yield 2
+    yield 7
+end tseq MakeNums
+
+function echo_beats(items: TSeq<Beat>) -> TSeq<Beat>
+    return items
+end function echo_beats
+
+function echo_nums(items: TSeq<uint<8>>) -> TSeq<uint<8>>
+    return items
+end function echo_nums
+
+function twice_beats(items: TSeq<Beat>) -> TSeq<Beat>
+    let marker : uint<8> = 1
+    return echo_beats(echo_beats(items))
+end function twice_beats
+
+testbench PureHelperTseqTb
+    dut : Top
+end testbench PureHelperTseqTb
+
+impl PureHelperTseqTest for PureHelperTseqTb
+    clock clk = SysDomain
+    run
+        let beats = MakeBeats()
+        let echoed_beats = twice_beats(beats)
+        let beat_sum : uint<16> = 0
+        for beat in echoed_beats
+            beat_sum = beat_sum + beat.value
+        end for
+
+        let nums = MakeNums()
+        let echoed_nums = echo_nums(nums)
+        let num_sum : uint<16> = 0
+        for num in echoed_nums
+            num_sum = num_sum + num
+        end for
+
+        assert beat_sum == 15 else fail("beat sum ${beat_sum}")
+        assert num_sum == 9 else fail("num sum ${num_sum}")
+        wait 1 cycles
+    end run
+end impl PureHelperTseqTest

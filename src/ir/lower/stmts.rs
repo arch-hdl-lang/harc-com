@@ -1550,6 +1550,16 @@ impl FuncBuilder<'_> {
             ) => Some(ty.clone()),
             _ => None,
         };
+        let helper_seq_ty = match &e {
+            Expr::Call(
+                crate::ir::CallTarget::Helper {
+                    ret: ty @ (IrType::RecordSeq(_) | IrType::Seq(_)),
+                    ..
+                },
+                _,
+            ) => Some(ty.clone()),
+            _ => None,
+        };
         // A `let` annotation must AGREE with a fixed-vector helper return,
         // not be laundered away by it (harc#745 Finding 1). Mirrors the
         // identical disagreement check the testbench-method vector-return
@@ -1576,6 +1586,25 @@ impl FuncBuilder<'_> {
             } else if l.ty.is_some() {
                 return Err(LowerError::Invalid(format!(
                     "`let {}` is declared with a non-vector type and initialised from a fixed vector",
+                    l.name.name
+                )));
+            }
+        }
+        if let Some(ret) = &helper_seq_ty {
+            if let Some(declared) = l
+                .ty
+                .as_ref()
+                .and_then(|ty| super::helpers::tseq_ir_type(Some(ty), &self.ctx.record_ids))
+            {
+                if &declared != ret {
+                    return Err(LowerError::Invalid(format!(
+                        "`let {}` TSeq annotation does not match the helper return",
+                        l.name.name
+                    )));
+                }
+            } else if l.ty.is_some() {
+                return Err(LowerError::Invalid(format!(
+                    "`let {}` is declared with a non-TSeq type and initialised from a TSeq",
                     l.name.name
                 )));
             }
@@ -1662,6 +1691,7 @@ impl FuncBuilder<'_> {
         }
         if let Some(ty) = record_ty
             .or(helper_aggregate_ty)
+            .or(helper_seq_ty)
             .or(declared_scalar_ty)
             .or(wide_scalar_ty)
             .or(signed_scalar_ty)

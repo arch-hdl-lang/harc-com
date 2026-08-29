@@ -423,6 +423,11 @@ fn cover_scalar_type(ty: &IrType) -> bool {
 
 fn helper_abi_type_valid(ty: &IrType, record_count: usize) -> bool {
     match ty {
+        IrType::RecordSeq(record) => record.index() < record_count,
+        IrType::Seq(elem) => matches!(
+            elem.as_ref(),
+            IrType::UInt(_) | IrType::SInt(_) | IrType::Bool
+        ),
         IrType::FixedVec { elem, len } if *len != 0 => {
             helper_fixed_vec_elem_valid(elem, record_count)
         }
@@ -441,8 +446,8 @@ fn helper_fixed_vec_elem_valid(ty: &IrType, record_count: usize) -> bool {
 }
 
 fn cover_call_compatible(expected: &IrType, actual: &IrType) -> bool {
-    if matches!(expected, IrType::FixedVec { .. })
-        || matches!(actual, IrType::FixedVec { .. })
+    if matches!(expected, IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_))
+        || matches!(actual, IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_))
     {
         return expected == actual;
     }
@@ -585,7 +590,7 @@ fn check_cover_expr(
                 ),
                 Some(actual) if !helper_abi_type_valid(actual, prog.records.len()) => bad(
                     format!(
-                        "helper `{name}` return must use the scalar or fixed-vector ABI, got {actual:?}"
+                        "helper `{name}` return must use the scalar, fixed-vector, or TSeq ABI, got {actual:?}"
                     ),
                     errs,
                 ),
@@ -2572,10 +2577,9 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
     }
 
     // Pure helpers emit as file-scope C++ functions whose params and return
-    // use the scalar-or-one-dimensional-fixed-vector helper ABI. Internal
-    // record locals are permitted, but a pass must not drift a parameter's
-    // mirrored local type or route a bare record/nested vector through the
-    // signature/return slot.
+    // use the scalar, fixed-vector, or TSeq helper ABI. Internal record locals
+    // are permitted, but a pass must not drift a parameter's mirrored local
+    // type or route malformed aggregate metadata into emission.
     if func.kind == FunctionKind::Helper {
         if func.params.len() > func.locals.len() {
             errs.push(VerifyError::BadProgramRef {
@@ -2599,7 +2603,7 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
                 Some(local) if !helper_abi_type_valid(&local.ty, prog.records.len()) => {
                     errs.push(VerifyError::BadProgramRef {
                         what: format!(
-                            "fn{} helper `{}` param {} must use the scalar helper ABI or fixed-vector extension, got {:?}",
+                            "fn{} helper `{}` param {} must use the scalar, fixed-vector, or TSeq helper ABI, got {:?}",
                             fid.0, func.name, index, local.ty
                         ),
                     });
@@ -2612,7 +2616,7 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
                 Some(local) if !helper_abi_type_valid(&local.ty, prog.records.len()) => {
                     errs.push(VerifyError::BadProgramRef {
                         what: format!(
-                            "fn{} helper `{}` return %{} must use the scalar helper ABI or fixed-vector extension, got {:?}",
+                            "fn{} helper `{}` return %{} must use the scalar, fixed-vector, or TSeq helper ABI, got {:?}",
                             fid.0, func.name, ret.0, local.ty
                         ),
                     });
@@ -2624,6 +2628,20 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
                     ),
                 }),
                 _ => {}
+            }
+        }
+        for (index, local) in func.locals.iter().enumerate() {
+            if matches!(
+                local.ty,
+                IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_)
+            ) && !helper_abi_type_valid(&local.ty, prog.records.len())
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "fn{} helper `{}` local %{} has malformed aggregate type {:?}",
+                        fid.0, func.name, index, local.ty
+                    ),
+                });
             }
         }
     }

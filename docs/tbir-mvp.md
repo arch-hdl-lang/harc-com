@@ -9652,6 +9652,21 @@ former `transaction` group lives in
      at 117 textual matches (116 constructors plus the shared helper
      definition).
 
+171. **Typed TSeq values through pure helpers (2026-08-29).**
+
+     Standalone pure helpers now admit `TSeq<Record>` and scalar `TSeq<T>` in
+     their parameter and return ABI. Lowering carries exact `RecordSeq`/`Seq`
+     metadata through nested helper calls and inferred receiving locals;
+     verification checks the record id or scalar element type; and emission
+     renders the signature and default-initialized locals as `std::vector`.
+     Exact argument, return, and result-annotation mismatches are source-level
+     `Invalid` errors rather than post-lowering verifier failures. The
+     registered fixture composes record-sequence helpers, passes a scalar
+     sequence through a helper, iterates both results, and checks their sums
+     under v1/TBIR trace parity. No `unsupported(` constructor is retired, so
+     the raw inventory remains 117 textual matches (116 constructors plus the
+     shared helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

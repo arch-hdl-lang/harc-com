@@ -1257,14 +1257,14 @@ pub(super) fn emit_tseq(
     Ok(())
 }
 
-/// C++ scalar type for a pure-helper local (param, internal local, or
-/// return slot). Reuse the ordinary TBIR local mapping so helper ABIs keep
-/// both signedness and declared widths, including `_harc_u128` and
-/// `HarcWide<N>` values. A separate 64-bit-only helper mapping truncated
-/// wide arguments and returns before the helper body could observe them.
+/// C++ value type for a pure-helper local (param, internal local, or return
+/// slot). Reuse the ordinary scalar mapping and add the fixed/dynamic
+/// aggregate carriers so helper ABIs keep exact element types and widths.
 fn helper_local_cty(ty: &crate::ir::IrType, records: &[RecordSchema]) -> String {
     match ty {
         IrType::FixedVec { .. } => super::aggregate_value_cty(ty, records),
+        IrType::RecordSeq(record) => format!("std::vector<{}>", records[record.index()].name),
+        IrType::Seq(elem) => format!("std::vector<{}>", super::field_scalar_cty(elem)),
         _ => super::local_scalar_cty(ty),
     }
 }
@@ -1335,7 +1335,8 @@ pub(super) fn emit_helper_prototype(
 /// parameters (TB-IR convention), so they emit as parameters and are
 /// not re-declared in the body. Parameters, internal locals, and the
 /// return slot use the ordinary TBIR scalar mapping or the aggregate
-/// `std::array` carrier so their complete types survive the helper ABI.
+/// `std::array`/`std::vector` carriers so their complete types survive the
+/// helper ABI.
 pub(super) fn emit_helper_function(
     out: &mut String,
     prog: &TbProgram,
@@ -1380,7 +1381,7 @@ pub(super) fn emit_helper_function(
                 // type name before this hoisted declaration.
                 writeln!(out, "{INDENT}::{} {name}{{}}; (void){name};", schema.name).ok();
             }
-            IrType::FixedVec { .. } => {
+            IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_) => {
                 let cty = helper_local_cty(&local.ty, &prog.records);
                 writeln!(out, "{INDENT}{cty} {name}{{}}; (void){name};").ok();
             }
