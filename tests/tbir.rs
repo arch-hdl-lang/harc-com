@@ -22197,6 +22197,62 @@ fn uninitialized_tseq_locals_start_as_typed_empty_sequences() {
 }
 
 #[test]
+fn tseq_generators_assign_into_existing_typed_sequence_locals() {
+    let src = include_str!("fixtures/tseq_local_assignment_test.harc");
+
+    let prog = lower_src(src).expect("TSeq generator assignments lower");
+    verify::verify_program(&prog).expect("TSeq generator assignments verify");
+    let run = prog.function(prog.tests[0].run);
+    for (name, expected) in [
+        ("beats", ir::IrType::RecordSeq(ir::RecordId(0))),
+        (
+            "nums",
+            ir::IrType::Seq(Box::new(ir::IrType::UInt(Some(8)))),
+        ),
+    ] {
+        let local = run
+            .locals
+            .iter()
+            .position(|local| local.name == name)
+            .map(|index| ir::LocalId(index as u32))
+            .unwrap_or_else(|| panic!("missing `{name}` local"));
+        assert_eq!(run.locals[local.index()].ty, expected);
+        assert!(run.blocks.iter().flat_map(|block| &block.stmts).any(
+            |stmt| matches!(
+                stmt,
+                ir::Stmt::Assign(dest, ir::Expr::Call(ir::CallTarget::Tseq(_), _))
+                    if *dest == local
+            )
+        ));
+    }
+
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::vector<Beat> beats{};")
+            && cpp.contains("std::vector<uint64_t> nums{};")
+            && cpp.contains("beats = MakeBeats();")
+            && cpp.contains("nums = MakeNums();"),
+        "typed sequence assignments emit as vector-to-vector copies:\n{cpp}"
+    );
+
+    for (from, to) in [
+        ("beats = MakeBeats()", "beats = MakeNums()"),
+        ("nums = (MakeNums())", "nums = MakeBeats()"),
+    ] {
+        let mismatched = src.replace(from, to);
+        let error = lower_src(&mismatched).expect_err("mismatched TSeq assignment is invalid");
+        let message = assert_invalid(&error);
+        assert!(message.contains("but tseq"), "{message}");
+    }
+    let wrong_width = src.replace(
+        "let nums : TSeq<uint<8>>",
+        "let nums : TSeq<uint<16>>",
+    );
+    let error = lower_src(&wrong_width).expect_err("scalar TSeq width mismatch is invalid");
+    assert!(assert_invalid(&error).contains("but tseq"));
+}
+
+#[test]
 fn pure_helper_tseq_signatures_are_typed_end_to_end() {
     let src = include_str!("fixtures/pure_helper_tseq_test.harc");
     let prog = lower_src(src).expect("pure-helper TSeq signatures lower");
