@@ -17171,6 +17171,222 @@ end impl RecordVecPureHelperTest"#;
     );
 }
 
+/// harc#745 Finding 1: a `let` annotation on a fixed-vector helper-call
+/// RHS must be honoured, not laundered into the helper's aggregate return
+/// type. A scalar annotation disagrees with a fixed-vector return, so it is
+/// a program error under neither backend's model — rejected with a
+/// diagnostic, matching the identical check #734 added on the
+/// testbench-method vector-return path. Before the fix tbir declared a
+/// `std::array` local with NO diagnostic while v1 emitted `uint64_t x =
+/// echo_vec(...)`, which does not compile.
+#[test]
+fn fixed_vector_helper_return_scalar_annotation_is_rejected() {
+    let src = r#"function echo_vec(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
+    return values
+end function echo_vec
+
+testbench Tb
+    dut : Top
+    values : Vec<uint<8>, 2>
+end testbench Tb
+
+impl T for Tb
+    run
+        let x : uint<8> = echo_vec(values)
+        wait 1 cycle
+    end run
+end impl T"#;
+    let err = lower_src(src)
+        .expect_err("a scalar annotation cannot be laundered by a fixed-vector helper return");
+    assert!(
+        assert_invalid(&err).contains("helper return"),
+        "expected the disagreement to name the helper return; got {err}"
+    );
+}
+
+/// harc#745 Finding 1 (Repro B): a fixed-vector annotation of a DIFFERENT
+/// length must not be silently overwritten by the helper's own length.
+#[test]
+fn fixed_vector_helper_return_wrong_length_annotation_is_rejected() {
+    let src = r#"function echo_vec(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
+    return values
+end function echo_vec
+
+testbench Tb
+    dut : Top
+    values : Vec<uint<8>, 2>
+end testbench Tb
+
+impl T for Tb
+    run
+        let x : Vec<uint<8>, 4> = echo_vec(values)
+        wait 1 cycle
+    end run
+end impl T"#;
+    let err = lower_src(src)
+        .expect_err("a Vec<_, 4> annotation cannot take the helper's Vec<_, 2> length");
+    assert!(
+        assert_invalid(&err).contains("does not match the helper return"),
+        "{err}"
+    );
+}
+
+/// harc#745 Finding 1: the MATCHING annotation still lowers and emits the
+/// aggregate local — the disagreement check must not over-reject.
+#[test]
+fn matching_fixed_vector_helper_annotation_still_lowers() {
+    let src = r#"function echo_vec(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
+    return values
+end function echo_vec
+
+testbench Tb
+    dut : Top
+    values : Vec<uint<8>, 2>
+end testbench Tb
+
+impl T for Tb
+    run
+        let z : Vec<uint<8>, 2> = echo_vec(values)
+        wait 1 cycle
+    end run
+end impl T"#;
+    lower_src(src).expect("a matching fixed-vector annotation still lowers");
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::array<uint64_t, 2> z"),
+        "the matching annotation still declares the aggregate local; got:\n{cpp}"
+    );
+}
+
+/// harc#745 Finding 2: a fixed-vector-returning call in fixed-vector
+/// ARGUMENT position (`vec_matches(echo_vec(v), v)`) is composed into
+/// well-typed C++ by v1, so refusing it as `Invalid` violated the
+/// tbir-mvp rule that `Invalid` means no backend runs it in ANY reachable
+/// configuration. It is a tbir gap, not a program error — `Unsupported`,
+/// which honestly names `--codegen v1` as the working fallback.
+#[test]
+fn composed_fixed_vector_into_helper_arg_is_unsupported_not_invalid() {
+    let src = r#"function echo_vec(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
+    return values
+end function echo_vec
+
+function vec_matches(a: Vec<uint<8>, 2>, b: Vec<uint<8>, 2>) -> bool
+    return a == b
+end function vec_matches
+
+testbench Tb
+    dut : Top
+    values : Vec<uint<8>, 2>
+end testbench Tb
+
+impl T for Tb
+    run
+        assert vec_matches(echo_vec(values), values) else fail("x")
+        wait 1 cycle
+    end run
+end impl T"#;
+    let err = lower_src(src).expect_err("a composed fixed-vector arg is not yet supported");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("composed fixed-vector value"), "{msg}");
+}
+
+/// harc#745 Finding 2 (return position): `return echo_vec(v)` where the
+/// helper returns a fixed vector is likewise a v1-composable tbir gap, not
+/// an `Invalid` program error.
+#[test]
+fn composed_fixed_vector_helper_return_is_unsupported_not_invalid() {
+    let src = r#"function echo_vec(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
+    return values
+end function echo_vec
+
+function pass_through(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
+    return echo_vec(values)
+end function pass_through
+
+testbench Tb
+    dut : Top
+    values : Vec<uint<8>, 2>
+end testbench Tb
+
+impl T for Tb
+    run
+        let y : Vec<uint<8>, 2> = pass_through(values)
+        wait 1 cycle
+    end run
+end impl T"#;
+    let err = lower_src(src).expect_err("a composed fixed-vector return is not yet supported");
+    let msg = assert_unsupported(&err);
+    assert!(msg.contains("composed fixed-vector helper return"), "{msg}");
+}
+
+/// harc#745 Finding 2, honesty guard (independent review F1): the
+/// composition is reclassified to `Unsupported` ONLY when its shape
+/// matches the destination. A helper returning `Vec<_, 2>` composed into
+/// a `Vec<_, 4>` slot is a mismatch v1 ALSO fails to compile, so pointing
+/// the user at `--codegen v1` would be dishonest — it must stay `Invalid`.
+#[test]
+fn shape_mismatched_composed_fixed_vector_stays_invalid() {
+    let src = r#"function echo2(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
+    return values
+end function echo2
+
+function widen(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 4>
+    return echo2(values)
+end function widen
+
+testbench Tb
+    dut : Top
+    values : Vec<uint<8>, 2>
+end testbench Tb
+
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#;
+    let err = lower_src(src).expect_err("a Vec<_,2> call cannot satisfy a Vec<_,4> return");
+    // Invalid, NOT Unsupported: v1 cannot compile this either.
+    assert_invalid(&err);
+}
+
+/// harc#745 Finding 2, premise verification (independent review F2): the
+/// choice of `Unsupported` over `NotImplemented` is only honest if v1
+/// actually compiles the matched composition. Assert v1 emits C++ for it
+/// (the reachable proxy the parity harness uses), so the "v1 is the
+/// working fallback" claim is tested, not asserted by comment.
+#[test]
+fn v1_composes_the_matched_fixed_vector_arg_that_tbir_defers() {
+    let src = r#"function echo_vec(values: Vec<uint<8>, 2>) -> Vec<uint<8>, 2>
+    return values
+end function echo_vec
+
+function vec_matches(a: Vec<uint<8>, 2>, b: Vec<uint<8>, 2>) -> bool
+    return a == b
+end function vec_matches
+
+testbench Tb
+    dut : Top
+    values : Vec<uint<8>, 2>
+end testbench Tb
+
+impl T for Tb
+    run
+        assert vec_matches(echo_vec(values), values) else fail("x")
+        wait 1 cycle
+    end run
+end impl T"#;
+    // tbir defers it as Unsupported (pointing at v1)...
+    let msg = assert_unsupported(&lower_src(src).expect_err("tbir defers the composition"));
+    assert!(msg.contains("--codegen v1"), "{msg}");
+    // ...and v1 genuinely emits it — the composed call is present verbatim,
+    // so the fallback the diagnostic promises actually exists.
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the composition");
+    assert!(
+        v1.contains("vec_matches(echo_vec(_tb.values), _tb.values)"),
+        "v1 must compose the nested helper calls (std::array into std::array); got:\n{v1}"
+    );
+}
+
 #[test]
 fn helper_call_with_dut_access_is_unsupported() {
     let src = r#"

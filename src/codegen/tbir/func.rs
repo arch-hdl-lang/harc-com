@@ -3460,6 +3460,13 @@ fn flow_hook_capture_name(func: &TbFunction, local: LocalId) -> String {
 /// bakes its (single) instance name into the shared body, so it keeps the
 /// plain arg-only signature even when it carries state; a stateless type
 /// has no per-instance struct at all.
+///
+/// Paired with the verifier's receiver-storage guard in
+/// `ir::verify` (the `requires_state_storage` predicate over
+/// `tb.transactor_fields`). That guard is intentionally the WEAKER of the
+/// two (`!state_fields.is_empty()`, without the `bound_bus` clause): it must
+/// never reject a program this ABI would emit. If this predicate ever
+/// changes which transactors get a receiver, update that guard in lockstep.
 pub(super) fn uses_state_receiver(schema: &TransactorSchema) -> bool {
     !schema.state_fields.is_empty() && schema.bound_bus.is_none()
 }
