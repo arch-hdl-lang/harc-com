@@ -923,13 +923,19 @@ impl super::FuncBuilder<'_> {
         } else {
             (1u64 << reg.width) - 1
         };
-        let masked = bin(BinOp::BitAnd, v, lit(mask));
         // When the binding has any per-register `on regs.REG` write
         // callback, route through `RecordWriteCb` (recursion-depth guard +
         // callback dispatch) — even for a register without its OWN callback,
         // so its mirror write is depth-counted consistently with v1 (which
         // wraps the whole decode chain in one guard). A binding with no
         // callbacks keeps the plain mirror write (prior behavior).
+        //
+        // The callback sees the RAW value while the mirror stores `value &
+        // mask` — matching v1 and the runtime `RecordWrite` path (the
+        // masking happens in emission, not here), so a write wider than the
+        // register width delivers the same callback argument on the const
+        // and runtime address paths. See ral-support.md: the handler body
+        // "sees the written `data`".
         if let Some(cbs) = self.ctx.regblock_callbacks.get(&binding) {
             let callback = cbs.iter().find(|(r, _)| *r == reg.name).map(|(_, f)| *f);
             self.push(Stmt::RecordWriteCb {
@@ -937,7 +943,8 @@ impl super::FuncBuilder<'_> {
                 binding: binding.clone(),
                 field: reg.name.clone(),
                 offset: reg.offset,
-                value: masked,
+                value: v,
+                mask,
                 callback,
             });
             return Ok(true);
@@ -948,7 +955,7 @@ impl super::FuncBuilder<'_> {
             path: Vec::new(),
             mid_indices: Vec::new(),
             index: None,
-            value: masked,
+            value: bin(BinOp::BitAnd, v, lit(mask)),
         });
         Ok(true)
     }

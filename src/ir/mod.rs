@@ -2217,8 +2217,14 @@ pub enum Stmt {
         /// The const-decoded register byte offset — used verbatim in the
         /// recursion-guard FATAL message so it matches v1's `at addr 0x..`.
         offset: u64,
-        /// Masked observed value to store in the mirror cell.
+        /// The RAW (unmasked) observed value. The mirror cell stores
+        /// `value & mask`, but the callback fires with the unmasked value —
+        /// matching v1 (`cpp_tb.rs` `try_emit_record_write`) and the runtime
+        /// `RecordWrite` path, both of which mask only the mirror store.
         value: Expr,
+        /// Bit mask for the register width, applied to the mirror store only
+        /// (`u64::MAX` for a width >= 64).
+        mask: u64,
         /// Callback for this register, fired after the mirror update.
         /// `None` when only other registers in the binding carry callbacks.
         callback: Option<FunctionId>,
