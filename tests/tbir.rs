@@ -16803,7 +16803,7 @@ end test PureHelperTest
         errs.iter().any(|err| matches!(
             err,
             verify::VerifyError::BadProgramRef { what }
-                if what.contains("param 0 must use the scalar helper ABI")
+                if what.contains("param 0 must use the scalar, fixed-vector, or TSeq helper ABI")
         )),
         "{errs:?}"
     );
@@ -16821,7 +16821,7 @@ end test PureHelperTest
         errs.iter().any(|err| matches!(
             err,
             verify::VerifyError::BadProgramRef { what }
-                if what.contains("return") && what.contains("scalar helper ABI")
+                if what.contains("return") && what.contains("scalar, fixed-vector, or TSeq helper ABI")
         )),
         "{errs:?}"
     );
@@ -21969,6 +21969,105 @@ fn testbench_method_tseq_signatures_are_typed_end_to_end() {
         &lower_src(&port_return)
             .expect_err("a scalar DUT port cannot satisfy a TSeq method return"),
     );
+}
+
+#[test]
+fn pure_helper_tseq_signatures_are_typed_end_to_end() {
+    let src = include_str!("fixtures/pure_helper_tseq_test.harc");
+    let prog = lower_src(src).expect("pure-helper TSeq signatures lower");
+    verify::verify_program(&prog).expect("pure-helper TSeq signatures verify");
+    let helpers: Vec<_> = prog
+        .functions
+        .iter()
+        .filter(|function| function.kind == ir::FunctionKind::Helper)
+        .collect();
+    assert!(helpers.iter().any(|function| {
+        matches!(
+            function.params.first().map(|param| &param.ty),
+            Some(ir::IrType::RecordSeq(ir::RecordId(0)))
+        ) && function
+            .ret
+            .is_some_and(|ret| matches!(function.locals[ret.index()].ty, ir::IrType::RecordSeq(ir::RecordId(0))))
+    }));
+    assert!(helpers.iter().any(|function| {
+        matches!(
+            function.params.first().map(|param| &param.ty),
+            Some(ir::IrType::Seq(elem)) if matches!(elem.as_ref(), ir::IrType::UInt(Some(8)))
+        )
+    }));
+    let run = prog.function(prog.tests[0].run);
+    assert!(run.locals.iter().any(|local| matches!(local.ty, ir::IrType::RecordSeq(_))));
+    assert!(run.locals.iter().any(|local| matches!(local.ty, ir::IrType::Seq(_))));
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("static std::vector<Beat> harc_helper_echo_beats(std::vector<Beat> items)")
+            && cpp.contains("static std::vector<uint64_t> harc_helper_echo_nums(std::vector<uint64_t> items)"),
+        "pure-helper sequence ABI must use vectors:\n{cpp}"
+    );
+    let record_helper = prog
+        .functions
+        .iter()
+        .position(|function| {
+            function.kind == ir::FunctionKind::Helper
+                && matches!(
+                    function.params.first().map(|param| &param.ty),
+                    Some(ir::IrType::RecordSeq(_))
+                )
+        })
+        .expect("record-sequence helper");
+    let mut corrupt = prog.clone();
+    corrupt.functions[record_helper].params[0].ty = ir::IrType::RecordSeq(ir::RecordId(999));
+    corrupt.functions[record_helper].locals[0].ty = ir::IrType::RecordSeq(ir::RecordId(999));
+    assert!(verify::verify_program(&corrupt).is_err());
+
+    let scalar_helper = prog
+        .functions
+        .iter()
+        .position(|function| {
+            function.kind == ir::FunctionKind::Helper
+                && matches!(function.params.first().map(|param| &param.ty), Some(ir::IrType::Seq(_)))
+        })
+        .expect("scalar-sequence helper");
+    let mut corrupt = prog.clone();
+    let bad = ir::IrType::Seq(Box::new(ir::IrType::Record(ir::RecordId(0))));
+    corrupt.functions[scalar_helper].params[0].ty = bad.clone();
+    corrupt.functions[scalar_helper].locals[0].ty = bad;
+    assert!(verify::verify_program(&corrupt).is_err());
+
+    let internal_helper = prog
+        .functions
+        .iter()
+        .position(|function| function.name == "twice_beats")
+        .expect("helper with an internal scalar local");
+    let internal_local = prog.functions[internal_helper]
+        .locals
+        .iter()
+        .position(|local| local.name == "marker")
+        .expect("internal marker local");
+    let mut corrupt = prog.clone();
+    corrupt.functions[internal_helper].locals[internal_local].ty =
+        ir::IrType::RecordSeq(ir::RecordId(999));
+    let errors = verify::verify_program(&corrupt)
+        .expect_err("malformed internal helper sequence metadata is rejected");
+    assert!(errors.iter().any(|error| error
+        .to_string()
+        .contains("malformed aggregate type")));
+
+    let bad_param = src.replace(
+        "function echo_nums(items: TSeq<uint<8>>) -> TSeq<uint<8>>",
+        "function echo_nums(items: TSeq<sint<8>>) -> TSeq<sint<8>>",
+    );
+    assert_invalid(&lower_src(&bad_param).expect_err("sequence argument mismatch is invalid"));
+    let bad_return = src.replace(
+        "function echo_beats(items: TSeq<Beat>) -> TSeq<Beat>",
+        "function echo_beats(items: TSeq<Beat>) -> TSeq<uint<8>>",
+    );
+    assert_invalid(&lower_src(&bad_return).expect_err("sequence return mismatch is invalid"));
+    let bad_annotation = src.replace(
+        "let echoed_nums = echo_nums(nums)",
+        "let echoed_nums : TSeq<sint<8>> = echo_nums(nums)",
+    );
+    assert_invalid(&lower_src(&bad_annotation).expect_err("sequence annotation mismatch is invalid"));
 }
 
 #[test]

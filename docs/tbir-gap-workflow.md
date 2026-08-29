@@ -374,6 +374,13 @@ not applicable before requesting review:
    divergence 114 without removing an `unsupported(` constructor, so the raw
    inventory remains 117 textual matches (116 constructors plus the helper
    definition).
+   Standalone pure helpers now use the same exact sequence decoder for
+   `TSeq<Record>` and scalar `TSeq<T>` parameters and returns. Their C++ ABI
+   uses `std::vector`, calls and inferred result locals retain the IR sequence
+   type, and verifier checks reject malformed sequence signatures. This closes
+   a typed ABI gap without removing an `unsupported(` constructor, so the raw
+   inventory remains 117 textual matches (116 constructors plus the helper
+   definition).
    Nested fixed-vector pure-helper signatures remove that helper-specific
    fence and recursively validate/render the already-carried aggregate type;
    the testbench-method and transactor signature fences remain, so this slice

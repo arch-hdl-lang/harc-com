@@ -831,6 +831,14 @@ impl FuncBuilder<'_> {
                         ));
                     }
                     self.check_slot_ir(&ir, &expected, "pure-helper return")?;
+                    if matches!(expected, IrType::RecordSeq(_) | IrType::Seq(_)) {
+                        let actual = self.expr_type(&ir).unwrap_or(IrType::Unknown);
+                        if actual != expected {
+                            return Err(LowerError::Invalid(format!(
+                                "pure-helper return expects {expected:?}, got {actual:?}"
+                            )));
+                        }
+                    }
                 }
                 self.push(Stmt::Assign(ret, ir));
             }
@@ -973,6 +981,9 @@ fn pure_helper_signature_type(
     ty: Option<&TypeExpr>,
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<IrType, LowerError> {
+    if let Some(seq) = tseq_ir_type(ty, record_ids) {
+        return Ok(seq);
+    }
     if let Some(fixed @ IrType::FixedVec { .. }) = ty.and_then(|ty| {
         super::components::fixed_vec_ir_type_with_records(ty, record_ids)
     }) {
