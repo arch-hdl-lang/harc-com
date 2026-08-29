@@ -124,6 +124,9 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Recursive fixed-vector parameters and returns through CFG-inlined file
   helpers that touch the DUT or synchronization state, including exact
   argument, return-slot, inferred-result, and verifier metadata.
+- [x] Record and scalar `TSeq<T>` returns through unbound and bus-bound
+  initiator transactor methods, including exact call-result annotations and
+  return-expression validation.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -445,6 +448,13 @@ not applicable before requesting review:
    This routes around the shared constant-expression constructor, so the raw
    inventory remains 117 textual matches (116 constructors plus the helper
    definition).
+   Dedicated transactor methods now resolve record and scalar `TSeq<T>`
+   returns through the same sequence ABI already used for their parameters.
+   Method schemas, return slots, inferred call destinations, and emitted
+   `std::vector` signatures retain the exact element type; incompatible result
+   annotations and scalar return expressions fail during lowering. This
+   routes through shared aggregate paths, so the raw inventory remains 117
+   textual matches (116 constructors plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

@@ -1,0 +1,67 @@
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+transaction Beat
+    value : uint<8>
+end transaction Beat
+
+tseq MakeBeats() -> TSeq<Beat>
+    let a : Beat
+    a.value = 4
+    yield a
+    let b : Beat
+    b.value = 7
+    yield b
+end tseq MakeBeats
+
+tseq MakeNums() -> TSeq<uint<8>>
+    yield 3
+    yield 5
+end tseq MakeNums
+
+transactor TseqEcho
+    dut : Top
+
+    when active
+        hookable echo_beats(items: TSeq<Beat>) -> TSeq<Beat>
+            dut.en = 1
+            wait 1 cycle
+            return items
+        end echo_beats
+
+        hookable echo_nums(items: TSeq<uint<8>>) -> TSeq<uint<8>>
+            return items
+        end echo_nums
+    end when
+end transactor TseqEcho
+
+testbench TransactorTseqReturnTb
+    dut : Top
+    echo : TseqEcho active
+end testbench TransactorTseqReturnTb
+
+impl TransactorTseqReturnTest for TransactorTseqReturnTb
+    clock clk = SysDomain
+    run
+        echo.dut = dut
+
+        let beats = MakeBeats()
+        let echoed_beats = echo.echo_beats(beats)
+        let beat_sum : uint<16> = 0
+        for beat in echoed_beats
+            beat_sum = beat_sum + beat.value
+        end for
+
+        let nums = MakeNums()
+        let echoed_nums = echo.echo_nums(nums)
+        let num_sum : uint<16> = 0
+        for num in echoed_nums
+            num_sum = num_sum + num
+        end for
+
+        assert beat_sum == 11 else fail("beat sum ${beat_sum}")
+        assert num_sum == 8 else fail("num sum ${num_sum}")
+        assert dut.en == 1 else fail("transactor sequence method did not run")
+    end run
+end impl TransactorTseqReturnTest

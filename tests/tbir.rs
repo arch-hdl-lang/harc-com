@@ -18426,6 +18426,136 @@ end impl BoundVecTest"#;
 }
 
 #[test]
+fn transactor_tseq_returns_are_typed_end_to_end() {
+    let src = fixture("transactor_tseq_return_test.harc");
+    let prog = lower_src(&src).expect("TSeq transactor method returns lower");
+    verify::verify_program(&prog).expect("TSeq transactor method returns verify");
+
+    let record_seq = ir::IrType::RecordSeq(ir::RecordId(0));
+    let scalar_seq = ir::IrType::Seq(Box::new(ir::IrType::UInt(Some(8))));
+    let schema = prog
+        .transactors
+        .iter()
+        .find(|schema| schema.name == "TseqEcho")
+        .expect("TseqEcho schema");
+    for (name, expected) in [
+        ("echo_beats", record_seq.clone()),
+        ("echo_nums", scalar_seq.clone()),
+    ] {
+        let method = schema.method(name).expect("method schema");
+        assert_eq!(method.param_tys, vec![expected.clone()]);
+        assert_eq!(method.ret_ty, Some(expected.clone()));
+        let function = prog.function(method.function);
+        assert_eq!(function.params[0].ty, expected);
+        assert_eq!(
+            function.ret.map(|ret| function.locals[ret.index()].ty.clone()),
+            Some(function.params[0].ty.clone())
+        );
+    }
+
+    let run = prog.function(prog.tests[0].run);
+    for (name, expected) in [
+        ("echoed_beats", record_seq.clone()),
+        ("echoed_nums", scalar_seq.clone()),
+    ] {
+        assert_eq!(
+            run.locals
+                .iter()
+                .find(|local| local.name == name)
+                .map(|local| local.ty.clone()),
+            Some(expected),
+            "unannotated transactor result `{name}` inherits the sequence ABI"
+        );
+    }
+
+    let cpp = emit_cpp_src(&src);
+    assert!(
+        cpp.contains("std::function<std::vector<Beat>(std::vector<Beat>)> TseqEcho_echo_beats;")
+            && cpp.contains("std::function<std::vector<uint64_t>(std::vector<uint64_t>)> TseqEcho_echo_nums;"),
+        "transactor method ABI must retain both sequence carriers:\n{cpp}"
+    );
+
+    let mismatched = src.replace(
+        "let echoed_beats = echo.echo_beats(beats)",
+        "let echoed_beats : TSeq<uint<8>> = echo.echo_beats(beats)",
+    );
+    assert_invalid(
+        &lower_src(&mismatched).expect_err("mismatched TSeq result annotation is invalid"),
+    );
+
+    for declaration in [
+        "let echoed_nums = (echo.echo_nums(nums))",
+        "let echoed_nums : TSeq<uint<8>> = (echo.echo_nums(nums))",
+    ] {
+        let parenthesized = src.replace(
+            "let echoed_nums = echo.echo_nums(nums)",
+            declaration,
+        );
+        let parenthesized = lower_src(&parenthesized)
+            .unwrap_or_else(|error| panic!("parenthesized sequence result lowers: {error:?}"));
+        verify::verify_program(&parenthesized)
+            .expect("parenthesized sequence result retains valid metadata");
+        let run = parenthesized.function(parenthesized.tests[0].run);
+        assert!(matches!(
+            run.locals
+                .iter()
+                .find(|local| local.name == "echoed_nums")
+                .map(|local| &local.ty),
+            Some(ir::IrType::Seq(elem))
+                if matches!(elem.as_ref(), ir::IrType::UInt(Some(8)))
+        ));
+    }
+    let mismatched_parenthesized = src.replace(
+        "let echoed_nums = echo.echo_nums(nums)",
+        "let echoed_nums : TSeq<sint<8>> = (echo.echo_nums(nums))",
+    );
+    assert_invalid(
+        &lower_src(&mismatched_parenthesized)
+            .expect_err("mismatched parenthesized TSeq annotation is invalid"),
+    );
+
+    let bad_return = src.replace(
+        "return items\n        end echo_nums",
+        "return dut.count_out\n        end echo_nums",
+    );
+    assert_invalid(
+        &lower_src(&bad_return)
+            .expect_err("a scalar DUT port cannot satisfy a TSeq transactor return"),
+    );
+
+    let bound = r#"use BusAxiLite
+transaction Beat
+    value : uint<8>
+end transaction Beat
+transactor BoundTseqEcho bound to BusAxiLite
+    when active
+        hookable echo(items: TSeq<Beat>) -> TSeq<Beat>
+            return items
+        end echo
+    end when
+end transactor BoundTseqEcho
+testbench BoundTb
+    dut : AxiLiteRegs
+end testbench BoundTb
+impl BoundTest for BoundTb
+    run
+        wait 1 cycle
+    end run
+end impl BoundTest"#;
+    let bound = lower_with_stdlib_bus_src(bound)
+        .expect("bound-initiator TSeq return declaration lowers");
+    verify::verify_program(&bound).expect("bound-initiator TSeq return verifies");
+    assert!(bound.transactors.iter().any(|schema| {
+        schema.name == "BoundTseqEcho"
+            && schema.methods.iter().any(|method| {
+                method.name == "echo"
+                    && method.param_tys == vec![ir::IrType::RecordSeq(ir::RecordId(0))]
+                    && method.ret_ty == Some(ir::IrType::RecordSeq(ir::RecordId(0)))
+            })
+    }));
+}
+
+#[test]
 fn expression_transactor_results_retain_type_and_allow_widening() {
     let direct = r#"
 transactor SignedDriver
@@ -18483,6 +18613,57 @@ end impl SignedTest
     );
     let prog = lower_src(&widening).expect("widening method assignment lowers");
     verify::verify_program(&prog).expect("widening method assignment verifies");
+
+    let parenthesized_widening = direct.replace(
+        "assert drv.negative() < 0\n        assert drv.is_negative()",
+        "let value : sint<16> = (drv.negative())\n        assert value < 0",
+    );
+    let prog = lower_src(&parenthesized_widening)
+        .expect("parenthesized widening method result lowers");
+    verify::verify_program(&prog).expect("parenthesized widening method result verifies");
+    let run = prog.function(prog.tests[0].run);
+    assert_eq!(
+        run.locals
+            .iter()
+            .find(|local| local.name == "value")
+            .map(|local| local.ty.clone()),
+        Some(ir::IrType::SInt(Some(16))),
+        "the receiving local keeps its compatible explicit width"
+    );
+
+    for expression in ["drv.negative()", "(drv.negative())"] {
+        let widthless_annotated = direct.replace(
+            "assert drv.negative() < 0\n        assert drv.is_negative()",
+            &format!("let value : sint = {expression}\n        assert value < 0"),
+        );
+        let prog = lower_src(&widthless_annotated)
+            .unwrap_or_else(|error| panic!("widthless `{expression}` result lowers: {error:?}"));
+        verify::verify_program(&prog).expect("widthless annotated result verifies");
+        let run = prog.function(prog.tests[0].run);
+        assert_eq!(
+            run.locals
+                .iter()
+                .find(|local| local.name == "value")
+                .map(|local| local.ty.clone()),
+            Some(ir::IrType::SInt(None)),
+            "widthless annotation is preserved for `{expression}`"
+        );
+    }
+    let widthless_bool = direct.replace(
+        "assert drv.negative() < 0\n        assert drv.is_negative()",
+        "let value : uint = (drv.is_negative())\n        assert value",
+    );
+    let prog = lower_src(&widthless_bool).expect("bool result widens into widthless uint");
+    verify::verify_program(&prog).expect("widthless uint from bool verifies");
+    let run = prog.function(prog.tests[0].run);
+    assert_eq!(
+        run.locals
+            .iter()
+            .find(|local| local.name == "value")
+            .map(|local| local.ty.clone()),
+        Some(ir::IrType::UInt(None)),
+        "the widthless uint annotation is retained for a bool result"
+    );
 
     let widthless = direct
         .replace("negative() -> sint<8>", "negative() -> int")

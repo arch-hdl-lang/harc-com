@@ -2062,9 +2062,9 @@ fn check_method_return_ty(
 }
 
 /// Resolve a transactor method return through the aggregate-aware parameter
-/// path. Fixed vectors are by-value `std::array` results, including recursive
-/// nested arrays now that whole-vector copies classify nested element
-/// carriers. All other spellings retain the scalar gate.
+/// path. `TSeq<T>` and fixed vectors are by-value aggregate results, matching
+/// the parameter ABI and the component/testbench method resolvers. All other
+/// spellings retain the scalar gate.
 fn method_return_ir_type(
     tname: &str,
     mname: &str,
@@ -2075,6 +2075,9 @@ fn method_return_ir_type(
     let Some(ty) = ty else {
         return Ok(None);
     };
+    if let Some(seq) = super::helpers::tseq_ir_type(Some(ty), record_ids) {
+        return Ok(Some(seq));
+    }
     if let Some(fixed @ IrType::FixedVec { .. }) =
         super::components::fixed_vec_ir_type_with_records(ty, record_ids)
     {
