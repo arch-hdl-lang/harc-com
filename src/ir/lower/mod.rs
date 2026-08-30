@@ -4017,14 +4017,11 @@ fn lower_test(
                         false
                     }
                     _ => {
-                        return Err(unsupported(
-                            &format!(
-                                "bound-to event-driven transactor instance `let {} : {simple}` \
-                                 without an `active`/`passive` mode",
-                                l.name.name
-                            ),
-                            "annotate the instance `active` (driver) or `passive` (monitor)",
-                        ));
+                        return Err(LowerError::Invalid(format!(
+                            "bound-to event-driven transactor instance `let {} : {simple}` \
+                             needs an `active`/`passive` mode annotation",
+                            l.name.name
+                        )));
                     }
                 };
                 // RHS must be a bare bus-binding identifier.
@@ -4223,14 +4220,11 @@ fn lower_test(
                             ));
                         }
                         _ => {
-                            return Err(unsupported(
-                                &format!(
-                                    "DUT-poking transactor instance `let {} : {simple}` without \
-                                     an `active`/`passive` mode",
-                                    l.name.name
-                                ),
-                                "annotate the instance `active`",
-                            ));
+                            return Err(LowerError::Invalid(format!(
+                                "DUT-poking transactor instance `let {} : {simple}` needs an \
+                                 `active`/`passive` mode annotation",
+                                l.name.name
+                            )));
                         }
                     }
                 }
@@ -4299,14 +4293,11 @@ fn lower_test(
                         ));
                     }
                     _ => {
-                        return Err(unsupported(
-                            &format!(
-                                "transactor instance `let {} : {simple}` without an \
-                                 `active`/`passive` mode",
-                                l.name.name
-                            ),
-                            "",
-                        ));
+                        return Err(LowerError::Invalid(format!(
+                            "transactor instance `let {} : {simple}` needs an \
+                             `active`/`passive` mode annotation",
+                            l.name.name
+                        )));
                     }
                 }
                 let xid = ir::TransactorId(

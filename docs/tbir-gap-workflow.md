@@ -137,6 +137,8 @@ family of rejections over a one-site exception. Current implementation order:
   actor's concrete state receiver while emitting the shared responder body.
 - [x] Malformed component declarations and member uses report `Invalid`
   directly instead of advertising v1 as a TBIR escape hatch.
+- [x] Missing `active`/`passive` annotations at every test-scope transactor
+  declaration surface report `Invalid`, matching v1's source error.
 
 This list intentionally excludes v1 failures such as a blocking bus call
 nested in an expression. Those may still be useful TB-IR enhancements, but
@@ -144,7 +146,7 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 109 remaining constructor call sites (110 textual matches including
+Treat the 106 remaining constructor call sites (107 textual matches including
 the `unsupported` helper definition) as an inventory, not 116 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,

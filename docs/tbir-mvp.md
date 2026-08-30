@@ -9796,6 +9796,15 @@ former `transaction` group lives in
      vectors, untyped queues, and duplicate watchdogs deliberately retain
      `Unsupported`: v1 emits those shapes, so the escape hatch is measurable.
 
+182. **Missing test-scope transactor modes are source errors (2026-08-29).**
+
+     All three remaining test-scope declaration paths now agree with v1 that
+     a test-scope transactor instance needs an explicit `active` or `passive`
+     annotation: bound event-driven components, DUT-poking componentized BFMs,
+     and ordinary unbound transactors. Their old escape-hatch diagnostics are
+     now source-level `Invalid` errors, leaving 107 textual `unsupported(`
+     matches (106 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
