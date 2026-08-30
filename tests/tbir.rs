@@ -45464,3 +45464,116 @@ end test T"#;
         "{msg}"
     );
 }
+
+/// Explicitly passive unbound transactors retain their always-on state at
+/// every declaration surface. Only the `when active` method surface is
+/// removed, and call-site validation reports that distinction.
+#[test]
+fn passive_unbound_transactors_keep_state_and_hide_active_only_methods() {
+    let poker = r#"transactor Poker
+    dut : Top
+    count : uint<32> default 7
+    when active
+        hookable poke()
+            count = count + 1
+        end poke
+    end when
+end transactor Poker
+
+env Holder
+    p : Poker active
+end env Holder
+"#;
+
+    let cases = [
+        (
+            "testbench field",
+            format!(
+                r#"{poker}
+testbench Tb
+    dut : Top
+    p : Poker passive
+end testbench Tb
+impl T for Tb
+    run
+        assert p.count == 7
+        wait 1 cycle
+    end run
+end impl T"#
+            ),
+        ),
+        (
+            "test-scope component",
+            format!(
+                r#"{poker}
+test T
+    let dut : Top
+    let p : Poker passive
+    run
+        assert p.count == 7
+        wait 1 cycle
+    end run
+end test T"#
+            ),
+        ),
+        (
+            "test-scope plain transactor",
+            r#"transactor Plain
+    dut : Top
+    count : uint<32> default 7
+    when active
+        hookable poke()
+            count = count + 1
+        end poke
+    end when
+end transactor Plain
+test T
+    let dut : Top
+    let p : Plain passive
+    run
+        assert p.count == 7
+        wait 1 cycle
+    end run
+end test T"#
+                .to_string(),
+        ),
+    ];
+
+    for (what, src) in &cases {
+        cpp_tb::emit(&merged_src(src))
+            .unwrap_or_else(|e| panic!("v1 must emit {what}: {e}"));
+        let prog = lower_src(src).unwrap_or_else(|e| panic!("TBIR must lower {what}: {e}"));
+        verify::verify_program(&prog)
+            .unwrap_or_else(|e| panic!("TBIR must verify {what}: {e:?}"));
+        let cpp = tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
+            .unwrap_or_else(|e| panic!("TBIR must emit {what}: {e}"));
+        assert!(
+            cpp.contains("uint64_t count = 7;")
+                && cpp.contains("if (!((p.count == 7)))"),
+            "{what}: emitted code must retain the state default and assertion read: {cpp}"
+        );
+        let storage = if *what == "test-scope plain transactor" {
+            "_Plain_state p;"
+        } else {
+            "Poker p;"
+        };
+        assert!(cpp.contains(storage), "{what}: missing state owner `{storage}`: {cpp}");
+    }
+
+    for (what, src) in &cases {
+        let active_call = src.replace("assert p.count == 7", "p.poke()");
+        let err = lower_src(&active_call)
+            .expect_err("a passive instance must not expose an active-only method");
+        let msg = assert_invalid(&err);
+        assert!(
+            msg.contains("poke")
+                && msg.contains("passive")
+                && if *what == "test-scope plain transactor" {
+                    msg.contains("declared inside `when active`")
+                } else {
+                    msg.contains("active-only")
+                },
+            "{what}: {msg}"
+        );
+    }
+}
