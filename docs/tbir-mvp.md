@@ -9751,6 +9751,23 @@ former `transaction` group lives in
      the raw inventory is 118 textual matches (117 constructors plus the
      helper definition).
 
+178. **Component result type errors stop advertising v1 (2026-08-29).**
+
+     A component-method result entering an explicitly typed local now reports
+     `Invalid` when the assignment narrows, crosses the scalar/record boundary,
+     or names a different record identity. Initializer and later-assignment
+     spellings share the same source-type rule; successful widening paths are
+     unchanged. This reclassifies one shared `unsupported(` constructor.
+
+179. **Transactor DUT bind errors stop advertising v1 (2026-08-29).**
+
+     The erased static bind is valid only as `<instance>.<declared DUT field> =
+     <test DUT>`. A different member name or a non-DUT value is a source
+     member/type error under every backend and now reports `Invalid`, with the
+     expected bind field named in the diagnostic. Two false escape-hatch
+     constructors are removed, leaving 116 textual `unsupported(` matches
+     (115 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

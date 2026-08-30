@@ -23226,11 +23226,20 @@ fn transactor_call_resolution_is_checked() {
 
 /// The DUT bind statement is validated: the target must be the
 /// transactor's module-typed field and the value must be the test DUT.
+/// Violating either side is a source type/member error under every backend,
+/// not a missing TBIR feature that should advertise v1 as an escape hatch.
 #[test]
 fn transactor_dut_bind_is_validated() {
     let src = XACTOR_SRC.replace("xt.dut = dut", "xt.dut = 5");
-    let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+    let msg = assert_invalid(&lower_src(&src).unwrap_err());
     assert!(msg.contains("something other than the test DUT"), "{msg}");
+
+    let wrong_field = XACTOR_SRC.replace("xt.dut = dut", "xt.no_such_field = dut");
+    let msg = assert_invalid(&lower_src(&wrong_field).unwrap_err());
+    assert!(
+        msg.contains("xt.no_such_field") && msg.contains("xt.dut"),
+        "{msg}"
+    );
 }
 
 /// A timed `wait until` inside a transactor method lowers to v1's
