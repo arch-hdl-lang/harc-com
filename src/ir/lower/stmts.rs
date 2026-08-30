@@ -2059,12 +2059,10 @@ impl FuncBuilder<'_> {
     ) -> Result<(), LowerError> {
         if let Some(actual) = method_schema.ret_ty.clone() {
             if !component_method_result_compatible(&expected, &actual) {
-                return Err(unsupported(
-                    &format!(
-                        "assignment of `{method}` result to local `{local}` with incompatible type"
-                    ),
-                    format!("expected {expected:?}, method returns {actual:?}"),
-                ));
+                return Err(LowerError::Invalid(format!(
+                    "assignment of `{method}` result to local `{local}` with incompatible type: \
+                     expected {expected:?}, method returns {actual:?}"
+                )));
             }
         }
         Ok(())

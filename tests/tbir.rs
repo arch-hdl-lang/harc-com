@@ -26440,6 +26440,10 @@ end impl ComponentScalarWidenLetTest
     verify::verify_program(&prog).expect("verifies");
 }
 
+/// Component-method results entering an explicitly typed local are checked at
+/// the source boundary.  Narrowing and scalar/record identity mismatches are
+/// program type errors under every backend, so these cases are `Invalid`
+/// rather than TBIR gaps that advertise v1 as an escape hatch.
 #[test]
 fn component_method_typed_let_rejects_scalar_narrowing() {
     let src = r#"
@@ -26461,7 +26465,7 @@ impl ComponentScalarNarrowLetTest for Tb
 end impl ComponentScalarNarrowLetTest
 "#;
     let err = lower_src(src).expect_err("narrowing method initializer must be rejected");
-    let msg = assert_unsupported(&err);
+    let msg = assert_invalid(&err);
     assert!(msg.contains("incompatible type"), "{msg}");
 }
 
@@ -26492,7 +26496,7 @@ impl ComponentRecordToScalarLetTest for Tb
 end impl ComponentRecordToScalarLetTest
 "#;
     let err = lower_src(src).expect_err("record method result must not initialize scalar local");
-    let msg = assert_unsupported(&err);
+    let msg = assert_invalid(&err);
     assert!(msg.contains("incompatible type"), "{msg}");
 }
 
@@ -26522,7 +26526,7 @@ impl ComponentScalarToRecordAssignTest for Tb
 end impl ComponentScalarToRecordAssignTest
 "#;
     let err = lower_src(src).expect_err("scalar method result must not assign to record local");
-    let msg = assert_unsupported(&err);
+    let msg = assert_invalid(&err);
     assert!(msg.contains("incompatible type"), "{msg}");
 }
 
@@ -26551,7 +26555,7 @@ impl ComponentScalarToRecordLetTest for Tb
 end impl ComponentScalarToRecordLetTest
 "#;
     let err = lower_src(src).expect_err("scalar method result must not initialize record local");
-    let msg = assert_unsupported(&err);
+    let msg = assert_invalid(&err);
     assert!(msg.contains("incompatible type"), "{msg}");
 }
 
@@ -26587,7 +26591,7 @@ impl ComponentWrongRecordAssignTest for Tb
 end impl ComponentWrongRecordAssignTest
 "#;
     let err = lower_src(src).expect_err("wrong record method result must not assign");
-    let msg = assert_unsupported(&err);
+    let msg = assert_invalid(&err);
     assert!(msg.contains("incompatible type"), "{msg}");
 }
 
@@ -26622,7 +26626,7 @@ impl ComponentWrongRecordLetTest for Tb
 end impl ComponentWrongRecordLetTest
 "#;
     let err = lower_src(src).expect_err("wrong record method result must not initialize local");
-    let msg = assert_unsupported(&err);
+    let msg = assert_invalid(&err);
     assert!(msg.contains("incompatible type"), "{msg}");
 }
 /// Issue #452: a test-scope `let` read (un-shadowed) at the top level of the
