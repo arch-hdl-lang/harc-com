@@ -2178,7 +2178,11 @@ impl FuncBuilder<'_> {
                     .collect();
                 let value = digits
                     .parse::<u64>()
-                    .map_err(|_| unsupported("time literal with no leading numeric value", ""))?;
+                    .map_err(|_| {
+                        LowerError::Invalid(
+                            "time literal has no leading numeric value".to_string(),
+                        )
+                    })?;
                 Ok(Expr::Literal {
                     value,
                     ty: IrType::UInt(Some(64)),

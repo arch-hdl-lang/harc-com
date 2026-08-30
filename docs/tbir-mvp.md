@@ -9784,6 +9784,18 @@ former `transaction` group lives in
      textual `unsupported(` matches (114 constructors plus the helper
      definition).
 
+181. **Malformed component shapes stop advertising v1 (2026-08-29).**
+
+     Five dedicated guards now report source-level `Invalid`: transactor
+     lifecycle items blocked by the parser, `emit` naming a non-event
+     component field, malformed time literals, transactor/test DUT type
+     mismatches, and unresolved testbench queue metadata. The two reachable
+     source spellings are pinned together; the remaining guards are defensive
+     parser/lowering invariants. This leaves 110 textual `unsupported(`
+     matches (109 constructors plus the helper definition). Zero-length
+     vectors, untyped queues, and duplicate watchdogs deliberately retain
+     `Unsupported`: v1 emits those shapes, so the escape hatch is measurable.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
