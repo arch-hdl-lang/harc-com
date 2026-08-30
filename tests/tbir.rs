@@ -24558,18 +24558,41 @@ end test RuntimePromotedLetTest"#;
         Some(&ir::IrType::UInt(Some(32)))
     );
 
-    let unresolved = src.replace(
+    let port_init = src.replace(
         "let observed : uint<32> = middle + 1",
         "let observed = dut.count_out",
     );
-    let msg = assert_unsupported(&lower_src(&unresolved).unwrap_err());
+    let port_prog = lower_src(&port_init).expect("an untyped promoted DUT read lowers");
+    verify::verify_program(&port_prog).expect("the promoted DUT read verifies");
+    let port_tb = &port_prog.testbenches[port_prog.tests[0].testbench.index()];
+    assert_eq!(
+        port_tb
+            .scalar_fields
+            .iter()
+            .find(|field| field.name == "observed")
+            .map(|field| &field.ty),
+        Some(&ir::IrType::UInt(None))
+    );
+    let port_cpp = emit_cpp_src(&port_init);
+    let read = port_cpp
+        .find("harc_rt::harc_read(dut->count_out)")
+        .expect("the initializer reads the DUT port");
+    let store = port_cpp
+        .find("_tb.observed = __t0")
+        .expect("the initializer stores the port snapshot in shared state");
+    assert!(
+        read < store,
+        "the port must be read before it is stored:\n{port_cpp}"
+    );
+
+    let compound_port = src.replace(
+        "let observed : uint<32> = middle + 1",
+        "let observed = dut.count_out + 1",
+    );
+    let msg = assert_unsupported(&lower_src(&compound_port).unwrap_err());
     assert!(
         msg.contains("untyped promoted test-scope `let observed`"),
-        "{msg}"
-    );
-    assert!(
-        msg.contains("declare the promoted let's scalar type"),
-        "{msg}"
+        "a compound untyped DUT expression must retain the narrow boundary: {msg}"
     );
 
     for initializer in ["-4'd1", "~4'd0", "~(middle + 4'd0)"] {

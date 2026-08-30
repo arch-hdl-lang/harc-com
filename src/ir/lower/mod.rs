@@ -5606,7 +5606,17 @@ fn lower_test(
                 Some(ExprKind::Bool(b)) => *b as u64,
                 None => 0,
                 Some(_) => {
-                    if declared_ty.is_none() && inferred_ty.is_none() {
+                    // A bare DUT-port initializer has the same host-scalar
+                    // fallback as an ordinary untyped port read: until SV
+                    // metadata supplies an exact width, v1 stores it in its
+                    // default uint64 carrier.  The source-ordered assignment
+                    // below still lowers the port through DutRead, so using
+                    // UInt(None) here only sizes the persistent `_tb` cell.
+                    let untyped_port_init = l
+                        .value
+                        .as_ref()
+                        .is_some_and(is_direct_dut_port_initializer);
+                    if declared_ty.is_none() && inferred_ty.is_none() && !untyped_port_init {
                         return Err(unsupported(
                             &format!(
                                 "an untyped promoted test-scope `let {}` with a runtime initializer",
@@ -6829,6 +6839,24 @@ fn infer_promoted_scalar_type(
             Some(IrType::SInt(None))
         }
         other => other,
+    }
+}
+
+/// Whether an initializer is a direct read rooted at the conventional DUT
+/// binding (`dut.port`, including indexed/sliced port forms).  This is kept
+/// deliberately narrower than arbitrary field access: record/component
+/// fields need their declared aggregate type and must not inherit the
+/// untyped host-scalar fallback used for DUT ports.
+fn is_direct_dut_port_initializer(expr: &crate::ast::Expr) -> bool {
+    let mut expr = exprs::unparen_expr(expr);
+    loop {
+        match &*expr.kind {
+            ExprKind::Field { target, .. }
+            | ExprKind::Index { target, .. }
+            | ExprKind::BitSlice { target, .. } => expr = exprs::unparen_expr(target),
+            ExprKind::Ident(id) => return id.name == "dut",
+            _ => return false,
+        }
     }
 }
 
