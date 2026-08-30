@@ -228,11 +228,12 @@ component sub-component + DUT-bind machinery. v1 emits this BFM identically
 to a component (a struct with a `dut` handle + `<Type>_<method>(<Type>&
 self, ...)` free-function lambdas, `wait N cycles` → synchronous `tick()`
 loops), so the component-method emission is byte-faithful. Being a
-transactor, an env-held BFM still requires an explicit `active` mode at
-every binding site (a `passive` instance has no methods — every method
-lives under `when active`); a new `transactor_is_dut_poking_bfm(t,
+transactor, an env-held BFM still requires an explicit mode at every binding
+site. A passive instance retains its always-on state and handlers while
+methods declared under `when active` stay unavailable; a new
+`transactor_is_dut_poking_bfm(t,
 env_held)` classifier (true exactly for the env-held BFM) feeds the
-`dut_poking_bfm_names` gate that enforces this at the testbench-field and
+`dut_poking_bfm_names` gate that enforces the mode at the testbench-field and
 test-scope-`let` sites.
 
 | Fixture | Status | First blocker |

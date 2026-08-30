@@ -139,6 +139,9 @@ family of rejections over a one-site exception. Current implementation order:
   directly instead of advertising v1 as a TBIR escape hatch.
 - [x] Missing `active`/`passive` annotations at every test-scope transactor
   declaration surface report `Invalid`, matching v1's source error.
+- [x] Explicitly passive unbound transactors retain always-on state at
+  testbench-field and test-scope declaration surfaces while active-only
+  methods remain unavailable.
 
 This list intentionally excludes v1 failures such as a blocking bus call
 nested in an expression. Those may still be useful TB-IR enhancements, but
@@ -146,7 +149,7 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 106 remaining constructor call sites (107 textual matches including
+Treat the 103 remaining constructor call sites (104 textual matches including
 the `unsupported` helper definition) as an inventory, not 116 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,

@@ -257,11 +257,11 @@ pub(crate) fn transactor_has_mode_sensitive_analysis_surface(
 /// BFM without its own `on` handler. This is either a hookable BFM held by
 /// an env, or any DUT-attached transactor exposing an event field (which
 /// needs the component event path even if it declares no methods).
-/// Such a transactor is a transactor at every binding site (its methods
-/// live under `when active`), so it requires an explicit `active` mode
-/// just like an event-driven consumer — even though it lowers to a
-/// `ComponentSchema`. A `passive` instance has no methods at all. Feeds
-/// the `dut_poking_bfm_names` `active`-mode gate. A non-env-held BFM without
+/// Such a transactor is a transactor at every binding site, so it requires
+/// an explicit mode just like an event-driven consumer — even though it
+/// lowers to a `ComponentSchema`. A passive instance retains always-on
+/// state and handlers while methods inside `when active` stay unavailable.
+/// Feeds the `dut_poking_bfm_names` mode gate. A non-env-held BFM without
 /// an event stays a `TransactorSchema`; an event-bearing one is component-
 /// hosted and therefore also needs this gate.
 pub(crate) fn transactor_is_dut_poking_bfm(

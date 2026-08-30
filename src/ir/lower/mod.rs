@@ -1992,10 +1992,10 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // handle, no `on`/bound). They route to a `ComponentSchema` when an
     // `env` holds one by value or when an event field needs component event
     // lowering, but remain
-    // transactors at a binding site: their methods live under `when
-    // active`, so an instance requires an explicit `active` mode (same as
-    // `event_driven_transactor_names`; a `passive` instance has no
-    // methods). A disjoint subset of `component_type_names`.
+    // transactors at a binding site, so an instance requires an explicit
+    // mode (same as `event_driven_transactor_names`). A passive instance
+    // retains always-on state and handlers while methods inside `when active`
+    // stay unavailable. A disjoint subset of `component_type_names`.
     let dut_poking_bfm_names: HashSet<String> = file
         .items
         .iter()
@@ -3129,26 +3129,16 @@ fn validate_testbench_component(
                     // CounterDriver active`). It routes to a
                     // `ComponentSchema` (so an env can hold one by value)
                     // but is still a transactor: its methods live under
-                    // `when active`, so it requires an explicit `active`
-                    // mode — exactly like the event-driven gate above. A
-                    // `passive` instance structurally lacks every method.
+                    // `when active`, so it requires an explicit mode —
+                    // exactly like the event-driven gate above. A
+                    // `passive` instance structurally lacks every active-only method,
+                    // but retains its always-on state and handlers.
                     // Checked before the composite-component gate (which
                     // rejects any mode), since a BFM IS in
                     // `component_type_names`.
                     if dut_poking_bfm_names.contains(simple) {
                         match mode {
-                            Some(TransactorMode::Active) => continue,
-                            Some(TransactorMode::Passive) => {
-                                return Err(unsupported(
-                                    &format!(
-                                        "a passive DUT-poking transactor field `{}.{} : \
-                                         {simple} passive`",
-                                        c.name.name, f.name.name
-                                    ),
-                                    "methods inside `when active` do not exist on a passive \
-                                     instance",
-                                ));
-                            }
+                            Some(TransactorMode::Active | TransactorMode::Passive) => continue,
                             None => {
                                 // MEASURED, after a previous batch left
                                 // this arm alone saying its shape had
@@ -3645,8 +3635,10 @@ fn lower_test(
     let mut addrmap_binds: Vec<(String, String, String)> = Vec::new();
     // Test-scope unbound-transactor instances (`let h : Xactor active`),
     // accessed by bare name. Merged into `transactor_fields` after the
-    // testbench-field walk; collected here as (name, transactor id).
-    let mut test_scope_xactors: Vec<(String, TransactorId)> = Vec::new();
+    // testbench-field walk; collected here as (name, transactor id,
+    // passive). Keeping the mode lets the shared call resolver expose
+    // always-on state while rejecting methods declared in `when active`.
+    let mut test_scope_xactors: Vec<(String, TransactorId, bool)> = Vec::new();
     // Test-scope composite-component instances (`let env : AnalysisEnv`),
     // collected as (name, component id). Emitted as plain run-scope
     // locals + their `connect` push_backs.
@@ -4197,8 +4189,9 @@ fn lower_test(
                 // `ComponentSchema`, so it lands in this component-let
                 // branch — but it is still a transactor: its methods live
                 // under `when active`, so a test-scope `let drv : X active`
-                // requires an explicit `active` mode (a `passive` instance
-                // has no methods). A genuine composite component (env /
+                // requires an explicit mode. A passive instance retains
+                // its always-on state while activation-aware lowering hides
+                // methods declared in `when active`. A genuine composite component (env /
                 // agent / scoreboard / sequencer) takes no mode.
                 if dut_poking_bfm_names.contains(simple) {
                     match l.ty.as_ref() {
@@ -4209,16 +4202,7 @@ fn lower_test(
                         Some(TypeExpr::Named {
                             mode: Some(TransactorMode::Passive),
                             ..
-                        }) => {
-                            return Err(unsupported(
-                                &format!(
-                                    "passive DUT-poking transactor instance `let {} : \
-                                     {simple} passive`",
-                                    l.name.name
-                                ),
-                                "methods inside `when active` do not exist on a passive instance",
-                            ));
-                        }
+                        }) => {}
                         _ => {
                             return Err(LowerError::Invalid(format!(
                                 "DUT-poking transactor instance `let {} : {simple}` needs an \
@@ -4272,26 +4256,18 @@ fn lower_test(
                     ));
                 }
                 let simple = type_simple_name(l.ty.as_ref()).unwrap();
-                // Require an explicit `active` mode (matching the
-                // testbench-field rule: every method lives in `when
-                // active`, so a passive instance has none).
-                match l.ty.as_ref() {
+                // Require an explicit mode. Passive instances keep their
+                // always-on state; the shared resolver rejects calls to
+                // methods declared in `when active`.
+                let passive = match l.ty.as_ref() {
                     Some(TypeExpr::Named {
                         mode: Some(TransactorMode::Active),
                         ..
-                    }) => {}
+                    }) => false,
                     Some(TypeExpr::Named {
                         mode: Some(TransactorMode::Passive),
                         ..
-                    }) => {
-                        return Err(unsupported(
-                            &format!(
-                                "passive transactor instance `let {} : {simple} passive`",
-                                l.name.name
-                            ),
-                            "methods inside `when active` do not exist on a passive instance",
-                        ));
-                    }
+                    }) => true,
                     _ => {
                         return Err(LowerError::Invalid(format!(
                             "transactor instance `let {} : {simple}` needs an \
@@ -4299,7 +4275,7 @@ fn lower_test(
                             l.name.name
                         )));
                     }
-                }
+                };
                 let xid = ir::TransactorId(
                     prog.transactors
                         .iter()
@@ -4316,7 +4292,7 @@ fn lower_test(
                         )));
                     }
                 }
-                test_scope_xactors.push((l.name.name.clone(), xid));
+                test_scope_xactors.push((l.name.name.clone(), xid, passive));
             }
             TestItem::Let(l) => {
                 if !l.probes.is_empty() || l.bind {
@@ -4709,8 +4685,8 @@ fn lower_test(
     // aren't `_tb`-prefixed by the desugaring), recorded separately so
     // resolution knows which access shape to expect.
     let mut bare_transactor_fields: HashSet<String> =
-        test_scope_xactors.iter().map(|(n, _)| n.clone()).collect();
-    for (name, xid) in &test_scope_xactors {
+        test_scope_xactors.iter().map(|(n, _, _)| n.clone()).collect();
+    for (name, xid, passive) in &test_scope_xactors {
         if transactor_fields.iter().any(|(f, _)| f == name) {
             return Err(LowerError::Invalid(format!(
                 "name `{name}` is both a testbench transactor field and a test-scope \
@@ -4719,6 +4695,9 @@ fn lower_test(
             )));
         }
         transactor_fields.push((name.clone(), *xid));
+        if *passive {
+            passive_transactor_fields.insert(name.clone());
+        }
     }
     // Bound-to initiator-side BFM instances (`let helper : H active =
     // bind axil`). Validate the bound bus binding matches the
