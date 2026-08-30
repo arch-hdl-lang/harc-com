@@ -133,6 +133,8 @@ family of rejections over a one-site exception. Current implementation order:
   pure helpers, reusable testbench methods, and component methods, retaining
   exact nested `std::array` element carriers and verifier metadata.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
+- [x] Multiple bindings of one bound target-transactor type, using the
+  actor's concrete state receiver while emitting the shared responder body.
 
 This list intentionally excludes v1 failures such as a blocking bus call
 nested in an expression. Those may still be useful TB-IR enhancements, but
@@ -140,7 +142,7 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 115 remaining constructor call sites (116 textual matches including
+Treat the 114 remaining constructor call sites (115 textual matches including
 the `unsupported` helper definition) as an inventory, not 116 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,

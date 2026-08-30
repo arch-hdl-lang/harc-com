@@ -4376,7 +4376,10 @@ pub(super) fn emit_target_actor(
             self_subst: None,
             dut_type: "",
             trace_component: instance,
-            state_receiver: None,
+            // Target responder functions are shared by every binding of the
+            // transactor type. Resolve their empty-instance state nodes
+            // against this actor's concrete storage object.
+            state_receiver: Some(instance),
             temporal_widths: &[],
         };
         let wire = |sig: &str| match binding {

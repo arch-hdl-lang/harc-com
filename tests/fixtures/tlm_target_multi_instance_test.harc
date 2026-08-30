@@ -1,0 +1,58 @@
+// Two bindings of one target-transactor type must share code, not state.
+// Each SV initiator issues one request concurrently on its own bus binding.
+// A baked receiver name aliases the counters and changes one result to 209;
+// actor-specific receivers keep both counters at one.
+
+bus TlmMemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus TlmMemBus
+
+transactor CountingTarget bound to TlmMemBus
+    calls : uint<32> default 0
+
+    thread bus.read(addr: uint<8>)
+        calls = calls + 1
+        return calls * 100 + addr
+    end thread
+end transactor CountingTarget
+
+testbench MultiTargetTb
+    dut : TlmDualReadInitiator
+end testbench MultiTargetTb
+
+impl MultiTargetTest for MultiTargetTb
+    let left_bus  : TlmMemBus = bind dut with {
+        read.req_valid: "left_read_req_valid",
+        read.req_ready: "left_read_req_ready",
+        read.addr:      "left_read_addr",
+        read.rsp_valid: "left_read_rsp_valid",
+        read.rsp_ready: "left_read_rsp_ready",
+        read.rsp_data:  "left_read_rsp_data"
+    }
+    let right_bus : TlmMemBus = bind dut with {
+        read.req_valid: "right_read_req_valid",
+        read.req_ready: "right_read_req_ready",
+        read.addr:      "right_read_addr",
+        read.rsp_valid: "right_read_rsp_valid",
+        read.rsp_ready: "right_read_rsp_ready",
+        read.rsp_data:  "right_read_rsp_data"
+    }
+    let left  : CountingTarget passive = bind left_bus
+    let right : CountingTarget passive = bind right_bus
+
+    run
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+
+        wait until dut.done == 1 timeout 40 cycles
+            fail("dual initiators did not receive both responses")
+        assert left.calls == 1 else fail("left target calls=${left.calls}, expected 1")
+        assert right.calls == 1 else fail("right target calls=${right.calls}, expected 1")
+        assert dut.left_result == 105
+            else fail("left result=${dut.left_result}, expected 105")
+        assert dut.right_result == 109
+            else fail("right result=${dut.right_result}, expected 109")
+        log(info, "PASS: two target instances kept independent state")
+    end run
+end impl MultiTargetTest
