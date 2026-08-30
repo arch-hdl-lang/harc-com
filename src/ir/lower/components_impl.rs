@@ -855,10 +855,10 @@ pub(crate) fn lower_component_schema(
                 // Testbench lifecycle blocks are parser-restricted already;
                 // retain a precise lowerer guard for malformed AST input.
                 ComponentItem::Lifecycle(..) if is_transactor => {
-                    return Err(unsupported(
-                        &format!("a lifecycle declaration on transactor `{name}`"),
-                        "lifecycle declarations are supported only on testbench composition",
-                    ));
+                    return Err(LowerError::Invalid(format!(
+                        "lifecycle declaration on transactor `{name}` is malformed; lifecycle \
+                         declarations are supported only on testbench composition"
+                    )));
                 }
                 // Connect blocks are resolved separately (env-binding stage).
                 ComponentItem::Connect(_) | ComponentItem::Lifecycle(..) => {}
@@ -5263,10 +5263,10 @@ impl super::FuncBuilder<'_> {
                 self.require_self_activation(field.activation, "event", &event)?;
             }
             _ => {
-                return Err(unsupported(
-                    &format!("`emit {event}` — not an `event` field of `{}`", comp.name),
-                    "",
-                ));
+                return Err(LowerError::Invalid(format!(
+                    "`emit {event}` does not name an `event` field of `{}`",
+                    comp.name
+                )));
             }
         }
         // Same missing arity check as the path form above; see the

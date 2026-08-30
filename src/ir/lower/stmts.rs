@@ -4202,10 +4202,10 @@ impl FuncBuilder<'_> {
 
     pub(crate) fn tb_queue_elem(&self, field: &str) -> Result<crate::ir::QueueElem, LowerError> {
         self.ctx.tb_queue_fields.get(field).cloned().ok_or_else(|| {
-            unsupported(
-                &format!("an unknown testbench queue field `{field}`"),
-                "declare the queue on the reusable testbench",
-            )
+            LowerError::Invalid(format!(
+                "unknown testbench queue field `{field}`; declare the queue on the reusable \
+                 testbench"
+            ))
         })
     }
 

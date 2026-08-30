@@ -45330,3 +45330,56 @@ end impl T
         "bare-sized `~4'd0` must stay signed so `< 0` holds"
     );
 }
+
+/// Malformed declarations and member uses are source errors, not TBIR subset
+/// gaps. In particular, none may advertise the retiring v1 backend as an
+/// escape hatch.
+#[test]
+fn malformed_component_shapes_report_invalid_not_unsupported() {
+    let cases = [
+        (
+            "emit scalar field",
+            r#"agent A
+    n : uint<8> default 0
+    hookable fire()
+        emit n(1)
+    end fire
+end agent A
+testbench Tb
+    dut : Top
+    a : A
+end testbench Tb
+impl T for Tb
+    run
+        a.fire()
+    end run
+end impl T"#,
+            "does not name an `event` field",
+        ),
+        (
+            "transactor DUT type mismatch",
+            r#"transactor Drv
+    dut : Other
+    when active
+        hookable fire()
+            dut.en = 1
+        end fire
+    end when
+end transactor Drv
+test T
+    let dut : Top
+    let drv : Drv active
+    run
+        wait 1 cycle
+    end run
+end test T"#,
+            "differs from the test DUT type",
+        ),
+    ];
+
+    for (what, src, want) in cases {
+        let err = lower_src(src).expect_err(&format!("{what} must be rejected"));
+        let msg = assert_invalid(&err);
+        assert!(msg.contains(want), "{what}: {msg}");
+    }
+}

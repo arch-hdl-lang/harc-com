@@ -4318,14 +4318,11 @@ fn lower_test(
                 let xdut = &prog.transactors[xid.index()].dut_type;
                 if let Some(dt) = &dut_type {
                     if xdut != dt {
-                        return Err(unsupported(
-                            &format!(
-                                "transactor instance `{}` whose DUT field type `{xdut}` \
-                                 differs from the test DUT type `{dt}`",
-                                l.name.name
-                            ),
-                            "",
-                        ));
+                        return Err(LowerError::Invalid(format!(
+                            "transactor instance `{}` has DUT field type `{xdut}`, which \
+                             differs from the test DUT type `{dt}`",
+                            l.name.name
+                        )));
                     }
                 }
                 test_scope_xactors.push((l.name.name.clone(), xid));
