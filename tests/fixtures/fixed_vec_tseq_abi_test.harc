@@ -1,0 +1,57 @@
+// Nonempty scalar-leaf fixed-vector TSeq values through every callable ABI.
+
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+struct Row
+    data : Vec<uint<8>, 2>
+end struct Row
+
+tseq Rows(n: int) -> TSeq<Vec<uint<8>, 2>>
+    let row : Row
+    for i in 1 .. n
+        row.data[0] = i
+        row.data[1] = i + 10
+        yield row.data
+    end for
+end tseq Rows
+
+function echo_rows(items: TSeq<Vec<uint<8>, 2>>) -> TSeq<Vec<uint<8>, 2>>
+    return items
+end function echo_rows
+
+sequencer RowRelay
+    hookable relay(items: TSeq<Vec<uint<8>, 2>>) -> TSeq<Vec<uint<8>, 2>>
+        return items
+    end relay
+end sequencer RowRelay
+
+testbench FixedVecTseqAbiTb
+    dut : Top
+    relay : RowRelay
+
+    function bounce(items: TSeq<Vec<uint<8>, 2>>) -> TSeq<Vec<uint<8>, 2>>
+        return echo_rows(items)
+    end function bounce
+end testbench FixedVecTseqAbiTb
+
+impl FixedVecTseqAbiTest for FixedVecTseqAbiTb
+    clock clk = SysDomain
+    run
+        let rows = Rows(2)
+        let echoed = echo_rows(rows)
+        let bounced = bounce(echoed)
+        let relayed = relay.relay(bounced)
+        let count = 0
+        let sum = 0
+        for row in relayed
+            sum = sum + row[0] + row[1]
+            count = count + 1
+        end for
+        assert count == 2 else fail("expected two rows, got ${count}")
+        assert sum == 26 else fail("fixed-vector TSeq ABI changed data: sum=${sum}")
+        log(info, "PASS: fixed-vector TSeq callable ABIs")
+        wait 1 cycle
+    end run
+end impl FixedVecTseqAbiTest

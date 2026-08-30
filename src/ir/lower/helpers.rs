@@ -368,9 +368,11 @@ impl FuncBuilder<'_> {
                 ));
             } else {
                 let param_ty = inlined_helper_signature_type(
+                    name,
+                    &format!("parameter `{}`", p.name.name),
                     p.ty.as_ref(),
                     &self.ctx.record_ids,
-                );
+                )?;
                 let v = if matches!(param_ty, IrType::FixedVec { .. }) {
                     let value = self.whole_vec_value_rhs(e)?.ok_or_else(|| {
                         LowerError::Invalid(format!(
@@ -407,9 +409,11 @@ impl FuncBuilder<'_> {
         let mut ret_ty = IrType::Unknown;
         if decl.return_ty.is_some() {
             ret_ty = inlined_helper_signature_type(
+                name,
+                "return type",
                 decl.return_ty.as_ref(),
                 &self.ctx.record_ids,
-            );
+            )?;
             self.set_local_type(dest, ret_ty.clone());
         }
         self.push_return_default(dest, &ret_ty);
@@ -436,7 +440,12 @@ impl FuncBuilder<'_> {
                 let id = self.declare(&p.name.name);
                 self.set_local_type(
                     id,
-                    inlined_helper_signature_type(p.ty.as_ref(), &self.ctx.record_ids),
+                    inlined_helper_signature_type(
+                        name,
+                        &format!("parameter `{}`", p.name.name),
+                        p.ty.as_ref(),
+                        &self.ctx.record_ids,
+                    )?,
                 );
                 self.push(Stmt::Assign(id, e));
             }
@@ -959,8 +968,31 @@ pub(crate) fn tseq_ir_type(
         if let ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) = ir_type_of(Some(inner)) {
             return Some(IrType::Seq(Box::new(ty)));
         }
+        if let Some(ty @ IrType::FixedVec { .. }) =
+            super::components::fixed_vec_elem_ir_type(inner)
+        {
+            return Some(IrType::Seq(Box::new(ty)));
+        }
     }
     Some(IrType::Unknown)
+}
+
+/// Resolve a `TSeq` used at a callable boundary. `tseq_ir_type` deliberately
+/// leaves unsupported element spellings as `Unknown` for non-ABI callers;
+/// callable signatures must reject that sentinel instead of emitting it as a
+/// scalar value.
+pub(crate) fn callable_tseq_ir_type(
+    construct: String,
+    ty: Option<&TypeExpr>,
+    record_ids: &HashMap<String, RecordId>,
+) -> Result<Option<IrType>, LowerError> {
+    match tseq_ir_type(ty, record_ids) {
+        Some(IrType::Unknown) => Err(unsupported(
+            &construct,
+            "callable TSeq values support records, scalars, and scalar-leaf fixed vectors",
+        )),
+        other => Ok(other),
+    }
 }
 
 /// The declared type of a SLOT, for the argument checks — as opposed to
@@ -1006,12 +1038,16 @@ pub(crate) fn slot_ir_type(
 /// and calls. Scalar and declared-record behavior is unchanged; a
 /// fixed vector uses the recursive aggregate `std::array` carrier.
 fn pure_helper_signature_type(
-    _helper: &str,
-    _what: &str,
+    helper: &str,
+    what: &str,
     ty: Option<&TypeExpr>,
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<IrType, LowerError> {
-    if let Some(seq) = tseq_ir_type(ty, record_ids) {
+    if let Some(seq) = callable_tseq_ir_type(
+        format!("{what} of helper `{helper}` has an unsupported TSeq element type"),
+        ty,
+        record_ids,
+    )? {
         return Ok(seq);
     }
     if let Some(fixed @ IrType::FixedVec { .. }) = ty.and_then(|ty| {
@@ -1041,27 +1077,39 @@ fn ir_type_of_param(ty: Option<&TypeExpr>, ctx: &super::LowerCtx) -> IrType {
 }
 
 fn inlined_helper_signature_type(
+    helper: &str,
+    what: &str,
     ty: Option<&TypeExpr>,
     record_ids: &HashMap<String, RecordId>,
-) -> IrType {
-    if let Some(seq) = tseq_ir_type(ty, record_ids) {
-        return seq;
+) -> Result<IrType, LowerError> {
+    if let Some(seq) = callable_tseq_ir_type(
+        format!("{what} of helper `{helper}` has an unsupported TSeq element type"),
+        ty,
+        record_ids,
+    )? {
+        return Ok(seq);
     }
     if let Some(fixed @ IrType::FixedVec { .. }) = ty.and_then(|ty| {
         super::components::fixed_vec_ir_type_with_records(ty, record_ids)
     }) {
-        return fixed;
+        return Ok(fixed);
     }
-    ir_type_of_with_records(ty, record_ids)
+    Ok(ir_type_of_with_records(ty, record_ids))
 }
 
 fn testbench_method_signature_type(
-    _method: &str,
-    _what: &str,
+    method: &str,
+    what: &str,
     ty: Option<&TypeExpr>,
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<IrType, LowerError> {
-    if let Some(seq) = tseq_ir_type(ty, record_ids) {
+    if let Some(seq) = callable_tseq_ir_type(
+        format!(
+            "{what} of testbench method `{method}` has an unsupported TSeq element type"
+        ),
+        ty,
+        record_ids,
+    )? {
         return Ok(seq);
     }
     if let Some(fixed @ IrType::FixedVec { .. }) = ty.and_then(|ty| {

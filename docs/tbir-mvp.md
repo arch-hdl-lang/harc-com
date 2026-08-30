@@ -9734,6 +9734,23 @@ former `transaction` group lives in
      helper-call rejection, leaving the raw unsupported inventory unchanged
      by this batch.
 
+177. **Scalar-leaf fixed-vector TSeq values at typed seams (2026-08-29).**
+
+     Scalar-leaf `TSeq<Vec<T, N>>` now resolves through the shared recursive fixed-vector
+     decoder instead of degrading to `Unknown`. Typed empty locals, pure
+     helpers, reusable testbench methods, and component methods carry
+     `Seq(FixedVec)` through parameters, aggregate-initialized return slots,
+     inferred results, and iteration elements. Verification applies recursive
+     scalar-leaf shape and nonzero-length checks, and C++ emission retains the exact
+     `std::vector<std::array<...>>` carrier. Shape-mismatched annotations are
+     source-level `Invalid` errors. The registered nonempty fixture passes two
+     rows through the generator, pure-helper, testbench-method, and component-
+     method ABIs and checks their contents under v1/TBIR trace equivalence.
+     Record-leaf vectors and unknown element types retain one shared callable-
+     signature unsupported boundary instead of degrading to a scalar ABI, so
+     the raw inventory is 118 textual matches (117 constructors plus the
+     helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

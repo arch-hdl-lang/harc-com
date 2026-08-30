@@ -290,6 +290,7 @@ sequencer_connect_test | Top | top_counter.sv | top_counter.arch | pass
 tseq_basic_test | Top | top_counter.sv | top_counter.arch | pass
 tseq_scalar_test | Top | top_counter.sv | top_counter.arch | pass
 tseq_fixed_vec_test | Top | top_counter.sv | top_counter.arch | pass
+fixed_vec_tseq_abi_test | Top | top_counter.sv | top_counter.arch | pass
 tb_method_tseq_test | Top | top_counter.sv | top_counter.arch | pass
 pure_helper_tseq_test | Top | top_counter.sv | top_counter.arch | pass
 transactor_tseq_return_test | Top | top_counter.sv | top_counter.arch | pass

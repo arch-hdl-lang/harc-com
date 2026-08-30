@@ -22185,7 +22185,26 @@ fn uninitialized_tseq_locals_start_as_typed_empty_sequences() {
         "typed empty sequences emit as vectors:\n{cpp}"
     );
 
-    for bad in ["Missing", "Vec<uint<8>, 2>"] {
+    let fixed_vec = src.replace(
+        "let empty_nums : TSeq<uint<8>>",
+        "let empty_nums : TSeq<uint<8>>\n        let empty_rows : TSeq<Vec<uint<8>, 2>>",
+    );
+    let fixed_vec_prog = lower_src(&fixed_vec).expect("an empty fixed-vector TSeq local lowers");
+    verify::verify_program(&fixed_vec_prog).expect("the fixed-vector sequence verifies");
+    let row_seq = ir::IrType::Seq(Box::new(ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::UInt(Some(8))),
+        len: 2,
+    }));
+    let fixed_vec_run = fixed_vec_prog.function(fixed_vec_prog.tests[0].run);
+    assert!(fixed_vec_run.locals.iter().any(|local| {
+        local.name == "empty_rows" && local.ty == row_seq
+    }));
+    assert!(
+        emit_cpp_src(&fixed_vec).contains("std::vector<std::array<uint64_t, 2>> empty_rows{};"),
+        "fixed-vector sequences retain their aggregate element carrier"
+    );
+
+    for bad in ["Missing", "Vec<Beat, 2>"] {
         let malformed = src.replace("TSeq<uint<8>>", &format!("TSeq<{bad}>"));
         let error = match lower_src(&malformed) {
             Err(error) => error,
@@ -22349,6 +22368,277 @@ fn pure_helper_tseq_signatures_are_typed_end_to_end() {
         "let echoed_nums : TSeq<sint<8>> = echo_nums(nums)",
     );
     assert_invalid(&lower_src(&bad_annotation).expect_err("sequence annotation mismatch is invalid"));
+}
+
+#[test]
+fn fixed_vector_tseq_signatures_are_typed_end_to_end() {
+    let src = r#"transaction Beat
+    value : uint<8> default 0
+end transaction Beat
+
+function echo_rows(items: TSeq<Vec<uint<8>, 2>>) -> TSeq<Vec<uint<8>, 2>>
+    return items
+end function echo_rows
+
+sequencer RowRelay
+    hookable relay(items: TSeq<Vec<uint<8>, 2>>) -> TSeq<Vec<uint<8>, 2>>
+        return items
+    end relay
+end sequencer RowRelay
+
+testbench Tb
+    dut : Top
+    relay : RowRelay
+
+    function bounce(items: TSeq<Vec<uint<8>, 2>>) -> TSeq<Vec<uint<8>, 2>>
+        return echo_rows(items)
+    end function bounce
+end testbench Tb
+
+impl FixedVectorTseqSignatureTest for Tb
+    run
+        let rows : TSeq<Vec<uint<8>, 2>>
+        let echoed = echo_rows(rows)
+        let bounced = bounce(echoed)
+        let relayed = relay.relay(bounced)
+        for row in relayed
+            wait 0 cycles
+        end for
+        wait 1 cycle
+    end run
+end impl FixedVectorTseqSignatureTest"#;
+
+    let prog = lower_src(src).expect("fixed-vector TSeq signatures lower");
+    verify::verify_program(&prog).expect("fixed-vector TSeq signatures verify");
+    let expected = ir::IrType::Seq(Box::new(ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::UInt(Some(8))),
+        len: 2,
+    }));
+    assert!(prog.functions.iter().any(|function| {
+        function.kind == ir::FunctionKind::Helper
+            && function.params.first().is_some_and(|param| param.ty == expected)
+            && function
+                .ret
+                .is_some_and(|ret| function.locals[ret.index()].ty == expected)
+    }));
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.locals
+            .iter()
+            .filter(|local| local.ty == expected)
+            .count()
+            >= 6,
+        "arguments, parameters, return slots, and results retain the aggregate sequence type:\n{run}"
+    );
+    let relay = prog
+        .components
+        .iter()
+        .find(|component| component.name == "RowRelay")
+        .and_then(|component| component.method("relay"))
+        .expect("component relay method");
+    assert_eq!(relay.param_tys, vec![expected.clone()]);
+    assert_eq!(relay.ret_ty, Some(expected.clone()));
+    let relay_function = relay.function;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::vector<std::array<uint64_t, 2>>"),
+        "every sequence ABI must retain its fixed-vector element carrier:\n{cpp}"
+    );
+
+    let mismatched = src.replace(
+        "let echoed = echo_rows(rows)",
+        "let echoed : TSeq<Vec<uint<8>, 3>> = echo_rows(rows)",
+    );
+    assert_invalid(
+        &lower_src(&mismatched)
+            .expect_err("a fixed-vector TSeq annotation must match its element shape"),
+    );
+
+    let helper_id = prog
+        .functions
+        .iter()
+        .position(|function| function.kind == ir::FunctionKind::Helper)
+        .expect("echo_rows helper");
+    let mut malformed = prog.clone();
+    let bad = ir::IrType::Seq(Box::new(ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::UInt(Some(8))),
+        len: 0,
+    }));
+    malformed.functions[helper_id].params[0].ty = bad.clone();
+    malformed.functions[helper_id].locals[0].ty = bad;
+    let errors = verify::verify_program(&malformed)
+        .expect_err("fixed-vector sequence ABIs reject malformed aggregate metadata");
+    assert!(errors.iter().any(|error| error
+        .to_string()
+        .contains("param 0 must use the scalar, fixed-vector, or TSeq helper ABI")));
+
+    let mut record_leaf = prog.clone();
+    let bad = ir::IrType::Seq(Box::new(ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::Record(ir::RecordId(0))),
+        len: 2,
+    }));
+    record_leaf.functions[helper_id].params[0].ty = bad.clone();
+    record_leaf.functions[helper_id].locals[0].ty = bad;
+    let errors = verify::verify_program(&record_leaf)
+        .expect_err("a valid record ID still cannot enter the scalar-leaf sequence ABI");
+    assert!(errors.iter().any(|error| error
+        .to_string()
+        .contains("param 0 must use the scalar, fixed-vector, or TSeq helper ABI")));
+
+    let mut bad_component_param = prog.clone();
+    let bad = ir::IrType::Seq(Box::new(ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::UInt(Some(8))),
+        len: 0,
+    }));
+    let relay_schema = bad_component_param
+        .components
+        .iter_mut()
+        .find(|component| component.name == "RowRelay")
+        .and_then(|component| component.methods.iter_mut().find(|method| method.name == "relay"))
+        .unwrap();
+    relay_schema.param_tys[0] = bad.clone();
+    bad_component_param.functions[relay_function.index()].params[0].ty = bad.clone();
+    bad_component_param.functions[relay_function.index()].locals[0].ty = bad;
+    let errors = verify::verify_program(&bad_component_param)
+        .expect_err("matching but malformed component parameter metadata is rejected");
+    assert!(errors.iter().any(|error| error
+        .to_string()
+        .contains("parameter 0 has invalid aggregate schema")));
+
+    let mut mismatched_component_return = prog.clone();
+    let relay_schema = mismatched_component_return
+        .components
+        .iter_mut()
+        .find(|component| component.name == "RowRelay")
+        .and_then(|component| component.methods.iter_mut().find(|method| method.name == "relay"))
+        .unwrap();
+    relay_schema.ret_ty = Some(ir::IrType::Seq(Box::new(ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::UInt(Some(8))),
+        len: 3,
+    })));
+    let errors = verify::verify_program(&mismatched_component_return)
+        .expect_err("component sequence return schemas must match the function return slot");
+    assert!(errors.iter().any(|error| {
+        let message = error.to_string();
+        message.contains("return schema") && message.contains("disagrees with fn")
+    }));
+
+    let mut missing_record_return = prog.clone();
+    let missing = ir::IrType::RecordSeq(ir::RecordId(999));
+    let relay_schema = missing_record_return
+        .components
+        .iter_mut()
+        .find(|component| component.name == "RowRelay")
+        .and_then(|component| component.methods.iter_mut().find(|method| method.name == "relay"))
+        .unwrap();
+    relay_schema.ret_ty = Some(missing.clone());
+    let ret = missing_record_return.functions[relay_function.index()]
+        .ret
+        .expect("relay return slot");
+    missing_record_return.functions[relay_function.index()].locals[ret.index()].ty = missing;
+    let errors = verify::verify_program(&missing_record_return)
+        .expect_err("component record-sequence returns require an existing record");
+    assert!(errors.iter().any(|error| error
+        .to_string()
+        .contains("invalid record-sequence return schema")));
+}
+
+#[test]
+fn record_leaf_fixed_vector_tseq_callable_signatures_keep_the_unsupported_fence() {
+    let pure = r#"transaction Beat
+    value : uint<8> default 0
+end transaction Beat
+
+function bad(items: TSeq<Vec<Beat, 2>>) -> uint<8>
+    return 0
+end function bad
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl PureRecordLeafTseq for Tb
+    run
+        wait 1 cycle
+    end run
+end impl PureRecordLeafTseq"#;
+    let msg = assert_unsupported(&lower_src(pure).expect_err("pure helper ABI must reject it"));
+    assert!(msg.contains("parameter `items` of helper `bad`"), "{msg}");
+
+    let inlined = r#"transaction Beat
+    value : uint<8> default 0
+end transaction Beat
+
+function bad(d: Top, items: TSeq<Vec<Beat, 2>>) -> uint<8>
+    return 0
+end function bad
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl InlinedRecordLeafTseq for Tb
+    run
+        let ignored = bad(dut, 0)
+        wait 1 cycle
+    end run
+end impl InlinedRecordLeafTseq"#;
+    let msg = assert_unsupported(&lower_src(inlined).expect_err("inlined helper ABI must reject it"));
+    assert!(msg.contains("parameter `items` of helper `bad`"), "{msg}");
+
+    let testbench_method = r#"transaction Beat
+    value : uint<8> default 0
+end transaction Beat
+
+testbench Tb
+    dut : Top
+
+    function bad(items: TSeq<Vec<Beat, 2>>) -> uint<8>
+        return 0
+    end function bad
+end testbench Tb
+
+impl TestbenchMethodRecordLeafTseq for Tb
+    run
+        let ignored = bad(0)
+        wait 1 cycle
+    end run
+end impl TestbenchMethodRecordLeafTseq"#;
+    let msg = assert_unsupported(
+        &lower_src(testbench_method).expect_err("testbench method ABI must reject it"),
+    );
+    assert!(
+        msg.contains("parameter `items` of testbench method `bad`"),
+        "{msg}"
+    );
+
+    let component_method = r#"transaction Beat
+    value : uint<8> default 0
+end transaction Beat
+
+sequencer Relay
+    hookable bad(items: TSeq<Vec<Beat, 2>>) -> uint<8>
+        return 0
+    end bad
+end sequencer Relay
+
+testbench Tb
+    dut : Top
+    relay : Relay
+end testbench Tb
+
+impl ComponentMethodRecordLeafTseq for Tb
+    run
+        wait 1 cycle
+    end run
+end impl ComponentMethodRecordLeafTseq"#;
+    let msg = assert_unsupported(
+        &lower_src(component_method).expect_err("component method ABI must reject it"),
+    );
+    assert!(
+        msg.contains("parameter `items` of component method `Relay.bad`"),
+        "{msg}"
+    );
 }
 
 #[test]
