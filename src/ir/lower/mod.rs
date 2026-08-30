@@ -5215,8 +5215,10 @@ fn lower_test(
     // `bound to` bus, and the instance name must be unique. Build the
     // per-instance state map (for test-scope `target.<field>` access) and
     // the actor schemas, and substitute the instance name into the
-    // responder bodies' `TransactorState` placeholders (lowered with an
-    // empty instance at transactor-decl time, before the bind was known).
+    // responder bodies keep their `TransactorState` placeholders empty:
+    // target actors supply the concrete per-instance state receiver while
+    // emitting the shared type-level body. This lets any number of bindings
+    // reuse one responder function without one binding clobbering another.
     let mut target_tlm_actors: Vec<ir::TargetTlmActorSchema> = Vec::new();
     let mut target_state: HashMap<String, HashMap<String, crate::ir::StateFieldKind>> =
         HashMap::new();
@@ -5255,31 +5257,6 @@ fn lower_test(
                 .map(|f| (f.name.clone(), f.kind.clone()))
                 .collect(),
         );
-        // Fill the instance into the responder bodies' state-access
-        // placeholders. The responder `TbFunction`s are shared per
-        // transactor TYPE across the whole file, so a second test binding
-        // the same transactor to a DIFFERENT instance name would clobber
-        // the first test's already-filled bodies. The subset is one
-        // passive instance per bound transactor — reject the multi-
-        // instance case loudly rather than silently mis-emit.
-        let methods: Vec<usize> = xschema
-            .target_methods
-            .iter()
-            .map(|m| m.function.index())
-            .collect();
-        let xname = xschema.name.clone();
-        for fidx in methods {
-            if let Err(prev) = fill_transactor_state_instance(&mut prog.functions[fidx], instance) {
-                return Err(unsupported(
-                    &format!(
-                        "bound-to transactor `{xname}` bound to more than one instance \
-                         (`{prev}`, `{instance}`)"
-                    ),
-                    "the target-side TLM subset materializes one passive instance per bound \
-                     transactor; multiple instances need per-instance responder bodies",
-                ));
-            }
-        }
         target_tlm_actors.push(ir::TargetTlmActorSchema {
             instance: instance.clone(),
             bus_field: bus_field.clone(),
@@ -5305,9 +5282,9 @@ fn lower_test(
     // which shared one baked-in name per TYPE and therefore rejected a
     // second active instance (a fill would clobber the first's name).
     //
-    // Bound-to TARGET responders (`target_tlm_actors`, handled above) and
-    // bound-to INITIATOR BFMs keep their own name-fill path — see the
-    // fill loop below, gated on `bound_bus`.
+    // Bound-to TARGET responders (`target_tlm_actors`, handled above) use the
+    // same receiver principle at actor emission. Bound-to INITIATOR BFMs keep
+    // their bus-prefix fill path below, gated on `bound_bus`.
     let mut unbound_state_actors: Vec<ir::UnboundStateActorSchema> = Vec::new();
     for (field, xid) in &transactor_fields {
         let xschema = &prog.transactors[xid.index()];
@@ -8366,14 +8343,12 @@ fn remap_terminator(t: &mut Terminator, remap: &[BlockId]) {
     }
 }
 
-/// Fill the bound responder instance name into a target-method body's
-/// `TransactorState` / `TransactorStateWrite` placeholders (lowered with
-/// an empty instance at transactor-decl time). The responder bodies are
-/// shared per transactor TYPE across the file, so this is idempotent for
-/// the same instance but `Err(prev)` when a state node was already filled
-/// with a DIFFERENT instance (a second test binding the same transactor
-/// to another name) — the caller turns that into an `Unsupported`. The
-/// scan-then-fill split keeps the body un-mutated on the error path.
+/// Fill the concrete storage name into a bound initiator-BFM method body's
+/// `TransactorState` / `TransactorStateWrite` placeholders. Target responder
+/// bodies no longer use this path: their placeholders stay empty and actor
+/// emission supplies the receiver. Initiator bodies still share one function
+/// per type, so this is idempotent for the same instance but `Err(prev)` for a
+/// different one. The scan-then-fill split keeps the body un-mutated on error.
 fn fill_transactor_state_instance(func: &mut TbFunction, instance: &str) -> Result<(), String> {
     if let Some(prev) = existing_state_instance(func) {
         if prev != instance {
@@ -8386,7 +8361,7 @@ fn fill_transactor_state_instance(func: &mut TbFunction, instance: &str) -> Resu
 
 /// First non-empty instance name already present on any `TransactorState`
 /// / `TransactorStateWrite` node in the body, or `None` (all empty
-/// placeholders, the common single-bind case).
+/// placeholders, the common initiator single-bind case).
 fn existing_state_instance(func: &TbFunction) -> Option<String> {
     fn in_expr(e: &ir::Expr) -> Option<String> {
         match e {

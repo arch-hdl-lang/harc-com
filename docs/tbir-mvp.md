@@ -948,10 +948,11 @@ reason. Code locations are authoritative.
     `Stmt::TransactorStateWrite { instance, field, value }` — host state,
     allowed wherever a `Local` is. Inside the responder body the
     `instance` is lowered as an empty placeholder (the bind is not yet
-    known) and filled at the test-binding stage
-    (`fill_transactor_state_instance`); the subset has exactly one
-    `passive` instance per bound transactor per file, so the fill is
-    unambiguous. Emission (`emit_target_actor`, mirroring v1's
+    known). It remains type-shared through verification; each
+    `emit_target_actor` call supplies its concrete actor receiver, which is
+    authoritative even over malformed legacy IR carrying a baked name.
+    Any number of passive instances may therefore reuse one responder body
+    while keeping independent state. Emission (mirroring v1's
     `emit_bound_tlm_target_actors` blocking path) generates a test-scope
     per-instance state struct (state fields + `_last_in/out_cycle`
     activity stamps) plus one background-coroutine actor per target
@@ -9767,6 +9768,21 @@ former `transaction` group lives in
      expected bind field named in the diagnostic. Two false escape-hatch
      constructors are removed, leaving 116 textual `unsupported(` matches
      (115 constructors plus the helper definition).
+
+180. **Bound target responders support multiple instances (2026-08-29).**
+
+     Target responder functions remain shared per transactor type, but their
+     empty-instance state nodes now resolve through the concrete actor's state
+     receiver during emission. Binding one target type more than once—within
+     one test or across tests—therefore produces independent state paths
+     instead of clobbering the first binding's lowered body. The emitted-C++
+     unit probe requires both receiver names from one shared function and
+     corrupts a legacy baked receiver to prove actor context remains
+     authoritative. A two-bus self-checking fixture drives two instances
+     concurrently, observes independent counters/results, and trace-diffs
+     clean against v1. This removes the singleton rejection and leaves 115
+     textual `unsupported(` matches (114 constructors plus the helper
+     definition).
 
 ## Next steps
 

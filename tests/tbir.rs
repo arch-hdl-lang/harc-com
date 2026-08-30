@@ -13110,7 +13110,7 @@ end impl T
     let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits it too");
     assert!(
         cpp.contains("target.ba.data == target.bb.data"),
-        "the responder-body read is instance-filled and compared:\n{cpp}"
+        "the responder-body read is actor-resolved and compared:\n{cpp}"
     );
     assert!(v1.contains("target.ba.data == target.bb.data"), "{v1}");
     // The WRITE lowers in this lane too — the mutation round found this
@@ -23609,8 +23609,8 @@ fn tlm_target_blocking_responder_lowers() {
     assert_eq!(tb.target_tlm_actors[0].bus_field, "mem");
 }
 
-/// State fields lower as `TransactorState` reads/writes, instance-filled
-/// at the test bind, and the test reads them back (`target.read_count`).
+/// State fields lower as shared-body `TransactorState` reads/writes with an
+/// empty receiver placeholder; each emitted actor supplies its instance.
 #[test]
 fn tlm_target_state_fields_lower() {
     let prog = lower_src(&fixture("tlm_target_thread_if_test.harc")).expect("lowers");
@@ -23618,25 +23618,25 @@ fn tlm_target_state_fields_lower() {
     let x = &prog.transactors[0];
     let names: Vec<&str> = x.state_fields.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, ["read_count", "prep_acc"]);
-    // The responder body's state writes are instance-filled to `target`.
+    // The responder body remains reusable across every actor instance.
     let body = prog.function(x.target_methods[0].function);
     let filled = body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
         matches!(
             s,
-            ir::Stmt::TransactorStateWrite { instance, .. } if instance == "target"
+            ir::Stmt::TransactorStateWrite { instance, .. } if instance.is_empty()
         )
     });
     assert!(
         filled,
-        "responder body must carry instance-filled state writes"
+        "responder body must carry shared empty-instance state writes"
     );
 }
 
 /// #494 P0a: a bound-to TARGET transactor may now carry NON-SCALAR
 /// persistent state — a `queue<Record>` and a `queue<scalar>`. The state
 /// fields lower as `StateFieldKind::Queue` reusing the scoreboard/
-/// component `QueueElem` machinery; the responder body's push/pop are
-/// instance-filled to the bound `responder` actor.
+/// component `QueueElem` machinery; the responder body's push/pop retain
+/// the shared empty receiver that each actor resolves while emitting.
 #[test]
 fn target_nonscalar_queue_state_lowers() {
     let prog = lower_src(&fixture("target_nonscalar_state_test.harc")).expect("lowers");
@@ -23660,28 +23660,27 @@ fn target_nonscalar_queue_state_lowers() {
             }
         }
     ));
-    // The responder body's state-queue push/pop are instance-filled to
-    // the bound `responder` actor (placeholder resolved at test bind).
+    // The responder body's state-queue push/pop remain type-shared.
     let body = prog.function(x.target_methods[0].function);
     let has_push = body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
         matches!(
             s,
-            ir::Stmt::TransactorStateQueuePush { instance, .. } if instance == "responder"
+            ir::Stmt::TransactorStateQueuePush { instance, .. } if instance.is_empty()
         )
     });
     let has_pop = body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
         matches!(
             s,
-            ir::Stmt::TransactorStateQueuePop { instance, .. } if instance == "responder"
+            ir::Stmt::TransactorStateQueuePop { instance, .. } if instance.is_empty()
         )
     });
     assert!(
         has_push,
-        "responder body must carry instance-filled state-queue push"
+        "responder body must carry shared empty-instance state-queue push"
     );
     assert!(
         has_pop,
-        "responder body must carry instance-filled state-queue pop"
+        "responder body must carry shared empty-instance state-queue pop"
     );
 }
 
@@ -23886,7 +23885,7 @@ fn target_nonscalar_queue_wide_scalar_behavior_is_exact() {
 
 /// #494 P0a follow-up: a WHOLE value-record target-transactor state field
 /// (`last : Beat`) lowers to `StateFieldKind::Record`, and its subfield
-/// read/write ops are instance-filled to the bound `responder` actor.
+/// read/write ops retain the shared empty receiver resolved by each actor.
 #[test]
 fn target_record_state_lowers() {
     let prog = lower_src(&fixture("target_record_state_test.harc")).expect("lowers");
@@ -23900,8 +23899,7 @@ fn target_record_state_lowers() {
         &x.state_fields[0].kind,
         ir::StateFieldKind::Record { .. }
     ));
-    // The responder body's record-subfield writes are instance-filled to
-    // the bound `responder` actor (placeholder resolved at test bind).
+    // The responder body's record-subfield writes remain type-shared.
     let body = prog.function(x.target_methods[0].function);
     let subfield_writes: Vec<String> = body
         .blocks
@@ -23913,24 +23911,23 @@ fn target_record_state_lowers() {
                 field,
                 path,
                 ..
-            } if instance == "responder" && field == "last" => Some(path.join(".")),
+            } if instance.is_empty() && field == "last" => Some(path.join(".")),
             _ => None,
         })
         .collect();
     assert_eq!(
         subfield_writes,
         ["addr", "data"],
-        "responder body must carry instance-filled record-subfield writes"
+        "responder body must carry shared empty-instance record-subfield writes"
     );
-    // And a subfield READ (`last.data`) instance-filled likewise (the
-    // returned value / the in-body asserts).
+    // And a subfield READ (`last.data`) keeps the same placeholder.
     let has_subfield_read = body
         .blocks
         .iter()
-        .any(|b| block_has_state_record_field_read(b, "responder", "last"));
+        .any(|b| block_has_state_record_field_read(b, "", "last"));
     assert!(
         has_subfield_read,
-        "responder body must carry an instance-filled record-subfield read"
+        "responder body must carry a shared empty-instance record-subfield read"
     );
 }
 
@@ -24131,13 +24128,11 @@ end impl T
     assert!(lower_src(&mk("2")).is_ok(), "tags 2 must lower");
 }
 
-/// The responder `TbFunction`s are shared per transactor TYPE; binding
-/// the same bound transactor to two instances across two tests would
-/// clobber the first test's instance-filled bodies. The subset is one
-/// passive instance per bound transactor — lowering rejects the second
-/// bind loudly (in ALL build profiles), never silently mis-emits.
+/// Responder `TbFunction`s are shared per transactor TYPE. Each target actor
+/// supplies its own state receiver while emitting that shared body, so two
+/// bindings cannot clobber one another's state path.
 #[test]
-fn tlm_target_multi_instance_unsupported() {
+fn tlm_target_multi_instance_uses_per_actor_state_receivers() {
     let src = r#"
 bus MemBus
     tlm_method read(addr: uint<8>) -> uint<32>: blocking;
@@ -24177,11 +24172,56 @@ impl TestB for TbB
     end run
 end impl TestB
 "#;
-    let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let mut prog = lower_src(src).expect("two bindings of one target type lower");
+    verify::verify_program(&prog).expect("shared responder body verifies");
+    assert_eq!(prog.testbenches.len(), 2);
+    assert_eq!(prog.testbenches[0].target_tlm_actors[0].instance, "target");
+    assert_eq!(prog.testbenches[1].target_tlm_actors[0].instance, "responder");
+
+    let responder = prog
+        .transactors
+        .iter()
+        .find(|x| x.name == "MemTarget")
+        .and_then(|x| x.target_methods.first())
+        .map(|m| &prog.functions[m.function.index()])
+        .expect("shared responder body");
+    let responder_id = responder.id;
+    let dump = format!("{responder:?}");
     assert!(
-        msg.contains("more than one instance"),
-        "expected the multi-instance rejection: {msg}"
+        dump.contains("instance: \"\""),
+        "the shared body must retain empty-instance state placeholders: {dump}"
+    );
+
+    let cpp = tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
+        .expect("both target actors emit from the shared body");
+    assert!(
+        cpp.contains("target.read_count = (target.read_count + 1);")
+            && cpp.contains("responder.read_count = (responder.read_count + 1);"),
+        "each actor must bind the shared state access to its own receiver:\n{cpp}"
+    );
+
+    // Emission context is the final aliasing backstop. If a pass regresses
+    // to the legacy baked-name representation, the right actor must still
+    // render against `responder`, never the stale `target` receiver.
+    let mut corrupted = false;
+    for block in &mut prog.functions[responder_id.index()].blocks {
+        for stmt in &mut block.stmts {
+            if let ir::Stmt::TransactorStateWrite { instance, .. } = stmt {
+                *instance = "target".to_string();
+                corrupted = true;
+                break;
+            }
+        }
+        if corrupted {
+            break;
+        }
+    }
+    assert!(corrupted, "fixture must carry a state write to corrupt");
+    let cpp = tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
+        .expect("actor receiver overrides a stale baked state name");
+    assert!(
+        cpp.contains("responder.read_count = (responder.read_count + 1);"),
+        "the second actor must override the corrupted first-actor receiver:\n{cpp}"
     );
 }
 

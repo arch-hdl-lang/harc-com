@@ -3600,8 +3600,9 @@ impl Checker<'_> {
             body_transactor.filter(|_| instance.is_empty() || self.func.owner.is_none())
         {
             // Target responder bodies are schema functions shared by every
-            // binding, so they have no owning testbench even after binding
-            // fills the emission placeholder with an instance name.
+            // binding and retain an empty receiver placeholder. The ownerless
+            // fallback also lets verification diagnose pass-mutated legacy IR;
+            // actor emission remains authoritative over any stale name.
             transactor
         } else if instance.is_empty() {
             return Err(

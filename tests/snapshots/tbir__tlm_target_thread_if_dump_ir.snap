@@ -22,9 +22,9 @@ fn fn0 TlmMemTarget_target_read [kind=TransactorBody(x0)]
   entry = b0
 
   b0:
-    Assign(%req_seq, target.read_count)
-    TransactorStateWrite(target.read_count, (target.read_count + 1))
-    TransactorStateWrite(target.prep_acc, 0)
+    Assign(%req_seq, .read_count)
+    TransactorStateWrite(.read_count, (.read_count + 1))
+    TransactorStateWrite(.prep_acc, 0)
     Assign(%i, 0)
     -> Jump(b1)
 
@@ -32,7 +32,7 @@ fn fn0 TlmMemTarget_target_read [kind=TransactorBody(x0)]
     -> Branch((%i <= 3), b2, b4)
 
   b2:
-    TransactorStateWrite(target.prep_acc, ((target.prep_acc + %addr) + %i))
+    TransactorStateWrite(.prep_acc, ((.prep_acc + %addr) + %i))
     -> Jump(b3)
 
   b3:
@@ -46,11 +46,11 @@ fn fn0 TlmMemTarget_target_read [kind=TransactorBody(x0)]
     -> Branch((%addr < 8), b6, b7)
 
   b6:
-    Assign(%__ret, (((256 + %addr) + %req_seq) + target.prep_acc))
+    Assign(%__ret, (((256 + %addr) + %req_seq) + .prep_acc))
     -> Return
 
   b7:
-    Assign(%__ret, (((512 + %addr) + %req_seq) + target.prep_acc))
+    Assign(%__ret, (((512 + %addr) + %req_seq) + .prep_acc))
     -> Return
 
 fn fn1 run_TlmTargetThreadIfTest [kind=Run, owner=tb0]

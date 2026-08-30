@@ -159,6 +159,12 @@ pub(super) fn lane_width(cx: &ECx<'_>, p: &PortRef) -> Option<u32> {
 /// per-call state receiver (`self_state`); reaching an empty instance with no
 /// receiver in scope means a lowering/pass bug left a placeholder unbound.
 pub(super) fn resolve_state_instance(cx: &ECx<'_>, instance: &str) -> Result<String, EmitError> {
+    // A concrete emission context is authoritative. Shared target-responder
+    // bodies are rendered once per actor; even malformed/pass-mutated IR that
+    // retained a stale non-empty name must not alias another actor's state.
+    if let Some(receiver) = cx.state_receiver {
+        return Ok(receiver.to_string());
+    }
     if !instance.is_empty() {
         if let Some(storage) = owner_tb(cx).and_then(|tb| {
             tb.unbound_state_actors
@@ -170,13 +176,11 @@ pub(super) fn resolve_state_instance(cx: &ECx<'_>, instance: &str) -> Result<Str
         }
         return Ok(instance.to_string());
     }
-    cx.state_receiver.map(str::to_string).ok_or_else(|| {
-        EmitError(format!(
-            "tbir: empty-instance transactor-state access in {} with no state receiver \
-                 in scope (unfilled placeholder — lowering/pass bug)",
-            cx.func.name
-        ))
-    })
+    Err(EmitError(format!(
+        "tbir: empty-instance transactor-state access in {} with no state receiver \
+             in scope (unfilled placeholder — lowering/pass bug)",
+        cx.func.name
+    )))
 }
 
 /// Render an IR expression.
