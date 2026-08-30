@@ -45383,3 +45383,84 @@ end test T"#,
         assert!(msg.contains(want), "{what}: {msg}");
     }
 }
+
+/// Every remaining test-scope transactor landing agrees with v1 that a mode
+/// annotation is mandatory. Explicit-but-wrong modes retain their separate
+/// mis-lowering classifications; this covers only the absent annotation.
+#[test]
+fn all_modeless_test_scope_transactor_instances_are_invalid() {
+    let dut_bfm = r#"transactor Poker
+    dut : Top
+    when active
+        hookable poke()
+            dut.en = 1
+        end poke
+    end when
+end transactor Poker
+
+env Holder
+    p : Poker active
+end env Holder
+
+test T
+    let dut : Top
+    let p : Poker
+    run
+        wait 1 cycle
+    end run
+end test T"#;
+
+    let plain = r#"transactor Plain
+    dut : Top
+    count : uint<32> default 0
+end transactor Plain
+
+test T
+    let dut : Top
+    let p : Plain
+    run
+        wait 1 cycle
+    end run
+end test T"#;
+
+    for (what, src, want_prefix) in [
+        ("DUT-poking BFM", dut_bfm, "DUT-poking transactor instance"),
+        ("plain transactor", plain, "transactor instance"),
+    ] {
+        let v1 = cpp_tb::emit(&merged_src(src)).expect_err("v1 requires a transactor mode");
+        assert!(format!("{v1}").contains("mode"), "{what}: {v1}");
+        let err = lower_src(src).expect_err("TBIR requires the same mode");
+        let msg = assert_invalid(&err);
+        assert!(
+            msg.starts_with(want_prefix)
+                && msg.contains("active`/`passive` mode annotation")
+                && (what != "plain transactor" || !msg.contains("DUT-poking")),
+            "{what}: {msg}"
+        );
+    }
+
+    // The bound event/monitor landing needs the stdlib bus merged exactly as
+    // the simulation path does. Remove the active annotation from the driver.
+    let base = fixture("axilite_bound_mon_test.harc");
+    const DECL: &str = "let drv  : AxilXactor active  = bind axil";
+    assert!(base.contains(DECL), "fixture shape changed");
+    let modeless = base.replacen(DECL, "let drv  : AxilXactor         = bind axil", 1);
+    let with_bus = |source: &str| {
+        let file = parse_source(source).expect("fixture parses");
+        let bus_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("stdlib")
+            .join("BusAxiLite.arch");
+        let bus = parse_source(&std::fs::read_to_string(bus_path).expect("read stdlib bus"))
+            .expect("stdlib bus parses");
+        merge::merge_for_sim(vec![file, bus], None).expect("fixture merges with stdlib bus")
+    };
+    let merged = with_bus(&modeless);
+    let v1 = cpp_tb::emit(&merged).expect_err("v1 requires a bound transactor mode");
+    assert!(format!("{v1}").contains("mode"), "{v1}");
+    let err = lower::lower_program(&merged).expect_err("TBIR requires the same bound mode");
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("bound-to event-driven") && msg.contains("mode annotation"),
+        "{msg}"
+    );
+}
