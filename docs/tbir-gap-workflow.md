@@ -140,8 +140,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 117 remaining constructor call sites (118 textual matches including
-the `unsupported` helper definition) as an inventory, not 118 separate tasks.
+Treat the 115 remaining constructor call sites (116 textual matches including
+the `unsupported` helper definition) as an inventory, not 116 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -475,6 +475,14 @@ not applicable before requesting review:
    unknown and record-leaf fixed-vector element types instead of degrading
    them to a scalar ABI, so the raw inventory is 118 textual matches (117
    constructors plus the helper definition).
+   Component-method result incompatibilities are source type errors, not
+   backend gaps. Reclassifying the shared narrowing/scalar-record/record-id
+   mismatch constructor leaves 116 constructors plus the helper definition.
+   Invalid transactor DUT binds then remove two more false escape hatches:
+   the target must be the declared module field and the value must be the test
+   DUT. Accounting for the callable-signature fence above, the raw inventory
+   is now 116 textual matches (115 constructors plus
+   the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

@@ -4865,10 +4865,11 @@ impl FuncBuilder<'_> {
         };
         let schema = &self.ctx.transactors[xid.index()];
         if sub.name != schema.dut_field {
-            return Err(unsupported(
-                &format!("assignment to transactor field `{}.{}`", xfield, sub.name),
-                "only the module-typed DUT bind is lowered",
-            ));
+            return Err(LowerError::Invalid(format!(
+                "assignment to transactor field `{}.{}` is not a DUT bind; the module-typed \
+                 bind field is `{}.{}`",
+                xfield, sub.name, xfield, schema.dut_field
+            )));
         }
         // RHS must be the test's DUT.
         let is_dut = match &*value.kind {
@@ -4876,13 +4877,10 @@ impl FuncBuilder<'_> {
             _ => false,
         };
         if !is_dut {
-            return Err(unsupported(
-                &format!(
-                    "binding `{}.{}` to something other than the test DUT",
-                    xfield, sub.name
-                ),
-                "",
-            ));
+            return Err(LowerError::Invalid(format!(
+                "binding `{}.{}` to something other than the test DUT",
+                xfield, sub.name
+            )));
         }
         Ok(true)
     }
