@@ -424,14 +424,21 @@ fn cover_scalar_type(ty: &IrType) -> bool {
 fn helper_abi_type_valid(ty: &IrType, record_count: usize) -> bool {
     match ty {
         IrType::RecordSeq(record) => record.index() < record_count,
-        IrType::Seq(elem) => matches!(
-            elem.as_ref(),
-            IrType::UInt(_) | IrType::SInt(_) | IrType::Bool
-        ),
+        IrType::Seq(elem) => sequence_elem_valid(elem),
         IrType::FixedVec { elem, len } if *len != 0 => {
             helper_fixed_vec_elem_valid(elem, record_count)
         }
         other => cover_scalar_type(other),
+    }
+}
+
+/// Element types admitted by the typed `Seq` ABI. Fixed-vector sequence
+/// elements intentionally use the scalar-leaf decoder; record-leaf vectors
+/// require record-aware C++ rendering that this sequence ABI does not expose.
+fn sequence_elem_valid(ty: &IrType) -> bool {
+    match ty {
+        IrType::FixedVec { .. } => fixed_vec_elem_valid(ty),
+        scalar => matches!(scalar, IrType::UInt(_) | IrType::SInt(_) | IrType::Bool),
     }
 }
 
@@ -995,12 +1002,18 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
         drop(check_component_function);
         for method in &component.methods {
             for (param, ty) in method.param_tys.iter().enumerate() {
-                if matches!(ty, IrType::FixedVec { .. })
-                    && !component_fixed_vec_elem_valid(ty, prog.records.len())
-                {
+                let invalid_aggregate = match ty {
+                    IrType::RecordSeq(record) => record.index() >= prog.records.len(),
+                    IrType::FixedVec { .. } => {
+                        !component_fixed_vec_elem_valid(ty, prog.records.len())
+                    }
+                    IrType::Seq(elem) => !sequence_elem_valid(elem),
+                    _ => false,
+                };
+                if invalid_aggregate {
                     errs.push(VerifyError::BadProgramRef {
                         what: format!(
-                            "component c{ci} `{}` method `{}` parameter {param} has invalid fixed-vector schema {ty:?}",
+                            "component c{ci} `{}` method `{}` parameter {param} has invalid aggregate schema {ty:?}",
                             component.name, method.name
                         ),
                     });
@@ -1050,6 +1063,8 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     method.ret_ty,
                     Some(
                         IrType::Record(_)
+                            | IrType::RecordSeq(_)
+                            | IrType::Seq(_)
                             | IrType::FixedVec { .. }
                             | IrType::UInt(_)
                             | IrType::SInt(_)
@@ -1074,6 +1089,26 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                             what: format!(
                                 "component c{ci} `{}` method `{}` has invalid fixed-vector return schema {ty:?}",
                                 component.name, method.name
+                            ),
+                        });
+                    }
+                }
+                if let Some(IrType::Seq(elem)) = &method.ret_ty {
+                    if !sequence_elem_valid(elem) {
+                        errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "component c{ci} `{}` method `{}` has invalid sequence return schema {:?}",
+                                component.name, method.name, method.ret_ty
+                            ),
+                        });
+                    }
+                }
+                if let Some(IrType::RecordSeq(record)) = &method.ret_ty {
+                    if record.index() >= prog.records.len() {
+                        errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "component c{ci} `{}` method `{}` has invalid record-sequence return schema {:?}",
+                                component.name, method.name, method.ret_ty
                             ),
                         });
                     }
@@ -4372,10 +4407,9 @@ impl Checker<'_> {
                             IrType::RecordSeq(record) => {
                                 record.index() >= self.prog.records.len()
                             }
-                            IrType::Seq(elem) => !matches!(
-                                elem.as_ref(),
-                                IrType::UInt(_) | IrType::SInt(_) | IrType::Bool
-                            ),
+                            IrType::Seq(_) => {
+                                !helper_abi_type_valid(&tl.ty, self.prog.records.len())
+                            }
                             _ => true,
                         })
                     {

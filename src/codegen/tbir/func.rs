@@ -4095,6 +4095,8 @@ fn emit_component_fn_lambda(
     // `IrType` the params below do and the two cannot drift.
     let ret_ty = match func.ret.map(|r| &func.locals[r.index()].ty) {
         Some(IrType::Record(r)) => prog.records[r.index()].name.clone(),
+        Some(IrType::RecordSeq(r)) => format!("std::vector<{}>", prog.records[r.index()].name),
+        Some(IrType::Seq(elem)) => format!("std::vector<{}>", super::field_scalar_cty(elem)),
         Some(ty @ IrType::FixedVec { .. }) => super::aggregate_value_cty(ty, &prog.records),
         Some(ty) => super::local_scalar_cty(ty),
         None => "void".to_string(),

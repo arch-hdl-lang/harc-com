@@ -794,13 +794,34 @@ pub(crate) fn lower_component_schema(
                     let param_tys = h
                         .params
                         .iter()
-                        .map(|p| method_schema_ir_type(p.ty.as_ref(), ids, record_ids, true))
-                        .collect();
+                        .map(|p| {
+                            method_schema_ir_type(
+                                name,
+                                &h.name.name,
+                                &format!("parameter `{}`", p.name.name),
+                                p.ty.as_ref(),
+                                ids,
+                                record_ids,
+                                true,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
                     let has_ret = h.return_ty.is_some();
                     let ret_ty = h
                         .return_ty
                         .as_ref()
-                        .map(|t| method_schema_ir_type(Some(t), ids, record_ids, true));
+                        .map(|t| {
+                            method_schema_ir_type(
+                                name,
+                                &h.name.name,
+                                "return type",
+                                Some(t),
+                                ids,
+                                record_ids,
+                                true,
+                            )
+                        })
+                        .transpose()?;
                     let fid = FunctionId(*next_fn);
                     *next_fn += 1;
                     methods.push(ComponentMethodSchema {
@@ -2275,18 +2296,27 @@ fn on_handler_arg_name(h: &crate::ast::OnHandler) -> String {
 /// local so `for t in txns` lowers to the counted-loop-over-sequence form
 /// (same typing a `let txns = SomeTseq(...)` local would get). A
 /// `TSeq<scalar>` or unresolved element falls back to `Unknown`.
-fn method_param_ir_type(ty: Option<&TypeExpr>, ctx: &LowerCtx) -> IrType {
+fn method_param_ir_type(
+    method: &str,
+    what: &str,
+    ty: Option<&TypeExpr>,
+    ctx: &LowerCtx,
+) -> Result<IrType, LowerError> {
     // A `TSeq<T>` parameter. `RecordSeq` for a record element and
     // `Seq(scalar)` for a scalar one, mirroring how `collect_tseq_records`
     // types a scalar-element tseq result (#453). v1 renders both as
     // `std::vector<T>`; only the element C++ type differs.
-    if let Some(seq) = helpers::tseq_ir_type(ty, &ctx.record_ids) {
-        return seq;
+    if let Some(seq) = helpers::callable_tseq_ir_type(
+        format!("{what} of component method `{method}` has an unsupported TSeq element type"),
+        ty,
+        &ctx.record_ids,
+    )? {
+        return Ok(seq);
     }
     if let Some(fixed @ IrType::FixedVec { .. }) =
         ty.and_then(|ty| fixed_vec_elem_ir_type_with_records(ty, &ctx.record_ids))
     {
-        return fixed;
+        return Ok(fixed);
     }
     // A record-typed component/scoreboard method parameter
     // (`observe(cmd: Cmd)`) is a by-value transaction/struct, not a
@@ -2295,7 +2325,7 @@ fn method_param_ir_type(ty: Option<&TypeExpr>, ctx: &LowerCtx) -> IrType {
     if let Some(TypeExpr::Named { name, .. }) = ty {
         let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
         if let Some(rid) = ctx.record_ids.get(simple) {
-            return IrType::Record(*rid);
+            return Ok(IrType::Record(*rid));
         }
     }
     // A component-typed parameter (`observe(addr, model: ProtocolModel)`):
@@ -2304,7 +2334,7 @@ fn method_param_ir_type(ty: Option<&TypeExpr>, ctx: &LowerCtx) -> IrType {
     if let Some(TypeExpr::Named { name, .. }) = ty {
         let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
         if let Some(rid) = ctx.record_ids.get(simple) {
-            return IrType::Record(*rid);
+            return Ok(IrType::Record(*rid));
         }
         if let Some(cid) = ctx
             .components
@@ -2312,38 +2342,47 @@ fn method_param_ir_type(ty: Option<&TypeExpr>, ctx: &LowerCtx) -> IrType {
             .position(|c| c.name == simple)
             .map(|i| ComponentId(i as u32))
         {
-            return IrType::Component(cid);
+            return Ok(IrType::Component(cid));
         }
     }
-    helpers::ir_type_of(ty)
+    Ok(helpers::ir_type_of(ty))
 }
 
 fn method_schema_ir_type(
+    component: &str,
+    method: &str,
+    what: &str,
     ty: Option<&TypeExpr>,
     ids: &HashMap<String, ComponentId>,
     record_ids: &HashMap<String, RecordId>,
     allow_fixed_vec: bool,
-) -> IrType {
-    if let Some(seq) = helpers::tseq_ir_type(ty, record_ids) {
-        return seq;
+) -> Result<IrType, LowerError> {
+    if let Some(seq) = helpers::callable_tseq_ir_type(
+        format!(
+            "{what} of component method `{component}.{method}` has an unsupported TSeq element type"
+        ),
+        ty,
+        record_ids,
+    )? {
+        return Ok(seq);
     }
     if allow_fixed_vec {
         if let Some(fixed @ IrType::FixedVec { .. }) =
             ty.and_then(|ty| fixed_vec_elem_ir_type_with_records(ty, record_ids))
         {
-            return fixed;
+            return Ok(fixed);
         }
     }
     if let Some(TypeExpr::Named { name, .. }) = ty {
         let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
         if let Some(rid) = record_ids.get(simple) {
-            return IrType::Record(*rid);
+            return Ok(IrType::Record(*rid));
         }
         if let Some(cid) = ids.get(simple) {
-            return IrType::Component(*cid);
+            return Ok(IrType::Component(*cid));
         }
     }
-    helpers::ir_type_of(ty)
+    Ok(helpers::ir_type_of(ty))
 }
 
 fn lower_method_body(
@@ -2363,7 +2402,12 @@ fn lower_method_body(
     // transactor method body.
     let mut params = Vec::with_capacity(h.params.len());
     for p in &h.params {
-        let ty = method_param_ir_type(p.ty.as_ref(), ctx);
+        let ty = method_param_ir_type(
+            &h.name.name,
+            &format!("parameter `{}`", p.name.name),
+            p.ty.as_ref(),
+            ctx,
+        )?;
         let local = b.declare(&p.name.name);
         b.set_local_type(local, ty.clone());
         if let Some(t) = &p.ty {
@@ -2393,17 +2437,13 @@ fn lower_method_body(
         // few lines up use, so a parameter and a return spelled with the
         // same type can no longer disagree.
         //
-        // RECORD, fixed-vector, and SCALAR only. `method_param_ir_type` also resolves
-        // `TSeq<T>` and component-typed spellings, but the method
-        // emitter maps both of those returns to `uint64_t` and no
-        // fixture returns one — typing the slot without teaching the
-        // emitter would declare `std::vector<Beat> __ret` inside a
-        // lambda still declared `-> uint64_t`, which is a new
-        // inconsistency, not a fix. They keep the `Unknown` slot they
-        // have; issue #642 lists expanding unrelated features as a
-        // non-goal.
-        match method_param_ir_type(Some(rt), ctx) {
+        // Component-typed spellings remain excluded. Record/scalar/fixed-
+        // vector returns and typed dynamic sequences all have exact value
+        // carriers in the component-method emitter.
+        match method_param_ir_type(&h.name.name, "return type", Some(rt), ctx)? {
             ty @ (IrType::Record(_)
+            | IrType::RecordSeq(_)
+            | IrType::Seq(_)
             | IrType::FixedVec { .. }
             | IrType::UInt(_)
             | IrType::SInt(_)

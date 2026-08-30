@@ -78,6 +78,7 @@ extern_fn_ref_test      | Top            | top_counter.sv         |     | extern
 relation_inlining_test  | Top            | top_counter.sv         |
 tseq_scalar_test        | Top            | top_counter.sv         |
 tseq_fixed_vec_test     | Top            | top_counter.sv         |
+fixed_vec_tseq_abi_test | Top            | top_counter.sv         |
 transactor_wait_self_predicate_test | Top | top_counter.sv        |
 transactor_wait_bound_predicate_test | Top | top_counter.sv        |
 promoted_let_runtime_init_test | Top      | top_counter.sv         |

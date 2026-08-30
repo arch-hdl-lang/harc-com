@@ -129,6 +129,9 @@ family of rejections over a one-site exception. Current implementation order:
   return-expression validation.
 - [x] Uninitialized test-scope `TSeq<Record>` and scalar `TSeq<T>` locals as
   typed empty sequences (TBIR-first; v1 mis-emits these as scalar locals).
+- [x] Scalar-leaf fixed-vector `TSeq<Vec<T, N>>` values across typed empty locals,
+  pure helpers, reusable testbench methods, and component methods, retaining
+  exact nested `std::array` element carriers and verifier metadata.
 - [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
 
 This list intentionally excludes v1 failures such as a blocking bus call
@@ -137,8 +140,8 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 116 remaining constructor call sites (117 textual matches including
-the `unsupported` helper definition) as an inventory, not 117 separate tasks.
+Treat the 117 remaining constructor call sites (118 textual matches including
+the `unsupported` helper definition) as an inventory, not 118 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
 shared IR primitive, and equivalence fixture. Then:
@@ -464,6 +467,14 @@ not applicable before requesting review:
    are used. The shared unsupported constructor remains for other typed local
    shapes, leaving the raw inventory at 117 textual matches (116 constructors
    plus the helper definition).
+   Scalar-leaf fixed-vector `TSeq<Vec<T, N>>` values now reuse the same `Seq`
+   container and recursive fixed-vector ABI as generators. Empty locals,
+   helper/testbench/component method parameters and returns, inferred results,
+   iteration elements, verifier checks, and C++ `std::vector<std::array<...>>`
+   emission retain the exact shape. A shared callable-signature fence rejects
+   unknown and record-leaf fixed-vector element types instead of degrading
+   them to a scalar ABI, so the raw inventory is 118 textual matches (117
+   constructors plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
