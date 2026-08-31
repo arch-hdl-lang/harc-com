@@ -685,6 +685,7 @@ fn main() -> Result<()> {
                         // Plain `--dut`/`--sv` path: the DUT `.arch` inputs are
                         // the interface source for port-override ingestion.
                         dut.clone(),
+                        Vec::new(),
                         cosim.clone(),
                     )
                 }
@@ -2543,6 +2544,11 @@ fn cmd_sim(
     // still must be applied so both backends model the same flattened port set.
     // On the plain `--dut` path this equals `dut`.
     dut_iface: Vec<PathBuf>,
+    // Extra SV sources scanned into the DUT interface catalog WITHOUT
+    // selecting the Verilator backend. `--check-backends` uses this to give
+    // the ARCH-sim run the same flattened bus-port set `arch build` produced
+    // (the native `.arch` catalog does not flatten bus perspective ports).
+    catalog_sv: Vec<PathBuf>,
     // `--cosim dpi`: simulator-owned-time DPI-C co-sim (spec §10).
     cosim: Option<String>,
 ) -> Result<()> {
@@ -2799,11 +2805,13 @@ fn cmd_sim(
     let top_for_interface = top
         .clone()
         .or_else(|| harc::codegen::cpp_tb::dut_type_name(&codegen_source));
+    let mut interface_sv = sv.clone();
+    interface_sv.extend(catalog_sv.iter().cloned());
     let dut_interface = top_for_interface
         .as_deref()
         .map(|top_name| {
             harc::codegen::cpp_tb::dut_interface_catalog_with_parameter_overrides(
-                &sv,
+                &interface_sv,
                 &dut_iface,
                 top_name,
                 &vec_lane_widths,
@@ -3777,6 +3785,7 @@ fn cmd_sim_check_backends(
         None,
         waves.clone(),
         dut.clone(),
+        sv.clone(),
         None,
     )?;
 
@@ -3809,6 +3818,7 @@ fn cmd_sim_check_backends(
         // the DUT `.arch` interface still supplies the port-level override so
         // BOTH backends model the same flattened bus port set.
         dut.clone(),
+        Vec::new(),
         None,
     )?;
 

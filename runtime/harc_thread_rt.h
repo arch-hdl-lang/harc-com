@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <type_traits>
+#include <utility>
 #include <vector>
 #include <atomic>
 #include <thread>
@@ -673,9 +674,32 @@ struct HarcBusSignalRef {
     }
 };
 
+// C++17-compatible detection of the `harc_write`/`harc_read` accessor
+// members carried by `HarcBusSignalRef`. `requires` expressions would be
+// clearer, but `arch sim` compiles the TB with `-std=c++17` (non-parallel
+// thread sim), where concepts are unavailable.
+template<typename Sig, typename Val, typename = void>
+struct has_harc_write_member : std::false_type {};
+
+template<typename Sig, typename Val>
+struct has_harc_write_member<
+    Sig,
+    Val,
+    std::void_t<decltype(std::declval<Sig&>().harc_write(std::declval<Val>()))>>
+    : std::true_type {};
+
+template<typename Sig, typename = void>
+struct has_harc_read_member : std::false_type {};
+
+template<typename Sig>
+struct has_harc_read_member<
+    Sig,
+    std::void_t<decltype(std::declval<const Sig&>().harc_read())>>
+    : std::true_type {};
+
 template<typename Sig, typename Val>
 inline void harc_assign(Sig& sig, Val val) {
-    if constexpr (requires { sig.harc_write(val); }) {
+    if constexpr (has_harc_write_member<Sig, Val>::value) {
         sig.harc_write(val);
     } else if constexpr (std::is_assignable_v<Sig&, Val>) {
         sig = val;
@@ -702,7 +726,7 @@ inline void harc_assign(Sig& sig, Val val) {
 
 template<typename Sig>
 inline auto harc_read(const Sig& sig) {
-    if constexpr (requires { sig.harc_read(); }) {
+    if constexpr (has_harc_read_member<Sig>::value) {
         return sig.harc_read();
     } else if constexpr (std::is_arithmetic_v<Sig>) {
         return static_cast<_harc_u128>(sig);
