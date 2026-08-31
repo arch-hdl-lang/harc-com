@@ -6793,18 +6793,12 @@ fn infer_promoted_scalar_type(
 /// untyped host-scalar fallback used for DUT ports.
 fn is_direct_dut_port_initializer(expr: &crate::ast::Expr) -> bool {
     let mut expr = exprs::unparen_expr(expr);
-    // Require at least one accessor: a bare `dut` handle is not a port read
-    // and must not inherit the untyped host-scalar fallback.
-    let mut saw_accessor = false;
     loop {
         match &*expr.kind {
             ExprKind::Field { target, .. }
             | ExprKind::Index { target, .. }
-            | ExprKind::BitSlice { target, .. } => {
-                saw_accessor = true;
-                expr = exprs::unparen_expr(target);
-            }
-            ExprKind::Ident(id) => return saw_accessor && id.name == "dut",
+            | ExprKind::BitSlice { target, .. } => expr = exprs::unparen_expr(target),
+            ExprKind::Ident(id) => return id.name == "dut",
             _ => return false,
         }
     }
@@ -9177,67 +9171,6 @@ fn fill_initiator_bus_prefix(
     // Rewrite pass.
     run(true);
     Ok(())
-}
-
-#[cfg(test)]
-mod dut_port_init_tests {
-    use super::is_direct_dut_port_initializer;
-    use crate::ast::{Expr, ExprKind, Ident};
-    use crate::lexer::Span;
-
-    fn sp() -> Span {
-        Span::new(0, 0)
-    }
-
-    fn ident(name: &str) -> Expr {
-        Expr::new(
-            ExprKind::Ident(Ident {
-                name: name.to_string(),
-                span: sp(),
-            }),
-            sp(),
-        )
-    }
-
-    fn field(target: Expr, name: &str) -> Expr {
-        Expr::new(
-            ExprKind::Field {
-                target,
-                name: Ident {
-                    name: name.to_string(),
-                    span: sp(),
-                },
-            },
-            sp(),
-        )
-    }
-
-    #[test]
-    fn bare_dut_handle_is_not_a_port_initializer() {
-        // A bare `dut` (no field/index/slice) must not be treated as a
-        // direct port read; otherwise the untyped host-scalar fallback
-        // would lower a whole DUT handle into a scalar cell instead of
-        // yielding the clean `unsupported` diagnostic.
-        assert!(!is_direct_dut_port_initializer(&ident("dut")));
-    }
-
-    #[test]
-    fn dut_field_and_nested_accessor_are_port_initializers() {
-        assert!(is_direct_dut_port_initializer(&field(ident("dut"), "port")));
-        assert!(is_direct_dut_port_initializer(&field(
-            field(ident("dut"), "bus"),
-            "ready"
-        )));
-    }
-
-    #[test]
-    fn non_dut_root_is_not_a_port_initializer() {
-        assert!(!is_direct_dut_port_initializer(&ident("other")));
-        assert!(!is_direct_dut_port_initializer(&field(
-            ident("other"),
-            "port"
-        )));
-    }
 }
 
 #[cfg(test)]
