@@ -2136,7 +2136,13 @@ fn method_return_ir_type(
     let Some(ty) = ty else {
         return Ok(None);
     };
-    if let Some(seq) = super::helpers::tseq_ir_type(Some(ty), record_ids) {
+    if let Some(seq) = super::helpers::callable_tseq_ir_type(
+        || format!(
+            "transactor `{tname}` method `{mname}` {what} has an unsupported TSeq element type"
+        ),
+        Some(ty),
+        record_ids,
+    )? {
         return Ok(Some(seq));
     }
     if let Some(fixed @ IrType::FixedVec { .. }) =
@@ -2266,8 +2272,17 @@ fn method_param_ir_type(
     // schema uses. Without it the type came back `Unknown` and the slot
     // check described a `TSeq<Beat>` parameter as taking a non-record
     // value — then rejected `drv.dispatch(xs)`, which v1 compiles
-    // (`[&](Drv& self, const std::vector<Beat>& txns)`).
-    if let Some(seq) = helpers::tseq_ir_type(p.ty.as_ref(), record_ids) {
+    // (`[&](Drv& self, const std::vector<Beat>& txns)`). The callable fence
+    // rejects unsupported element spellings instead of leaking `Unknown`
+    // into the emitted C++.
+    if let Some(seq) = helpers::callable_tseq_ir_type(
+        || format!(
+            "transactor `{tname}` method `{mname}` parameter `{}` has an unsupported TSeq element type",
+            p.name.name
+        ),
+        p.ty.as_ref(),
+        record_ids,
+    )? {
         return Ok(seq);
     }
     if let Some(fixed @ IrType::FixedVec { .. }) =

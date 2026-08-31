@@ -59,7 +59,7 @@ transactor ApbXactor
             dut.apb_sel = 1
             dut.apb_enable = 0
             dut.apb_write = 1
-            dut.apb_addr = addr
+            dut.apb_addr = addr.trunc<3>()
             dut.apb_wdata = data
             wait 1 cycle
             dut.apb_enable = 1
@@ -73,7 +73,7 @@ transactor ApbXactor
             dut.apb_sel = 1
             dut.apb_enable = 0
             dut.apb_write = 0
-            dut.apb_addr = addr
+            dut.apb_addr = addr.trunc<3>()
             wait 1 cycle
             dut.apb_enable = 1
             wait 1 cycle

@@ -1830,6 +1830,13 @@ pub struct TestbenchSchema {
     /// `RecordFieldWrite` / `Expr::RecordField` plus helper
     /// `Stmt::TransactorCall` edges, so emission needs nothing here.
     pub regblock_bindings: Vec<RegblockBinding>,
+    /// Addrmap mirror locals: `(mangled mirror name, via-helper field)`.
+    /// An addrmap instance mirrors a register block through the addrmap's
+    /// `via` frontdoor helper, but its mirror is a run-function local
+    /// (`__addrmap_<chip>_<inst>`) rather than a `_tb` register-block member;
+    /// the register-read emitter consults this table to recover the helper
+    /// field for the split-aware transactor call.
+    pub addrmap_mirror_helpers: Vec<(String, String)>,
     /// Bound-to target-side TLM responder actors (`let target : X
     /// passive = bind <busbinding>`), in declaration order. Each names a
     /// passive instance of a `transactor X bound to <Bus>` transactor

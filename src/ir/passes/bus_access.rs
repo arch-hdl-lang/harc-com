@@ -853,7 +853,12 @@ fn validate_physical_access(
     } else {
         port.value_type().clone()
     };
-    if !wire_type_compatible(prog, &logical.value_type, &actual) {
+    let compatible = if is_tag_signal(&logical.signal) {
+        tag_width_compatible(&logical.value_type, &actual)
+    } else {
+        wire_type_compatible(prog, &logical.value_type, &actual)
+    };
+    if !compatible {
         return Err(BusAccessPlanError(format!(
             "bus access in fn{} `{}` maps `{}.{}` type {:?} to DUT port `{physical}` type {actual:?}",
             function.id.0,
@@ -898,12 +903,33 @@ fn wire_type_compatible(prog: &TbProgram, expected: &IrType, actual: &IrType) ->
     match (expected, actual) {
         (IrType::Bool, IrType::Bool | IrType::UInt(Some(1)))
         | (IrType::UInt(Some(1)), IrType::Bool) => true,
+        // A widthless bus schema signal is a signedness-family constraint that
+        // the DUT interface catalog resolves, not an exact width. It matches a
+        // concrete unsigned/signed port of the same family at any width.
+        (IrType::UInt(None), IrType::UInt(_)) | (IrType::UInt(_), IrType::UInt(None))
+        | (IrType::SInt(None), IrType::SInt(_)) | (IrType::SInt(_), IrType::SInt(None)) => true,
         (IrType::UInt(Some(lhs)), IrType::UInt(Some(rhs)))
         | (IrType::SInt(Some(lhs)), IrType::SInt(Some(rhs))) => lhs == rhs,
         (IrType::Record(_), IrType::UInt(Some(width)))
         | (IrType::FixedVec { .. }, IrType::UInt(Some(width))) => {
             packed_width(prog, expected) == Some(*width)
         }
+        _ => expected == actual,
+    }
+}
+
+/// Out-of-order TLM tag wires (`req_tag`/`rsp_tag`) carry a transaction tag
+/// bounded by the responder/initiator's `tags` count, so the semantic width is
+/// `ceil(log2(tags))`. A physical DUT port wider than that is overprovisioned
+/// and safe in BOTH directions: a driven tag always fits the semantic width,
+/// and its high physical bits are zero.
+fn is_tag_signal(signal: &str) -> bool {
+    matches!(signal, "req_tag" | "rsp_tag")
+}
+
+fn tag_width_compatible(expected: &IrType, actual: &IrType) -> bool {
+    match (expected, actual) {
+        (IrType::UInt(Some(semantic)), IrType::UInt(Some(physical))) => physical >= semantic,
         _ => expected == actual,
     }
 }

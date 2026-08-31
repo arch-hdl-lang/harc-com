@@ -32,7 +32,9 @@ env DottedEmitTop
 
     // The parameter deliberately shadows `self.sink`. Lexical lookup must
     // publish through the supplied component rather than silently retargeting
-    // the event to the same-named field.
+    // the event to the same-named field. Component parameters are by-value
+    // copies (see `docs/tbir-mvp.md`), so the emit targets the copy's own
+    // `received` fan-out — not `self.sink`, and not the caller's `other`.
     hookable publish_to(sink : DottedEmitSink, v : uint<8>)
         emit sink.received(v)
     end publish_to
@@ -55,10 +57,10 @@ test ComponentDottedEmitTest
             else fail("dotted emits delivered ${env.relay.sink.seen} events, expected 2")
         assert env.relay.sink.last == 7
             else fail("last dotted payload=${env.relay.sink.last}, expected 7")
-        assert env.other.seen == 1
-            else fail("shadowed component parameter received ${env.other.seen} events, expected 1")
-        assert env.other.last == 11
-            else fail("shadowed component parameter last=${env.other.last}, expected 11")
+        assert env.other.seen == 0
+            else fail("by-value component parameter aliased the original (${env.other.seen} events, expected 0)")
+        assert env.other.last == 0
+            else fail("by-value component parameter aliased the original (last=${env.other.last}, expected 0)")
         assert env.sink.seen == 0
             else fail("same-named self field was incorrectly targeted ${env.sink.seen} times")
         log(info, "PASS: component-body dotted emits reached nested child event")

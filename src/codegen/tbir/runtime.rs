@@ -714,32 +714,7 @@ fn transactor_method_param_ctypes(
         .locals
         .iter()
         .take(function.params.len())
-        .map(|local| match &local.ty {
-            crate::ir::IrType::Record(record) => prog
-                .records
-                .get(record.index())
-                .map(|schema| schema.name.clone())
-                .ok_or_else(|| {
-                    super::EmitError(format!(
-                        "tbir: transactor method `{}` references missing record r{}",
-                        method.name, record.0
-                    ))
-                }),
-            crate::ir::IrType::RecordSeq(record) => prog
-                .records
-                .get(record.index())
-                .map(|schema| format!("std::vector<{}>", schema.name))
-                .ok_or_else(|| {
-                    super::EmitError(format!(
-                        "tbir: transactor method `{}` references missing record r{}",
-                        method.name, record.0
-                    ))
-                }),
-            crate::ir::IrType::Seq(scalar) => {
-                Ok(format!("std::vector<{}>", super::local_scalar_cty(scalar)))
-            }
-            ty => Ok(super::local_scalar_cty(ty)),
-        })
+        .map(|local| super::callable_value_cty(prog, &local.ty))
         .collect()
 }
 
@@ -1084,7 +1059,7 @@ pub(super) fn component_struct(
                     RuntimeHookSide::Pre => "pre",
                     RuntimeHookSide::Post => "post",
                 };
-                let arg_csv = component_method_param_ctypes(prog, method).join(", ");
+                let arg_csv = component_method_param_ctypes(prog, method)?.join(", ");
                 let field = component_internal_member_name(
                     c,
                     &format!("_harc_hook_{}_{suffix}", method.name),
@@ -1112,7 +1087,7 @@ pub(super) fn component_struct(
                     RuntimeHookSide::Pre => "pre",
                     RuntimeHookSide::Post => "post",
                 };
-                let arg_csv = component_method_param_ctypes(prog, method).join(", ");
+                let arg_csv = component_method_param_ctypes(prog, method)?.join(", ");
                 let init = runtime_cell_initializer(cell)?;
                 writeln!(
                     out,
@@ -1724,20 +1699,10 @@ pub(super) fn randomize_site_state_field(
 fn component_method_param_ctypes(
     prog: &crate::ir::TbProgram,
     m: &crate::ir::ComponentMethodSchema,
-) -> Vec<String> {
+) -> Result<Vec<String>, super::EmitError> {
     let func = prog.function(m.function);
     (0..m.param_names.len())
-        .map(|i| match func.locals[i].ty {
-            crate::ir::IrType::Record(r) => prog.records[r.index()].name.clone(),
-            crate::ir::IrType::RecordSeq(r) => {
-                format!("std::vector<{}>", prog.records[r.index()].name)
-            }
-            crate::ir::IrType::Seq(ref scalar) => {
-                format!("std::vector<{}>", super::field_scalar_cty(scalar))
-            }
-            crate::ir::IrType::Component(c) => prog.components[c.index()].name.clone(),
-            ref ty => super::local_scalar_cty(ty),
-        })
+        .map(|i| super::callable_value_cty(prog, &func.locals[i].ty))
         .collect()
 }
 

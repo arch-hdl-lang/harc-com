@@ -2447,7 +2447,7 @@ pub(crate) fn method_param_ir_type(
     ctx: &LowerCtx,
 ) -> Result<IrType, LowerError> {
     callable_method_param_ir_type(
-        format!("{what} of component method `{method}` has an unsupported TSeq element type"),
+        || format!("{what} of component method `{method}` has an unsupported TSeq element type"),
         ty,
         ctx,
     )
@@ -2460,14 +2460,14 @@ pub(crate) fn testbench_method_param_ir_type(
     ctx: &LowerCtx,
 ) -> Result<IrType, LowerError> {
     callable_method_param_ir_type(
-        format!("{what} of testbench method `{method}` has an unsupported TSeq element type"),
+        || format!("{what} of testbench method `{method}` has an unsupported TSeq element type"),
         ty,
         ctx,
     )
 }
 
 fn callable_method_param_ir_type(
-    unsupported_tseq_construct: String,
+    unsupported_tseq_construct: impl FnOnce() -> String,
     ty: Option<&TypeExpr>,
     ctx: &LowerCtx,
 ) -> Result<IrType, LowerError> {
@@ -2525,7 +2525,7 @@ pub(crate) fn method_schema_ir_type(
     allow_fixed_vec: bool,
 ) -> Result<IrType, LowerError> {
     callable_method_schema_ir_type(
-        format!(
+        || format!(
             "{what} of component method `{component}.{method}` has an unsupported TSeq element type"
         ),
         ty,
@@ -2544,7 +2544,7 @@ pub(crate) fn testbench_method_schema_ir_type(
     allow_fixed_vec: bool,
 ) -> Result<IrType, LowerError> {
     callable_method_schema_ir_type(
-        format!("{what} of testbench method `{method}` has an unsupported TSeq element type"),
+        || format!("{what} of testbench method `{method}` has an unsupported TSeq element type"),
         ty,
         ids,
         record_ids,
@@ -2553,7 +2553,7 @@ pub(crate) fn testbench_method_schema_ir_type(
 }
 
 fn callable_method_schema_ir_type(
-    unsupported_tseq_construct: String,
+    unsupported_tseq_construct: impl FnOnce() -> String,
     ty: Option<&TypeExpr>,
     ids: &HashMap<String, ComponentId>,
     record_ids: &HashMap<String, RecordId>,

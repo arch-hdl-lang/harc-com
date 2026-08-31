@@ -3716,6 +3716,7 @@ fn validate_testbench(
         passive_transactor_fields,
         scoreboard_fields: _,
         regblock_bindings,
+        addrmap_mirror_helpers: _,
         target_tlm_actors,
         component_fields: _,
         unbound_state_actors,

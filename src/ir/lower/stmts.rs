@@ -1479,7 +1479,7 @@ impl FuncBuilder<'_> {
                         }
                     }
                     if let Some(declared) = declared_scalar_ty.clone() {
-                        if !component_method_result_compatible(&declared, &ty) {
+                        if !transactor_method_result_compatible(&declared, &ty) {
                             return Err(LowerError::Invalid(format!(
                                 "`let {}` type {declared:?} is incompatible with transactor method return {ty:?}",
                                 l.name.name
@@ -7317,6 +7317,41 @@ fn component_method_result_compatible(expected: &IrType, actual: &IrType) -> boo
         (IrType::UInt(Some(ew)), IrType::UInt(Some(aw)))
         | (IrType::SInt(Some(ew)), IrType::SInt(Some(aw))) => aw <= ew,
         (IrType::UInt(Some(ew)), IrType::Bool) | (IrType::SInt(Some(ew)), IrType::Bool) => *ew >= 1,
+        _ => false,
+    }
+}
+
+/// Directional compatibility for a transactor method RESULT bound to a
+/// declared `let` type: the destination (`expected`) receives a returned
+/// value (`actual`). A widthless destination is the callable ABI's 64-bit
+/// carrier — `uint` stores an unsigned 64-bit value and `sint` a signed
+/// 64-bit value — not an unrestricted scalar wildcard. Same-signed concrete
+/// values widen; opposite signedness and values wider than the destination
+/// carrier require an explicit conversion.
+fn transactor_method_result_compatible(expected: &IrType, actual: &IrType) -> bool {
+    if matches!(expected, IrType::Unknown) || matches!(actual, IrType::Unknown) {
+        return true;
+    }
+    if expected == actual {
+        return true;
+    }
+    match expected {
+        IrType::UInt(None) => {
+            matches!(actual, IrType::UInt(Some(w)) if *w <= 64) || matches!(actual, IrType::Bool)
+        }
+        IrType::SInt(None) => {
+            matches!(actual, IrType::SInt(Some(w)) if *w <= 64) || matches!(actual, IrType::Bool)
+        }
+        IrType::UInt(Some(ew)) => match actual {
+            IrType::UInt(Some(aw)) => aw <= ew,
+            IrType::Bool => *ew >= 1,
+            _ => false,
+        },
+        IrType::SInt(Some(ew)) => match actual {
+            IrType::SInt(Some(aw)) => aw <= ew,
+            IrType::Bool => *ew >= 1,
+            _ => false,
+        },
         _ => false,
     }
 }

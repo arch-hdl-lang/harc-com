@@ -1158,13 +1158,13 @@ pub(crate) fn tseq_ir_type(
 /// callable signatures must reject that sentinel instead of emitting it as a
 /// scalar value.
 pub(crate) fn callable_tseq_ir_type(
-    construct: String,
+    construct: impl FnOnce() -> String,
     ty: Option<&TypeExpr>,
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<Option<IrType>, LowerError> {
     match tseq_ir_type(ty, record_ids) {
         Some(IrType::Unknown) => Err(unsupported(
-            &construct,
+            &construct(),
             "callable TSeq values support records, scalars, and scalar-leaf fixed vectors",
         )),
         other => Ok(other),
@@ -1279,7 +1279,7 @@ fn pure_helper_signature_type(
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<IrType, LowerError> {
     if let Some(seq) = callable_tseq_ir_type(
-        format!("{what} of helper `{helper}` has an unsupported TSeq element type"),
+        || format!("{what} of helper `{helper}` has an unsupported TSeq element type"),
         ty,
         record_ids,
     )? {
@@ -1318,7 +1318,7 @@ fn inlined_helper_signature_type(
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<IrType, LowerError> {
     if let Some(seq) = callable_tseq_ir_type(
-        format!("{what} of helper `{helper}` has an unsupported TSeq element type"),
+        || format!("{what} of helper `{helper}` has an unsupported TSeq element type"),
         ty,
         record_ids,
     )? {
@@ -1339,7 +1339,7 @@ fn testbench_method_signature_type(
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<IrType, LowerError> {
     if let Some(seq) = callable_tseq_ir_type(
-        format!("{what} of testbench method `{method}` has an unsupported TSeq element type"),
+        || format!("{what} of testbench method `{method}` has an unsupported TSeq element type"),
         ty,
         record_ids,
     )? {

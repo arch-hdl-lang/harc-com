@@ -822,10 +822,18 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                         cx.func.name
                     ))
                 })?;
-                let binding = owner
+                let helper_field = owner
                     .regblock_bindings
                     .iter()
                     .find(|binding| binding.field == local.name)
+                    .map(|binding| binding.helper_field.as_str())
+                    .or_else(|| {
+                        owner
+                            .addrmap_mirror_helpers
+                            .iter()
+                            .find(|(field, _)| (*field) == local.name)
+                            .map(|(_, helper)| helper.as_str())
+                    })
                     .ok_or_else(|| {
                         EmitError(format!(
                             "tbir: register read in {} has no binding for mirror `{}`",
@@ -851,7 +859,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                 })?;
                 let mut args = super::func::transactor_call_context_args(
                     cx,
-                    &binding.helper_field,
+                    helper_field,
                     crate::ir::TransactorId(transactor as u32),
                     method.function,
                 )?;

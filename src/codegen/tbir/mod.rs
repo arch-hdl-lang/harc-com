@@ -1420,6 +1420,62 @@ pub(super) fn aggregate_value_cty(ty: &ir::IrType, records: &[ir::RecordSchema])
     }
 }
 
+/// C++ value/parameter carrier for a callable `IrType`. This is the single
+/// recursive resolver behind hook signatures, transactor and component method
+/// parameter/return lists, helper and testbench-method signatures, and callable
+/// locals. Record / record-sequence / component values keep their schema
+/// carriers; a sequence element and a fixed-vector dimension both recurse
+/// through the aggregate carrier, so `Seq<Vec<T, N>>` renders
+/// `std::vector<std::array<…>>` exactly like a standalone `Vec<T, N>`, and
+/// every callable surface agrees on the spelling. Scalar leaves use the scalar
+/// ABI carrier (`local_scalar_cty`).
+pub(super) fn callable_value_cty(
+    prog: &TbProgram,
+    ty: &ir::IrType,
+) -> Result<String, EmitError> {
+    Ok(match ty {
+        ir::IrType::Record(record) => prog
+            .records
+            .get(record.index())
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: callable value references missing record r{}",
+                    record.0
+                ))
+            })?
+            .name
+            .clone(),
+        ir::IrType::RecordSeq(record) => format!(
+            "std::vector<{}>",
+            prog.records
+                .get(record.index())
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: callable value references missing record r{}",
+                        record.0
+                    ))
+                })?
+                .name
+        ),
+        ir::IrType::Seq(elem) => {
+            format!("std::vector<{}>", aggregate_value_cty(elem, &prog.records))
+        }
+        ir::IrType::FixedVec { .. } => aggregate_value_cty(ty, &prog.records),
+        ir::IrType::Component(component) => prog
+            .components
+            .get(component.index())
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: callable value references missing component c{}",
+                    component.0
+                ))
+            })?
+            .name
+            .clone(),
+        other => local_scalar_cty(other),
+    })
+}
+
 /// C++ storage type for a loop-switch local / method param. Unsigned and
 /// unknown scalars ≤64 bits widen to `uint64_t`; a `sint` ≤64 bits is
 /// `int64_t`, matching v1's `c_type_for`, so signed division, modulo,

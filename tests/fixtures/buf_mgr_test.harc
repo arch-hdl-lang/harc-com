@@ -87,7 +87,7 @@ transactor BufMgrXactor
             wait 1 cycle              // DQ1 → DQ2
             assert dut.dequeue_resp_valid == 1
                 else fail("dequeue: resp_valid=0 for queue ${qn}")
-            return dut.dequeue_data
+            return dut.dequeue_data.trunc<32>()
         end dequeue
 
         // Hold all valids low for n cycles. Mirrors the C++ TB's `idle(n)`,

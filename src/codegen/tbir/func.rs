@@ -1567,78 +1567,24 @@ fn tseq_return_cty(prog: &TbProgram, func: &TbFunction) -> Result<String, EmitEr
         .ret
         .map(|r| func.local(r).ty.clone())
         .unwrap_or(IrType::Unknown);
-    let elem = match &acc_ty {
-        IrType::RecordSeq(rid) => prog
-            .records
-            .get(rid.index())
-            .ok_or_else(|| {
-                EmitError(format!(
-                    "tbir: tseq `{}` references missing element record r{}",
-                    func.name, rid.0
-                ))
-            })?
-            .name
-            .clone(),
-        IrType::Seq(scalar) => tseq_scalar_cty(scalar),
+    match &acc_ty {
+        IrType::RecordSeq(_) | IrType::Seq(_) => super::callable_value_cty(prog, &acc_ty),
         _ => {
             return Err(EmitError(format!(
                 "tbir: tseq `{}` has no RecordSeq/Seq return accumulator (lowering bug)",
                 func.name
             )));
         }
-    };
-    Ok(format!("std::vector<{elem}>"))
+    }
 }
 
 fn callable_value_cty(prog: &TbProgram, ty: &IrType) -> Result<String, EmitError> {
-    Ok(match ty {
-        IrType::Record(record) => prog
-            .records
-            .get(record.index())
-            .ok_or_else(|| {
-                EmitError(format!(
-                    "tbir: callable value references missing record r{}",
-                    record.0
-                ))
-            })?
-            .name
-            .clone(),
-        IrType::RecordSeq(record) => format!(
-            "std::vector<{}>",
-            prog.records
-                .get(record.index())
-                .ok_or_else(|| EmitError(format!(
-                    "tbir: callable value references missing record r{}",
-                    record.0
-                )))?
-                .name
-        ),
-        IrType::Seq(scalar) => format!("std::vector<{}>", tseq_scalar_cty(scalar)),
-        IrType::FixedVec { .. } => super::aggregate_value_cty(ty, &prog.records),
-        IrType::Component(component) => prog
-            .components
-            .get(component.index())
-            .ok_or_else(|| {
-                EmitError(format!(
-                    "tbir: callable value references missing component c{}",
-                    component.0
-                ))
-            })?
-            .name
-            .clone(),
-        other => super::local_scalar_cty(other),
-    })
-}
-
-fn tseq_scalar_cty(ty: &IrType) -> String {
-    crate::ir::value_abi_class(ty)
-        .map(crate::codegen::cpp_tb::value_abi_class_cpp)
-        .unwrap_or_else(|| super::local_scalar_cty(ty).to_string())
+    super::callable_value_cty(prog, ty)
 }
 
 #[cfg(test)]
 mod value_abi_type_tests {
-    use super::tseq_scalar_cty;
+    use super::super::field_scalar_cty;
     use crate::codegen::cpp_tb::ir_vec_elem_class;
     use crate::ir::{sequence_element_compatible, value_abi_class, IrType, ValueAbiClass};
 
@@ -1668,7 +1614,7 @@ mod value_abi_type_tests {
         for (ty, class, cpp) in cases {
             assert_eq!(value_abi_class(&ty), Some(class));
             assert_eq!(ir_vec_elem_class(&ty).as_deref(), Some(cpp));
-            assert_eq!(tseq_scalar_cty(&ty), cpp);
+            assert_eq!(field_scalar_cty(&ty), cpp);
         }
     }
 
@@ -2871,15 +2817,8 @@ fn event_payload_cty(prog: &TbProgram, cx: &ECx<'_>, event: LocalId) -> Result<S
     }
 }
 
-fn hook_param_cty(prog: &TbProgram, ty: &IrType) -> String {
-    match ty {
-        IrType::Record(r) => prog.records[r.index()].name.clone(),
-        IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
-        IrType::Seq(scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
-        IrType::FixedVec { .. } => super::aggregate_value_cty(ty, &prog.records),
-        IrType::Component(c) => prog.components[c.index()].name.clone(),
-        other => super::local_scalar_cty(other),
-    }
+fn hook_param_cty(prog: &TbProgram, ty: &IrType) -> Result<String, EmitError> {
+    super::callable_value_cty(prog, ty)
 }
 
 fn persistent_callback_capture(cx: &ECx<'_>) -> &'static str {
@@ -3866,7 +3805,7 @@ fn emit_stmt(
             let mut args = Vec::with_capacity(body.params.len());
             for (i, local) in body.locals.iter().take(method_param_count).enumerate() {
                 let name = format!("_h{i}");
-                decls.push(format!("{} {name}", hook_param_cty(prog, &local.ty)));
+                decls.push(format!("{} {name}", hook_param_cty(prog, &local.ty)?));
                 args.push(name);
             }
             for capture in captures {
@@ -8462,7 +8401,7 @@ pub(super) fn emit_test_hook(
 
     // Hooks are void in this subset; a value-returning hook is never
     // produced by lowering (the firing site discards any result).
-    let param_ty = |i: usize| {
+    let param_ty = |i: usize| -> Result<String, EmitError> {
         hook_param_cty(
             prog,
             local_ir_type(&cx, crate::ir::LocalId(i as u32)).unwrap_or(&func.locals[i].ty),
@@ -8473,9 +8412,9 @@ pub(super) fn emit_test_hook(
         .enumerate()
         .map(|(i, n)| {
             let reference = if i >= capture_base { "&" } else { "" };
-            format!("{}{reference} {n}", param_ty(i))
+            Ok(format!("{}{reference} {n}", param_ty(i)?))
         })
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>, EmitError>>()?
         .join(", ");
     // A per-register `on regs.REG` callback can re-enter `record_write` and
     // call itself. Every callback body therefore binds through its planned

@@ -5562,6 +5562,7 @@ fn lower_test(
     // transactor field declaring `write(addr,data)` / `read(addr)`).
     let mut addrmap_bindings_map: HashMap<String, addrmap::AddrmapBindingCtx> = HashMap::new();
     let mut addrmap_init_order: Vec<(String, RecordId)> = Vec::new();
+    let mut addrmap_mirror_helpers: Vec<(String, String)> = Vec::new();
     // Helper maps for instance resolution: regblock type → mirror record
     // id and register table.
     let regblock_record_of: HashMap<String, RecordId> = regblock_ids
@@ -5633,6 +5634,7 @@ fn lower_test(
         )?;
         for (key, rec) in &actx.mirror_inits {
             addrmap_init_order.push((key.clone(), *rec));
+            addrmap_mirror_helpers.push((key.clone(), helper_field.clone()));
         }
         addrmap_bindings_map.insert(binding.clone(), actx);
     }
@@ -6144,6 +6146,7 @@ fn lower_test(
         passive_transactor_fields: passive_transactor_fields.clone(),
         scoreboard_fields: scoreboard_fields.clone(),
         regblock_bindings: regblock_binding_schemas,
+        addrmap_mirror_helpers,
         target_tlm_actors: target_tlm_actors.clone(),
         component_fields: component_field_bindings,
         unbound_state_actors,
