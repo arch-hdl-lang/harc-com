@@ -1,6 +1,5 @@
 ---
 source: tests/tbir.rs
-assertion_line: 2103
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
@@ -13,9 +12,10 @@ fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
     %1 total : unknown
     %2 i : unknown
     %3 bump : unknown
-    %4 _anon : unknown
-    %5 want : uint<32>
-    %6 got : unknown
+    %4 queued : uint<32>
+    %5 _anon : unknown
+    %6 want : uint<32>
+    %7 got : unknown
   entry = b0
 
   b0:
@@ -43,6 +43,8 @@ fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
     Assign(%bump, (%i + 1))
     Assign(%total, (%total + %bump))
     ScoreboardOp(sb0.sb, expected.push(%total))
+    Assign(%queued, ScoreboardQuery(sb0.sb.expected.front()))
+    AssertCheck { cond: (%queued == %total), on_fail: "front changed or removed the queued expectation" }
     ScoreboardOp(sb0.sb, writes = (ScoreboardQuery(sb0.sb.writes) + 1))
     DutWrite(dut.en, 1)
     Assign(%_anon, 1)

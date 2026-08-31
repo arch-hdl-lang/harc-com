@@ -19,7 +19,7 @@
 // statements after the pop still execute, with the poisoned value.
 //
 // Pass criterion: the run reports
-//   "FATAL] pop() on an empty queue"
+//   "FATAL] queue front/pop on an empty queue"
 // and never reports "ALL TESTS PASSED". Like
 // `regblock_record_recursion_test`, this fixture is therefore NOT
 // runnable via the standard run_fixtures.sh sentinel check — see

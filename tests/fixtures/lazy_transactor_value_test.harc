@@ -1,0 +1,69 @@
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+function readv() -> bool
+    return false
+end function readv
+
+transactor LazyValueXactor
+    dut : Top
+    calls : uint<8> default 0
+
+    when active
+        hookable clear()
+            calls = 0
+        end clear
+
+        hookable readv() -> bool
+            calls = calls + 1
+            return true
+        end readv
+
+        hookable nested_readv() -> bool
+            return readv()
+        end nested_readv
+
+        hookable exercise_sibling_lazy() -> bool
+            let skipped_and = false && nested_readv()
+            let skipped_or = true || readv()
+            let then_selected = true ? nested_readv() : readv()
+            let else_selected = false ? readv() : nested_readv()
+            return !skipped_and && skipped_or && then_selected && else_selected
+        end exercise_sibling_lazy
+    end when
+end transactor LazyValueXactor
+
+testbench LazyTransactorValueTb
+    dut : Top
+    xact : LazyValueXactor active
+end testbench LazyTransactorValueTb
+
+impl LazyTransactorValueTest for LazyTransactorValueTb
+    clock clk = SysDomain
+    run
+        xact.dut = dut
+        xact.clear()
+
+        let skipped_and = false && xact.nested_readv()
+        let skipped_or = true || xact.readv()
+        assert !skipped_and && skipped_or
+            else fail("bound transactor short-circuit result mismatch")
+        assert xact.calls == 0
+            else fail("untaken bound transactor call executed: calls=${xact.calls}")
+
+        let then_selected = true ? xact.nested_readv() : xact.readv()
+        let else_selected = false ? xact.readv() : xact.nested_readv()
+        assert then_selected && else_selected
+            else fail("bound transactor ternary result mismatch")
+        assert xact.calls == 2
+            else fail("bound transactor calls did not execute exactly once: calls=${xact.calls}")
+
+        xact.clear()
+        let sibling_ok = xact.exercise_sibling_lazy()
+        assert sibling_ok else fail("sibling transactor lazy result mismatch")
+        assert xact.calls == 2
+            else fail("sibling transactor calls did not execute exactly once: calls=${xact.calls}")
+        log(info, "PASS: lazy transactor values")
+    end run
+end impl LazyTransactorValueTest

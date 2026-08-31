@@ -6,6 +6,10 @@
 //! either annotate the IR, mutate it, or return a side-table; every
 //! mutating pass must leave the program `verify`-clean.
 
+pub mod bus_access;
+pub mod callable_placement;
 pub mod covergroup_hooks;
+pub mod dut_access;
 pub mod lower_coroutine;
 pub mod placement;
+pub mod runtime_cells;

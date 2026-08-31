@@ -184,12 +184,18 @@ fn checker_closures(cpp: &str) -> Vec<String> {
     out
 }
 
-/// The file-scope cover-counter declarations.
-fn cover_counter_decls(cpp: &str) -> Vec<String> {
-    cpp.lines()
-        .filter(|l| l.starts_with("static uint64_t _cov_") && l.ends_with("_hits = 0;"))
-        .map(|l| l.to_string())
-        .collect()
+fn runtime_cells_decl(cpp: &str) -> (String, String) {
+    let start = cpp
+        .find("struct HarcRuntimeCells_")
+        .expect("per-run runtime-cell declaration");
+    let from = &cpp[start..];
+    let name = from["struct ".len()..]
+        .split_whitespace()
+        .next()
+        .expect("runtime-cell type name")
+        .to_string();
+    let end = from.find("\n};").expect("runtime-cell declaration closes") + 3;
+    (from[..end].to_string(), name)
 }
 
 fn cxx() -> Option<String> {
@@ -238,16 +244,14 @@ fn emitted_concurrent_checks_compile_and_evaluate() {
         4,
         "one closure per concurrent check; got:\n{cpp}"
     );
-    let counters = cover_counter_decls(&cpp);
     assert_eq!(
-        counters.len(),
+        cpp.matches("uint64_t cover_run_s0_hits = 0;").count(),
         1,
-        "one file-scope cover counter; got:\n{cpp}"
+        "one per-run cover counter; got:\n{cpp}"
     );
-    let counter_name = counters[0]
-        .trim_start_matches("static uint64_t ")
-        .trim_end_matches(" = 0;")
-        .to_string();
+    assert!(!cpp.contains("static uint64_t _cov_"), "{cpp}");
+    let (cell_decl, cell_type) = runtime_cells_decl(&cpp);
+    let counter_name = "_harc_runtime_cells.cover_run_s0_hits";
 
     // Stimulus, one row per primary-clock edge: (a, b, c). Chosen so each
     // shape fires at a different cycle, and so a latch that read its own
@@ -263,7 +267,6 @@ fn emitted_concurrent_checks_compile_and_evaluate() {
     // Expected: 3 errors, 1 ASSUME-FAIL line, 1 cover hit.
     let probe = dir.join("probe.cpp");
     let body = closures.join("\n");
-    let decl = &counters[0];
     std::fs::write(
         &probe,
         format!(
@@ -286,10 +289,11 @@ static void sim_log_line(const char* sev, const char* fmt, ...) {{
     if (sev[0] == 'A') assume_fails++;
 }}
 
-{decl}
+{cell_decl}
 
 int main() {{
     std::vector<std::function<void()>> _checkers;
+    {cell_type} _harc_runtime_cells{{}};
 {body}
     const uint64_t stim[4][3] = {{ {{0,0,0}}, {{1,1,1}}, {{1,0,1}}, {{0,0,0}} }};
     for (int i = 0; i < 4; i++) {{
@@ -355,14 +359,12 @@ fn emitted_on_handlers_compile_and_fire_on_the_right_cycles() {
     let closures = checker_closures(&cpp);
     assert_eq!(closures.len(), 2, "one closure per handler; got:\n{cpp}");
 
-    // The body lambdas are declared at test scope; lift their
-    // declarations verbatim so the probe calls the real emitted bodies.
-    // Each is `std::function<void()> _on_handler_N; _on_handler_N = [&]() -> void {…};`
+    // The body functions are persistent runtime cells. Lift each emitted
+    // assignment verbatim so the probe calls the real emitted body.
     let mut bodies = String::new();
     for i in 0..2 {
-        let decl = format!("std::function<void()> _on_handler_{i};");
-        assert!(cpp.contains(&decl), "missing `{decl}` in:\n{cpp}");
-        let at = cpp.find(&format!("_on_handler_{i} = [&]")).expect("body");
+        let name = format!("_harc_runtime_cells.test_hook_cycle_run_hs{i}");
+        let at = cpp.find(&format!("{name} = [&]")).expect("body");
         let from = &cpp[at..];
         let open = from.find('{').expect("body opens");
         let mut depth = 0usize;
@@ -380,8 +382,6 @@ fn emitted_on_handlers_compile_and_fire_on_the_right_cycles() {
                 _ => {}
             }
         }
-        bodies.push_str(&decl);
-        bodies.push('\n');
         bodies.push_str(&from[..end + 1]);
         bodies.push_str(";\n");
     }
@@ -393,6 +393,7 @@ fn emitted_on_handlers_compile_and_fire_on_the_right_cycles() {
     //     cycle_count is 1..5 → fires at 2 and 4 → 2 firings.
     let probe = dir.join("probe.cpp");
     let body = closures.join("\n");
+    let (cell_decl, cell_type) = runtime_cells_decl(&cpp);
     std::fs::write(
         &probe,
         format!(
@@ -413,8 +414,11 @@ static void sim_log_line(const char* sev, const char* fmt, ...) {{
     if (fmt[0] == 'r') rose_hits++; else tick_hits++;
 }}
 
+{cell_decl}
+
 int main() {{
     std::vector<std::function<void()>> _checkers;
+    {cell_type} _harc_runtime_cells{{}};
 {bodies}
 {body}
     const uint64_t stim[5] = {{0, 1, 1, 0, 1}};
@@ -473,17 +477,15 @@ fn emitted_event_channel_fans_out_to_every_subscriber() {
 
     let dir = fresh_outdir("evprobe");
     let cpp = emit_src(&dir, "ev_tb", EVENT_TB);
-    // Pull the channel declaration plus every statement that touches it,
-    // in emitted order, so the probe runs the real sequence.
-    let decl = cpp
-        .lines()
-        .find(|l| l.contains("std::vector<std::function<void(uint64_t)>> e;"))
-        .unwrap_or_else(|| panic!("missing the channel declaration in:\n{cpp}"))
-        .trim()
-        .to_string();
+    // Pull every statement that touches the run-owned channel, in emitted
+    // order, so the probe runs the real sequence.
+    let (cell_decl, cell_type) = runtime_cells_decl(&cpp);
     let ops: Vec<String> = cpp
         .lines()
-        .filter(|l| l.contains("e.push_back(") || l.contains("for (auto& _s : e)"))
+        .filter(|line| {
+            line.contains("event_run_n1_e.push_back(")
+                || line.contains("for (auto& _s : _harc_runtime_cells.event_run_n1_e)")
+        })
         .map(|l| l.trim().to_string())
         .collect();
     assert_eq!(
@@ -504,11 +506,13 @@ fn emitted_event_channel_fans_out_to_every_subscriber() {
 
 // Stand-ins for the test-scope subscriber lambdas the emitter declares.
 static long long seen_a = 0, seen_b = 0;
-static void _on_event_0(uint64_t v) {{ seen_a += (long long)v; }}
-static void _on_event_1(uint64_t v) {{ seen_b += (long long)v * 10; }}
+
+{cell_decl}
 
 int main() {{
-    {decl}
+    {cell_type} _harc_runtime_cells{{}};
+    _harc_runtime_cells.test_hook_event_run_hs0 = [&](uint64_t v) {{ seen_a += (long long)v; }};
+    _harc_runtime_cells.test_hook_event_run_hs1 = [&](uint64_t v) {{ seen_b += (long long)v * 10; }};
     {ops_src}
     printf("%lld %lld\n", seen_a, seen_b);
     return 0;
@@ -592,6 +596,7 @@ fn emitted_check_messages_and_runtime_slices_compile_and_print() {
     // invariant message once.
     let probe = dir.join("probe.cpp");
     let body = closures.join("\n");
+    let (cell_decl, cell_type) = runtime_cells_decl(&cpp);
     std::fs::write(
         &probe,
         format!(
@@ -615,10 +620,11 @@ static void sim_log_line(const char* sev, const char* fmt, ...) {{
     printf("\n");
 }}
 
+{cell_decl}
+
 int main() {{
-    // The test-scope local both the message and the slice bound capture.
-    int64_t lo = 0;
     std::vector<std::function<void()>> _checkers;
+    {cell_type} _harc_runtime_cells{{}};
 {body}
     const uint64_t stim[3][3] = {{ {{0,1,0}}, {{1,0,0}}, {{0,0,0}} }};
     for (int i = 0; i < 3; i++) {{

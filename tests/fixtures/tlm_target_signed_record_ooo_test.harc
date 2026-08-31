@@ -1,0 +1,67 @@
+struct SignedRecordReply
+    narrow : sint<8>
+    wide : sint<65>
+end struct SignedRecordReply
+
+bus SignedRecordBus
+    tlm_method widen(value: sint<8>) -> sint<65>: blocking;
+    tlm_method transform(request: SignedRecordReply) -> SignedRecordReply: out_of_order tags 2;
+end bus SignedRecordBus
+
+transactor SignedRecordTarget bound to SignedRecordBus
+    requests : uint<8> default 0
+
+    thread bus.widen(value: sint<8>)
+        requests = requests + 1
+        wait 1 cycle
+        return value
+    end thread
+
+    thread bus.transform(request: SignedRecordReply)
+        requests = requests + 1
+        let reply : SignedRecordReply
+        reply.narrow = request.narrow - 1
+        reply.wide = request.wide
+        if request.narrow == -5
+            wait 5 cycles
+        else
+            wait 1 cycle
+        end if
+        return reply
+    end thread
+end transactor SignedRecordTarget
+
+testbench SignedRecordTargetTb
+    dut : TlmSignedRecordOooInitiator
+end testbench SignedRecordTargetTb
+
+impl SignedRecordTargetTest for SignedRecordTargetTb
+    let bus : SignedRecordBus = bind dut with {
+        widen.req_valid: "widen_req_valid",
+        widen.value: "widen_value",
+        widen.req_ready: "widen_req_ready",
+        widen.rsp_valid: "widen_rsp_valid",
+        widen.rsp_data: "widen_rsp_data",
+        widen.rsp_ready: "widen_rsp_ready",
+        transform.req_valid: "transform_req_valid",
+        transform.request: "transform_request",
+        transform.req_tag: "transform_req_tag",
+        transform.req_ready: "transform_req_ready",
+        transform.rsp_valid: "transform_rsp_valid",
+        transform.rsp_data: "transform_rsp_data",
+        transform.rsp_tag: "transform_rsp_tag",
+        transform.rsp_ready: "transform_rsp_ready"
+    }
+    let target : SignedRecordTarget passive = bind bus
+
+    run
+        dut.rst = 1
+        wait 2 cycles
+        dut.rst = 0
+
+        wait until dut.done == 1 timeout 80 cycles fail("signed record target timed out")
+        assert dut.error == 0 else fail("signed record target response mismatch code=${dut.error}")
+        assert target.requests == 3 else fail("signed record target request count ${target.requests}")
+        log(info, "ALL TESTS PASSED - tlm_target_signed_record_ooo_test")
+    end run
+end impl SignedRecordTargetTest

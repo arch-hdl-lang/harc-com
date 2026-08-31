@@ -107,9 +107,7 @@ pub enum Trigger {
     /// A `TbLifecycleCall` re-inlined a reusable testbench lifecycle body
     /// (#619 M4a). The body is opaque to this analysis and may itself
     /// suspend, so its `succ` is treated as a resume boundary.
-    LifecycleInlined {
-        function: crate::ir::FunctionId,
-    },
+    LifecycleInlined { function: crate::ir::FunctionId },
 }
 
 /// Structured pass failure — never a panic (mirrors
@@ -163,8 +161,7 @@ pub fn run(prog: &TbProgram) -> Result<CoroutineMetadata, LowerCoroutineError> {
         // call-by-value functions.
         if !matches!(
             func.kind,
-            FunctionKind::Run
-                | FunctionKind::Check
+            FunctionKind::TestBody { .. }
                 | FunctionKind::SamplerAuto { .. }
                 | FunctionKind::TransactorBody { .. }
         ) {
@@ -479,12 +476,17 @@ mod tests {
             functions: vec![TbFunction {
                 id: FunctionId(0),
                 name: "run_T".to_string(),
-                kind: FunctionKind::Run,
+                kind: FunctionKind::TestBody {
+                    test: crate::ir::TestId(0),
+                    member: crate::ir::TestCallableMember::Run,
+                    name: "T".to_string(),
+                },
                 params: vec![],
                 locals,
                 blocks,
                 entry: BlockId(0),
                 owner: None,
+                testbench_record_locals: Vec::new(),
                 ret: None,
                 implicit_returns: vec![],
             }],
@@ -670,6 +672,7 @@ mod tests {
             blocks: vec![block(vec![], Terminator::Return)],
             entry: BlockId(0),
             owner: None,
+            testbench_record_locals: Vec::new(),
             ret: None,
             implicit_returns: vec![],
         });

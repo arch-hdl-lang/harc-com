@@ -289,7 +289,7 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 }
                 visit_fmt(args, &mut accesses, &mut transactor);
             }
-            Stmt::RecordInit(_, _) => {
+            Stmt::RecordInit(_, _) | Stmt::ComponentInit { .. } => {
                 host_service_only = false;
             }
             Stmt::AggregateInit(_) => {
@@ -433,7 +433,7 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                     visit_expr(a, &mut accesses, &mut transactor);
                 }
             }
-            Stmt::ComponentCall { args, .. } => {
+            Stmt::ComponentCall { args, .. } | Stmt::TestbenchCall { args, .. } => {
                 // A component method call — host-side composition dispatch.
                 host_service_only = false;
                 for a in args {
@@ -456,8 +456,8 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 // Pop into a host local — pure host state, no value expr.
                 host_service_only = false;
             }
-            Stmt::ComponentSubAssign { .. } => {
-                // Whole sub-component value copy — pure host state, no pin
+            Stmt::ComponentSubAssign { .. } | Stmt::ComponentAssign { .. } => {
+                // Whole component value copy — pure host state, no pin
                 // access and no inline-readable value expr.
                 host_service_only = false;
             }
@@ -542,110 +542,18 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
 }
 
 fn visit_expr(e: &Expr, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
-    match e {
-        Expr::Port(p) => {
-            if !accesses.contains(&p.access) {
-                accesses.push(p.access);
-            }
-        }
-        Expr::Binary(_, a, b) => {
-            visit_expr(a, accesses, transactor);
-            visit_expr(b, accesses, transactor);
-        }
-        Expr::Unary(_, a) => visit_expr(a, accesses, transactor),
-        Expr::DynamicListQuery { target, .. } => visit_expr(target, accesses, transactor),
-        Expr::BitSlice { target, .. } => visit_expr(target, accesses, transactor),
-        Expr::BitSliceDyn { target, hi, lo } => {
-            visit_expr(target, accesses, transactor);
-            visit_expr(hi, accesses, transactor);
-            visit_expr(lo, accesses, transactor);
-        }
-        Expr::PortSnapshotLane { port, index, .. } => {
+    crate::ir::visit::walk_expr(e, &mut |expr| match expr {
+        Expr::Port(port) | Expr::PortSnapshotLane { port, .. } => {
             if !accesses.contains(&port.access) {
                 accesses.push(port.access);
             }
-            visit_expr(index, accesses, transactor);
         }
-        Expr::Ternary(c, t, e) => {
-            visit_expr(c, accesses, transactor);
-            visit_expr(t, accesses, transactor);
-            visit_expr(e, accesses, transactor);
-        }
-        Expr::WidthCast { inner, .. } => visit_expr(inner, accesses, transactor),
-        Expr::ComponentIdle { n, .. } | Expr::TransactorIdle { n, .. } => {
-            visit_expr(n, accesses, transactor)
-        }
-        Expr::SeqIndex { index, .. } => visit_expr(index, accesses, transactor),
-        Expr::Call(target, args) => {
-            if matches!(target, CallTarget::TransactorMethod { .. }) {
-                *transactor = true;
-            }
-            for a in args {
-                visit_expr(a, accesses, transactor);
-            }
-        }
-        // A bus-reading register frontdoor read drives the helper (which
-        // may advance the clock), so it touches the transactor seam just
-        // like a `TransactorMethod` call edge. A WO read serves from the
-        // mirror (pure host state) — no transactor contact.
-        Expr::RegRead { reads_bus, .. } => {
-            if *reads_bus {
-                *transactor = true;
-            }
-        }
-        // Host-state record read; its element-index sub-exprs may carry
-        // DUT reads (a port-typed index in a wait predicate), so visit
-        // them like any other value position.
-        Expr::RecordField {
-            mid_indices, index, ..
-        } => {
-            for (_, idx) in mid_indices {
-                visit_expr(idx, accesses, transactor);
-            }
-            if let Some(idx) = index {
-                visit_expr(idx, accesses, transactor);
-            }
-        }
-        Expr::Literal { .. }
-        | Expr::WideLiteral(_)
-        | Expr::Local(_)
-        | Expr::CycleCount
-        | Expr::ErrorCount
-        | Expr::TbField(_)
-        | Expr::TemporalSlot { .. }
-        | Expr::TbQueueQuery { .. }
-        | Expr::TransactorState { .. }
-        | Expr::TransactorStateQueueQuery { .. }
-        | Expr::ScoreboardQuery { .. }
-        | Expr::ComponentField { .. }
-        | Expr::ComponentValue { .. }
-        | Expr::ComponentQueueQuery { .. }
-        | Expr::SeqLen(_)
-        | Expr::CovBin { .. }
-        | Expr::CovHookParam { .. }
-        | Expr::CovHookArg { .. } => {}
-        Expr::TransactorStateRecordField {
-            mid_indices, index, ..
-        } => {
-            for (_, idx) in mid_indices {
-                visit_expr(idx, accesses, transactor);
-            }
-            if let Some(idx) = index {
-                visit_expr(idx, accesses, transactor);
-            }
-        }
-        Expr::ComponentVecElement {
-            index, inner_index, ..
-        }
-        | Expr::TbFieldVecElement {
-            index, inner_index, ..
-        } => {
-            visit_expr(index, accesses, transactor);
-            if let Some(inner) = inner_index {
-                visit_expr(inner, accesses, transactor);
-            }
-        }
-    }
+        Expr::Call(CallTarget::TransactorMethod { .. }, _) => *transactor = true,
+        Expr::RegRead {
+            reads_bus: true, ..
+        } => *transactor = true,
+        _ => {}
+    });
 }
 
 fn visit_fmt(args: &FmtArgs, accesses: &mut Vec<PortAccess>, transactor: &mut bool) {
@@ -833,12 +741,15 @@ mod tests {
     fn port(access: PortAccess) -> PortRef {
         PortRef {
             testbench_field: "dut".to_string(),
+            origin: crate::ir::PortOrigin::Dut,
             port_path: vec!["p".to_string()],
             aggregate_path: false,
             deferred_bus_binding: None,
             direction: None,
             width: None,
+            value_type: None,
             access,
+            probe: None,
             lane: None,
         }
     }
@@ -859,12 +770,17 @@ mod tests {
             functions: vec![TbFunction {
                 id: FunctionId(0),
                 name: "run_T".to_string(),
-                kind: FunctionKind::Run,
+                kind: FunctionKind::TestBody {
+                    test: crate::ir::TestId(0),
+                    member: crate::ir::TestCallableMember::Run,
+                    name: "T".to_string(),
+                },
                 params: vec![],
                 locals,
                 blocks,
                 entry: BlockId(0),
                 owner: None,
+                testbench_record_locals: Vec::new(),
                 ret: None,
                 implicit_returns: vec![],
             }],
@@ -1049,6 +965,7 @@ mod tests {
             blocks: vec![block(vec![], Terminator::Return)],
             entry: BlockId(0),
             owner: None,
+            testbench_record_locals: Vec::new(),
             ret: None,
             implicit_returns: vec![],
         });

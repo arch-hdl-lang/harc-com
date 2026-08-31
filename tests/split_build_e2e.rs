@@ -697,7 +697,8 @@ fn split_build_shared_lifecycle_coro_links_and_dispatches_e2e() {
                 // The `\n` anchor excludes the `static …` match above (which is
                 // preceded by `static `, not a newline).
                 assert!(
-                    !body.contains("\nharc_rt::HarcThread _harc_lc__tb_lifecycle_LcSharedTb_Setup("),
+                    !body
+                        .contains("\nharc_rt::HarcThread _harc_lc__tb_lifecycle_LcSharedTb_Setup("),
                     "shard {} must NOT emit an EXTERNAL Coro definition (would be a \
                      duplicate-symbol link error across shards)",
                     s.display()

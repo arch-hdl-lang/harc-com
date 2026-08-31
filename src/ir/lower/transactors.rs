@@ -342,6 +342,7 @@ pub(crate) fn lower_transactor(
             .any(|ci| matches!(ci, ComponentItem::Hookable(_)));
         if has_hookable {
             return lower_bound_initiator_transactor(
+                id,
                 t,
                 next_fn,
                 helper_registry,
@@ -351,6 +352,7 @@ pub(crate) fn lower_transactor(
             );
         }
         return lower_bound_target_transactor(
+            id,
             t,
             next_fn,
             helper_registry,
@@ -423,6 +425,8 @@ pub(crate) fn lower_transactor(
     // module-typed field name; everything else mirrors the file-level
     // helper context (records visible, no clocks, no testbench).
     let method_ctx = LowerCtx {
+        source_id: record_ctx.source_id,
+        diagnostics: record_ctx.diagnostics.clone(),
         dut_field: dut_field.clone(),
         tb_field: None,
         cov_fields: HashMap::new(),
@@ -435,7 +439,7 @@ pub(crate) fn lower_transactor(
         // instances — both are test-scope; nested call edges stay out
         // of method bodies structurally.
         bus_bindings: HashMap::new(),
-        bus_remaps: HashMap::new(),
+        bus_origins: HashMap::new(),
         transactor_fields: HashMap::new(),
         target_transactor_fields: HashMap::new(),
         passive_transactor_fields: std::collections::HashSet::new(),
@@ -451,7 +455,6 @@ pub(crate) fn lower_transactor(
         consts: record_ctx.consts.clone(),
         properties: record_ctx.properties.clone(),
         owner: None,
-        const_signed: record_ctx.const_signed.clone(),
         ambiguous_variants: record_ctx.ambiguous_variants.clone(),
         enum_names: HashSet::new(),
         tb_scalar_fields: HashMap::new(),
@@ -459,6 +462,7 @@ pub(crate) fn lower_transactor(
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
+        tb_method_functions: HashMap::new(),
         test_scope_lets: HashSet::new(),
         regblock_instance_types: record_ctx.regblock_instance_types.clone(),
         regblock_bindings: HashMap::new(),
@@ -476,8 +480,10 @@ pub(crate) fn lower_transactor(
         record_keeps: record_ctx.record_keeps.clone(),
         randomize_problem_ids: HashMap::new(),
         tseqs: HashMap::new(),
-        // Transactor-context lowering never resolves test-scope probes.
-        probes: HashMap::new(),
+        // A standalone transactor's module-typed DUT handle may address a
+        // probe guaranteed by every test in the suite.
+        probes: record_ctx.probes.clone(),
+        partial_probe_names: record_ctx.partial_probe_names.clone(),
         extern_fns: record_ctx.extern_fns.clone(),
         // Transactor bodies never host a testbench-lifecycle marker call
         // (#619 M4a); the map stays empty here.
@@ -486,7 +492,7 @@ pub(crate) fn lower_transactor(
 
     let mut funcs = Vec::new();
     let mut sibling_methods = HashMap::new();
-    for (h, active_only) in &methods_ast {
+    for (method_index, (h, active_only)) in methods_ast.iter().enumerate() {
         let mname = h.name.name.clone();
         let param_tys = h
             .params
@@ -511,6 +517,7 @@ pub(crate) fn lower_transactor(
                     param_tys,
                     ret_ty,
                     *active_only,
+                    FunctionId(next_fn.0 + method_index as u32),
                 ),
             )
             .is_some()
@@ -522,6 +529,7 @@ pub(crate) fn lower_transactor(
     }
     for (h, active_only) in methods_ast {
         let mname = &h.name.name;
+        check_method_nested_string_types(&method_ctx, tname, h)?;
         let ret_ty = method_return_ir_type(
             tname,
             mname,
@@ -534,6 +542,7 @@ pub(crate) fn lower_transactor(
         let mut b = FuncBuilder::new(&method_ctx, helper_registry, side_tables);
         b.in_transactor_method = true;
         b.self_transactor = Some(tname.clone());
+        b.self_transactor_id = Some(id);
         b.self_transactor_methods = sibling_methods.clone();
         b.self_transactor_method_active_only = active_only;
         b.current_body_name = Some(mname.clone());
@@ -562,10 +571,15 @@ pub(crate) fn lower_transactor(
         // Leave natural completion unterminated so `finish` records the
         // synthesized return in `implicit_returns`. Post hooks fire there,
         // but must bypass an explicit source `return`.
+        let member = crate::ir::TransactorCallableId(schema.methods.len() as u32);
         let mut f = b.finish(
             fid,
             format!("{tname}_{mname}"),
-            FunctionKind::TransactorBody { transactor: id },
+            FunctionKind::TransactorBody {
+                transactor: id,
+                member,
+                name: mname.clone(),
+            },
             None,
         )?;
         f.params = params;
@@ -600,6 +614,7 @@ pub(crate) fn lower_transactor(
 /// bus methods — test-scope `let x = fork mem.read_ooo(...)` — IS
 /// lowered; see `bus::try_lower_tlm_fork`.)
 fn lower_bound_target_transactor(
+    id: TransactorId,
     t: &TransactorDecl,
     next_fn: FunctionId,
     helper_registry: &helpers::HelperRegistry<'_>,
@@ -889,6 +904,8 @@ fn lower_bound_target_transactor(
     // gated below) — that is the multi-lane dispatcher/arbiter, a
     // follow-up slice distinct from re-issuing a downstream OOO call.
     let body_ctx = LowerCtx {
+        source_id: record_ctx.source_id,
+        diagnostics: record_ctx.diagnostics.clone(),
         dut_field: String::new(),
         tb_field: None,
         cov_fields: HashMap::new(),
@@ -898,9 +915,10 @@ fn lower_bound_target_transactor(
         record_ids: record_ctx.record_ids.clone(),
         records: record_ctx.records.clone(),
         bus_bindings: downstream_binds.clone(),
-        // Responder bodies carry the placeholder bus prefix; remaps are
-        // applied at bind time by `fill_initiator_bus_prefix`.
-        bus_remaps: HashMap::new(),
+        bus_origins: downstream_binds
+            .keys()
+            .map(|name| (name.clone(), crate::ir::PortOrigin::BoundBus))
+            .collect(),
         transactor_fields: HashMap::new(),
         target_transactor_fields: HashMap::new(),
         passive_transactor_fields: std::collections::HashSet::new(),
@@ -912,7 +930,6 @@ fn lower_bound_target_transactor(
         consts: record_ctx.consts.clone(),
         properties: record_ctx.properties.clone(),
         owner: None,
-        const_signed: record_ctx.const_signed.clone(),
         ambiguous_variants: record_ctx.ambiguous_variants.clone(),
         enum_names: HashSet::new(),
         tb_scalar_fields: HashMap::new(),
@@ -920,6 +937,7 @@ fn lower_bound_target_transactor(
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
+        tb_method_functions: HashMap::new(),
         test_scope_lets: HashSet::new(),
         regblock_instance_types: record_ctx.regblock_instance_types.clone(),
         regblock_bindings: HashMap::new(),
@@ -937,8 +955,9 @@ fn lower_bound_target_transactor(
         record_keeps: record_ctx.record_keeps.clone(),
         randomize_problem_ids: HashMap::new(),
         tseqs: HashMap::new(),
-        // Transactor-context lowering never resolves test-scope probes.
+        // A bus-bound transactor has no module-typed DUT handle of its own.
         probes: HashMap::new(),
+        partial_probe_names: HashSet::new(),
         extern_fns: record_ctx.extern_fns.clone(),
         // Transactor bodies never host a testbench-lifecycle marker call
         // (#619 M4a); the map stays empty here.
@@ -1021,44 +1040,41 @@ fn lower_bound_target_transactor(
                 th.params.len()
             )));
         }
+        let mut resolved_param_tys = Vec::with_capacity(th.params.len());
         for (p, name) in th.params.iter().zip(method.args.iter()) {
-            check_scalar_ty(
-                tname,
-                mname,
-                &format!("parameter `{}`", p.name.name),
-                p.ty.as_ref(),
-            )?;
-            // Cross-check the declared widths fit the u64 value model via
-            // the bus method's declared arg type too.
-            check_scalar_ty(
+            let bus_ty = resolve_tlm_wire_ty(
+                &body_ctx,
                 tname,
                 mname,
                 &format!("argument `{}`", name.0.name),
-                Some(&name.1),
+                &name.1,
             )?;
+            let param_ty =
+                p.ty.as_ref()
+                    .map(|ty| {
+                        resolve_tlm_wire_ty(
+                            &body_ctx,
+                            tname,
+                            mname,
+                            &format!("parameter `{}`", p.name.name),
+                            ty,
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| bus_ty.clone());
+            if param_ty != bus_ty {
+                return Err(LowerError::Invalid(format!(
+                    "transactor `{tname}` target thread `bus.{mname}` parameter `{}` has type {param_ty:?}, but the bus argument `{}` has type {bus_ty:?}",
+                    p.name.name, name.0.name
+                )));
+            }
+            resolved_param_tys.push(param_ty);
         }
-        // The return type may be a record (`-> HarcBurstResp32x4`): the
-        // responder builds it field-wise and the backend packs it onto
-        // the response pin (`harc_drive_<R>`). A scalar return goes
-        // through the ≤64-bit gate; any other non-scalar type is
-        // rejected.
-        let ret_record = method
+        let resolved_ret_ty = method
             .ret
             .as_ref()
-            .and_then(|t| record_id_of_type(&body_ctx, t));
-        if let Some(record) = ret_record {
-            body_ctx.reject_dynamic_list_record_wire(
-                record,
-                &format!(
-                    "record return from target responder `bus.{mname}` crossing a TLM response wire"
-                ),
-            )?;
-        }
-        if let Some(ret) = method.ret.as_ref() {
-            if ret_record.is_none() {
-                check_scalar_ty(tname, mname, "return type", Some(ret))?;
-            }
-        }
+            .map(|ret| resolve_tlm_wire_ty(&body_ctx, tname, mname, "return type", ret))
+            .transpose()?;
 
         let fid = FunctionId(next_fn.0 + funcs.len() as u32);
         let mut b = FuncBuilder::new(&body_ctx, helper_registry, side_tables);
@@ -1087,8 +1103,7 @@ fn lower_bound_target_transactor(
                 .collect();
         }
         let mut params = Vec::with_capacity(th.params.len());
-        for p in &th.params {
-            let ty = helpers::ir_type_of(p.ty.as_ref());
+        for (p, ty) in th.params.iter().zip(resolved_param_tys) {
             let local = b.declare(&p.name.name);
             b.set_local_type(local, ty.clone());
             params.push(TypedParam {
@@ -1099,38 +1114,46 @@ fn lower_bound_target_transactor(
         let has_ret = method.ret.is_some();
         if has_ret {
             let ret = b.declare("__ret");
-            // A record return slot carries its record type so the
-            // backend drives it through the pack helper, and so a
-            // `return <record-local>` type-checks (whole-record copy).
-            if let Some(rid) = ret_record {
-                b.set_local_type(ret, crate::ir::IrType::Record(rid));
-            }
+            b.set_local_type(
+                ret,
+                resolved_ret_ty
+                    .clone()
+                    .expect("a value-returning target method has a resolved return type"),
+            );
             b.helper_ret = Some(ret);
         }
         b.lower_block_stmts(&th.body)?;
         if !b.is_terminated() {
             b.terminate(Terminator::Return);
         }
+        let member = crate::ir::TransactorCallableId(
+            schema
+                .methods
+                .len()
+                .saturating_add(schema.target_methods.len()) as u32,
+        );
         let mut f = b.finish(
             fid,
             format!("{tname}_target_{mname}"),
             FunctionKind::TransactorBody {
-                transactor: TransactorId(0),
+                transactor: id,
+                member,
+                name: mname.to_string(),
             },
             None,
         )?;
-        // The transactor id is fixed up by the caller's push order; the
-        // body never reads its own kind's id, so the placeholder is inert.
-        if let FunctionKind::TransactorBody { transactor } = &mut f.kind {
-            *transactor = TransactorId(record_ctx.transactors.len() as u32);
-        }
         f.params = params;
         schema.target_methods.push(TargetTlmMethodSchema {
             name: mname.to_string(),
             function: fid,
             activation,
             args: method.args.iter().map(|(n, _)| n.name.clone()).collect(),
+            param_tys: f.params.iter().map(|param| param.ty.clone()).collect(),
             has_ret,
+            ret_ty: f
+                .ret
+                .and_then(|ret| f.locals.get(ret.index()))
+                .map(|local| local.ty.clone()),
             ooo_tags,
         });
         funcs.push(f);
@@ -1139,17 +1162,10 @@ fn lower_bound_target_transactor(
     Ok((schema, funcs))
 }
 
-/// Placeholder bus-binding prefix used while lowering an initiator-side
-/// BFM method body, before the test's `let helper = bind <axil>` names
-/// the real binding. This is the bare `bus` keyword the BFM body uses to
-/// name its bound bus (matching v1's `driver_bus_for_hookables`, where
-/// `bus` inside a hookable resolves to the parent's bus binding): the
-/// method-body `bus_bindings` map is keyed by it, so every
-/// `bus.<ch>.<sig>` access lowers to a `PortRef` whose first path segment
-/// is this string. The test-binding stage rewrites that segment to the
-/// bound bus binding's name (the arch-com §19.6 flat prefix). It is the
-/// flat prefix only inside the (instance-less) method body, so it cannot
-/// collide with any test-scope binding.
+/// Logical bus-binding name used while lowering an initiator-side BFM body.
+/// Port references retain `PortOrigin::BoundBus`; the spelling supplies only
+/// the protocol-relative channel/signal path, while a renderer receives the
+/// concrete per-instance adapter separately.
 pub(crate) const INITIATOR_BUS_PLACEHOLDER: &str = "bus";
 
 /// Lower a bound-to **initiator-side** BFM transactor (`transactor X
@@ -1168,16 +1184,14 @@ pub(crate) const INITIATOR_BUS_PLACEHOLDER: &str = "bus";
 /// resolves (via a `bus_bindings` entry keyed by the placeholder prefix)
 /// to the bound `BusDecl`, so the existing channel-handshake lowering
 /// (`lower_handshake_send`/`recv`, CFG-inlined to v1's 16-cycle-budget
-/// valid/ready dance) applies verbatim. The placeholder bus prefix is
-/// filled with the real binding name at test-binding time
-/// (`fill_initiator_bus_prefix`).
+/// valid/ready dance) applies verbatim. Port provenance stays receiver-
+/// relative until emission supplies a concrete adapter.
 ///
 /// Persistent scalar state fields (`last_read : uint<32> default 0`)
 /// materialize on a per-instance state struct, exactly like the bound-to
 /// target and unbound DUT-poking forms: method bodies read/write them by
 /// bare name and the test reads them back as `<instance>.<field>`. The
-/// per-instance state map and the body `TransactorState` placeholders are
-/// filled at test-binding time, alongside the bus prefix.
+/// per-instance state map supplies the receiver explicitly at emission.
 ///
 /// Method waits keep v1's synchronous hookable semantics (the tbir
 /// backend emits them as `tick()` loops). Out of subset, rejected
@@ -1186,6 +1200,7 @@ pub(crate) const INITIATOR_BUS_PLACEHOLDER: &str = "bus";
 /// `fork`-issue, `bind ... with { ... }` remaps, and nested transactor
 /// calls.
 fn lower_bound_initiator_transactor(
+    id: TransactorId,
     t: &TransactorDecl,
     next_fn: FunctionId,
     helper_registry: &helpers::HelperRegistry<'_>,
@@ -1488,6 +1503,8 @@ fn lower_bound_initiator_transactor(
     let mut bus_bindings: HashMap<String, BusDecl> = HashMap::new();
     bus_bindings.insert(INITIATOR_BUS_PLACEHOLDER.to_string(), (*bus).clone());
     let method_ctx = LowerCtx {
+        source_id: record_ctx.source_id,
+        diagnostics: record_ctx.diagnostics.clone(),
         dut_field: "dut".to_string(),
         tb_field: None,
         cov_fields: HashMap::new(),
@@ -1497,9 +1514,10 @@ fn lower_bound_initiator_transactor(
         record_ids: record_ctx.record_ids.clone(),
         records: record_ctx.records.clone(),
         bus_bindings,
-        // Initiator-BFM method bodies carry the placeholder bus prefix;
-        // remaps are applied at bind time by `fill_initiator_bus_prefix`.
-        bus_remaps: HashMap::new(),
+        bus_origins: HashMap::from([(
+            INITIATOR_BUS_PLACEHOLDER.to_string(),
+            crate::ir::PortOrigin::BoundBus,
+        )]),
         transactor_fields: HashMap::new(),
         target_transactor_fields: HashMap::new(),
         passive_transactor_fields: std::collections::HashSet::new(),
@@ -1511,7 +1529,6 @@ fn lower_bound_initiator_transactor(
         consts: record_ctx.consts.clone(),
         properties: record_ctx.properties.clone(),
         owner: None,
-        const_signed: record_ctx.const_signed.clone(),
         ambiguous_variants: record_ctx.ambiguous_variants.clone(),
         enum_names: HashSet::new(),
         tb_scalar_fields: HashMap::new(),
@@ -1519,6 +1536,7 @@ fn lower_bound_initiator_transactor(
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
+        tb_method_functions: HashMap::new(),
         test_scope_lets: HashSet::new(),
         regblock_instance_types: record_ctx.regblock_instance_types.clone(),
         regblock_bindings: HashMap::new(),
@@ -1535,6 +1553,7 @@ fn lower_bound_initiator_transactor(
         tseqs: HashMap::new(),
         // Transactor-context lowering never resolves test-scope probes.
         probes: HashMap::new(),
+        partial_probe_names: HashSet::new(),
         extern_fns: record_ctx.extern_fns.clone(),
         // Transactor bodies never host a testbench-lifecycle marker call
         // (#619 M4a); the map stays empty here.
@@ -1543,7 +1562,7 @@ fn lower_bound_initiator_transactor(
 
     let mut funcs = Vec::new();
     let mut sibling_methods = HashMap::new();
-    for (h, active_only) in &methods_ast {
+    for (method_index, (h, active_only)) in methods_ast.iter().enumerate() {
         let mname = h.name.name.clone();
         let param_tys = h
             .params
@@ -1568,6 +1587,7 @@ fn lower_bound_initiator_transactor(
                     param_tys,
                     ret_ty,
                     *active_only,
+                    FunctionId(next_fn.0 + method_index as u32),
                 ),
             )
             .is_some()
@@ -1579,6 +1599,7 @@ fn lower_bound_initiator_transactor(
     }
     for (h, active_only) in methods_ast {
         let mname = &h.name.name;
+        check_method_nested_string_types(&method_ctx, tname, h)?;
         let ret_ty = method_return_ir_type(
             tname,
             mname,
@@ -1591,6 +1612,7 @@ fn lower_bound_initiator_transactor(
         let mut b = FuncBuilder::new(&method_ctx, helper_registry, side_tables);
         b.in_transactor_method = true;
         b.self_transactor = Some(tname.clone());
+        b.self_transactor_id = Some(id);
         b.self_transactor_methods = sibling_methods.clone();
         b.self_transactor_method_active_only = active_only;
         b.current_body_name = Some(mname.clone());
@@ -1618,14 +1640,14 @@ fn lower_bound_initiator_transactor(
         b.lower_block_stmts(&h.body)?;
         // Preserve natural-vs-explicit return provenance for post-hook
         // fan-out (same contract as unbound/component hookable methods).
+        let member = crate::ir::TransactorCallableId(schema.methods.len() as u32);
         let mut f = b.finish(
             fid,
             format!("{tname}_{mname}"),
-            // The transactor id is fixed up by the caller's push order;
-            // a method body never reads its own kind's id. The bound-
-            // target path uses the same placeholder convention.
             FunctionKind::TransactorBody {
-                transactor: TransactorId(record_ctx.transactors.len() as u32),
+                transactor: id,
+                member,
+                name: mname.clone(),
             },
             None,
         )?;
@@ -1706,6 +1728,13 @@ fn lower_state_field(
 ) -> Result<StateFieldSchema, LowerError> {
     let fname = &f.name.name;
     let who = owner.label();
+    if let Some(span) = helpers::nested_string_type_span(Some(&f.ty)) {
+        record_ctx.diagnostics.record(record_ctx.source_id, span);
+        return Err(unsupported(
+            &format!("{who} field `{tname}.{fname}` whose type contains `String`"),
+            "String containers and aggregates are not supported in persistent fields",
+        ));
+    }
     if f.direction.is_some() {
         // `f.direction.is_some()` admits an EVENT field and everything
         // else, and they get different verdicts. The event half is
@@ -1894,8 +1923,7 @@ fn lower_state_field(
         if f.default.is_some() {
             return Err(not_implemented(
                 &format!("{who} `{tname}` fixed-vector state field `{fname}` with a default"),
-                "a fixed-vector state field is value-initialised; drop the `default`"
-                    .to_string(),
+                "a fixed-vector state field is value-initialised; drop the `default`".to_string(),
                 V1Status::EmitsUncompilable,
             ));
         }
@@ -2022,16 +2050,46 @@ fn lower_state_field(
     })
 }
 
-/// TLM bus-target args and returns must be scalar (bool / uint / sint) and at
-/// most 64 bits wide because their wire protocol is 64-bit. Active transactor
-/// method params and returns use their separate exact-width gates below.
-fn check_scalar_ty(
+fn resolve_tlm_wire_ty(
+    ctx: &super::LowerCtx,
     tname: &str,
     mname: &str,
     what: &str,
-    ty: Option<&TypeExpr>,
-) -> Result<(), LowerError> {
-    check_scalar_ty_max(tname, mname, what, ty, 64)
+    ty: &TypeExpr,
+) -> Result<IrType, LowerError> {
+    if matches!(
+        ty,
+        TypeExpr::Builtin {
+            name: crate::ast::BuiltinTy::String,
+            ..
+        }
+    ) {
+        return Err(not_implemented(
+            &format!("transactor method `{tname}.{mname}` {what} of type `String`"),
+            "String values are host-side callable values; TLM request/response wires carry packed numeric or record values",
+            V1Status::EmitsUncompilable,
+        ));
+    }
+    if let Some(record) = record_id_of_type(ctx, ty) {
+        ctx.reject_dynamic_list_record_wire(
+            record,
+            &format!("record {what} from target responder `bus.{mname}` crossing a TLM wire"),
+        )?;
+        return Ok(IrType::Record(record));
+    }
+    let lowered = helpers::ir_type_of(Some(ty));
+    match lowered {
+        IrType::Bool => Ok(lowered),
+        IrType::UInt(Some(width)) | IrType::SInt(Some(width)) if width <= 1024 => Ok(lowered),
+        IrType::UInt(Some(width)) | IrType::SInt(Some(width)) => Err(unsupported(
+            &format!("transactor method `{tname}.{mname}` {what} wider than 1024 bits"),
+            &format!("the packed TLM value model supports at most 1024 bits, got {width}"),
+        )),
+        _ => Err(unsupported(
+            &format!("transactor method `{tname}.{mname}` {what} with a non-scalar type"),
+            "TLM wires carry bool, fixed-width uint/sint, or finite packed records",
+        )),
+    }
 }
 
 /// Active-method value param: the tbir wide-value ABI mirrors v1's value
@@ -2091,6 +2149,36 @@ fn method_return_ir_type(
         Some(ty),
         record_ids,
     )))
+}
+
+fn check_method_nested_string_types(
+    ctx: &super::LowerCtx,
+    tname: &str,
+    method: &HookableMethod,
+) -> Result<(), LowerError> {
+    if let Some((param, span)) = method.params.iter().find_map(|param| {
+        helpers::nested_string_type_span(param.ty.as_ref()).map(|span| (param, span))
+    }) {
+        ctx.diagnostics.record(ctx.source_id, span);
+        return Err(unsupported(
+            &format!(
+                "transactor `{tname}` method `{}` parameter `{}` whose type contains `String`",
+                method.name.name, param.name.name
+            ),
+            "String containers and aggregates are not supported; use exact top-level `String` for a callable parameter",
+        ));
+    }
+    if let Some(span) = helpers::nested_string_type_span(method.return_ty.as_ref()) {
+        ctx.diagnostics.record(ctx.source_id, span);
+        return Err(unsupported(
+            &format!(
+                "transactor `{tname}` method `{}` return type containing `String`",
+                method.name.name
+            ),
+            "String containers and aggregates are not supported; use exact top-level `String` for a callable return",
+        ));
+    }
+    Ok(())
 }
 
 /// Shared scalar-type gate parameterized by the maximum allowed bit width
@@ -2162,6 +2250,12 @@ fn method_param_ir_type(
     p: &Param,
     record_ids: &HashMap<String, ir::RecordId>,
 ) -> Result<IrType, LowerError> {
+    if helpers::is_string_tseq_type(p.ty.as_ref()) {
+        return Err(LowerError::Invalid(format!(
+            "transactor `{tname}` method `{mname}` parameter `{}` cannot use `TSeq<String>`; String sequences are not supported",
+            p.name.name
+        )));
+    }
     if let Some(TypeExpr::Named { name, .. }) = p.ty.as_ref() {
         let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
         if let Some(&rid) = record_ids.get(simple) {
@@ -2176,9 +2270,10 @@ fn method_param_ir_type(
     if let Some(seq) = helpers::tseq_ir_type(p.ty.as_ref(), record_ids) {
         return Ok(seq);
     }
-    if let Some(fixed @ IrType::FixedVec { .. }) = p.ty.as_ref().and_then(|ty| {
-        super::components::fixed_vec_ir_type_with_records(ty, record_ids)
-    }) {
+    if let Some(fixed @ IrType::FixedVec { .. }) =
+        p.ty.as_ref()
+            .and_then(|ty| super::components::fixed_vec_ir_type_with_records(ty, record_ids))
+    {
         return Ok(fixed);
     }
     check_method_param_ty(

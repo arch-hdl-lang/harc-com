@@ -71,6 +71,8 @@ sized_scalar_literal_test | Top | top_counter.sv | top_counter.arch | pass
 const_expr_init_test | Top | top_counter.sv | top_counter.arch | pass
 signed_use_site_test | Top | top_counter.sv | top_counter.arch | pass
 signed_helper_param_test | Top | top_counter.sv | top_counter.arch | pass
+lazy_transactor_value_test | Top | top_counter.sv | - | pass
+string_extern_args_parity_test | Top | top_counter.sv | - | pass | - | string_extern_args.cpp
 pure_helper_record_value_test | Top | top_counter.sv | top_counter.arch | pass
 struct_keep_randomize_test | Top | top_counter.sv | top_counter.arch | pass
 call_return_type_test | Top | top_counter.sv | - | pass | - | call_return_type_ref.cpp
@@ -279,8 +281,8 @@ wrapping_keep_constraint_test | Top | top_counter.sv | - | pass
 axilite_constraint_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass | axilite_regs_test.harc | - | AxiLiteConstraintTest
 agent_on_handler_test | Top | top_counter.sv | - | pass
 component_event_subscription_test | Top | top_counter.sv | - | pass
-method_hook_family_test | Top | top_counter.sv | top_counter.arch | pass
 component_method_randomize_test | Top | top_counter.sv | - | pass
+component_subcopy_value_test | Top | top_counter.sv | - | pass
 component_struct_keep_randomize_test | Top | top_counter.sv | - | pass
 phase_struct_keep_randomize_test | Top | top_counter.sv | - | pass
 regblock_access_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass

@@ -161,6 +161,30 @@ struct LowerCtx<'a> {
 }
 
 impl LowerError {
+    pub fn span(&self) -> Span {
+        match self {
+            LowerError::BvLitOutOfRange { span, .. }
+            | LowerError::WidthMismatch { span, .. }
+            | LowerError::SignednessMismatch { span, .. }
+            | LowerError::UnresolvedIdent { span, .. }
+            | LowerError::FieldNotFound { span, .. }
+            | LowerError::NonBoolLogical { span, .. }
+            | LowerError::NonBvBitwise { span, .. }
+            | LowerError::BadShiftAmount { span, .. }
+            | LowerError::SetElemTypeMismatch { span, .. }
+            | LowerError::InRhsNotSetOrRange { span, .. }
+            | LowerError::UnsupportedV1 { span, .. }
+            | LowerError::UnknownRelation { span, .. }
+            | LowerError::RelationArityMismatch { span, .. }
+            | LowerError::RecursiveRelation { span, .. }
+            | LowerError::RelationExpansionTooLarge { span, .. }
+            | LowerError::RelationNamedArgMisplaced { span, .. }
+            | LowerError::DisallowedInConstraint { span, .. }
+            | LowerError::IntParseFailed { span, .. }
+            | LowerError::BadSoftWeight { span } => *span,
+        }
+    }
+
     /// The five variants `lower_program` acts on.
     ///
     /// `surface_constraint_lower_error` matches these variants by hand
@@ -688,23 +712,37 @@ fn lower_ident(ctx: &mut LowerCtx<'_>, name: &str, span: Span) -> CTypedExpr {
         );
     }
     // 3. File-scope integer constant?
-    if let Some(text) = ctx.elab.consts.get(name) {
-        match parse_int_literal(text) {
-            Some(value) => {
-                return CTypedExpr::new(
-                    CExprKind::BvLit { value },
-                    CType::uint(default_unsigned_width(value)),
-                    span,
-                );
-            }
-            None => {
-                ctx.record_error(LowerError::IntParseFailed {
-                    source: text.clone(),
-                    span,
-                });
-                return ctx.bottom(span, CExprKind::BvLit { value: 0 });
-            }
+    if let Some(constant) = ctx.elab.consts.get(name) {
+        if constant.is_bool {
+            return CTypedExpr::new(CExprKind::BoolLit(constant.value != 0), CType::Bool, span);
         }
+        let ty = match (constant.width, constant.signedness) {
+            (Some(width), crate::constraints::Signedness::Signed) => CType::sint(width),
+            (Some(width), crate::constraints::Signedness::Unsigned) => CType::uint(width),
+            (None, crate::constraints::Signedness::Signed) => CType::sint(64),
+            _ => CType::uint(default_unsigned_width(constant.value as u128)),
+        };
+        if constant.signedness == crate::constraints::Signedness::Signed
+            && (constant.value as i64) < 0
+        {
+            let magnitude = constant.value.wrapping_neg() as u128;
+            let inner = CTypedExpr::new(CExprKind::BvLit { value: magnitude }, ty.clone(), span);
+            return CTypedExpr::new(
+                CExprKind::Unary {
+                    op: CUnaryOp::Neg,
+                    expr: Box::new(inner),
+                },
+                ty,
+                span,
+            );
+        }
+        return CTypedExpr::new(
+            CExprKind::BvLit {
+                value: constant.value as u128,
+            },
+            ty,
+            span,
+        );
     }
     // 4. Bare field of the target record?
     let path = FieldPath::single(name);
@@ -2302,6 +2340,23 @@ end transaction RegPair
             display.contains("==") && display.contains("24:u8"),
             "got: {display}"
         );
+    }
+
+    #[test]
+    fn typed_file_constant_keeps_declared_constraint_type() {
+        let src = r#"
+const LIMIT : uint<32> = 24
+
+transaction RegPair
+  addr : uint<32>
+end transaction RegPair
+"#;
+        let problem = lower_with_body(src, &["p.addr < LIMIT"])
+            .expect("typed const and field widths should agree");
+        let CExprKind::Binary { rhs, .. } = &problem.constraints[0].expr.kind else {
+            panic!("expected binary constraint")
+        };
+        assert_eq!(rhs.ty, CType::uint(32));
     }
 
     #[test]

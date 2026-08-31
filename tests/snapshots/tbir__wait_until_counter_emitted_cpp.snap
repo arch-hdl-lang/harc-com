@@ -55,11 +55,6 @@ static void _harc_eval_posedge(DUT* dut) {
     dut->eval();
 }
 
-static harc_rt::random::HarcRng harc_rng;
-static inline uint64_t harc_rng_next() {
-    return harc_rng.next();
-}
-
 struct WaitUntilCounterTb {
     VTop* dut = nullptr;
     uint64_t _last_in_cycle = 0;
@@ -67,6 +62,7 @@ struct WaitUntilCounterTb {
 };
 
 struct HarcTestContext {
+    VerilatedContext verilated;
     VTop* dut = nullptr;
 #if HARC_TRACE_ENABLED
     HarcTraceC* tfp = nullptr;
@@ -78,15 +74,16 @@ struct HarcTestContext {
     int cycle_count = 0;
     harc_rt::trace::HarcTraceWriter trace;
     harc_rt::log::HarcLogContext log_ctx;
+    harc_rt::random::HarcRng rng;
     std::vector<std::function<void()>> _checkers;
     std::vector<std::function<void()>> _post_eval_services;
     std::vector<std::function<void()>> _auto_cov_reports;
 };
 
 int run_WaitUntilCounterTest(int argc, char** argv) {
-    Verilated::commandArgs(argc, argv);
     HarcTestContext ctx;
-    ctx.dut = new VTop;
+    ctx.verilated.commandArgs(argc, argv);
+    ctx.dut = harc_rt::log::harc_make_dut<VTop>(&ctx.verilated);
     auto* dut = ctx.dut;
 #if HARC_TRACE_ENABLED
     auto* tfp = ctx.tfp;
@@ -98,6 +95,8 @@ int run_WaitUntilCounterTest(int argc, char** argv) {
     auto& cycle_count = ctx.cycle_count;
     auto& trace = ctx.trace;
     auto& log_ctx = ctx.log_ctx;
+    auto& harc_rng = ctx.rng;
+    auto harc_rng_next = [&]() { return harc_rng.next(); };
     auto& _checkers = ctx._checkers;
     auto& _post_eval_services = ctx._post_eval_services;
     auto& _auto_cov_reports = ctx._auto_cov_reports;
@@ -182,7 +181,7 @@ int run_WaitUntilCounterTest(int argc, char** argv) {
     // scheduler tick — same semantics as `log(fatal, ...)`. Emitted
     // verbatim by both codegens so the two traces stay diffable.
     harc_rt::HarcQueueFatalScope _queue_fatal_scope([&]() {
-        sim_log_line("FATAL", "pop() on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed");
+        sim_log_line("FATAL", "queue front/pop on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed");
         ctx.errors++;
         _fatal = true;
     });
@@ -304,8 +303,12 @@ int run_WaitUntilCounterTest(int argc, char** argv) {
 
 
     for (auto& _r : _auto_cov_reports) _r();
+    _auto_cov_reports.clear();
+    _post_eval_services.clear();
+    _checkers.clear();
+    harc_rt::harc_destroy_scheduler_threads(sched);
     dut->final();
-    HARC_RT_WRITE_COVERAGE(Verilated::threadContextp()->coveragep());
+    HARC_RT_WRITE_COVERAGE(ctx.verilated.coveragep());
     HARC_RT_CLOSE_WAVE_TRACE(tfp);
     delete dut;
 

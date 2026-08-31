@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 
 use crate::ast::{
-    Block, CallArg, ComponentItem, Expr, ExprKind, Item, SourceFile, Stmt, StmtKind, TestDecl,
-    TestItem, TseqDecl, TypeExpr,
+    Block, CallArg, ComponentItem, Expr, ExprKind, Item, SourceFile, SourceId, Stmt, StmtKind,
+    TestDecl, TestItem, TseqDecl, TypeExpr,
 };
 use crate::constraints::elaborate_constraints;
 use crate::constraints::typed::{CTypedProblem, ConstraintProblemId};
@@ -33,6 +33,7 @@ pub struct TypedSolverProblemEntry {
 pub enum TypedSolverProblemSource {
     TransactionTemplate {
         transaction: String,
+        source_id: SourceId,
         span: Span,
     },
     RandomizeSite {
@@ -41,6 +42,7 @@ pub enum TypedSolverProblemSource {
         transaction: String,
         blocking: bool,
         has_with_body: bool,
+        source_id: SourceId,
         span: Span,
     },
 }
@@ -84,6 +86,7 @@ struct RandomizeSite {
     target: String,
     with_body: Vec<Expr>,
     blocking: bool,
+    source_id: SourceId,
     span: Span,
     context: String,
 }
@@ -92,11 +95,23 @@ pub fn build_typed_solver_problem_table(file: &SourceFile) -> TypedSolverProblem
     let elab = elaborate_constraints(file);
     let backend = Z3Backend;
     let mut entries = Vec::new();
-    let mut next_problem_id = 1u32;
+    let mut next_problem_id = 1u64;
 
     for txn in elab.transactions.clone() {
+        let source_id = file
+            .items
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match item {
+                Item::Transaction(decl) if decl.name.name == txn.name => {
+                    Some(file.item_source(index))
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
         let source = TypedSolverProblemSource::TransactionTemplate {
             transaction: txn.name.clone(),
+            source_id,
             span: txn.span,
         };
         let build = match lower_problem(
@@ -120,11 +135,11 @@ pub fn build_typed_solver_problem_table(file: &SourceFile) -> TypedSolverProblem
     }
 
     push_site_entries(
+        file,
         &elab,
         &backend,
         collect_randomize_sites(file),
         &mut entries,
-        &mut next_problem_id,
     );
 
     TypedSolverProblemTable { entries }
@@ -136,11 +151,9 @@ pub fn build_typed_solver_problem_table(file: &SourceFile) -> TypedSolverProblem
 ///
 /// This is a **validation-only** table and deliberately a separate
 /// function rather than more arms in `collect_randomize_sites`. The
-/// main table's entry order assigns `problem_id`s that both backends
-/// bake into emitted symbol names, so widening it would renumber
-/// existing sites; these entries are built purely to be read for their
-/// `LowerError`s and never reach emission. Problem ids therefore
-/// restart at 1 and mean nothing outside this table.
+/// main table assigns stable semantic `problem_id`s that both backends
+/// bake into emitted symbol names. These entries are built purely to be
+/// read for their `LowerError`s and never reach emission.
 pub fn build_component_scope_problem_table(file: &SourceFile) -> TypedSolverProblemTable {
     let sites = collect_component_randomize_sites(file);
     // Collect first, and return before `elaborate_constraints` when
@@ -157,18 +170,27 @@ pub fn build_component_scope_problem_table(file: &SourceFile) -> TypedSolverProb
     let elab = elaborate_constraints(file);
     let backend = Z3Backend;
     let mut entries = Vec::new();
-    let mut next_problem_id = 1u32;
-    push_site_entries(&elab, &backend, sites, &mut entries, &mut next_problem_id);
+    push_site_entries(file, &elab, &backend, sites, &mut entries);
     TypedSolverProblemTable { entries }
 }
 
 fn push_site_entries(
+    file: &SourceFile,
     elab: &crate::constraints::ConstraintElaboration,
     backend: &Z3Backend,
     sites: Vec<RandomizeSite>,
     entries: &mut Vec<TypedSolverProblemEntry>,
-    next_problem_id: &mut u32,
 ) {
+    let mut occurrence_by_site = BTreeMap::<(String, String, String), u32>::new();
+    let mut used_ids = entries
+        .iter()
+        .filter_map(|entry| match &entry.build {
+            TypedSolverProblemBuild::Z3 { typed, .. } => Some(typed.problem_id.0),
+            TypedSolverProblemBuild::LowerError(_) | TypedSolverProblemBuild::BackendError(_) => {
+                None
+            }
+        })
+        .collect::<std::collections::BTreeSet<_>>();
     for site in sites {
         let Some(txn) = elab
             .transaction(&site.txn_name)
@@ -183,14 +205,34 @@ fn push_site_entries(
             transaction: site.txn_name.clone(),
             blocking: site.blocking,
             has_with_body: !site.with_body.is_empty(),
+            source_id: site.source_id,
             span: site.span,
         };
+        let source_name = file
+            .source_for_id(site.source_id)
+            .map(|source| source.name.as_ref())
+            .unwrap_or("<unknown>");
+        let occurrence_key = (
+            source_name.to_string(),
+            site.context.clone(),
+            site.txn_name.clone(),
+        );
+        let occurrence = occurrence_by_site.entry(occurrence_key).or_default();
+        let mut collision = 0u32;
+        let problem_id = loop {
+            let id = stable_randomize_problem_id(source_name, &site, *occurrence, collision);
+            if used_ids.insert(id) {
+                break id;
+            }
+            collision += 1;
+        };
+        *occurrence += 1;
         let build = match lower_problem(
             elab,
             &txn,
             Some(&site.with_body),
             site.span,
-            ConstraintProblemId(*next_problem_id),
+            ConstraintProblemId(problem_id),
         ) {
             Ok(problem) => match backend.build(&problem) {
                 Ok(z3) => TypedSolverProblemBuild::Z3 {
@@ -202,8 +244,39 @@ fn push_site_entries(
             Err(errors) => TypedSolverProblemBuild::LowerError(errors),
         };
         entries.push(TypedSolverProblemEntry { source, build });
-        *next_problem_id += 1;
     }
+}
+
+fn stable_randomize_problem_id(
+    source_name: &str,
+    site: &RandomizeSite,
+    occurrence: u32,
+    collision: u32,
+) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for part in [
+        "harc-randomize-site-v1",
+        source_name,
+        site.context.as_str(),
+        site.target.as_str(),
+        site.txn_name.as_str(),
+    ] {
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for byte in occurrence
+        .to_le_bytes()
+        .into_iter()
+        .chain(collision.to_le_bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash | (1u64 << 63)
 }
 
 /// Randomize sites in the bodies `collect_randomize_sites` skips. Both
@@ -212,11 +285,12 @@ fn push_site_entries(
 /// C++ under *both* codegens with no diagnostic from either.
 fn collect_component_randomize_sites(file: &SourceFile) -> Vec<RandomizeSite> {
     let mut out = Vec::new();
-    for item in &file.items {
+    for (item_index, item) in file.items.iter().enumerate() {
+        let source_id = file.item_source(item_index);
         match item {
             Item::Agent(c) | Item::Env(c) | Item::Scoreboard(c) | Item::Sequencer(c) => {
                 let scope = component_field_scope([&c.items[..]]);
-                collect_component_items(&c.items, &scope, &c.name.name, &mut out);
+                collect_component_items(&c.items, &scope, &c.name.name, source_id, &mut out);
             }
             Item::Transactor(t) => {
                 // ONE scope across both halves, not one per half.
@@ -229,8 +303,8 @@ fn collect_component_randomize_sites(file: &SourceFile) -> Vec<RandomizeSite> {
                 // to close.
                 let active = t.when_active.as_deref().unwrap_or(&[]);
                 let scope = component_field_scope([&t.items[..], active]);
-                collect_component_items(&t.items, &scope, &t.name.name, &mut out);
-                collect_component_items(active, &scope, &t.name.name, &mut out);
+                collect_component_items(&t.items, &scope, &t.name.name, source_id, &mut out);
+                collect_component_items(active, &scope, &t.name.name, source_id, &mut out);
             }
             Item::Function(f) => {
                 let mut env = BTreeMap::new();
@@ -239,6 +313,7 @@ fn collect_component_randomize_sites(file: &SourceFile) -> Vec<RandomizeSite> {
                     &f.body,
                     &mut env,
                     &format!("function {}", f.name.name),
+                    source_id,
                     &mut out,
                 );
             }
@@ -288,6 +363,7 @@ fn collect_component_items(
     items: &[ComponentItem],
     scope: &ComponentScope,
     owner: &str,
+    source_id: SourceId,
     out: &mut Vec<RandomizeSite>,
 ) {
     let (fields, payloads) = (&scope.fields, &scope.payloads);
@@ -308,15 +384,15 @@ fn collect_component_items(
                         }
                     }
                 }
-                collect_block(&h.body, &mut env, owner, out);
+                collect_block(&h.body, &mut env, owner, source_id, out);
             }
             ComponentItem::Hookable(h) => {
                 extend_env_with_params(&mut env, &h.params);
-                collect_block(&h.body, &mut env, owner, out);
+                collect_block(&h.body, &mut env, owner, source_id, out);
             }
             ComponentItem::TargetTlmThread(t) => {
                 extend_env_with_params(&mut env, &t.params);
-                collect_block(&t.body, &mut env, owner, out);
+                collect_block(&t.body, &mut env, owner, source_id, out);
             }
             // Reached only from a `testbench`, and a `testbench` is
             // either bound by `impl ... for` — in which case
@@ -330,7 +406,7 @@ fn collect_component_items(
             // duplicate diagnostic costs a caller nothing: both tables
             // produce the same error and the first one wins.
             ComponentItem::Lifecycle(_, block) => {
-                collect_block(block, &mut env, owner, out);
+                collect_block(block, &mut env, owner, source_id, out);
             }
             // `watchdog disabled` suppresses all codegen for the
             // block, body included, so nothing written there can reach
@@ -342,7 +418,7 @@ fn collect_component_items(
             // way. It stays so that allowing a body later cannot
             // silently start refusing a suppressed block.
             ComponentItem::Watchdog(w) if !w.disabled => {
-                collect_block(&w.body, &mut env, owner, out);
+                collect_block(&w.body, &mut env, owner, source_id, out);
             }
             ComponentItem::Field(_)
             | ComponentItem::Connect(_)
@@ -406,27 +482,37 @@ fn event_payload_type_name(t: &TypeExpr) -> Option<String> {
 
 fn collect_randomize_sites(file: &SourceFile) -> Vec<RandomizeSite> {
     let mut out = Vec::new();
-    for item in &file.items {
+    for (item_index, item) in file.items.iter().enumerate() {
+        let source_id = file.item_source(item_index);
         match item {
-            Item::Test(test) => collect_test_randomize_sites(test, &mut out),
-            Item::Tseq(tseq) => collect_tseq_randomize_sites(tseq, &mut out),
+            Item::Test(test) => collect_test_randomize_sites(test, source_id, &mut out),
+            Item::Tseq(tseq) => collect_tseq_randomize_sites(tseq, source_id, &mut out),
             _ => {}
         }
     }
     out
 }
 
-fn collect_tseq_randomize_sites(tseq: &TseqDecl, out: &mut Vec<RandomizeSite>) {
+fn collect_tseq_randomize_sites(
+    tseq: &TseqDecl,
+    source_id: SourceId,
+    out: &mut Vec<RandomizeSite>,
+) {
     let mut env = BTreeMap::new();
     collect_block(
         &tseq.body,
         &mut env,
         &format!("tseq {}", tseq.name.name),
+        source_id,
         out,
     );
 }
 
-fn collect_test_randomize_sites(test: &TestDecl, out: &mut Vec<RandomizeSite>) {
+fn collect_test_randomize_sites(
+    test: &TestDecl,
+    source_id: SourceId,
+    out: &mut Vec<RandomizeSite>,
+) {
     let mut env = BTreeMap::new();
     for item in &test.items {
         if let TestItem::Let(l) = item {
@@ -434,9 +520,17 @@ fn collect_test_randomize_sites(test: &TestDecl, out: &mut Vec<RandomizeSite>) {
         }
     }
 
-    for item in &test.items {
+    for (item_index, item) in test.items.iter().enumerate() {
+        let item_source = test.item_source(item_index);
+        let item_source = if item_source.is_known() {
+            item_source
+        } else {
+            source_id
+        };
         match item {
-            TestItem::Stmt(stmt) => collect_stmt(stmt, &mut env.clone(), &test.name.name, out),
+            TestItem::Stmt(stmt) => {
+                collect_stmt(stmt, &mut env.clone(), &test.name.name, item_source, out)
+            }
             TestItem::Scope(scope) => {
                 for block in [
                     scope.setup.as_ref(),
@@ -447,11 +541,11 @@ fn collect_test_randomize_sites(test: &TestDecl, out: &mut Vec<RandomizeSite>) {
                 .into_iter()
                 .flatten()
                 {
-                    collect_block(block, &mut env.clone(), &test.name.name, out);
+                    collect_block(block, &mut env.clone(), &test.name.name, item_source, out);
                 }
             }
             TestItem::Phase(_, block) => {
-                collect_block(block, &mut env.clone(), &test.name.name, out)
+                collect_block(block, &mut env.clone(), &test.name.name, item_source, out)
             }
             TestItem::Let(_) | TestItem::Apply(_) | TestItem::Use(_) | TestItem::Clock(_) => {}
         }
@@ -462,10 +556,17 @@ fn collect_block(
     block: &Block,
     env: &mut BTreeMap<String, String>,
     context: &str,
+    fallback_source_id: SourceId,
     out: &mut Vec<RandomizeSite>,
 ) {
-    for stmt in &block.stmts {
-        collect_stmt(stmt, env, context, out);
+    for (index, stmt) in block.stmts.iter().enumerate() {
+        let source_id = block.stmt_source(index);
+        let source_id = if source_id.is_known() {
+            source_id
+        } else {
+            fallback_source_id
+        };
+        collect_stmt(stmt, env, context, source_id, out);
     }
 }
 
@@ -473,12 +574,13 @@ fn collect_stmt(
     stmt: &Stmt,
     env: &mut BTreeMap<String, String>,
     context: &str,
+    source_id: SourceId,
     out: &mut Vec<RandomizeSite>,
 ) {
     match &stmt.kind {
         StmtKind::Let(l) => {
             if let Some(value) = &l.value {
-                collect_expr(value, env, context, out);
+                collect_expr(value, env, context, source_id, out);
             }
             bind(env, &l.name.name, l.ty.as_ref());
         }
@@ -487,101 +589,101 @@ fn collect_stmt(
             target,
             with_body,
         } => {
-            collect_randomize_expr(*blocking, target, with_body, env, context, out);
+            collect_randomize_expr(*blocking, target, with_body, env, context, source_id, out);
             for expr in with_body {
-                collect_expr(expr, env, context, out);
+                collect_expr(expr, env, context, source_id, out);
             }
         }
         StmtKind::Assign { target, value } | StmtKind::Send { target, value } => {
-            collect_expr(target, env, context, out);
-            collect_expr(value, env, context, out);
+            collect_expr(target, env, context, source_id, out);
+            collect_expr(value, env, context, source_id, out);
         }
         StmtKind::For(f) => {
-            collect_expr(&f.iter, env, context, out);
-            collect_block(&f.body, &mut env.clone(), context, out);
+            collect_expr(&f.iter, env, context, source_id, out);
+            collect_block(&f.body, &mut env.clone(), context, source_id, out);
         }
         StmtKind::Repeat(r) => {
-            collect_expr(&r.count, env, context, out);
-            collect_block(&r.body, &mut env.clone(), context, out);
+            collect_expr(&r.count, env, context, source_id, out);
+            collect_block(&r.body, &mut env.clone(), context, source_id, out);
         }
-        StmtKind::Loop(block) => collect_block(block, &mut env.clone(), context, out),
+        StmtKind::Loop(block) => collect_block(block, &mut env.clone(), context, source_id, out),
         StmtKind::While { cond, body, .. } => {
-            collect_expr(cond, env, context, out);
-            collect_block(body, &mut env.clone(), context, out);
+            collect_expr(cond, env, context, source_id, out);
+            collect_block(body, &mut env.clone(), context, source_id, out);
         }
         StmtKind::If(ifs) => {
-            collect_expr(&ifs.cond, env, context, out);
-            collect_block(&ifs.then_block, &mut env.clone(), context, out);
+            collect_expr(&ifs.cond, env, context, source_id, out);
+            collect_block(&ifs.then_block, &mut env.clone(), context, source_id, out);
             for (cond, block) in &ifs.elsifs {
-                collect_expr(cond, env, context, out);
-                collect_block(block, &mut env.clone(), context, out);
+                collect_expr(cond, env, context, source_id, out);
+                collect_block(block, &mut env.clone(), context, source_id, out);
             }
             if let Some(block) = &ifs.else_block {
-                collect_block(block, &mut env.clone(), context, out);
+                collect_block(block, &mut env.clone(), context, source_id, out);
             }
         }
         StmtKind::Fork(fork) => {
             for block in &fork.branches {
-                collect_block(block, &mut env.clone(), context, out);
+                collect_block(block, &mut env.clone(), context, source_id, out);
             }
         }
         StmtKind::Parallel(blocks) | StmtKind::Schedule(blocks) => {
             for block in blocks {
-                collect_block(block, &mut env.clone(), context, out);
+                collect_block(block, &mut env.clone(), context, source_id, out);
             }
         }
         StmtKind::Select(arms) => {
             for arm in arms {
-                collect_expr(&arm.event, env, context, out);
-                collect_block(&arm.action, &mut env.clone(), context, out);
+                collect_expr(&arm.event, env, context, source_id, out);
+                collect_block(&arm.action, &mut env.clone(), context, source_id, out);
             }
         }
         StmtKind::On(handler) => {
-            collect_expr(&handler.event, env, context, out);
-            collect_block(&handler.body, &mut env.clone(), context, out);
+            collect_expr(&handler.event, env, context, source_id, out);
+            collect_block(&handler.body, &mut env.clone(), context, source_id, out);
         }
         StmtKind::Emit { args, .. } | StmtKind::Log { args, .. } | StmtKind::LogF { args, .. } => {
             for arg in args {
-                collect_call_arg(arg, env, context, out);
+                collect_call_arg(arg, env, context, source_id, out);
             }
         }
         StmtKind::Yield(expr) | StmtKind::Release(expr) | StmtKind::Fail { msg: expr, .. } => {
-            collect_expr(expr, env, context, out);
+            collect_expr(expr, env, context, source_id, out);
         }
         StmtKind::Return(expr) => {
             if let Some(expr) = expr {
-                collect_expr(expr, env, context, out);
+                collect_expr(expr, env, context, source_id, out);
             }
         }
         StmtKind::Assert(v) | StmtKind::Assume(v) | StmtKind::Cover(v) => {
             if let Some(expr) = &v.expr {
-                collect_expr(expr, env, context, out);
+                collect_expr(expr, env, context, source_id, out);
             }
             if let Some(expr) = &v.else_fail {
-                collect_expr(expr, env, context, out);
+                collect_expr(expr, env, context, source_id, out);
             }
         }
         StmtKind::After { duration, body, .. } => {
-            collect_expr(duration, env, context, out);
-            collect_block(body, &mut env.clone(), context, out);
+            collect_expr(duration, env, context, source_id, out);
+            collect_block(body, &mut env.clone(), context, source_id, out);
         }
-        StmtKind::Wait { duration, .. } => collect_expr(duration, env, context, out),
+        StmtKind::Wait { duration, .. } => collect_expr(duration, env, context, source_id, out),
         StmtKind::WaitUntil {
             conditions,
             timeout,
             ..
         } => {
             for cond in conditions {
-                collect_expr(cond, env, context, out);
+                collect_expr(cond, env, context, source_id, out);
             }
             if let Some(timeout) = timeout {
-                collect_expr(&timeout.cycles, env, context, out);
+                collect_expr(&timeout.cycles, env, context, source_id, out);
                 if let Some(msg) = &timeout.message {
-                    collect_expr(msg, env, context, out);
+                    collect_expr(msg, env, context, source_id, out);
                 }
             }
         }
-        StmtKind::Expr(expr) => collect_expr(expr, env, context, out),
+        StmtKind::Expr(expr) => collect_expr(expr, env, context, source_id, out),
         StmtKind::Apply(_)
         | StmtKind::Break { .. }
         | StmtKind::Continue { .. }
@@ -593,11 +695,12 @@ fn collect_call_arg(
     arg: &CallArg,
     env: &BTreeMap<String, String>,
     context: &str,
+    source_id: SourceId,
     out: &mut Vec<RandomizeSite>,
 ) {
     match arg {
         CallArg::Expr(expr) | CallArg::Named { value: expr, .. } => {
-            collect_expr(expr, env, context, out);
+            collect_expr(expr, env, context, source_id, out);
         }
     }
 }
@@ -606,6 +709,7 @@ fn collect_expr(
     expr: &Expr,
     env: &BTreeMap<String, String>,
     context: &str,
+    source_id: SourceId,
     out: &mut Vec<RandomizeSite>,
 ) {
     match expr.kind.as_ref() {
@@ -614,15 +718,15 @@ fn collect_expr(
             target,
             with_body,
         } => {
-            collect_randomize_expr(*blocking, target, with_body, env, context, out);
+            collect_randomize_expr(*blocking, target, with_body, env, context, source_id, out);
             for expr in with_body {
-                collect_expr(expr, env, context, out);
+                collect_expr(expr, env, context, source_id, out);
             }
         }
         ExprKind::Call { callee, args } => {
-            collect_expr(callee, env, context, out);
+            collect_expr(callee, env, context, source_id, out);
             for arg in args {
-                collect_call_arg(arg, env, context, out);
+                collect_call_arg(arg, env, context, source_id, out);
             }
         }
         ExprKind::Field { target, .. }
@@ -630,15 +734,15 @@ fn collect_expr(
         | ExprKind::Unary { expr: target, .. }
         | ExprKind::HashHash { expr: target, .. }
         | ExprKind::SeqRepeat { expr: target, .. }
-        | ExprKind::Paren(target) => collect_expr(target, env, context, out),
+        | ExprKind::Paren(target) => collect_expr(target, env, context, source_id, out),
         ExprKind::Index { target, index } => {
-            collect_expr(target, env, context, out);
-            collect_expr(index, env, context, out);
+            collect_expr(target, env, context, source_id, out);
+            collect_expr(index, env, context, source_id, out);
         }
         ExprKind::BitSlice { target, hi, lo } => {
-            collect_expr(target, env, context, out);
-            collect_expr(hi, env, context, out);
-            collect_expr(lo, env, context, out);
+            collect_expr(target, env, context, source_id, out);
+            collect_expr(hi, env, context, source_id, out);
+            collect_expr(lo, env, context, source_id, out);
         }
         ExprKind::Send { target, value }
         | ExprKind::Binary {
@@ -646,60 +750,60 @@ fn collect_expr(
             rhs: value,
             ..
         } => {
-            collect_expr(target, env, context, out);
-            collect_expr(value, env, context, out);
+            collect_expr(target, env, context, source_id, out);
+            collect_expr(value, env, context, source_id, out);
         }
-        ExprKind::ForkCall { call } => collect_expr(call, env, context, out),
+        ExprKind::ForkCall { call } => collect_expr(call, env, context, source_id, out),
         ExprKind::Ternary {
             cond,
             then_branch,
             else_branch,
         } => {
-            collect_expr(cond, env, context, out);
-            collect_expr(then_branch, env, context, out);
-            collect_expr(else_branch, env, context, out);
+            collect_expr(cond, env, context, source_id, out);
+            collect_expr(then_branch, env, context, source_id, out);
+            collect_expr(else_branch, env, context, source_id, out);
         }
         ExprKind::RangeLit { lo, hi } => {
             if let Some(lo) = lo {
-                collect_expr(lo, env, context, out);
+                collect_expr(lo, env, context, source_id, out);
             }
             if let Some(hi) = hi {
-                collect_expr(hi, env, context, out);
+                collect_expr(hi, env, context, source_id, out);
             }
         }
         ExprKind::SetLit(items) => {
             for item in items {
-                collect_expr(item, env, context, out);
+                collect_expr(item, env, context, source_id, out);
             }
         }
         ExprKind::SystemCall { args, .. } => {
             for arg in args {
-                collect_expr(arg, env, context, out);
+                collect_expr(arg, env, context, source_id, out);
             }
         }
         ExprKind::ForEachConstraint { iter, body, .. } => {
-            collect_expr(iter, env, context, out);
+            collect_expr(iter, env, context, source_id, out);
             for expr in body {
-                collect_expr(expr, env, context, out);
+                collect_expr(expr, env, context, source_id, out);
             }
         }
         ExprKind::SoftConstraint(sc) => {
-            collect_expr(&sc.expr, env, context, out);
+            collect_expr(&sc.expr, env, context, source_id, out);
             if let Some(weight) = &sc.weight {
-                collect_expr(weight, env, context, out);
+                collect_expr(weight, env, context, source_id, out);
             }
         }
         ExprKind::DistDirective { target, entries } => {
-            collect_expr(target, env, context, out);
+            collect_expr(target, env, context, source_id, out);
             for entry in entries {
-                collect_expr(&entry.value, env, context, out);
-                collect_expr(&entry.weight, env, context, out);
+                collect_expr(&entry.value, env, context, source_id, out);
+                collect_expr(&entry.weight, env, context, source_id, out);
             }
         }
-        ExprKind::NamedArg { value, .. } => collect_expr(value, env, context, out),
+        ExprKind::NamedArg { value, .. } => collect_expr(value, env, context, source_id, out),
         ExprKind::StructLit { fields, .. } => {
             for field in fields {
-                collect_expr(&field.value, env, context, out);
+                collect_expr(&field.value, env, context, source_id, out);
             }
         }
         ExprKind::CoverArrow { lhs, rhs, .. }
@@ -707,12 +811,12 @@ fn collect_expr(
             expr: lhs,
             set: rhs,
         } => {
-            collect_expr(lhs, env, context, out);
-            collect_expr(rhs, env, context, out);
+            collect_expr(lhs, env, context, source_id, out);
+            collect_expr(rhs, env, context, source_id, out);
         }
         ExprKind::SolveOrder { args } => {
             for arg in args {
-                collect_expr(arg, env, context, out);
+                collect_expr(arg, env, context, source_id, out);
             }
         }
         ExprKind::DistLit(_)
@@ -732,6 +836,7 @@ fn collect_randomize_expr(
     with_body: &[Expr],
     env: &BTreeMap<String, String>,
     context: &str,
+    source_id: SourceId,
     out: &mut Vec<RandomizeSite>,
 ) {
     let ExprKind::Ident(id) = target.kind.as_ref() else {
@@ -745,6 +850,7 @@ fn collect_randomize_expr(
         target: id.name.clone(),
         with_body: with_body.to_vec(),
         blocking,
+        source_id,
         span: target.span,
         context: format!("{context}: randomize({})", id.name),
     });
@@ -761,6 +867,22 @@ fn simple_type_name(ty: Option<&TypeExpr>) -> Option<String> {
 mod tests {
     use super::*;
     use crate::parser::parse_source;
+
+    fn randomize_problem_id(table: &TypedSolverProblemTable, context: &str) -> u64 {
+        table
+            .entries
+            .iter()
+            .find_map(|entry| match (&entry.source, &entry.build) {
+                (
+                    TypedSolverProblemSource::RandomizeSite {
+                        context: candidate, ..
+                    },
+                    TypedSolverProblemBuild::Z3 { typed, .. },
+                ) if candidate == context => Some(typed.problem_id.0),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing randomize site {context}"))
+    }
 
     #[test]
     fn builds_templates_and_randomize_sites() {
@@ -817,5 +939,112 @@ end transaction Packet
             table.entries[0].build,
             TypedSolverProblemBuild::LowerError(_)
         ));
+    }
+
+    #[test]
+    fn randomize_problem_ids_are_owner_stable_and_site_unique() {
+        let source = |include_alpha: bool| {
+            format!(
+                r#"
+transaction Packet
+    value : uint<8>
+end transaction Packet
+
+{}
+test Bravo
+    run
+        let p : Packet
+        randomize(p)
+        randomize(p)
+    end run
+end test Bravo
+"#,
+                if include_alpha {
+                    r#"test Alpha
+    run
+        let p : Packet
+        randomize(p)
+    end run
+end test Alpha"#
+                } else {
+                    ""
+                }
+            )
+        };
+
+        let without_alpha = build_typed_solver_problem_table(
+            &parse_source(&source(false)).expect("parse without Alpha"),
+        );
+        let with_alpha = build_typed_solver_problem_table(
+            &parse_source(&source(true)).expect("parse with Alpha"),
+        );
+
+        let bravo_without = without_alpha
+            .entries
+            .iter()
+            .filter_map(|entry| match (&entry.source, &entry.build) {
+                (
+                    TypedSolverProblemSource::RandomizeSite { context, .. },
+                    TypedSolverProblemBuild::Z3 { typed, .. },
+                ) if context == "Bravo: randomize(p)" => Some(typed.problem_id.0),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let bravo_with = with_alpha
+            .entries
+            .iter()
+            .filter_map(|entry| match (&entry.source, &entry.build) {
+                (
+                    TypedSolverProblemSource::RandomizeSite { context, .. },
+                    TypedSolverProblemBuild::Z3 { typed, .. },
+                ) if context == "Bravo: randomize(p)" => Some(typed.problem_id.0),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(bravo_without, bravo_with);
+        assert_eq!(bravo_with.len(), 2);
+        assert_ne!(bravo_with[0], bravo_with[1]);
+        assert_ne!(
+            randomize_problem_id(&with_alpha, "Alpha: randomize(p)"),
+            bravo_with[0]
+        );
+    }
+
+    #[test]
+    fn randomize_problem_id_survives_an_earlier_distinct_site_in_the_same_test() {
+        let source = |include_earlier: bool| {
+            format!(
+                r#"
+transaction Packet
+    value : uint<8>
+end transaction Packet
+
+test Stable
+    run
+        let earlier : Packet
+        let target : Packet
+{}        randomize(target)
+    end run
+end test Stable
+"#,
+                if include_earlier {
+                    "        randomize(earlier)\n"
+                } else {
+                    ""
+                }
+            )
+        };
+
+        let before = build_typed_solver_problem_table(
+            &parse_source(&source(false)).expect("parse before insertion"),
+        );
+        let after = build_typed_solver_problem_table(
+            &parse_source(&source(true)).expect("parse after insertion"),
+        );
+        assert_eq!(
+            randomize_problem_id(&before, "Stable: randomize(target)"),
+            randomize_problem_id(&after, "Stable: randomize(target)")
+        );
     }
 }

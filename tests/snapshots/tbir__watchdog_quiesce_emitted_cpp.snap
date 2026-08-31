@@ -55,10 +55,11 @@ static void _harc_eval_posedge(DUT* dut) {
     dut->eval();
 }
 
-static harc_rt::random::HarcRng harc_rng;
-static inline uint64_t harc_rng_next() {
-    return harc_rng.next();
-}
+// HARC typed runtime randomization problem descriptors.
+inline constexpr harc_rt::random::HarcRuntimeProblemDescriptor _harc_runtime_random_problem_table_entries[] = {
+    {1ULL, "randomize(TinyTxn)", "problem 1 randomize(TinyTxn)\n  field tag u8 random=true default=false attrs=[]\n"},
+};
+inline constexpr harc_rt::random::HarcRuntimeProblemTable _harc_runtime_random_problem_table = {_harc_runtime_random_problem_table_entries, 1};
 
 struct TinyTxn {
     uint64_t tag = 0;
@@ -94,8 +95,20 @@ template<typename Sig> static void harc_drive_TinyTxn(Sig& sig, const TinyTxn& v
 struct Producer {
     std::vector<std::function<void(TinyTxn)>> in_ev;
     uint64_t seen = 0;
+    int64_t _harc_component_watchdog_last = 0;
     uint64_t _last_in_cycle = 0;
     uint64_t _last_out_cycle = 0;
+    void _harc_copy_user_state_from(const Producer& source) {
+        this->seen = source.seen;
+    }
+    Producer() = default;
+    Producer(const Producer& source) {
+        _harc_copy_user_state_from(source);
+    }
+    Producer& operator=(const Producer& source) {
+        if (this != &source) _harc_copy_user_state_from(source);
+        return *this;
+    }
 };
 
 struct WatchdogQuiesceTb {
@@ -105,6 +118,7 @@ struct WatchdogQuiesceTb {
 };
 
 struct HarcTestContext {
+    VerilatedContext verilated;
     VTop* dut = nullptr;
 #if HARC_TRACE_ENABLED
     HarcTraceC* tfp = nullptr;
@@ -116,15 +130,16 @@ struct HarcTestContext {
     int cycle_count = 0;
     harc_rt::trace::HarcTraceWriter trace;
     harc_rt::log::HarcLogContext log_ctx;
+    harc_rt::random::HarcRng rng;
     std::vector<std::function<void()>> _checkers;
     std::vector<std::function<void()>> _post_eval_services;
     std::vector<std::function<void()>> _auto_cov_reports;
 };
 
 int run_WatchdogQuiesceTest(int argc, char** argv) {
-    Verilated::commandArgs(argc, argv);
     HarcTestContext ctx;
-    ctx.dut = new VTop;
+    ctx.verilated.commandArgs(argc, argv);
+    ctx.dut = harc_rt::log::harc_make_dut<VTop>(&ctx.verilated);
     auto* dut = ctx.dut;
 #if HARC_TRACE_ENABLED
     auto* tfp = ctx.tfp;
@@ -136,6 +151,8 @@ int run_WatchdogQuiesceTest(int argc, char** argv) {
     auto& cycle_count = ctx.cycle_count;
     auto& trace = ctx.trace;
     auto& log_ctx = ctx.log_ctx;
+    auto& harc_rng = ctx.rng;
+    auto harc_rng_next = [&]() { return harc_rng.next(); };
     auto& _checkers = ctx._checkers;
     auto& _post_eval_services = ctx._post_eval_services;
     auto& _auto_cov_reports = ctx._auto_cov_reports;
@@ -220,7 +237,7 @@ int run_WatchdogQuiesceTest(int argc, char** argv) {
     // scheduler tick — same semantics as `log(fatal, ...)`. Emitted
     // verbatim by both codegens so the two traces stay diffable.
     harc_rt::HarcQueueFatalScope _queue_fatal_scope([&]() {
-        sim_log_line("FATAL", "pop() on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed");
+        sim_log_line("FATAL", "queue front/pop on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed");
         ctx.errors++;
         _fatal = true;
     });
@@ -258,10 +275,9 @@ int run_WatchdogQuiesceTest(int argc, char** argv) {
     };
     prod.in_ev.push_back([&](auto _t) { prod._last_in_cycle = (uint64_t)cycle_count; Producer_on_h0(prod, _t); });
     _checkers.push_back([&]() {
-        static int64_t _wdog_prod_1_last = 0;
         int64_t _wdog_prod_1_period = (int64_t)(500);
-        if (_wdog_prod_1_period > 0 && (int64_t)cycle_count - _wdog_prod_1_last >= _wdog_prod_1_period) {
-            _wdog_prod_1_last = (int64_t)cycle_count;
+        if (_wdog_prod_1_period > 0 && (int64_t)cycle_count - prod._harc_component_watchdog_last >= _wdog_prod_1_period) {
+            prod._harc_component_watchdog_last = (int64_t)cycle_count;
             Producer_watchdog1(prod);
             int64_t _wdog_prod_1_max_idle = (int64_t)(1000);
             if (_wdog_prod_1_max_idle > 0 && (int64_t)((uint64_t)cycle_count - prod._last_in_cycle) >= _wdog_prod_1_max_idle && (int64_t)((uint64_t)cycle_count - prod._last_out_cycle) >= _wdog_prod_1_max_idle) {
@@ -383,8 +399,12 @@ int run_WatchdogQuiesceTest(int argc, char** argv) {
 
 
     for (auto& _r : _auto_cov_reports) _r();
+    _auto_cov_reports.clear();
+    _post_eval_services.clear();
+    _checkers.clear();
+    harc_rt::harc_destroy_scheduler_threads(sched);
     dut->final();
-    HARC_RT_WRITE_COVERAGE(Verilated::threadContextp()->coveragep());
+    HARC_RT_WRITE_COVERAGE(ctx.verilated.coveragep());
     HARC_RT_CLOSE_WAVE_TRACE(tfp);
     delete dut;
 

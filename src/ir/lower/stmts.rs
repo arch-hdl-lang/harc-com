@@ -154,6 +154,14 @@ fn is_non_positive_period_literal(e: &AstExpr) -> bool {
 
 impl FuncBuilder<'_> {
     pub(crate) fn lower_stmt(&mut self, s: &AstStmt) -> Result<(), LowerError> {
+        let result = self.lower_stmt_inner(s);
+        if result.is_err() {
+            self.record_error_span(s.span);
+        }
+        result
+    }
+
+    fn lower_stmt_inner(&mut self, s: &AstStmt) -> Result<(), LowerError> {
         self.ensure_open_block();
         match &s.kind {
             StmtKind::Let(l) => self.lower_let(l),
@@ -400,7 +408,10 @@ impl FuncBuilder<'_> {
                                     ))
                                 })?;
                             let cont = self.new_block();
-                            self.terminate(Terminator::TbLifecycleCall { function, succ: cont });
+                            self.terminate(Terminator::TbLifecycleCall {
+                                function,
+                                succ: cont,
+                            });
                             self.start_block(cont);
                             return Ok(());
                         }
@@ -413,6 +424,22 @@ impl FuncBuilder<'_> {
                     if let Some(m) = self.tb_method_call_name(callee) {
                         self.lower_tb_method_call(&m, args)?;
                         return Ok(());
+                    }
+                }
+                // `front()` is a value query, but discarding it must still
+                // execute the empty-queue guard. Route every queue owner
+                // through the expression seam and materialize the result;
+                // size/empty remain harmless no-ops in their owner-specific
+                // branches below.
+                if let ExprKind::Call { callee, args } = &*e.kind {
+                    if matches!(
+                        &*callee.kind,
+                        ExprKind::Field { name, .. } if name.name == "front"
+                    ) {
+                        if let Some(value) = self.lower_queue_value_call(callee, args)? {
+                            self.materialize_ordered_value(value);
+                            return Ok(());
+                        }
                     }
                 }
                 // Testbench-owned queue mutation: `_tb.pending.push(x)`.
@@ -720,15 +747,28 @@ impl FuncBuilder<'_> {
                     if let Some((base, component, method)) =
                         self.as_component_method_call(callee)?
                     {
-                        let declared = self.ctx.components[component.index()]
+                        let schema = self.ctx.components[component.index()]
                             .method(&method)
-                            .map(|m| m.param_names.clone());
-                        let lowered = self.lower_component_call_args(args, declared.as_deref())?;
-                        self.check_component_call_args(component, &method, &lowered)?;
+                            .cloned();
+                        let owner =
+                            format!("`{}.{method}`", self.ctx.components[component.index()].name);
+                        let declared = schema.as_ref().map(|m| {
+                            (
+                                m.param_names.as_slice(),
+                                m.param_tys.as_slice(),
+                                owner.as_str(),
+                            )
+                        });
+                        let lowered = self.lower_component_call_args(args, declared)?;
+                        self.check_component_call_args(component, &method, &lowered, args)?;
                         self.push(Stmt::ComponentCall {
                             base,
                             component,
                             method,
+                            function: schema
+                                .as_ref()
+                                .expect("component-call resolution guarantees a declared method")
+                                .function,
                             args: lowered,
                             dest: None,
                         });
@@ -801,7 +841,7 @@ impl FuncBuilder<'_> {
                 let what = match &*e.kind {
                     ExprKind::Call { callee, args } => match &*callee.kind {
                         ExprKind::Ident(id) => {
-                            if self.in_testbench_method_frame()
+                            if self.in_testbench_method_scope()
                                 && self.ctx.tb_methods.contains_key(&id.name)
                             {
                                 self.lower_tb_method_call(&id.name, args)?;
@@ -881,6 +921,7 @@ impl FuncBuilder<'_> {
             None => None,
         };
         let n = self.lower_expr_no_ports(duration)?;
+        self.validate_numeric_expr(&n, "wait cycle count")?;
         // A wide cycle count lowers: the emitter narrows it to the
         // `uint32_t` the terminator takes.
         //
@@ -935,6 +976,17 @@ impl FuncBuilder<'_> {
     }
 
     fn lower_let(&mut self, l: &crate::ast::LetStmt) -> Result<(), LowerError> {
+        if super::helpers::is_nested_string_type(l.ty.as_ref()) {
+            if let Some(ty) = &l.ty {
+                self.record_error_span(match ty {
+                    TypeExpr::Named { span, .. } | TypeExpr::Builtin { span, .. } => *span,
+                });
+            }
+            return Err(unsupported(
+                &format!("local `{}` whose type contains `String`", l.name.name),
+                "String containers and aggregates are not supported; use exact top-level `String` for an ephemeral local",
+            ));
+        }
         if !l.probes.is_empty() {
             return Err(not_implemented(
                 "probe declarations on a run-scope local",
@@ -1106,76 +1158,7 @@ impl FuncBuilder<'_> {
         if let Some(TypeExpr::Named { name, .. }) = l.ty.as_ref() {
             let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
             if let Some(&rid) = self.ctx.record_ids.get(simple) {
-                // `let r : ReadResponse = model.predict_read(addr)` — a
-                // record-typed local bound from a component-method call that
-                // returns that record. The dest local is record-typed and
-                // the call carries it (v1's `ReadResponse r =
-                // <Comp>_<method>(...)`). Any other initializer shape stays
-                // rejected (field-by-field assignment is the only other
-                // supported form).
                 if let Some(value) = &l.value {
-                    if let ExprKind::Call { callee, args } = &*value.kind {
-                        if let Some((base, component, method)) =
-                            self.as_component_method_call(callee)?
-                        {
-                            let comp = &self.ctx.components[component.index()];
-                            // UNREACHABLE by construction, and kept only so the
-                            // condition has one verdict everywhere it is
-                            // written. `as_component_method_call` validates
-                            // the method on EVERY path that returns
-                            // `Ok(Some(..))` — the two that error do so
-                            // themselves, the two that do not are guarded by
-                            // `is_some()` — so by the time a caller holds
-                            // `(base, component, method)` the method exists.
-                            // Confirmed by mutation: neutering this arm
-                            // fails no test, because nothing reaches it.
-                            // The reachable landing is the resolver's own
-                            // arm in `components.rs`, which is where the
-                            // measurement lives.
-                            let m = comp.method(&method).ok_or_else(|| {
-                                LowerError::Invalid(format!(
-                                    "component `{}` has no method `{method}`",
-                                    comp.name
-                                ))
-                            })?;
-                            if !m.has_ret {
-                                // REACHED, contrary to an earlier note
-                                // here. A typed `let` over a SCALAR type
-                                // is claimed by the untyped handler
-                                // below, which is what that note
-                                // generalized from — but this arm is
-                                // guarded on a RECORD type, and
-                                // `let t : TinyTxn = c.noret(3)` lands
-                                // here first try. v1: "conversion from
-                                // 'void' to non-scalar type 'TinyTxn'
-                                // requested".
-                                return Err(LowerError::Invalid(format!(
-                                    "`let {} : {simple} = {}.{method}(...)` — method \
-                                     `{method}` returns no value",
-                                    l.name.name, comp.name
-                                )));
-                            }
-                            self.check_component_method_result_assignable(
-                                m,
-                                IrType::Record(rid),
-                                &method,
-                                &l.name.name,
-                            )?;
-                            let declared = m.param_names.clone();
-                            let lowered = self.lower_component_call_args(args, Some(&declared))?;
-                            self.check_component_call_args(component, &method, &lowered)?;
-                            let id = self.declare(&l.name.name);
-                            self.set_local_type(id, IrType::Record(rid));
-                            self.push(Stmt::ComponentCall {
-                                base,
-                                component,
-                                method,
-                                args: lowered,
-                                dest: Some(id),
-                            });
-                            return Ok(());
-                        }
-                    }
                     // `let t2 : Txn = t1` — a by-value copy from a
                     // same-typed record value: a record local, a whole
                     // nested-record field read (`s.inner`), or one
@@ -1237,6 +1220,88 @@ impl FuncBuilder<'_> {
             self.set_local_type(id, IrType::Event(payload));
             return Ok(());
         }
+        // A named component with an initializer is a by-value snapshot;
+        // without one it is a fresh component instance whose field defaults
+        // run at this source position. Keep the latter explicit in the IR:
+        // locals are hoisted by the C++ backend, so declaration alone would
+        // fail to reinitialize a component declared inside a loop.
+        if let Some(TypeExpr::Named { name, mode, .. }) = l.ty.as_ref() {
+            let simple = name.segments.last().map(|segment| segment.name.as_str());
+            if let Some(component) = simple.and_then(|name| {
+                self.ctx
+                    .components
+                    .iter()
+                    .position(|candidate| candidate.name == name)
+                    .map(|index| crate::ir::ComponentId(index as u32))
+            }) {
+                if let Some(value) = &l.value {
+                    if mode.is_some() {
+                        return Err(LowerError::Invalid(format!(
+                            "component value local `{}` cannot carry an active/passive instance mode",
+                            l.name.name
+                        )));
+                    }
+                    let Some((base, actual)) = self.component_copy_source(value)? else {
+                        return Err(LowerError::Invalid(format!(
+                            "component value local `{}` requires a component initializer",
+                            l.name.name
+                        )));
+                    };
+                    if actual != component {
+                        return Err(LowerError::Invalid(format!(
+                            "cannot initialize component local `{}` of type `{}` from component `{}`",
+                            l.name.name,
+                            self.ctx.components[component.index()].name,
+                            self.ctx.components[actual.index()].name,
+                        )));
+                    }
+                    let id = self.declare(&l.name.name);
+                    self.set_local_type(id, IrType::Component(component));
+                    self.push(Stmt::Assign(id, Expr::ComponentValue { base }));
+                    return Ok(());
+                }
+
+                let instance_mode = super::component_mode_from_type(l.ty.as_ref());
+                let binding = crate::ir::ComponentFieldBinding {
+                    field: l.name.name.clone(),
+                    component,
+                    connects: Vec::new(),
+                    mode: instance_mode,
+                };
+                crate::ir::validate_component_binding_modes(
+                    &self.ctx.components,
+                    std::slice::from_ref(&binding),
+                )
+                .map_err(|error| {
+                    LowerError::Invalid(format!(
+                        "component local `{}` has invalid instance modes: {error}",
+                        l.name.name
+                    ))
+                })?;
+                if let Some(detail) =
+                    crate::ir::component_local_runtime_requirement(&self.ctx.components, component)
+                {
+                    return Err(unsupported(
+                        &format!(
+                            "default-constructed component local `{}` of type `{}`",
+                            l.name.name, self.ctx.components[component.index()].name
+                        ),
+                        format!(
+                            "v1 installs per-instance runtime infrastructure for {detail}; TB-IR component locals currently support state and method-only component trees"
+                        ),
+                    ));
+                }
+                let id = self.declare(&l.name.name);
+                self.set_local_type(id, IrType::Component(component));
+                self.component_local_modes.insert(id, instance_mode);
+                self.push(Stmt::ComponentInit {
+                    local: id,
+                    component,
+                    mode: instance_mode,
+                });
+                return Ok(());
+            }
+        }
         let Some(value) = &l.value else {
             // An explicitly typed transaction-sequence local begins as an
             // empty dynamic sequence. This is the local analogue of a tseq
@@ -1274,7 +1339,12 @@ impl FuncBuilder<'_> {
                 // and gives the verifier's dominance check a definition that
                 // dominates every later read of the declared-then-assigned
                 // local.
-                self.push(Stmt::Assign(id, Expr::Literal { value: 0, ty }));
+                let initial = if matches!(ty, IrType::String) {
+                    Expr::StringLiteral(String::new())
+                } else {
+                    Expr::Literal { value: 0, ty }
+                };
+                self.push(Stmt::Assign(id, initial));
                 return Ok(());
             }
             // A fixed-vector `let m : Vec<T, N>` with no initializer. This
@@ -1327,27 +1397,21 @@ impl FuncBuilder<'_> {
         let declared_scalar_ty = l.ty.as_ref().and_then(typed_let_ir_type);
         // Direct DUT-read form: `let x = dut.port` → DutRead(x, port).
         if let Some(port) = self.as_port_ref(value)? {
-            let id = self.declare(&l.name.name);
-            if let Some(w) = declared_width {
-                self.let_widths.insert(id, w);
-            }
-            if let Some(ty) = declared_scalar_ty.clone() {
-                self.set_local_type(id, ty);
-            }
-            self.push(Stmt::DutRead(id, port));
-            return Ok(());
+            return self.lower_direct_port_let(
+                &l.name.name,
+                declared_width,
+                declared_scalar_ty,
+                port,
+            );
         }
         // Bus-bound signal read (`let x = axil.r.data`) — same shape.
         if let Some(port) = self.as_bus_port_ref(value)? {
-            let id = self.declare(&l.name.name);
-            if let Some(w) = declared_width {
-                self.let_widths.insert(id, w);
-            }
-            if let Some(ty) = declared_scalar_ty.clone() {
-                self.set_local_type(id, ty);
-            }
-            self.push(Stmt::DutRead(id, port));
-            return Ok(());
+            return self.lower_direct_port_let(
+                &l.name.name,
+                declared_width,
+                declared_scalar_ty,
+                port,
+            );
         }
         // `let x = fork bus.<method>(a)` — issue the request now, defer
         // the response capture to the next `join_all`. Checked before the
@@ -1374,9 +1438,9 @@ impl FuncBuilder<'_> {
         // name and a transactor field are disjoint namespaces).
         if let ExprKind::Call { callee, args } = &*value.kind {
             if let ExprKind::Ident(name) = &*callee.kind {
-                if let Some((elem, _, _)) = self.ctx.tseqs.get(&name.name) {
+                if let Some((_, elem, _, _)) = self.ctx.tseqs.get(&name.name) {
                     let seq_ty = elem.seq_type();
-                    let call = self.lower_tseq_call(&name.name, args)?;
+                    let call = self.lower_tseq_call(&name.name, args, value.span)?;
                     let id = self.declare(&l.name.name);
                     self.set_local_type(id, seq_ty);
                     self.push(Stmt::Assign(id, call));
@@ -1389,8 +1453,14 @@ impl FuncBuilder<'_> {
         let transactor_value = super::exprs::unparen_expr(value);
         if let ExprKind::Call { callee, args } = &*transactor_value.kind {
             if let Some(call) = self.lower_transactor_call(callee, args, true)? {
+                let ret_ty = self.transactor_call_ret_ty(&call);
+                if let (Some(expected), Some(actual)) =
+                    (declared_scalar_ty.as_ref(), ret_ty.as_ref())
+                {
+                    self.check_string_types(expected, actual, &format!("local `{}`", l.name.name))?;
+                }
                 let id = self.declare(&l.name.name);
-                if let Some(ty) = self.transactor_call_ret_ty(&call) {
+                if let Some(ty) = ret_ty {
                     if matches!(ty, IrType::RecordSeq(_) | IrType::Seq(_)) {
                         if let Some(declared) = l.ty.as_ref().and_then(|declared| {
                             super::helpers::tseq_ir_type(Some(declared), &self.ctx.record_ids)
@@ -1430,144 +1500,6 @@ impl FuncBuilder<'_> {
                 return Ok(());
             }
         }
-        // `let v = env.drv.axil_read(addr)` — a value-returning component
-        // method call into a fresh local.
-        if let ExprKind::Call { callee, args } = &*value.kind {
-            if let Some((base, component, method)) = self.as_component_method_call(callee)? {
-                let comp = &self.ctx.components[component.index()];
-                // UNREACHABLE by construction, and kept only so the
-                // condition has one verdict everywhere it is
-                // written. `as_component_method_call` validates
-                // the method on EVERY path that returns
-                // `Ok(Some(..))` — the two that error do so
-                // themselves, the two that do not are guarded by
-                // `is_some()` — so by the time a caller holds
-                // `(base, component, method)` the method exists.
-                // Confirmed by mutation: neutering this arm
-                // fails no test, because nothing reaches it.
-                // The reachable landing is the resolver's own
-                // arm in `components.rs`, which is where the
-                // measurement lives.
-                let m = comp.method(&method).ok_or_else(|| {
-                    LowerError::Invalid(format!(
-                        "component `{}` has no method `{method}`",
-                        comp.name
-                    ))
-                })?;
-                if !m.has_ret {
-                    // MEASURED and reachable. `let x = c.noret(3)`
-                    // lands here, and v1 emits `auto x = Calc_noret(c,
-                    // 3);` — g++: "deduced type 'void' for 'x' is
-                    // incomplete". (The TYPED form emits `uint64_t x =
-                    // ...` and says "void value not ignored as it ought
-                    // to be"; a first version of this comment paired
-                    // this arm's source with that arm's emission.)
-                    // Taking a value from something that produces none
-                    // is a program error either way, so `Invalid` rather
-                    // than a suggestion. Pinned by mutation.
-                    return Err(LowerError::Invalid(format!(
-                        "`let {} = {}.{method}(...)` — method `{method}` returns no value",
-                        l.name.name, comp.name
-                    )));
-                }
-                if let Some(expected) = declared_scalar_ty.clone() {
-                    self.check_component_method_result_assignable(
-                        m,
-                        expected,
-                        &method,
-                        &l.name.name,
-                    )?;
-                }
-                let declared = m.param_names.clone();
-                let lowered = self.lower_component_call_args(args, Some(&declared))?;
-                self.check_component_call_args(component, &method, &lowered)?;
-                let id = self.declare(&l.name.name);
-                if let Some(w) = declared_width {
-                    self.let_widths.insert(id, w);
-                }
-                // The method's OWN return type when the `let` carries
-                // no annotation. `ret_ty` was sitting right here unused,
-                // so `let b = s.mk(1)` on a `-> Beat` method declared an
-                // untyped local: tbir emitted `uint64_t b; b =
-                // Src_mk(...)` — "cannot convert 'Beat' to 'uint64_t'" —
-                // while v1's `auto b = Src_mk(_tb.s, 1);` compiles.
-                //
-                // That silent mis-emission became visible the moment the
-                // slot guards below started reading the local's type:
-                // they saw "a scalar" and called five well-typed
-                // programs `Invalid`. Typing the local fixes both.
-                // Gated on `l.ty`, NOT on `declared_scalar_ty` —
-                // `typed_let_ir_type` answers `None` for `int` and for
-                // `bit`, so keying on it made the annotation invisible
-                // and typed the local as the method's record. The
-                // default backend then emitted `Beat n{}` for
-                // `let n : int = s.mk(1)` and RAN, while v1 refused to
-                // build it: a silent mis-lowering, and the exact defect
-                // the untyped-`let` guard a screen up keys on `l.ty` to
-                // prevent.
-                if let (Some(_), Some(IrType::Record(rid))) = (&l.ty, &m.ret_ty) {
-                    if declared_scalar_ty.is_none() {
-                        return Err(LowerError::Invalid(format!(
-                            "`let {}` is declared with a non-record type and initialised \
-                             from a `{}`",
-                            l.name.name,
-                            self.ctx.records[rid.index()].name
-                        )));
-                    }
-                }
-                // No need to re-test `l.ty`: `declared_scalar_ty` is
-                // `l.ty.and_then(typed_let_ir_type)`, so `l.ty == None`
-                // implies it is `None` too, and the pair
-                // `(None, Some(_))` is uninhabited. (An earlier comment
-                // credited the guard above for this; that was the wrong
-                // reason for a right conclusion.)
-                // `RecordSeq`/`Seq` alongside `Record`: a `-> TSeq<T>`
-                // method result is as much a typed value as a record
-                // one, and dropping it left `let ys = k.gen(xs)`
-                // untyped — so the next slot the local entered read it
-                // as having no known shape. `method_schema_ir_type`
-                // resolves the sequence into `ret_ty`; this arm just has
-                // to stop discarding it.
-                //
-                // A WIDE scalar return is the same argument once more.
-                // `function read() -> uint<256>` handed an untyped
-                // `let got = r.read()` a `uint64_t` local and the
-                // assignment kept the low word — the call-destination
-                // half of issue #642's return seam, which survives
-                // fixing the lambda's own return type. The filter
-                // matches `wide_scalar_ty`'s in the untyped-`let` tail
-                // below (`> 64`, where `local_scalar_cty` stops using a
-                // builtin integer); a ≤64-bit scalar return keeps the
-                // `uint64_t` default it has always had, since widening
-                // that would re-type every existing untyped getter
-                // local at once.
-                let inferred = declared_scalar_ty.clone().or_else(|| match &m.ret_ty {
-                    Some(
-                        ty @ (IrType::Record(_)
-                        | IrType::RecordSeq(_)
-                        | IrType::Seq(_)
-                        | IrType::FixedVec { .. }),
-                    ) => {
-                        Some(ty.clone())
-                    }
-                    Some(ty @ (IrType::UInt(Some(w)) | IrType::SInt(Some(w)))) if *w > 64 => {
-                        Some(ty.clone())
-                    }
-                    _ => None,
-                });
-                if let Some(ty) = inferred {
-                    self.set_local_type(id, ty);
-                }
-                self.push(Stmt::ComponentCall {
-                    base,
-                    component,
-                    method,
-                    args: lowered,
-                    dest: Some(id),
-                });
-                return Ok(());
-            }
-        }
         // RAL passive record read: `let v = regs.record_read(addr)`.
         if self.try_lower_record_read_let(&l.name.name, value)? {
             return Ok(());
@@ -1588,7 +1520,7 @@ impl FuncBuilder<'_> {
         // (an unknown register) is out of subset — reject precisely.
         self.reject_out_of_subset_regblock_access(value, "read")?;
         self.reject_out_of_subset_addrmap_access(value, "read")?;
-        // Testbench method call RHS: `let x = _tb.m(...)`, CFG-inlined.
+        // Testbench method call RHS: `let x = _tb.m(...)`.
         if self.try_lower_tb_method_let(l, value)? {
             return Ok(());
         }
@@ -1640,6 +1572,15 @@ impl FuncBuilder<'_> {
             if entry.pure {
                 return None;
             }
+            self.expr_type(&e)
+                .filter(|ty| matches!(ty, IrType::FixedVec { .. }))
+        })
+        // Canonical component/testbench value calls materialize their return
+        // into a typed local before this generic let path sees the expression.
+        // Preserve that fixed-vector type just as we preserve sequence types
+        // below; otherwise an unannotated `let got = component.snapshot()`
+        // degrades to Unknown and the next aggregate call fails verification.
+        .or_else(|| {
             self.expr_type(&e)
                 .filter(|ty| matches!(ty, IrType::FixedVec { .. }))
         });
@@ -1699,10 +1640,9 @@ impl FuncBuilder<'_> {
             }
         }
         if let Some(ret) = &helper_seq_ty {
-            if let Some(declared) = l
-                .ty
-                .as_ref()
-                .and_then(|ty| super::helpers::tseq_ir_type(Some(ty), &self.ctx.record_ids))
+            if let Some(declared) =
+                l.ty.as_ref()
+                    .and_then(|ty| super::helpers::tseq_ir_type(Some(ty), &self.ctx.record_ids))
             {
                 if &declared != ret {
                     return Err(LowerError::Invalid(format!(
@@ -1717,6 +1657,16 @@ impl FuncBuilder<'_> {
                 )));
             }
         }
+        let sequence_ty = self
+            .expr_type(&e)
+            .filter(|t| matches!(t, IrType::RecordSeq(_) | IrType::Seq(_)));
+        let queue_query_ty = match &e {
+            Expr::TbQueueQuery { query, .. }
+            | Expr::TransactorStateQueueQuery { query, .. }
+            | Expr::ScoreboardQuery { query, .. }
+            | Expr::ComponentQueueQuery { query, .. } => query.value_type(),
+            _ => None,
+        };
         // …but a record RHS under a DECLARED SCALAR type is a
         // disagreement, not an inference. `record_ty` wins the `.or`
         // chain below, so without this the annotation is discarded
@@ -1779,12 +1729,10 @@ impl FuncBuilder<'_> {
         // diagnose the untyped one rather than silently changing behavior.
         if l.ty.is_none()
             && wide_scalar_ty.is_some()
-            && l.value
-                .as_ref()
-                .is_some_and(|value| {
-                    !v1_untyped_let_uses_auto(value)
-                        && super::exprs::ast_expr_contains_sized_literal(value)
-                })
+            && l.value.as_ref().is_some_and(|value| {
+                !v1_untyped_let_uses_auto(value)
+                    && super::exprs::ast_expr_contains_sized_literal(value)
+            })
         {
             let v1_native_literal_overflow = l.value.as_ref().is_some_and(|value| {
                 super::exprs::ast_expr_contains_wide_sized_native_literal(value)
@@ -1833,6 +1781,7 @@ impl FuncBuilder<'_> {
                 ty => ty,
             }
         });
+        let string_ty = self.expr_type(&e).filter(|ty| matches!(ty, IrType::String));
         let id = self.declare(&l.name.name);
         if let Some(w) = declared_width {
             self.let_widths.insert(id, w);
@@ -1840,15 +1789,62 @@ impl FuncBuilder<'_> {
         if let Some(ty) = record_ty
             .or(helper_aggregate_ty)
             .or(helper_seq_ty)
+            .or(sequence_ty)
             .or(declared_scalar_ty)
+            .or(queue_query_ty)
             .or(wide_scalar_ty)
             .or(signed_scalar_ty)
             .or(sized_scalar_ty)
+            .or(string_ty)
         {
             self.set_local_type(id, ty);
         }
+        if let Err(error) = self.check_string_assignment(
+            self.local_type(id),
+            &e,
+            &format!("local `{}`", l.name.name),
+        ) {
+            self.record_error_span(value.span);
+            return Err(error);
+        }
         self.check_scalar_assign_width(id, &e, &l.name.name)?;
         self.push(Stmt::Assign(id, e));
+        Ok(())
+    }
+
+    fn lower_direct_port_let(
+        &mut self,
+        name: &str,
+        declared_width: Option<u32>,
+        declared_ty: Option<IrType>,
+        port: crate::ir::PortRef,
+    ) -> Result<(), LowerError> {
+        let source_ty = port
+            .value_type
+            .clone()
+            .or_else(|| port.width.map(|width| IrType::UInt(Some(width))));
+        let id = self.declare(name);
+        let local_ty = declared_ty.clone().or_else(|| source_ty.clone());
+        if let Some(ty) = local_ty {
+            self.set_local_type(id, ty);
+        }
+        let inferred_width = source_ty.as_ref().and_then(|ty| match ty {
+            IrType::UInt(Some(width)) | IrType::SInt(Some(width)) => Some(*width),
+            _ => None,
+        });
+        if let Some(width) = declared_width.or(inferred_width) {
+            self.let_widths.insert(id, width);
+        }
+
+        if let (Some(expected), Some(actual)) = (declared_ty.as_ref(), source_ty.as_ref()) {
+            if !queue_scalar_assignment_compatible(expected, actual) {
+                self.check_scalar_assign_width(id, &Expr::Port(port.clone()), name)?;
+                return Err(LowerError::Invalid(format!(
+                    "`let {name}` is declared {expected:?}, but the DUT signal has type {actual:?}"
+                )));
+            }
+        }
+        self.push(Stmt::DutRead(id, port));
         Ok(())
     }
 
@@ -2018,6 +2014,36 @@ impl FuncBuilder<'_> {
         self.set_local_type(dest, ty);
     }
 
+    /// Keep String as a distinct host-side value family. It may flow only
+    /// through slots declared `String`; treating it as an ordinary scalar
+    /// would let C++ pointer conversions stand in for language semantics.
+    fn check_string_assignment(
+        &self,
+        expected: &IrType,
+        value: &Expr,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        let actual = self.expr_type(value).unwrap_or(IrType::Unknown);
+        self.check_string_types(expected, &actual, what)
+    }
+
+    fn check_string_types(
+        &self,
+        expected: &IrType,
+        actual: &IrType,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        if matches!(expected, IrType::String) == matches!(actual, IrType::String) {
+            return Ok(());
+        }
+        if matches!(expected, IrType::String) || matches!(actual, IrType::String) {
+            return Err(LowerError::Invalid(format!(
+                "{what} has type {expected:?}, but the assigned value has type {actual:?}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Reject a narrowing scalar assignment at lowering, where it can
     /// carry a source-level fix.
     ///
@@ -2118,24 +2144,11 @@ impl FuncBuilder<'_> {
         ))
     }
 
-    fn check_component_method_result_assignable(
-        &self,
-        method_schema: &crate::ir::ComponentMethodSchema,
-        expected: IrType,
-        method: &str,
-        local: &str,
-    ) -> Result<(), LowerError> {
-        if let Some(actual) = method_schema.ret_ty.clone() {
-            if !component_method_result_compatible(&expected, &actual) {
-                return Err(LowerError::Invalid(format!(
-                    "assignment of `{method}` result to local `{local}` with incompatible type: \
-                     expected {expected:?}, method returns {actual:?}"
-                )));
-            }
-        }
-        Ok(())
-    }
-
+    /// A numeric/boolean destination cannot accept an aggregate or String
+    /// value. String stays a distinct host-side value family; letting it
+    /// reach one of these slots would rely on an accidental C++ pointer
+    /// conversion rather than a HARC operation.
+    ///
     /// The mirror of `record_assign_mismatch`: a SCALAR destination
     /// whose RHS types to a record.
     ///
@@ -2149,9 +2162,8 @@ impl FuncBuilder<'_> {
     /// convert 'Beat' to 'uint64_t' in assignment". v1 emits the same
     /// line and fails the same way, so no backend runs it.
     ///
-    /// Only callable now that `record_id_of_expr` types every
-    /// record-carrying RHS: before that a `None` here could mean
-    /// "could not tell".
+    /// `record_id_of_expr` supplies the aggregate classification for every
+    /// supported record-carrying RHS; an unknown result remains permissive.
     pub(crate) fn reject_record_into_scalar(
         &self,
         e: &crate::ir::Expr,
@@ -2164,6 +2176,9 @@ impl FuncBuilder<'_> {
             ))),
             None if self.bool_expr_has_invalid_record_operand(e) => Err(LowerError::Invalid(
                 format!("{what} is scalar but its value contains an invalid record composition"),
+            )),
+            None if matches!(self.expr_type(e), Some(IrType::String)) => Err(LowerError::Invalid(
+                format!("{what} is numeric or boolean and cannot be assigned a `String` value"),
             )),
             None => Ok(()),
         }
@@ -2187,6 +2202,7 @@ impl FuncBuilder<'_> {
         component: crate::ir::ComponentId,
         method: &str,
         args: &[crate::ir::Expr],
+        source_args: &[CallArg],
     ) -> Result<(), LowerError> {
         let Some(m) = self.ctx.components[component.index()].method(method) else {
             return Ok(());
@@ -2211,11 +2227,17 @@ impl FuncBuilder<'_> {
             // `k.feed(1)` on a `TSeq<Beat>` parameter be rejected at all
             // — and stops the `Beat` case from being told the slot takes
             // a non-record value.
-            self.check_slot_ir(
+            if let Err(error) = self.check_slot_ir(
                 a,
                 ty,
                 &format!("parameter `{pname}` of `{comp_name}.{method}`"),
-            )?;
+            ) {
+                let source = match &source_args[i] {
+                    CallArg::Expr(expr) | CallArg::Named { value: expr, .. } => expr,
+                };
+                self.record_error_span(source.span);
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -2256,7 +2278,16 @@ impl FuncBuilder<'_> {
         want: &IrType,
         what: &str,
     ) -> Result<(), LowerError> {
-        self.check_slot_shape(value, Slot::of_ir(want), what)
+        self.check_slot_shape(value, Slot::of_ir(want), what)?;
+        if let (IrType::Seq(expected), Some(IrType::Seq(actual))) = (want, self.expr_type(value)) {
+            if !crate::ir::sequence_element_compatible(expected, &actual) {
+                return Err(LowerError::Invalid(format!(
+                    "{what} takes {want:?} and was given {:?}",
+                    IrType::Seq(actual)
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn check_slot_shape(
@@ -2293,6 +2324,13 @@ impl FuncBuilder<'_> {
             )));
         }
         let got = self.slot_shape_of(value);
+        if matches!(got, Slot::String) != matches!(want, Slot::String) {
+            return Err(LowerError::Invalid(format!(
+                "{what} takes {} and was given {}",
+                self.slot_name(want),
+                self.slot_name(got)
+            )));
+        }
         if got == want || !want.known() || !got.known() {
             return Ok(());
         }
@@ -2318,6 +2356,9 @@ impl FuncBuilder<'_> {
         // use site), so reading their shape off `expr_type` alone would
         // make `q.push(1)` into a `queue<Beat>` unknown — and that cell
         // is the one this whole family started from.
+        if matches!(value, crate::ir::Expr::StringLiteral(_)) {
+            return Slot::String;
+        }
         if matches!(
             value,
             crate::ir::Expr::Literal { .. } | crate::ir::Expr::WideLiteral(_)
@@ -2349,6 +2390,7 @@ impl FuncBuilder<'_> {
             }
             Slot::Seq(None) => "a scalar `TSeq`".to_string(),
             Slot::FixedVec => "a fixed-vector value".to_string(),
+            Slot::String => "a `String` value".to_string(),
             Slot::Scalar => "a non-record value".to_string(),
             // Unreachable: `check_slot_shape` returns `Ok` before
             // building a message when either side is `Unknown`.
@@ -2666,8 +2708,8 @@ impl FuncBuilder<'_> {
             chain.leaf_index = chain.leaf_index.map(|index| self.hoist_ports(index));
             if let IrType::Seq(elem) = &chain.leaf_ty {
                 let dotted = format!("{}.{}", chain.field, chain.path.join("."));
-                let rhs = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
-                    .map(|class| self.whole_seq_copy_rhs(&class, value))
+                let rhs = crate::ir::value_abi_class(elem)
+                    .map(|class| self.whole_seq_copy_rhs(class, value))
                     .transpose()?
                     .flatten();
                 let Some(rhs) = rhs else {
@@ -2693,15 +2735,10 @@ impl FuncBuilder<'_> {
                 // two lanes: v1 emits `target.ba.data = target.bb.data;`
                 // and g++ accepts it (measured, 0 errors), so refusing
                 // it was a gap rather than a subset boundary. "Matching"
-                // is `ir_vec_elem_class`, the C++ member type — which
+                // is the neutral value ABI class — which
                 // makes `Vec<uint<8>, 4> = Vec<uint<32>, 4>` a copy too,
                 // exactly as v1 renders it.
-                let shape =
-                    crate::codegen::cpp_tb::ir_vec_elem_class(&chain.leaf_ty).map(|cls| (len, cls));
-                let rhs = match shape {
-                    Some(sh) => self.whole_vec_copy_rhs(sh, value)?,
-                    None => None,
-                };
+                let rhs = self.whole_vec_copy_rhs((len, chain.leaf_ty.clone()), value)?;
                 let Some(rhs) = rhs else {
                     // What is left is uniformly uncompilable under v1,
                     // measured: a length mismatch and a scalar RHS each
@@ -2757,12 +2794,7 @@ impl FuncBuilder<'_> {
                 let IrType::FixedVec { elem, len } = ty else {
                     unreachable!("fixed-vector state kind carries a fixed-vector type")
                 };
-                let shape = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
-                    .map(|class| (*len, class));
-                let e = match shape {
-                    Some(shape) => self.whole_vec_copy_rhs(shape, value)?,
-                    None => None,
-                };
+                let e = self.whole_vec_copy_rhs((*len, (**elem).clone()), value)?;
                 let Some(e) = e else {
                     return Err(LowerError::Invalid(format!(
                         "`{instance}.{field}` requires a matching fixed-vector value"
@@ -2838,12 +2870,7 @@ impl FuncBuilder<'_> {
             return Ok(());
         }
         if let Some((base, field, vec)) = self.as_component_vec_field(target)? {
-            let shape =
-                crate::codegen::cpp_tb::ir_vec_elem_class(&vec.elem).map(|elem| (vec.len, elem));
-            let rhs = match shape {
-                Some(shape) => self.whole_vec_copy_rhs(shape, value)?,
-                None => None,
-            };
+            let rhs = self.whole_vec_copy_rhs((vec.len, vec.elem.clone()), value)?;
             let Some(rhs) = rhs else {
                 let dotted = super::components::dotted_path(target)
                     .map(|path| path.join("."))
@@ -2871,8 +2898,8 @@ impl FuncBuilder<'_> {
         if let Some(chain) = self.as_indexed_component_record_field(target)? {
             let index = self.hoist_ports(chain.index);
             if let IrType::Seq(elem) = &chain.leaf_ty {
-                let rhs = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
-                    .map(|class| self.whole_seq_copy_rhs(&class, value))
+                let rhs = crate::ir::value_abi_class(elem)
+                    .map(|class| self.whole_seq_copy_rhs(class, value))
                     .transpose()?
                     .flatten();
                 let Some(value) = rhs else {
@@ -2924,8 +2951,8 @@ impl FuncBuilder<'_> {
         if let Some(tgt) = self.as_component_field_target(target)? {
             let (base, field) = (tgt.base, tgt.field);
             if let Some(IrType::Seq(elem)) = &tgt.leaf_ty {
-                let rhs = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
-                    .map(|class| self.whole_seq_copy_rhs(&class, value))
+                let rhs = crate::ir::value_abi_class(elem)
+                    .map(|class| self.whole_seq_copy_rhs(class, value))
                     .transpose()?
                     .flatten();
                 let Some(rhs) = rhs else {
@@ -2949,11 +2976,7 @@ impl FuncBuilder<'_> {
             // `self.a.data = self.b.data;` and g++ accepts it (0 errors,
             // measured), so refusing it was a gap.
             if let Some((len, elem)) = tgt.leaf_vec {
-                let shape = crate::codegen::cpp_tb::ir_vec_elem_class(&elem).map(|c| (len, c));
-                let rhs = match shape {
-                    Some(sh) => self.whole_vec_copy_rhs(sh, value)?,
-                    None => None,
-                };
+                let rhs = self.whole_vec_copy_rhs((len, elem), value)?;
                 let Some(rhs) = rhs else {
                     // Everything else this arm covers has v1 emitting an
                     // assignment g++ refuses — `a.data = 5` gives "no
@@ -3038,10 +3061,9 @@ impl FuncBuilder<'_> {
             });
             return Ok(());
         }
-        // Composite-component whole-value copy of a sub-component:
-        // `checker.sb = sb` / `responder.model = model`. The LHS terminal
-        // field is a `Sub` component field; the RHS is a test-scope
-        // component value.
+        // Composite-component whole-value copy of a sub-component. This
+        // covers test-scope paths and method-local self/parameter copies;
+        // lowering resolves and schema-checks both bases.
         if self.lower_component_sub_assign(target, value)? {
             return Ok(());
         }
@@ -3122,7 +3144,7 @@ impl FuncBuilder<'_> {
                             .ctx
                             .tseqs
                             .get(&name.name)
-                            .map(|(elem, _, _)| elem.seq_type())
+                            .map(|(_, elem, _, _)| elem.seq_type())
                         {
                             let expected = self.local_type(local).clone();
                             if expected != actual {
@@ -3131,7 +3153,7 @@ impl FuncBuilder<'_> {
                                     id.name, expected, name.name, actual
                                 )));
                             }
-                            let call = self.lower_tseq_call(&name.name, args)?;
+                            let call = self.lower_tseq_call(&name.name, args, tseq_value.span)?;
                             self.push(Stmt::Assign(local, call));
                             return Ok(());
                         }
@@ -3348,68 +3370,17 @@ impl FuncBuilder<'_> {
                                 self.ctx.records[rid.index()].name
                             )));
                         }
+                        if let Some(actual) = self.transactor_call_ret_ty(&call) {
+                            let expected = self.local_type(local).clone();
+                            self.check_string_types(
+                                &expected,
+                                &actual,
+                                &format!("local `{}`", id.name),
+                            )?;
+                        }
                         self.push(Stmt::TransactorCall {
                             dest: Some(local),
                             call,
-                        });
-                        return Ok(());
-                    }
-                }
-                // `v = env.source.next()` / `t = sqr.make_txn()` —
-                // value-returning component method call into an existing
-                // local. This mirrors the already-supported `let v =
-                // env.source.next()` lowering, but preserves the destination
-                // local's established scalar/record type.
-                if let ExprKind::Call { callee, args } = &*value.kind {
-                    if let Some((base, component, method)) =
-                        self.as_component_method_call(callee)?
-                    {
-                        let comp = &self.ctx.components[component.index()];
-                        // UNREACHABLE by construction, and kept only so the
-                        // condition has one verdict everywhere it is
-                        // written. `as_component_method_call` validates
-                        // the method on EVERY path that returns
-                        // `Ok(Some(..))` — the two that error do so
-                        // themselves, the two that do not are guarded by
-                        // `is_some()` — so by the time a caller holds
-                        // `(base, component, method)` the method exists.
-                        // Confirmed by mutation: neutering this arm
-                        // fails no test, because nothing reaches it.
-                        // The reachable landing is the resolver's own
-                        // arm in `components.rs`, which is where the
-                        // measurement lives.
-                        let m = comp.method(&method).ok_or_else(|| {
-                            LowerError::Invalid(format!(
-                                "component `{}` has no method `{method}`",
-                                comp.name
-                            ))
-                        })?;
-                        if !m.has_ret {
-                            // REACHED, contrary to an earlier note here:
-                            // `let x : uint<32> = 0` then
-                            // `x = c.noret(3)` lands on this arm, since
-                            // an assignment is not a `let` and nothing
-                            // claims it first. v1: "void value not
-                            // ignored as it ought to be".
-                            return Err(LowerError::Invalid(format!(
-                                "assignment from `{}.{method}(...)` — method \
-                                 `{method}` returns no value",
-                                comp.name
-                            )));
-                        }
-                        let expected = self.local_type(local).clone();
-                        self.check_component_method_result_assignable(
-                            m, expected, &method, &id.name,
-                        )?;
-                        let declared = m.param_names.clone();
-                        let lowered = self.lower_component_call_args(args, Some(&declared))?;
-                        self.check_component_call_args(component, &method, &lowered)?;
-                        self.push(Stmt::ComponentCall {
-                            base,
-                            component,
-                            method,
-                            args: lowered,
-                            dest: Some(local),
                         });
                         return Ok(());
                     }
@@ -3445,7 +3416,16 @@ impl FuncBuilder<'_> {
                     // report for a program error. The comment above
                     // named that channel as the thing this guard exists
                     // to keep programs out of, in one direction only.
+                    None if matches!(self.local_type(local), IrType::String) => {}
                     None => self.reject_record_into_scalar(&e, &format!("local `{}`", id.name))?,
+                }
+                if let Err(error) = self.check_string_assignment(
+                    self.local_type(local),
+                    &e,
+                    &format!("local `{}`", id.name),
+                ) {
+                    self.record_error_span(value.span);
+                    return Err(error);
                 }
                 self.check_scalar_assign_width(local, &e, &id.name)?;
                 self.push(Stmt::Assign(local, e));
@@ -3513,12 +3493,7 @@ impl FuncBuilder<'_> {
                         let IrType::FixedVec { elem, len } = &ty else {
                             unreachable!("fixed-vector state kind carries a fixed-vector type")
                         };
-                        let shape = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
-                            .map(|class| (*len, class));
-                        let e = match shape {
-                            Some(shape) => self.whole_vec_copy_rhs(shape, value)?,
-                            None => None,
-                        };
+                        let e = self.whole_vec_copy_rhs((*len, (**elem).clone()), value)?;
                         let Some(e) = e else {
                             return Err(LowerError::Invalid(format!(
                                 "state field `{}` requires a matching fixed-vector value",
@@ -3636,6 +3611,7 @@ impl FuncBuilder<'_> {
                         .map(|(position, index)| (position, self.hoist_ports(index)))
                         .collect();
                     let idx = self.lower_expr_no_ports(index)?;
+                    self.validate_numeric_expr(&idx, "record `Vec` index")?;
                     super::exprs::check_literal_vec_index_bounds(
                         &format!("{}.{}", chain.field, chain.path.join(".")),
                         &idx,
@@ -3682,10 +3658,12 @@ impl FuncBuilder<'_> {
                     {
                         if !matches!(**inner_elem, IrType::FixedVec { .. }) {
                             let outer = self.lower_expr_no_ports(outer_idx)?;
+                            self.validate_numeric_expr(&outer, "outer `Vec` index")?;
                             super::exprs::check_literal_component_vec_index_bounds(
                                 &base, &field, &outer, vec.len,
                             )?;
                             let inner = self.lower_expr_no_ports(index)?;
+                            self.validate_numeric_expr(&inner, "inner `Vec` index")?;
                             super::exprs::check_literal_component_vec_index_bounds(
                                 &base, &field, &inner, *inner_len,
                             )?;
@@ -3720,6 +3698,7 @@ impl FuncBuilder<'_> {
             }
             if let Some((base, field, vec)) = self.as_component_vec_field(it)? {
                 let index = self.lower_expr_no_ports(index)?;
+                self.validate_numeric_expr(&index, "component `Vec` index")?;
                 super::exprs::check_literal_component_vec_index_bounds(
                     &base, &field, &index, vec.len,
                 )?;
@@ -3767,8 +3746,10 @@ impl FuncBuilder<'_> {
                     {
                         if !matches!(**inner_elem, IrType::FixedVec { .. }) {
                             let outer = self.lower_expr_no_ports(outer_idx)?;
+                            self.validate_numeric_expr(&outer, "outer `Vec` index")?;
                             super::exprs::check_literal_tb_vec_index_bounds(&field, &outer, len)?;
                             let inner = self.lower_expr_no_ports(index)?;
+                            self.validate_numeric_expr(&inner, "inner `Vec` index")?;
                             super::exprs::check_literal_tb_vec_index_bounds(
                                 &field, &inner, *inner_len,
                             )?;
@@ -3792,6 +3773,7 @@ impl FuncBuilder<'_> {
             // write (`_tb.mem[i] = v`).
             if let Some((field, IrType::FixedVec { len, .. })) = self.as_tb_vec_field(it) {
                 let index = self.lower_expr_no_ports(index)?;
+                self.validate_numeric_expr(&index, "testbench `Vec` index")?;
                 super::exprs::check_literal_tb_vec_index_bounds(&field, &index, len)?;
                 let value = self.lower_expr_no_ports(value)?;
                 self.reject_record_into_scalar(
@@ -3819,6 +3801,7 @@ impl FuncBuilder<'_> {
                 }
                 if let Some((len, elem)) = rf.leaf_vec.clone() {
                     let index = self.lower_expr_no_ports(index)?;
+                    self.validate_numeric_expr(&index, "component record `Vec` index")?;
                     super::exprs::check_literal_component_vec_index_bounds(
                         &rf.base, &rf.dotted, &index, len,
                     )?;
@@ -3875,6 +3858,7 @@ impl FuncBuilder<'_> {
                     ));
                 }
                 let idx = self.lower_expr_no_ports(index)?;
+                self.validate_numeric_expr(&idx, "record `Vec` index")?;
                 super::exprs::check_literal_vec_index_bounds(
                     &chain.dotted,
                     &idx,
@@ -3930,8 +3914,8 @@ impl FuncBuilder<'_> {
         if let ExprKind::Field { .. } = &*target.kind {
             if let Some(chain) = self.try_record_field_chain(target)? {
                 if let IrType::Seq(elem) = &chain.leaf_ty {
-                    let rhs = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
-                        .map(|class| self.whole_seq_copy_rhs(&class, value))
+                    let rhs = crate::ir::value_abi_class(elem)
+                        .map(|class| self.whole_seq_copy_rhs(class, value))
                         .transpose()?
                         .flatten();
                     let Some(rhs) = rhs else {
@@ -3981,7 +3965,7 @@ impl FuncBuilder<'_> {
                     // `Vec<uint<32>, 4> = Vec<uint<16>, 4>` emits
                     // `std::array<uint64_t, 4> = std::array<uint64_t, 4>`
                     // and compiles — the shape check below asks
-                    // `ir_vec_elem_class`, which IS that collapse, so
+                    // the neutral value ABI class, which IS that collapse, so
                     // the copy lowers instead of being refused. Both
                     // backends emit `a.data = b.w16;`, measured.
                     //
@@ -4016,12 +4000,7 @@ impl FuncBuilder<'_> {
                     // `EmitsUncompilable`, told the user no backend runs
                     // it. v1 emits `r.data = c.a.data;` and g++ accepts
                     // it (0 errors, measured).
-                    let shape = crate::codegen::cpp_tb::ir_vec_elem_class(&chain.leaf_ty)
-                        .map(|cls| (dst_len, cls));
-                    let rhs = match shape {
-                        Some(sh) => self.whole_vec_copy_rhs(sh, value)?,
-                        None => None,
-                    };
+                    let rhs = self.whole_vec_copy_rhs((dst_len, chain.leaf_ty.clone()), value)?;
                     let Some(rhs) = rhs else {
                         return Err(mismatch());
                     };
@@ -4130,6 +4109,7 @@ impl FuncBuilder<'_> {
         // silent write to the DUT is the worst thing here.
         self.reject_scoreboard_list_index(target, "write")?;
         self.reject_indexed_component_record_path(target, "a write through")?;
+        self.record_error_span(target.span);
         Err(not_implemented(
             "assignment to a target that is neither a DUT port nor a local",
             "v1 either emits an assignment to a non-place, which does not compile, or — \
@@ -4634,11 +4614,16 @@ impl FuncBuilder<'_> {
         let m = schema
             .method(&method)
             .expect("as_transactor_call validated the method");
+        let schema_name = schema.name.clone();
+        let param_names = m.param_names.clone();
+        let param_tys = m.param_tys.clone();
+        let active_only = m.active_only;
+        let has_ret = m.has_ret;
         // A `when active` method is not callable on a `passive` instance —
         // the method structurally does not exist there. Reject the call at
         // lowering (mirroring v1's "`<m>` is declared inside `when active`"
         // diagnostic) rather than emitting an unresolved method reference.
-        if m.active_only && ctx.passive_transactor_fields.contains(&tb_field) {
+        if active_only && ctx.passive_transactor_fields.contains(&tb_field) {
             return Err(LowerError::Invalid(format!(
                 "method `{tb_field}.{method}(...)` is declared inside `when active` and is not \
                  callable on the passive instance `{tb_field}`; bind the instance `active` to \
@@ -4646,18 +4631,18 @@ impl FuncBuilder<'_> {
                  should exist on passive instances"
             )));
         }
-        if args.len() != m.param_names.len() {
+        if args.len() != param_names.len() {
             return Err(LowerError::Invalid(format!(
                 "transactor method `{}.{method}` takes {} argument(s), call passes {}",
-                schema.name,
-                m.param_names.len(),
+                schema_name,
+                param_names.len(),
                 args.len()
             )));
         }
-        if need_ret && !m.has_ret {
+        if need_ret && !has_ret {
             return Err(LowerError::Invalid(format!(
                 "transactor method `{}.{method}` returns no value",
-                schema.name
+                schema_name
             )));
         }
         if self.in_reevaluated_predicate
@@ -4692,34 +4677,64 @@ impl FuncBuilder<'_> {
         // named argument including the working form.
         super::reject_misplaced_named_args(
             args,
-            &m.param_names,
+            &param_names,
             &format!("transactor method call `{tb_field}.{method}(...)`"),
         )?;
+        let arg_exprs: Vec<&crate::ast::Expr> = args
+            .iter()
+            .map(|arg| match arg {
+                CallArg::Expr(expr) | CallArg::Named { value: expr, .. } => expr,
+            })
+            .collect();
+        let slots: Vec<String> = param_names
+            .iter()
+            .map(|name| format!("parameter `{name}` of `{schema_name}.{method}`"))
+            .collect();
+        let arg_effects: Vec<bool> = arg_exprs
+            .iter()
+            .map(|expr| self.expr_has_effectful_value_prelude(expr))
+            .collect();
         let mut lowered = Vec::with_capacity(args.len());
-        for (a, ty) in args.iter().zip(m.param_tys.iter()) {
-            let (CallArg::Expr(e) | CallArg::Named { value: e, .. }) = a;
-            lowered.push(self.lower_transactor_arg_expr(e, ty)?);
+        for (index, (e, ty)) in arg_exprs.iter().zip(param_tys.iter()).enumerate() {
+            let mut value = self.lower_transactor_arg_expr(e, ty)?;
+            let hint = match self.check_callable_argument(&value, ty, &slots[index]) {
+                Ok(hint) => hint,
+                Err(error) => {
+                    self.record_error_span(e.span);
+                    return Err(error);
+                }
+            };
+            if arg_effects[index + 1..].iter().any(|effect| *effect) {
+                value = self.materialize_ordered_value_as(value, hint);
+            }
+            lowered.push(value);
         }
         // Same rule as the component-method call one screen up, at the
         // transactor spelling of it. The schema had to learn
         // `param_tys` for this — it carried only names, so there was
         // nothing here to type-check against.
-        for (i, (a, ty)) in lowered.iter().zip(m.param_tys.iter()).enumerate() {
-            let pname = m
-                .param_names
+        for (i, (a, ty)) in lowered.iter().zip(param_tys.iter()).enumerate() {
+            let pname = param_names
                 .get(i)
                 .cloned()
                 .unwrap_or_else(|| format!("#{}", i + 1));
-            self.check_slot_ir(
+            if let Err(error) = self.check_slot_ir(
                 a,
                 ty,
-                &format!("parameter `{pname}` of `{}.{method}`", schema.name),
-            )?;
+                &format!("parameter `{pname}` of `{schema_name}.{method}`"),
+            ) {
+                self.record_error_span(arg_exprs[i].span);
+                return Err(error);
+            }
         }
         Ok(Some(Expr::Call(
             crate::ir::CallTarget::TransactorMethod {
                 bus_field: tb_field,
                 method,
+                target: crate::ir::TransactorMethodTarget::Callable {
+                    transactor: xid,
+                    function: m.function,
+                },
             },
             lowered,
         )))
@@ -4730,7 +4745,9 @@ impl FuncBuilder<'_> {
             return None;
         };
         match target {
-            crate::ir::CallTarget::TransactorMethod { bus_field, method } => {
+            crate::ir::CallTarget::TransactorMethod {
+                bus_field, method, ..
+            } => {
                 let xid = self.ctx.transactor_fields.get(bus_field)?;
                 self.ctx.transactors[xid.index()]
                     .method(method)?
@@ -4760,7 +4777,7 @@ impl FuncBuilder<'_> {
         let Some(transactor) = self.self_transactor.clone() else {
             return Ok(None);
         };
-        let Some((param_names, param_tys, ret_ty, callee_active_only)) =
+        let Some((param_names, param_tys, ret_ty, callee_active_only, function)) =
             self.self_transactor_methods.get(name).cloned()
         else {
             return Ok(None);
@@ -4819,10 +4836,34 @@ impl FuncBuilder<'_> {
             &param_names,
             &format!("transactor sibling method call `{transactor}.{name}(...)`"),
         )?;
+        let arg_exprs: Vec<&crate::ast::Expr> = args
+            .iter()
+            .map(|arg| match arg {
+                CallArg::Expr(expr) | CallArg::Named { value: expr, .. } => expr,
+            })
+            .collect();
+        let slots: Vec<String> = param_names
+            .iter()
+            .map(|pname| format!("parameter `{pname}` of `{transactor}.{name}`"))
+            .collect();
+        let arg_effects: Vec<bool> = arg_exprs
+            .iter()
+            .map(|expr| self.expr_has_effectful_value_prelude(expr))
+            .collect();
         let mut lowered = Vec::with_capacity(args.len());
-        for (a, ty) in args.iter().zip(param_tys.iter()) {
-            let (CallArg::Expr(e) | CallArg::Named { value: e, .. }) = a;
-            lowered.push(self.lower_transactor_arg_expr(e, ty)?);
+        for (index, (e, ty)) in arg_exprs.iter().zip(param_tys.iter()).enumerate() {
+            let mut value = self.lower_transactor_arg_expr(e, ty)?;
+            let hint = match self.check_callable_argument(&value, ty, &slots[index]) {
+                Ok(hint) => hint,
+                Err(error) => {
+                    self.record_error_span(e.span);
+                    return Err(error);
+                }
+            };
+            if arg_effects[index + 1..].iter().any(|effect| *effect) {
+                value = self.materialize_ordered_value_as(value, hint);
+            }
+            lowered.push(value);
         }
         // The SIBLING spelling of the parameter rule — `inner(1)` from
         // another method of the same transactor, where the bound-
@@ -4833,16 +4874,23 @@ impl FuncBuilder<'_> {
                 .get(i)
                 .cloned()
                 .unwrap_or_else(|| format!("#{}", i + 1));
-            self.check_slot_ir(
+            if let Err(error) = self.check_slot_ir(
                 a,
                 ty,
                 &format!("parameter `{pname}` of `{transactor}.{name}`"),
-            )?;
+            ) {
+                self.record_error_span(arg_exprs[i].span);
+                return Err(error);
+            }
         }
         Ok(Some(Expr::Call(
             crate::ir::CallTarget::TransactorSelfMethod {
-                transactor,
+                transactor: self
+                    .self_transactor_id
+                    .expect("a transactor method scope has a typed owner"),
+                transactor_name: transactor,
                 method: name.to_string(),
+                function,
             },
             lowered,
         )))
@@ -5034,12 +5082,16 @@ impl FuncBuilder<'_> {
         let problem_id = self
             .ctx
             .randomize_problem_ids
-            .get(&(target.span.start, target.span.end))
+            .get(&crate::ast::SourceSite::new(
+                self.current_source_id,
+                target.span,
+            ))
             .copied();
 
         let constraints_ref = self.push_constraint_site(crate::ir::ConstraintSite {
             record,
             target: target.clone(),
+            source_id: self.current_source_id,
             constraints,
             blocking,
             problem_id,
@@ -5056,92 +5108,55 @@ impl FuncBuilder<'_> {
     }
 
     /// Lower a tseq generator call (`RandomTxns(5)`) into a
-    /// `CallTarget::Tseq` edge. Args are scalar expressions, lowered (and
-    /// port-hoisted) like any call argument; named args are rejected
-    /// (tseq params are positional, matching v1).
+    /// `CallTarget::Tseq` edge. Arguments retain their declared scalar,
+    /// record, or sequence type and are lowered like other call arguments;
+    /// named args are rejected (tseq params are positional, matching v1).
     pub(crate) fn lower_tseq_call(
         &mut self,
         name: &str,
         args: &[crate::ast::CallArg],
+        call_span: crate::lexer::Span,
     ) -> Result<Expr, LowerError> {
         // v1 drops argument names and binds by position here too:
         // measured, `RandomTxns(n = 5)` emits `RandomTxns(5)` against
         // `auto RandomTxns = [&](uint64_t n)` — byte-identical to the
         // positional call. The names ride in `ctx.tseqs` for this.
-        let (param_names, param_tys) = match self.ctx.tseqs.get(name) {
-            Some((_, declared, tys)) => {
-                let (declared, tys) = (declared.clone(), tys.clone());
-                super::reject_misplaced_named_args(
-                    args,
-                    &declared,
-                    &format!("tseq call `{name}(...)`"),
-                )?;
-                (declared, tys)
-            }
-            None => (Vec::new(), Vec::new()),
+        let Some((function, _, param_names, param_tys)) = self.ctx.tseqs.get(name) else {
+            self.record_error_span(call_span);
+            return Err(LowerError::Invalid(format!(
+                "tseq call references missing declaration `{name}`"
+            )));
         };
-        // A RECORD-typed tseq parameter is not a slot any argument can
-        // enter, so the verdict belongs to the parameter rather than to
-        // what is passed. Neither emitter honours the declared type:
-        // v1 renders it as a Verilated module handle
-        // (`[&](VBeat* seed)`) and tbir as a scalar
-        // (`[&](uint64_t seed)`). v1's spelling does not compile under
-        // ANY call — `'VBeat' has not been declared` — so every call to
-        // such a tseq is uncompilable there.
-        //
-        // Naming it here rather than at the argument is what the first
-        // version of this got wrong: routing the slot through
-        // `slot_ir_type` resolved the parameter to `Record(Beat)`, so a
-        // `Beat` argument MATCHED and the call lowered, while a scalar
-        // one was rejected for being the wrong shape. Both spellings are
-        // equally unbuildable, and the comment left behind still claimed
-        // the record one was refused.
-        //
-        // Not `Invalid`: the DECLARATION alone is fine under tbir — an
-        // uncalled `tseq Wrap(seed: Beat)` compiles there (`uint64_t
-        // seed` is a valid lambda parameter, it is only wrong) — so the
-        // program is out of subset rather than meaningless, and the
-        // verdict is what v1 does with it.
-        if let Some((i, _)) = param_tys
+        let function = *function;
+        let param_names = param_names.clone();
+        let param_tys = param_tys.clone();
+        super::reject_misplaced_named_args(
+            args,
+            &param_names,
+            &format!("tseq call `{name}(...)`"),
+        )?;
+        if args.len() != param_tys.len() {
+            self.record_error_span(call_span);
+            return Err(LowerError::Invalid(format!(
+                "tseq `{name}` takes {} argument(s), call passes {}",
+                param_tys.len(),
+                args.len()
+            )));
+        }
+        let arg_exprs: Vec<&crate::ast::Expr> = args
             .iter()
-            .enumerate()
-            .find(|(_, t)| matches!(t, IrType::Record(_)))
-        {
-            let pname = param_names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("#{}", i + 1));
-            return Err(not_implemented(
-                &format!("a record-typed parameter `{pname}` on `tseq {name}`"),
-                format!(
-                    "v1 emits `{pname}` as a Verilated module handle (`V<Record>*`), which \
-                     does not compile; pass the record's fields as scalars instead"
-                ),
-                V1Status::EmitsUncompilable,
-            ));
-        }
-        let mut lowered = Vec::with_capacity(args.len());
-        for (i, a) in args.iter().enumerate() {
-            let (crate::ast::CallArg::Expr(e) | crate::ast::CallArg::Named { value: e, .. }) = a;
-            let v = self.lower_expr_no_ports(e)?;
-            // A note here once claimed every REACHABLE tseq parameter is
-            // a scalar, so the slot needed no type table and could be
-            // hard-coded to "not a record". `TSeq<T>` disproves it:
-            // `tseq Wrap(xs: TSeq<Beat>)` is compiled by v1 as
-            // `[&](const std::vector<Beat>& xs) -> std::vector<Beat>`,
-            // and the hard-coded slot rejected `Wrap(xs)` — which works
-            // — while passing `Wrap(7)`, which v1 refuses with "no known
-            // conversion from 'int' to 'const std::vector<Beat>&'".
-            //
-            // A record-typed parameter never reaches this loop — it is
-            // refused above, on the parameter rather than the argument.
-            if let Some(ty) = param_tys.get(i) {
-                self.check_slot_ir(&v, ty, &format!("parameter of tseq `{name}`"))?;
-            }
-            lowered.push(v);
-        }
+            .map(|arg| match arg {
+                crate::ast::CallArg::Expr(expr)
+                | crate::ast::CallArg::Named { value: expr, .. } => expr,
+            })
+            .collect();
+        let slots = vec![format!("parameter of tseq `{name}`"); param_tys.len()];
+        let lowered = self.lower_checked_ordered_args(&arg_exprs, &param_tys, &slots, false)?;
         Ok(Expr::Call(
-            crate::ir::CallTarget::Tseq(name.to_string()),
+            crate::ir::CallTarget::Tseq {
+                function,
+                name: name.to_string(),
+            },
             lowered,
         ))
     }
@@ -5173,6 +5188,13 @@ impl FuncBuilder<'_> {
             // Scalar-element sequence: yield any scalar expression.
             IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::Unknown => {
                 let v = self.lower_expr_no_ports(value)?;
+                if matches!(self.expr_type(&v), Some(IrType::String)) {
+                    self.record_error_span(value.span);
+                    return Err(LowerError::Invalid(
+                        "`yield` does not support String values; TSeq elements must be numeric, boolean, or record values"
+                            .into(),
+                    ));
+                }
                 // A scalar-element sequence must not accept a RECORD.
                 // Without this the record local is pushed verbatim and
                 // the emitter writes `std::vector<int64_t>::push_back(t)`
@@ -5220,6 +5242,13 @@ impl FuncBuilder<'_> {
             // record-valued ternaries are just as valid as a bare local.
             IrType::Record(elem_rid) => {
                 let v = self.lower_expr_no_ports(value)?;
+                if matches!(self.expr_type(&v), Some(IrType::String)) {
+                    self.record_error_span(value.span);
+                    return Err(LowerError::Invalid(
+                        "`yield` does not support String values; TSeq elements must be numeric, boolean, or record values"
+                            .into(),
+                    ));
+                }
                 if self.record_id_of_expr(&v) != Some(elem_rid) {
                     // A distinct record, scalar or malformed record
                     // expression is accepted by v1's frontend and pasted
@@ -5302,6 +5331,21 @@ impl FuncBuilder<'_> {
         self.side_tables.borrow_mut().pending_functions[id.index()] = f;
     }
 
+    fn reserve_test_hook_site(&mut self) -> crate::ir::TestHookSiteId {
+        let owner = self
+            .test_hook_site_owner
+            .clone()
+            .expect("test-hook sites are reserved only in test bodies");
+        let mut tables = self.side_tables.borrow_mut();
+        let ordinal = tables.next_test_hook_site.entry(owner.clone()).or_default();
+        let site = crate::ir::TestHookSiteId {
+            owner,
+            ordinal: *ordinal,
+        };
+        *ordinal += 1;
+        site
+    }
+
     /// `on <channel>(<param>) ... end on` — subscribe to a test-scope
     /// event channel or a component event field. The body becomes a
     /// ONE-parameter `FunctionKind::TestHook` function whose parameter is
@@ -5352,7 +5396,11 @@ impl FuncBuilder<'_> {
                     id.name, id.name
                 )));
             };
-            (EventChannelRef::Local(channel), payload.clone(), id.name.clone())
+            (
+                EventChannelRef::Local(channel),
+                payload.clone(),
+                id.name.clone(),
+            )
         } else {
             let Some(raw) = super::components::dotted_path(callee) else {
                 return Err(LowerError::Invalid(
@@ -5436,6 +5484,7 @@ impl FuncBuilder<'_> {
             }
         };
 
+        let site = self.reserve_test_hook_site();
         let pending_id = self.reserve_pending_function();
         let param_ty = match payload {
             // `scalar_ir_type()`, which keeps the DECLARED width. This
@@ -5466,8 +5515,10 @@ impl FuncBuilder<'_> {
         }
         let mut f = b.finish(
             pending_id,
-            format!("_on_event_{}", pending_id.0),
-            crate::ir::FunctionKind::TestHook,
+            crate::ir::TestHookMember::EventSubscription(site.clone()).function_name(""),
+            crate::ir::FunctionKind::TestHook {
+                member: crate::ir::TestHookMember::EventSubscription(site.clone()),
+            },
             self.ctx.owner,
         )?;
         // Build the param from the local's final (de-duplicated / synthesized)
@@ -5477,6 +5528,7 @@ impl FuncBuilder<'_> {
 
         self.commit_pending_function(pending_id, f);
         self.push(Stmt::EventSubscribe {
+            site,
             event: event_ref,
             handler: pending_id,
         });
@@ -5580,10 +5632,11 @@ impl FuncBuilder<'_> {
                     ty: self.local_type(*local).clone(),
                 })
                 .collect();
+            let site = self.reserve_test_hook_site();
             let pending_id = self.reserve_pending_function();
             let hook_fn = super::lower_method_hook_body(
                 pending_id,
-                format!("_on_method_hook_{}", pending_id.0),
+                crate::ir::TestHookMember::MethodSubscription(site.clone()).function_name(""),
                 self.ctx.owner,
                 &params,
                 &capture_params,
@@ -5591,9 +5644,11 @@ impl FuncBuilder<'_> {
                 self.ctx,
                 self.helpers,
                 self.side_tables,
+                crate::ir::TestHookMember::MethodSubscription(site.clone()),
             )?;
             self.commit_pending_function(pending_id, hook_fn);
             self.push(Stmt::MethodHookSubscribe {
+                site,
                 target,
                 side: h.hook.expect("hook branch has a side"),
                 handler: pending_id,
@@ -5681,11 +5736,10 @@ impl FuncBuilder<'_> {
             // live port reads remain inline, while anything that pushes a
             // statement or splits the CFG is rejected instead of being
             // evaluated once and cached at registration.
-            let period = self.with_check_body(
-                &[],
-                "a statement-position periodic handler period",
-                |b| b.lower_expr(&h.event),
-            )?;
+            let period =
+                self.with_check_body(&[], "a statement-position periodic handler period", |b| {
+                    b.lower_expr(&h.event)
+                })?;
             if !matches!(
                 self.expr_type(&period),
                 Some(IrType::UInt(_) | IrType::SInt(_) | IrType::Unknown) | None
@@ -5715,6 +5769,7 @@ impl FuncBuilder<'_> {
         // separate IR functions, so v1's shared `[&]` capture is not
         // representable); testbench fields and DUT ports resolve as usual,
         // and an unresolved name is reported by the ordinary lookup path.
+        let site = self.reserve_test_hook_site();
         let pending_id = self.reserve_pending_function();
         let mut b = FuncBuilder::new(self.ctx, self.helpers, self.side_tables);
         super::reserve_tb_record_names(&mut b, self.ctx);
@@ -5724,44 +5779,28 @@ impl FuncBuilder<'_> {
         }
         let f = b.finish(
             pending_id,
-            format!("_on_handler_{}", pending_id.0),
-            crate::ir::FunctionKind::TestHook,
+            crate::ir::TestHookMember::StatementCycle(site.clone()).function_name(""),
+            crate::ir::FunctionKind::TestHook {
+                member: crate::ir::TestHookMember::StatementCycle(site.clone()),
+            },
             self.ctx.owner,
         )?;
 
-        // The handler runs from a void per-cycle checker callback. v1 lowers
-        // an unqualified cycle wait to `co_await` inside that callback, which
-        // cannot be a coroutine under its void ABI and therefore does not
-        // compile. Other suspending terminators take different v1 paths; keep
-        // the shared conservative fence below until each one is measured.
-        if f.blocks.iter().any(|b| {
-            matches!(
-                b.terminator,
-                Terminator::WaitCycles(_, None, _)
-            )
-        }) {
-            return Err(super::not_implemented(
-                "an unqualified cycle `wait` inside a statement-position `on` handler body",
-                "the body runs from a void per-cycle checker callback; v1 emits `co_await` \
-                     inside that callback and the generated C++ does not compile — move the \
-                     wait into the run body, or gate the run body on the same condition with \
-                     `wait until`",
-                super::V1Status::EmitsUncompilable,
-            ));
-        }
-        if super::function_suspends(&f) {
-            return Err(unsupported(
-                "a `wait` inside a statement-position `on` handler body",
-                "the body runs from the per-cycle checker pass, and waits are not yet \
-                 represented safely there — move the wait into the run body, or gate the \
-                 run body on the same condition with `wait until`",
-            ));
-        }
         self.commit_pending_function(pending_id, f);
         let id = {
             let mut tables = self.side_tables.borrow_mut();
+            tables
+                .synchronous_callbacks
+                .push(super::SynchronousCallbackSite {
+                    function: pending_id,
+                    pending: true,
+                    kind: super::SynchronousCallbackKind::StatementCycle,
+                    source_id: self.ctx.source_id,
+                    span: h.span,
+                });
             let id = crate::ir::CycleHandlerId(tables.cycle_handlers.len() as u32);
             tables.cycle_handlers.push(CycleHandlerSchema {
+                site,
                 kind,
                 function: pending_id,
                 phase: crate::ir::HandlerPhase::from_ast(h.phase),
@@ -5846,7 +5885,7 @@ impl FuncBuilder<'_> {
                 crate::ast::SystemFn::Clog2 => continue,
             };
             self.temporal_slots
-                .insert((t.call_span.start, t.call_span.end), (i as u32, kind));
+                .insert(self.source_site(t.call_span), (i as u32, kind));
         }
         // A body that pushes a statement, opens a block, or moves the
         // cursor has escaped the closure: an inlined suspending helper
@@ -6154,7 +6193,7 @@ impl FuncBuilder<'_> {
     /// Lower an immediate assert/assume while preserving lazy diagnostic
     /// evaluation. Most messages remain a compact inline check. When a
     /// capture needs a statement-level call edge (an impure helper,
-    /// testbench/transactor method, or suspending TLM call), split the CFG:
+    /// component/testbench/transactor method, or suspending TLM call), split the CFG:
     /// branch on the condition first, then hoist the capture calls *inside*
     /// the failure arm before emitting an unconditional diagnostic check.
     /// This matches v1's call-at-the-log-site behavior without running the
@@ -6165,6 +6204,10 @@ impl FuncBuilder<'_> {
         msg: &str,
         assume: bool,
     ) -> Result<(), LowerError> {
+        // The first pass is only a capability probe. An Unsupported result
+        // selects the failure-side CFG lowering below, so its diagnostic must
+        // not outrank an unrelated error encountered later in the program.
+        let diagnostic_checkpoint = self.ctx.diagnostics.checkpoint();
         match self.lower_fmt(msg) {
             Ok(on_fail) => {
                 if assume {
@@ -6175,6 +6218,7 @@ impl FuncBuilder<'_> {
                 Ok(())
             }
             Err(LowerError::Unsupported { .. }) => {
+                self.ctx.diagnostics.restore(diagnostic_checkpoint);
                 // A CFG Branch cannot carry raw DUT reads: unlike the inline
                 // AssertCheck emitter, control-flow terminators require every
                 // port value to be sampled into a local first. The read still
@@ -6395,9 +6439,8 @@ impl FuncBuilder<'_> {
         Ok(())
     }
 
-    /// `let x = _tb.m(...)` — testbench method call RHS, CFG-inlined.
-    /// Returns `true` when the RHS was such a call (declared `x` holds
-    /// the inlined return value).
+    /// `let x = _tb.m(...)` — testbench method call RHS. Returns `true`
+    /// when the RHS was such a call and `x` receives the callable result.
     pub(crate) fn try_lower_tb_method_let(
         &mut self,
         l: &crate::ast::LetStmt,
@@ -6410,32 +6453,23 @@ impl FuncBuilder<'_> {
             return Ok(false);
         };
         let v = self.lower_tb_method_call(&m, args)?;
-        // The TESTBENCH-METHOD spelling of the component-method rule a
-        // screen up. `lower_tb_method_call` already typed its return
-        // temp, and this dropped that on the floor: an unannotated
-        // `let r = make_result(7)` on a `-> Beat` method left `r`
-        // untyped, so every slot guard read it as a scalar and called
-        // the program `Invalid` — while v1 emits
-        // `auto r = Tb_make_result(_tb, 7);` and compiles.
+        // Preserve the canonical callable's result type on the source local.
         let ret_record = self.record_id_of_expr(&v);
-        let ret_fixed = self.expr_type(&v).and_then(|ty| {
-            matches!(ty, IrType::FixedVec { .. }).then(|| ty.clone())
-        });
-        let ret_seq = self.expr_type(&v).and_then(|ty| {
-            matches!(ty, IrType::RecordSeq(_) | IrType::Seq(_)).then(|| ty.clone())
-        });
-        // No "…unless the annotation names that same record" escape,
-        // because by construction the annotation here never can. A `let`
-        // whose declared type names a record is claimed a thousand lines
-        // up, by the record-typed-local branch of `lower_let`, which
-        // returns on every path: same record → the struct-copy `Assign`,
-        // different record → `record_assign_mismatch`. So the only
-        // annotations that reach this lane are the ones that name no
-        // record at all — `int`, `bit`, an enum, an unknown name — and
-        // for those a record-returning RHS is always the mismatch.
-        // (Probed: `let r : Beat` and `let r : Pkg.Beat` lower, `let r :
-        // Other` reports the transaction-local mismatch, and only
-        // `let r : int` lands here.)
+        let ret_fixed = self
+            .expr_type(&v)
+            .and_then(|ty| matches!(ty, IrType::FixedVec { .. }).then(|| ty.clone()));
+        let ret_seq = self
+            .expr_type(&v)
+            .and_then(|ty| matches!(ty, IrType::RecordSeq(_) | IrType::Seq(_)).then(|| ty.clone()));
+        let ret_string = self.expr_type(&v).filter(|ty| matches!(ty, IrType::String));
+        let declared_ty = l.ty.as_ref().and_then(typed_let_ir_type);
+        if let Some(expected) = declared_ty.as_ref() {
+            let actual = self.expr_type(&v).unwrap_or(IrType::Unknown);
+            self.check_string_types(expected, &actual, &format!("local `{}`", l.name.name))?;
+        }
+        // A record result cannot flow into a scalar annotation. Record-typed
+        // annotations are handled by the record-local path before this one;
+        // only scalar/non-record annotations reach this lane.
         if let (Some(_), Some(rid)) = (&l.ty, ret_record) {
             return Err(LowerError::Invalid(format!(
                 "`let {}` is declared with a non-record type and initialised from a `{}`",
@@ -6464,10 +6498,9 @@ impl FuncBuilder<'_> {
             }
             self.set_local_type(id, ty);
         } else if let Some(ty) = ret_seq {
-            if let Some(declared) = l
-                .ty
-                .as_ref()
-                .and_then(|ty| super::helpers::tseq_ir_type(Some(ty), &self.ctx.record_ids))
+            if let Some(declared) =
+                l.ty.as_ref()
+                    .and_then(|ty| super::helpers::tseq_ir_type(Some(ty), &self.ctx.record_ids))
             {
                 if declared != ty {
                     return Err(LowerError::Invalid(format!(
@@ -6482,6 +6515,8 @@ impl FuncBuilder<'_> {
                 )));
             }
             self.set_local_type(id, ty);
+        } else if let Some(ty) = ret_string {
+            self.set_local_type(id, ty);
         }
         self.push(Stmt::Assign(id, v));
         Ok(true)
@@ -6492,11 +6527,10 @@ impl FuncBuilder<'_> {
     /// runtime log/trace text) are byte-identical across backends.
     ///
     /// Used by conditionally-evaluated messages when the caller has no
-    /// failure-side CFG seam. CFG-inlined calls stay rejected here because
-    /// eagerly hoisting them ahead of the check would run the inlined body
-    /// even when the message is never emitted. Immediate checks and timeout
-    /// headers retry with `lower_fmt_hoisting` only after entering their
-    /// failure/timeout block.
+    /// failure-side CFG seam. Effectful calls stay rejected here because
+    /// eagerly hoisting them ahead of the check would run the body even when
+    /// the message is never emitted. Immediate checks and timeout headers
+    /// retry only after entering their failure/timeout block.
     pub(crate) fn lower_fmt(&mut self, msg: &str) -> Result<FmtArgs, LowerError> {
         self.lower_fmt_impl(msg, false)
     }
@@ -6504,8 +6538,8 @@ impl FuncBuilder<'_> {
     /// `lower_fmt` for messages that are unconditional in the current CFG
     /// block (`log(...)`, a bare `fail(...)`, or a check's failure block):
     /// every interpolation is evaluated exactly once at the statement, so
-    /// a CFG-inlined call can be hoisted ahead of it with identical
-    /// observable order/count.
+    /// an effectful call can be hoisted ahead of it with identical observable
+    /// order/count.
     pub(crate) fn lower_fmt_hoisting(&mut self, msg: &str) -> Result<FmtArgs, LowerError> {
         self.lower_fmt_impl(msg, true)
     }
@@ -6543,9 +6577,9 @@ impl FuncBuilder<'_> {
         let mut args = Vec::with_capacity(parsed_caps.len());
         for (mut parsed, wide_hex, capture) in parsed_caps {
             // A message interpolation lowers lazily (the captured expr is
-            // re-evaluated at the log/failure site), so a CFG-inlined call
-            // — an impure helper or a testbench method — cannot live inside
-            // it. For a message unconditional in its current block, v1
+            // re-evaluated at the log/failure site), so an effectful helper or
+            // component/testbench method call cannot live inside it. For a
+            // message unconditional in its current block, v1
             // evaluates each `${...}` exactly once, in place, at the message point;
             // mirror that by eagerly HOISTING every such call into a fresh
             // temp before the statement, then referencing the temp in the
@@ -6591,10 +6625,15 @@ impl FuncBuilder<'_> {
                 expr = self.hoist_fmt_ports(expr);
                 let name = self.fresh_msg_tmp_name();
                 let tmp = self.declare(&name);
+                let fallback = match &expr {
+                    Expr::Local(local) if matches!(self.local_type(*local), IrType::Unknown) => {
+                        IrType::Unknown
+                    }
+                    _ => IrType::PortSnapshot,
+                };
                 self.set_local_type(
                     tmp,
-                    ty.filter(|ty| *ty != IrType::Unknown)
-                        .unwrap_or(IrType::PortSnapshot),
+                    ty.filter(|ty| *ty != IrType::Unknown).unwrap_or(fallback),
                 );
                 self.push(Stmt::Assign(tmp, expr));
                 expr = Expr::Local(tmp);
@@ -6631,10 +6670,10 @@ impl FuncBuilder<'_> {
         if self.hoist_fmt_suspending_call(e)? {
             return Ok(());
         }
-        if self.fmt_call_needs_hoist(e) {
+        if self.fmt_call_needs_hoist(e) || self.fmt_component_call_needs_hoist(e)? {
             // Hoist the whole call once. Lower it in normal (non-fmt-args)
-            // context so the impure/tb-method inline emits its statements
-            // into the current block ahead of the message.
+            // context so an impure helper emits its inline statements and a
+            // method emits its call edge ahead of the message.
             let call = std::mem::replace(e, AstExpr::new(ExprKind::Bool(false), e.span));
             let span = call.span;
             let lowered = self.lower_expr(&call)?;
@@ -6686,7 +6725,7 @@ impl FuncBuilder<'_> {
                     let span = e.span;
                     let name = self.fresh_msg_tmp_name();
                     let tmp = self.declare(&name);
-                    self.set_local_type(tmp, IrType::UInt(None));
+                    self.set_local_type(tmp, IrType::Unknown);
                     self.push(Stmt::Assign(tmp, lane));
                     *e = AstExpr::new(ExprKind::Ident(Ident { name, span }), span);
                     return Ok(());
@@ -6725,6 +6764,7 @@ impl FuncBuilder<'_> {
                 || is_bus_tlm
                 || self.as_transactor_call(callee)?.is_some()
                 || self.fmt_self_transactor_method(callee).is_some()
+                || matches!(self.as_component_method_call(callee), Ok(Some(_)))
             {
                 return Ok(true);
             }
@@ -6747,7 +6787,8 @@ impl FuncBuilder<'_> {
         Ok(self.fmt_call_needs_hoist(e)
             || is_bus_tlm
             || self.as_transactor_call(callee)?.is_some()
-            || self.fmt_self_transactor_method(callee).is_some())
+            || self.fmt_self_transactor_method(callee).is_some()
+            || matches!(self.as_component_method_call(callee), Ok(Some(_))))
     }
 
     fn reject_lazy_fmt_call_arguments(&self, e: &AstExpr) -> Result<(), LowerError> {
@@ -6940,11 +6981,11 @@ impl FuncBuilder<'_> {
         }
     }
 
-    /// A `Call` expression that must be hoisted out of a message: one that
-    /// CFG-inlines (impure/DUT-touching file-scope helper, or a testbench
-    /// method) and therefore cannot lower inside a lazily-evaluated
-    /// `${...}`. Pure helpers, extern fns, width-cast intrinsics, and
-    /// value-query method calls lower fine in place, so they return false.
+    /// A `Call` expression that must be hoisted out of a message because it
+    /// is effectful and cannot lower inside a lazily-evaluated `${...}`.
+    /// Component methods use the same hoist after resolving their receiver
+    /// and result type. Pure helpers, extern fns, width-cast
+    /// intrinsics, and value-query method calls lower fine in place.
     /// Bus/TLM and transactor calls are deliberately NOT hoisted here:
     /// they can suspend, so they stay statement-only and keep their own
     /// rejects.
@@ -6959,10 +7000,17 @@ impl FuncBuilder<'_> {
                 .helpers
                 .get(&id.name)
                 .map_or(false, |entry| !entry.pure),
-            // `_tb.m(...)` — a testbench method always CFG-inlines.
+            // `_tb.m(...)` — a testbench method is an effectful call edge.
             ExprKind::Field { .. } => self.tb_method_call_name(callee).is_some(),
             _ => false,
         }
+    }
+
+    fn fmt_component_call_needs_hoist(&self, e: &AstExpr) -> Result<bool, LowerError> {
+        let ExprKind::Call { callee, .. } = &*e.kind else {
+            return Ok(false);
+        };
+        Ok(matches!(self.as_component_method_call(callee), Ok(Some(_))))
     }
 }
 
@@ -7098,6 +7146,8 @@ enum Slot {
     /// A fixed-size aggregate vector. Exact shape is enforced by queue
     /// transfers; typed ABI slots must still distinguish it from scalars.
     FixedVec,
+    /// A host-side immutable C string.
+    String,
     /// Known to be a scalar — `uint<N>`, `sint<N>`, `bit`, `bool`.
     Scalar,
     /// Not nameable here. Never compared, never reported.
@@ -7121,6 +7171,7 @@ impl Slot {
             IrType::RecordSeq(rid) => Slot::Seq(Some(*rid)),
             IrType::Seq(_) => Slot::Seq(None),
             IrType::FixedVec { .. } => Slot::FixedVec,
+            IrType::String => Slot::String,
             IrType::UInt(_) | IrType::SInt(_) | IrType::Bool => Slot::Scalar,
             _ => Slot::Unknown,
         }
@@ -7140,7 +7191,7 @@ impl Slot {
 /// int)`". Neither backend runs it, so this is `Invalid`, and it is the
 /// mirror of the `push` branches' `[CallArg::Expr(arg)]` pattern, which
 /// has always been exact.
-fn queue_pop_takes_no_arguments(what: &str, args: &[CallArg]) -> Result<(), LowerError> {
+pub(crate) fn queue_pop_takes_no_arguments(what: &str, args: &[CallArg]) -> Result<(), LowerError> {
     if args.is_empty() {
         return Ok(());
     }
@@ -7196,11 +7247,10 @@ fn typed_let_ir_type(t: &TypeExpr) -> Option<IrType> {
         BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => Some(IrType::UInt(width)),
         BuiltinTy::SInt | BuiltinTy::SIntCap => Some(IrType::SInt(width)),
         BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Some(IrType::Bool),
+        BuiltinTy::String => Some(IrType::String),
         // `let t : time` → `uint64_t` (v1's `c_type_for(Time)`); the RHS
         // time literal lowers to a bare `Expr::Literal` of its numeric
-        // prefix (`100ns` -> 100). (String has no v1-supported local
-        // surface — see the `ExprKind::String` arm in lower/exprs.rs —
-        // so it is intentionally absent here.)
+        // prefix (`100ns` -> 100).
         BuiltinTy::Time => Some(IrType::UInt(Some(64))),
         _ => None,
     }
@@ -7214,7 +7264,13 @@ fn typed_let_ir_type(t: &TypeExpr) -> Option<IrType> {
 /// initialized values, queue pops, DUT reads, and component results have
 /// their own compatibility rules and are not widened by this batch.
 fn uninitialized_typed_let_ir_type(t: &TypeExpr) -> Option<IrType> {
-    if matches!(t, TypeExpr::Builtin { name: BuiltinTy::Int, .. }) {
+    if matches!(
+        t,
+        TypeExpr::Builtin {
+            name: BuiltinTy::Int,
+            ..
+        }
+    ) {
         Some(IrType::UInt(Some(32)))
     } else {
         typed_let_ir_type(t)
@@ -7250,7 +7306,10 @@ fn component_method_result_compatible(expected: &IrType, actual: &IrType) -> boo
     let widthless = |ty: &IrType| matches!(ty, IrType::UInt(None) | IrType::SInt(None));
     if widthless(expected) || widthless(actual) {
         let scalar = |ty: &IrType| {
-            matches!(ty, IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::Unknown)
+            matches!(
+                ty,
+                IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::Unknown
+            )
         };
         return scalar(expected) && scalar(actual);
     }
@@ -7270,36 +7329,11 @@ fn is_log_severity(s: &str) -> bool {
     matches!(s, "debug" | "info" | "warn" | "error" | "fatal")
 }
 
-/// A queue method in STATEMENT position that is neither `push` nor
-/// `pop` — both of those are lowered above, so this is what is left.
-///
-/// v1 emits the call against `harc_rt::HarcQueue`, whose whole API is
-/// `push`, `pop`, `size` and `empty`. So the split is exact rather than
-/// a proxy:
-///
-///   * `size` / `empty` — compile. The value is discarded, which makes
-///     the statement a legal no-op; `discard_queue_query_statement`
-///     accepts and elides it before this diagnostic helper is reached.
-///   * anything else — `clear`, `front`, a typo — g++: "'struct
-///     harc_rt::HarcQueue<long unsigned int>' has no member named
-///     'clear'". No backend runs it.
-///
-/// The emission is verbatim for every name EXCEPT the four width-method
-/// intrinsics: `try_emit_width_method` claims `trunc`/`zext`/`sext`/
-/// `resize` by name before the member-call path, so `sb.q.trunc(2)`
-/// comes out as `((uint64_t)(((uint64_t)(_tb.sb.q) & 0x3ULL)));`, not as
-/// a `.trunc(2)` call. The `Invalid` verdict still holds for those four
-/// — g++ rejects the cast: "invalid cast from type
-/// `harc_rt::HarcQueue<long unsigned int>` to type `uint64_t`" — but it
-/// holds for a different reason, so the runtime header is the
-/// discriminator for every other name and not for these.
-///
-/// Measured at ALL FIVE landings independently rather than four inferred
-/// from one: testbench-owned field, scoreboard queue, component queue,
-/// bare target-state field, and instance-qualified target-state field
-/// each take their own probe. All five behave this way — which is why
-/// they now share this helper instead of three of them carrying a
-/// hand-written `EmitsUncompilable` that measurement contradicts.
+/// Handle a queue query in statement position after `push`, `pop`, and `front`
+/// have been claimed. Discarded `size` and `empty` calls are legal no-ops for
+/// every queue-owner form. Other members are outside the `HarcQueue` API;
+/// width intrinsics are also invalid for a queue receiver even though their
+/// syntax is recognized earlier.
 fn discard_queue_query_statement(
     what: &str,
     method: &str,
@@ -7322,7 +7356,7 @@ fn discard_queue_query_statement(
 
 fn queue_method_in_statement_position(what: &str) -> LowerError {
     LowerError::Invalid(format!(
-        "{what} in statement position: `HarcQueue` has only `push`, `pop`, `size` and \
-         `empty`"
+        "{what} in statement position: `HarcQueue` has only `push`, `pop`, `size`, \
+         `empty`, and `front`"
     ))
 }

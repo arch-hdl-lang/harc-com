@@ -433,12 +433,25 @@ fn coverpoint_expr_type(
             Ok(field_schema.ty.clone())
         }
         Expr::Call(target, args) => match target {
-            CallTarget::Helper { name, ret } => {
+            CallTarget::Helper {
+                function,
+                name,
+                ret,
+            } => {
                 let helper = prog
                     .functions
-                    .iter()
-                    .find(|f| f.kind == FunctionKind::Helper && f.name == *name)
-                    .ok_or_else(|| format!("unknown pure helper `{name}`"))?;
+                    .get(function.index())
+                    .filter(|candidate| {
+                        candidate.id == *function
+                            && candidate.kind == FunctionKind::Helper
+                            && candidate.name == *name
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "pure helper call `{name}` references inconsistent fn{}",
+                            function.0
+                        )
+                    })?;
                 if args.len() != helper.params.len() {
                     return Err(format!(
                         "helper `{name}` takes {} argument(s), call passes {}",
@@ -469,14 +482,24 @@ fn coverpoint_expr_type(
                 }
                 Ok(ret.clone())
             }
-            CallTarget::ExternFn { name, ret } => {
-                for (idx, arg) in args.iter().enumerate() {
+            CallTarget::ExternFn { name, params, ret } => {
+                if args.len() != params.len() {
+                    return Err(format!(
+                        "extern function `{name}` takes {} argument(s), call carries {}",
+                        params.len(),
+                        args.len()
+                    ));
+                }
+                for (idx, (arg, expected)) in args.iter().zip(params).enumerate() {
                     let actual = coverpoint_expr_type(prog, hook_params, arg)?;
-                    require_scalar(
-                        prog,
-                        &actual,
-                        &format!("extern function `{name}` argument {}", idx + 1),
-                    )?;
+                    if !scalar_compatible(expected, &actual) {
+                        return Err(format!(
+                            "extern function `{name}` argument {} expects {}, got {}",
+                            idx + 1,
+                            type_name(prog, expected),
+                            type_name(prog, &actual)
+                        ));
+                    }
                 }
                 require_scalar(prog, ret, &format!("extern function `{name}` return"))?;
                 Ok(ret.clone())
@@ -544,6 +567,7 @@ fn type_name(prog: &TbProgram, ty: &IrType) -> String {
         IrType::SInt(Some(w)) => format!("sint<{w}>"),
         IrType::SInt(None) => "sint".to_string(),
         IrType::Bool => "bool".to_string(),
+        IrType::String => "String".to_string(),
         IrType::Event(_) => "event channel".to_string(),
         IrType::Record(r) => format!("record `{}`", prog.records[r.index()].name),
         IrType::RecordSeq(r) => format!("TSeq<{}>", prog.records[r.index()].name),

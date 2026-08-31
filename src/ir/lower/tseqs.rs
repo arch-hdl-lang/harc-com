@@ -50,7 +50,8 @@ use crate::ir::{
 
 use super::helpers::{ir_type_of, HelperRegistry};
 use super::{
-    not_implemented, unsupported, FuncBuilder, LowerCtx, LowerError, SideTables, V1Status,
+    not_implemented, unsupported, FuncBuilder, LowerCtx, LowerDiagnosticRecorder, LowerError,
+    SideTables, V1Status,
 };
 
 /// The element name of a `tseq`'s `-> TSeq<T>` return type when `T` is a
@@ -117,7 +118,7 @@ fn tseq_args(decl: &TseqDecl) -> Option<&[TypeArg]> {
 /// tseq name -> (element type, declared parameter NAMES, declared
 /// parameter TYPES). Named because the triple is threaded through
 /// `LowerCtx` and three lowering entry points.
-pub(crate) type TseqTable = HashMap<String, (TseqElem, Vec<String>, Vec<IrType>)>;
+pub(crate) type TseqTable = HashMap<String, (FunctionId, TseqElem, Vec<String>, Vec<IrType>)>;
 
 /// Build the `tseq name → element type` map, validating each declaration
 /// up front. A `tseq`'s element is either a declared record (`TSeq<Record>`,
@@ -133,10 +134,32 @@ pub(crate) type TseqTable = HashMap<String, (TseqElem, Vec<String>, Vec<IrType>)
 pub(crate) fn collect_tseq_records(
     file: &SourceFile,
     record_ids: &HashMap<String, RecordId>,
+    diagnostics: &LowerDiagnosticRecorder,
+    first_function: FunctionId,
 ) -> Result<TseqTable, LowerError> {
     let mut out = HashMap::new();
-    for it in &file.items {
+    let mut next_function = first_function.0;
+    for (item_index, it) in file.items.iter().enumerate() {
         let Item::Tseq(decl) = it else { continue };
+        if let Some((param, span)) = decl.params.iter().find_map(|param| {
+            super::helpers::nested_string_type_span(param.ty.as_ref()).map(|span| (param, span))
+        }) {
+            diagnostics.record(file.item_source(item_index), span);
+            return Err(unsupported(
+                &format!(
+                    "tseq `{}` parameter `{}` whose type contains `String`",
+                    decl.name.name, param.name.name
+                ),
+                "String containers and aggregates are not supported in transaction sequences",
+            ));
+        }
+        if let Some(span) = super::helpers::nested_string_type_span(decl.return_ty.as_ref()) {
+            diagnostics.record(file.item_source(item_index), span);
+            return Err(unsupported(
+                &format!("tseq `{}` return type containing `String`", decl.name.name),
+                "String sequence elements and nested String containers are not supported",
+            ));
+        }
         let elem = if let Some(scalar) = tseq_scalar_element(decl) {
             TseqElem::Scalar(scalar)
         } else if let Some(name) = tseq_element_name(decl) {
@@ -211,8 +234,13 @@ pub(crate) fn collect_tseq_records(
             .iter()
             .map(|p| super::helpers::slot_ir_type(p.ty.as_ref(), record_ids))
             .collect();
+        let function = FunctionId(next_function);
+        next_function += 1;
         if out
-            .insert(decl.name.name.clone(), (elem, param_names, param_tys))
+            .insert(
+                decl.name.name.clone(),
+                (function, elem, param_names, param_tys),
+            )
             .is_some()
         {
             return Err(LowerError::Invalid(format!(
@@ -237,15 +265,42 @@ pub(crate) fn lower_tseq<'a>(
     side_tables: &'a RefCell<SideTables>,
 ) -> Result<TbFunction, LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
+    let (_, _, _, param_tys) = ctx.tseqs.get(&decl.name.name).ok_or_else(|| {
+        LowerError::Invalid(format!(
+            "tseq `{}` is missing from the collected signature table",
+            decl.name.name
+        ))
+    })?;
+    if param_tys.len() != decl.params.len() {
+        return Err(LowerError::Invalid(format!(
+            "tseq `{}` has {} declared parameters but {} collected parameter types",
+            decl.name.name,
+            decl.params.len(),
+            param_tys.len()
+        )));
+    }
     // Params first, so locals 0..nparams mirror them.
     let mut params = Vec::with_capacity(decl.params.len());
-    for p in &decl.params {
-        let ty = ir_type_of(p.ty.as_ref());
+    for (p, ty) in decl.params.iter().zip(param_tys) {
+        if super::helpers::is_string_tseq_type(p.ty.as_ref()) {
+            b.record_error_span(p.span);
+            return Err(LowerError::Invalid(format!(
+                "tseq `{}` parameter `{}` cannot use `TSeq<String>`; String sequences are not supported",
+                decl.name.name, p.name.name
+            )));
+        }
+        if matches!(ty, IrType::String) {
+            b.record_error_span(p.span);
+            return Err(LowerError::Invalid(format!(
+                "tseq `{}` parameter `{}` cannot use `String`; TSeq callables support numeric, boolean, record, and sequence parameters",
+                decl.name.name, p.name.name
+            )));
+        }
         let local = b.declare(&p.name.name);
         b.set_local_type(local, ty.clone());
         params.push(TypedParam {
             name: p.name.name.clone(),
-            ty,
+            ty: ty.clone(),
         });
     }
     // The sequence accumulator — the function's return value. Marked

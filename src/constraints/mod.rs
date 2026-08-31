@@ -23,8 +23,17 @@ pub struct ConstraintElaboration {
     pub structs: Vec<TxnSchema>,
     pub transactions: Vec<TxnSchema>,
     pub relations: Vec<RelationSchema>,
-    pub consts: BTreeMap<String, String>,
+    pub consts: BTreeMap<String, IntegerConstSchema>,
     pub errors: Vec<ElaborationError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegerConstSchema {
+    pub value: u64,
+    pub literal: String,
+    pub width: Option<u32>,
+    pub signedness: Signedness,
+    pub is_bool: bool,
 }
 
 impl ConstraintElaboration {
@@ -388,12 +397,84 @@ pub fn elaborate_constraints(file: &SourceFile) -> ConstraintElaboration {
     }
 }
 
-fn collect_integer_consts(file: &SourceFile) -> BTreeMap<String, String> {
+fn collect_integer_consts(file: &SourceFile) -> BTreeMap<String, IntegerConstSchema> {
     let mut consts = BTreeMap::new();
+    let mut values = std::collections::HashMap::new();
     for item in &file.items {
-        let Item::Const(c) = item else { continue };
-        if let ExprKind::Int(text) = &*c.value.kind {
-            consts.insert(c.name.name.clone(), text.clone());
+        match item {
+            Item::Const(c) => {
+                let Ok(value) = crate::ir::lower::fold_const(&c.value, &values, &c.name.name)
+                    .and_then(|value| {
+                        crate::ir::lower::check_const_decl_type(c.ty.as_ref(), value)
+                            .map_err(crate::ir::lower::ConstFoldErr::Invalid)
+                    })
+                else {
+                    continue;
+                };
+                let declared_width = |args: &[TypeArg], fallback| {
+                    args.first()
+                        .and_then(|arg| match arg {
+                            TypeArg::Expr(expr) => match &*expr.kind {
+                                ExprKind::Int(text) => text.replace('_', "").parse::<u32>().ok(),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .or(fallback)
+                };
+                let (width, signedness, is_bool) = match c.ty.as_ref() {
+                    Some(TypeExpr::Builtin { name, args, .. }) => match name {
+                        BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => {
+                            (declared_width(args, Some(64)), Signedness::Unsigned, false)
+                        }
+                        BuiltinTy::SInt | BuiltinTy::SIntCap => {
+                            (declared_width(args, Some(64)), Signedness::Signed, false)
+                        }
+                        BuiltinTy::Bool | BuiltinTy::BoolLower => {
+                            (Some(1), Signedness::NotNumeric, true)
+                        }
+                        BuiltinTy::Bit => (Some(1), Signedness::Unsigned, false),
+                        BuiltinTy::Int => (Some(32), Signedness::Signed, false),
+                        _ => (None, Signedness::Unknown, false),
+                    },
+                    None => (
+                        None,
+                        if value.signed {
+                            Signedness::Signed
+                        } else {
+                            Signedness::Unsigned
+                        },
+                        false,
+                    ),
+                    _ => (None, Signedness::Unknown, false),
+                };
+                let literal = if is_bool {
+                    if value.bits == 0 { "0" } else { "1" }.to_string()
+                } else if value.signed {
+                    (value.bits as i64).to_string()
+                } else {
+                    value.bits.to_string()
+                };
+                consts.insert(
+                    c.name.name.clone(),
+                    IntegerConstSchema {
+                        value: value.bits,
+                        literal,
+                        width,
+                        signedness,
+                        is_bool,
+                    },
+                );
+                values.insert(c.name.name.clone(), value);
+            }
+            Item::Enum(e) => {
+                for (index, variant) in e.variants.iter().enumerate() {
+                    values
+                        .entry(variant.name.clone())
+                        .or_insert_with(|| crate::ir::lower::ConstVal::enum_variant(index as u64));
+                }
+            }
+            _ => {}
         }
     }
     consts
@@ -927,7 +1008,7 @@ fn validate_constraint_refs(
     transactions: &mut [TxnSchema],
     relations: &mut [RelationSchema],
     enum_variants: &BTreeMap<String, EnumVariantSchema>,
-    consts: &BTreeMap<String, String>,
+    consts: &BTreeMap<String, IntegerConstSchema>,
     errors: &mut Vec<ElaborationError>,
 ) {
     let record_index: BTreeMap<String, TxnSchema> = structs
@@ -1011,7 +1092,7 @@ struct RefValidationCtx<'a> {
     records: &'a BTreeMap<String, TxnSchema>,
     relation_names: &'a [String],
     enum_variants: &'a BTreeMap<String, EnumVariantSchema>,
-    consts: &'a BTreeMap<String, String>,
+    consts: &'a BTreeMap<String, IntegerConstSchema>,
 }
 
 fn validate_clause_refs(

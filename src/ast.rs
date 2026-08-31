@@ -6,6 +6,35 @@
 //! scoreboard, test/scope, covergroup, properties, and common statements.
 
 use crate::lexer::Span;
+use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SourceId(pub u32);
+
+impl SourceId {
+    pub fn is_known(self) -> bool {
+        self != Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SourceSite {
+    pub source_id: SourceId,
+    pub span: Span,
+}
+
+impl SourceSite {
+    pub fn new(source_id: SourceId, span: Span) -> Self {
+        Self { source_id, span }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceInfo {
+    pub id: SourceId,
+    pub name: Arc<str>,
+    pub text: Arc<str>,
+}
 
 // ── Identifiers ───────────────────────────────────────────────────────────────
 
@@ -27,6 +56,10 @@ pub struct Path {
 #[derive(Debug, Clone)]
 pub struct SourceFile {
     pub items: Vec<Item>,
+    /// Source identity for each top-level item, parallel to `items`.
+    pub item_sources: Vec<SourceId>,
+    /// Source texts retained for diagnostics after cross-file merging.
+    pub sources: Vec<SourceInfo>,
     /// Raw text of the leading `//!` block (prefixes stripped, lines
     /// joined by `\n`). Captures both free-form inner-doc prose AND a
     /// `---`-fenced YAML frontmatter block verbatim. None when the
@@ -46,6 +79,19 @@ pub struct SourceFile {
     /// markdown spec, with optional `#anchor`), `tags` (list of
     /// retrieval tags), `refs` (list of citations / ticket IDs / URLs).
     pub frontmatter: Option<String>,
+}
+
+impl SourceFile {
+    pub fn source_for_id(&self, id: SourceId) -> Option<&SourceInfo> {
+        self.sources.iter().find(|source| source.id == id)
+    }
+
+    pub fn item_source(&self, index: usize) -> SourceId {
+        self.item_sources
+            .get(index)
+            .copied()
+            .expect("every source item must retain its source identity")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -675,6 +721,8 @@ pub struct TestDecl {
     pub name: Ident,
     pub params: Vec<Param>,
     pub items: Vec<TestItem>,
+    /// Source identity for each test item, parallel to `items`.
+    pub item_sources: Vec<SourceId>,
     pub span: Span,
     pub doc: Option<String>,
     pub inner_doc: Option<String>,
@@ -690,6 +738,15 @@ pub struct TestDecl {
     /// the `for_testbench` discriminator gates the bare-name
     /// substitution + per-test Tb instance.
     pub for_testbench: Option<Ident>,
+}
+
+impl TestDecl {
+    pub fn item_source(&self, index: usize) -> SourceId {
+        self.item_sources
+            .get(index)
+            .copied()
+            .expect("every test item must retain its source identity")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1331,7 +1388,50 @@ pub enum SystemFn {
 #[derive(Debug, Clone)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
+    meta: Box<BlockMeta>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockMeta {
     pub span: Span,
+    /// Source identity for each statement, parallel to `Block::stmts`.
+    pub stmt_sources: Vec<SourceId>,
+}
+
+impl Block {
+    pub fn new(stmts: Vec<Stmt>, span: Span, source_id: SourceId) -> Self {
+        let stmt_sources = vec![source_id; stmts.len()];
+        Self::with_sources(stmts, stmt_sources, span)
+    }
+
+    pub fn with_sources(stmts: Vec<Stmt>, stmt_sources: Vec<SourceId>, span: Span) -> Self {
+        assert_eq!(stmts.len(), stmt_sources.len());
+        Self {
+            stmts,
+            meta: Box::new(BlockMeta { span, stmt_sources }),
+        }
+    }
+
+    pub fn stmt_source(&self, index: usize) -> SourceId {
+        self.stmt_sources
+            .get(index)
+            .copied()
+            .expect("every statement must retain its source identity")
+    }
+}
+
+impl std::ops::Deref for Block {
+    type Target = BlockMeta;
+
+    fn deref(&self) -> &Self::Target {
+        &self.meta
+    }
+}
+
+impl std::ops::DerefMut for Block {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.meta
+    }
 }
 
 #[derive(Debug, Clone)]

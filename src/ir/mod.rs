@@ -10,7 +10,9 @@
 pub mod display;
 pub mod lower;
 pub mod passes;
+pub(crate) mod scalar;
 pub mod verify;
+pub mod visit;
 
 macro_rules! ir_id {
     ($(#[$doc:meta])* $name:ident) => {
@@ -47,12 +49,30 @@ ir_id!(
     TestbenchId
 );
 ir_id!(
+    /// Index into `TbProgram::tests`.
+    TestId
+);
+ir_id!(
+    /// Index into `TbProgram::testbench_types`.
+    TestbenchTypeId
+);
+ir_id!(
+    /// Source-order identity of a method within one reusable testbench type.
+    TestbenchMethodId
+);
+ir_id!(
     /// Index into `TbProgram::records`.
     RecordId
 );
 ir_id!(
     /// Index into `TbProgram::transactors`.
     TransactorId
+);
+ir_id!(
+    /// Canonical callable identity within one transactor declaration.
+    ///
+    /// Ordinary methods precede target responder methods in schema order.
+    TransactorCallableId
 );
 ir_id!(
     /// Index into `TbProgram::scoreboards`.
@@ -65,6 +85,21 @@ ir_id!(
 ir_id!(
     /// Index into `TbProgram::components`.
     ComponentId
+);
+ir_id!(
+    /// Canonical callable identity within one component declaration.
+    ///
+    /// Methods come first, followed by event, periodic, cycle-trigger, and
+    /// watchdog handlers in their schema order.
+    ComponentCallableId
+);
+ir_id!(
+    /// Index into `TbProgram::probes`.
+    ProbeId
+);
+ir_id!(
+    /// Stable identity of a concrete bus binding within a testbench schema.
+    BusBindingId
 );
 ir_id!(
     /// Index into `TbProgram::property_checks` — one registered
@@ -117,8 +152,15 @@ impl TseqElem {
 #[derive(Debug, Clone, Default)]
 pub struct TbProgram {
     pub functions: Vec<TbFunction>,
+    /// Canonical reusable testbench declarations. Multiple `impl` tests may
+    /// point at one type while each keeps its own per-run `TestbenchSchema`.
+    pub testbench_types: Vec<TestbenchTypeSchema>,
     pub testbenches: Vec<TestbenchSchema>,
     pub tests: Vec<TestSchema>,
+    /// Canonical suite-wide DUT probe catalog. Every probe-bearing
+    /// `PortRef` carries a stable `ProbeId` into this table so verification
+    /// and emission never have to infer probe identity from a string path.
+    pub probes: Vec<ProbeSchema>,
     pub covgroups: Vec<CovgroupSchema>,
     /// Value-record schemas (`transaction` declarations), in file
     /// order. The design doc's records table; see `RecordSchema`.
@@ -156,6 +198,52 @@ pub struct TbProgram {
     pub cycle_handlers: Vec<CycleHandlerSchema>,
 }
 
+/// Source-level scalar spelling retained for DUT probes. `bits<N>` and
+/// `uint<N>` share the same host arithmetic type, while remaining distinct in
+/// this schema so catalog conflicts and emitted SystemVerilog preserve the
+/// declaration exactly. `bit` and `bool` likewise share `IrType::Bool` but
+/// remain distinct catalog entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProbeScalarType {
+    Bit,
+    Bool,
+    UInt(u32),
+    SInt(u32),
+    Bits(u32),
+}
+
+impl ProbeScalarType {
+    pub fn width(self) -> u32 {
+        match self {
+            Self::Bit | Self::Bool => 1,
+            Self::UInt(width) | Self::SInt(width) | Self::Bits(width) => width,
+        }
+    }
+
+    pub fn ir_type(self) -> IrType {
+        match self {
+            Self::Bit | Self::Bool => IrType::Bool,
+            Self::UInt(width) | Self::Bits(width) => IrType::UInt(Some(width)),
+            Self::SInt(width) => IrType::SInt(Some(width)),
+        }
+    }
+}
+
+/// One validated DUT-internal probe in the merged suite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeSchema {
+    pub id: ProbeId,
+    pub dut_type: String,
+    pub name: String,
+    pub sv_path: String,
+    pub ty: ProbeScalarType,
+    pub force: bool,
+    /// True when every test declares this exact probe contract. Shared
+    /// component/transactor functions have no single testbench owner and may
+    /// reference only probes with this bit set.
+    pub shared: bool,
+}
+
 /// One statement-position `on` handler (spec §7.10 / §7.x cycle
 /// triggers) written inside a run or check body, as opposed to the
 /// testbench-declaration-scoped forms in `TestbenchSchema::
@@ -173,6 +261,7 @@ pub struct TbProgram {
 /// without capturing anything that dies with the enclosing block.
 #[derive(Debug, Clone)]
 pub struct CycleHandlerSchema {
+    pub site: TestHookSiteId,
     pub kind: CycleHandlerKind,
     /// Lowered handler body (`kind: TestHook`, zero params).
     pub function: FunctionId,
@@ -237,7 +326,7 @@ pub enum PropertyShape {
 }
 
 /// One `past(e)` / `rose(e)` / `fell(e)` / `stable(e)` latch inside a
-/// concurrent check body. The backend gives each slot a `static`
+/// concurrent check body. The backend gives each slot a per-run
 /// previous-value cell plus a per-call current-value local; references
 /// to the slot inside the body are `Expr::TemporalSlot`, so the tree is
 /// self-contained (v1 threads the same information through a span-keyed
@@ -269,7 +358,7 @@ pub enum TemporalFn {
 /// cycles from that point on) and evaluated once per primary-clock edge.
 #[derive(Debug, Clone)]
 pub struct PropertyCheckSchema {
-    /// Unique C++ identifier stem for this check's `static` state,
+    /// Unique C++ identifier stem for this check's per-run state,
     /// derived from the source span (v1's `_p_<start>_<end>`).
     pub tag: String,
     /// Human-readable name in the failure line — the property name for
@@ -316,8 +405,8 @@ pub struct CoverCheckSchema {
 ///
 /// This is the data a `Terminator::Randomize`'s `ConstraintRef` resolves
 /// to. The design pins `ConstraintRef` as "a handle into the constraint
-/// IR, not a copy"; `problem_id` IS that handle (an index into the
-/// `build_typed_solver_problem_table` problem table). The remaining
+/// IR, not a copy"; `problem_id` is the stable runtime identity of that
+/// problem. The remaining
 /// fields are the *emission inputs* v1's constraint-solver codegen
 /// already consumes (`emit_constraint_solver_block`): the source
 /// `target` expression, the combined constraint set (transaction-level
@@ -334,9 +423,12 @@ pub struct CoverCheckSchema {
 pub struct ConstraintSite {
     /// Record type name (`transaction`/`struct`) of the target local.
     pub record: String,
-    /// Source `randomize(t)` target expression — the join key v1 uses
-    /// for the per-site solver cache tag and the problem-table lookup.
+    /// Source `randomize(t)` target expression. Together with `source_id`,
+    /// this is the join key for the solver cache and problem-table lookup.
     pub target: crate::ast::Expr,
+    /// Source file that owns the randomize site. Span offsets are only
+    /// meaningful within this source.
+    pub source_id: crate::ast::SourceId,
     /// Combined constraint set: transaction `keep`s first, then the
     /// call-site `with {...}` body (v1's merge order). Empty for a bare
     /// `randomize(t)` of a keep-free transaction (the unconstrained
@@ -345,11 +437,11 @@ pub struct ConstraintSite {
     /// `randomize(t)` (false) vs blocking `randomize(t) with ...` (the
     /// AST `blocking` flag) — selects v1's queued vs blocking solve shell.
     pub blocking: bool,
-    /// Problem-table handle (`ConstraintProblemId.0`) when the typed
+    /// Stable problem-table identity (`ConstraintProblemId.0`) when the typed
     /// constraint IR built a Z3-ready problem for this site; `None` when
     /// the site has no solver problem (lower/backend error — v1 then
     /// emits the nullptr-descriptor fallback, mirrored here).
-    pub problem_id: Option<u32>,
+    pub problem_id: Option<u64>,
 }
 
 /// One `regblock` declaration, lowered to its register-level subset
@@ -516,9 +608,13 @@ pub struct TargetTlmMethodSchema {
     /// Declared argument names (one per thread parameter), in order —
     /// the request-payload wire bases (`<bus>_<method>_<arg>`).
     pub args: Vec<String>,
+    /// Exact lowered parameter types, paired with `args`.
+    pub param_tys: Vec<IrType>,
     /// True for value-returning methods (`-> T`): the responder drives
     /// a `<bus>_<method>_rsp_data` wire after the body returns.
     pub has_ret: bool,
+    /// Exact lowered return type when `has_ret` is true.
+    pub ret_ty: Option<IrType>,
     /// `None` for a `blocking` `tlm_method` (single in-order responder
     /// coroutine, issue-order `req_tag`/`rsp_tag` unused). `Some(N)` for
     /// an `out_of_order tags N` method: emission generates the multi-lane
@@ -595,6 +691,14 @@ impl TransactorSchema {
 
     pub fn method(&self, name: &str) -> Option<&TransactorMethodSchema> {
         self.methods.iter().find(|m| m.name == name)
+    }
+
+    pub fn requires_runtime_receiver(&self) -> bool {
+        !self.state_fields.is_empty()
+            || self
+                .methods
+                .iter()
+                .any(|method| method.hookable || !method.cov_hook_subs.is_empty())
     }
 }
 
@@ -842,7 +946,7 @@ pub struct ComponentSchema {
     /// observer half of an agent-mode transactor). Each fires its body
     /// once per primary-clock cycle that the trigger predicate satisfies
     /// the requested edge mode (rising/falling/level), dispatched from a
-    /// selected cycle-service closure with per-instance static prev-state. The body
+    /// selected cycle-service closure with per-instance previous-state. The body
     /// is lowered as a zero-arg `ComponentMethod` function (`self` only);
     /// bare field reads resolve self-relatively, `dut.<sig>` reads resolve
     /// to the DUT handle, and `sb.<f>` writes resolve to the sub-scoreboard.
@@ -859,19 +963,17 @@ pub struct ComponentSchema {
     pub watchdog: Option<WatchdogSchema>,
     /// `transactor X bound to <Bus>` — the bus this event-driven
     /// transactor's `on <ev>` handler bodies drive (via `bus.<ch>.send/
-    /// recv`/`<ch>.<sig>` handshake accesses, CFG-inlined exactly like the
-    /// bound-initiator BFM). `None` for env/scoreboard/agent/sequencer and
-    /// for an UNBOUND event-driven transactor (which pokes a private DUT
-    /// handle instead). When `Some`, the handler bodies carry the
-    /// placeholder bus prefix (`transactors::INITIATOR_BUS_PLACEHOLDER`),
-    /// filled with the real binding name at test-binding time.
+    /// recv`/`<ch>.<sig>` handshake accesses). `None` for
+    /// env/scoreboard/agent/sequencer and for an unbound event-driven
+    /// transactor. When present, handler ports retain `BoundBus` provenance
+    /// and are resolved through an explicit per-instance adapter.
     pub bound_bus: Option<String>,
 }
 
 /// The source-level ownership mode of a component-path transactor binding.
 /// Structural components may carry this only as inherited context for a nested
 /// transactor; they never gain an active surface themselves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ComponentInstanceMode {
     Active,
     Passive,
@@ -901,8 +1003,17 @@ pub fn component_mode_includes_activation(
     matches!(activation, Activation::Always) || mode.is_some_and(|mode| mode.includes(activation))
 }
 
+pub fn component_connect_modes_enabled(
+    source_mode: Option<ComponentInstanceMode>,
+    sink_mode: Option<ComponentInstanceMode>,
+    edge: &ConnectEdgeSchema,
+) -> bool {
+    component_mode_includes_activation(source_mode, edge.src_activation)
+        && component_mode_includes_activation(sink_mode, edge.sink_activation)
+}
+
 /// Whether a component member came from the ordinary body or `when active`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Activation {
     Always,
     ActiveOnly,
@@ -959,10 +1070,9 @@ pub struct CycleTriggerHandlerSchema {
     /// the handler's `arg` local (+ per-field aliases) so `arg`/`arg.<f>`
     /// reads resolve, then runs the user body (`sb.<q>.push(arg.<f>)`).
     /// `None` for an agent-mode `on <bool-expr>` cycle-trigger (which reads
-    /// `dut.<sig>` directly). The placeholder bus prefix in the trigger +
-    /// body is filled with the real binding name at test-binding time, like
-    /// the bound-bus driver. Always-on: present on BOTH active and passive
-    /// instances (the observation half, unaffected by `when active` mode).
+    /// `dut.<sig>` directly). The trigger and body retain `BoundBus`
+    /// provenance and are resolved through the instance adapter. Always-on:
+    /// present on both active and passive instances.
     ///
     /// Sampling cadence differs from the plain `edge` modes: v1 lowers a
     /// bound monitor as a `wait_until(valid && ready)` + `wait_cycles(1)`
@@ -1300,6 +1410,54 @@ pub fn validate_component_binding_modes(
     Ok(())
 }
 
+/// Return the first constructor-time facility that prevents a component tree
+/// from being represented as a function-local value. TB-IR can reset plain
+/// state and dispatch methods on such a local, but runtime registrations and
+/// DUT/bus bindings require testbench-owned lifetime and setup.
+pub(crate) fn component_local_runtime_requirement(
+    components: &[ComponentSchema],
+    component: ComponentId,
+) -> Option<String> {
+    fn visit(
+        components: &[ComponentSchema],
+        component: ComponentId,
+        visiting: &mut std::collections::HashSet<ComponentId>,
+    ) -> Option<String> {
+        if !visiting.insert(component) {
+            return None;
+        }
+        let schema = components.get(component.index())?;
+        let reason = if schema.bound_bus.is_some() {
+            Some(format!("bound-bus setup on `{}`", schema.name))
+        } else if !schema.connects.is_empty() {
+            Some(format!("connect registration on `{}`", schema.name))
+        } else if !schema.on_handlers.is_empty() {
+            Some(format!("event-handler registration on `{}`", schema.name))
+        } else if !schema.periodic_handlers.is_empty()
+            || !schema.cycle_handlers.is_empty()
+            || schema.watchdog.is_some()
+        {
+            Some(format!("lifecycle registration on `{}`", schema.name))
+        } else if schema
+            .fields
+            .iter()
+            .any(|field| matches!(field.kind, ComponentFieldKind::Dut { .. }))
+        {
+            Some(format!("a DUT binding on `{}`", schema.name))
+        } else {
+            schema.fields.iter().find_map(|field| match field.kind {
+                ComponentFieldKind::Sub {
+                    component: child, ..
+                } => visit(components, child, visiting),
+                _ => None,
+            })
+        };
+        visiting.remove(&component);
+        reason
+    }
+    visit(components, component, &mut std::collections::HashSet::new())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentKindTag {
     Env,
@@ -1570,6 +1728,7 @@ pub enum ConnectSink {
 /// One `test` (or `impl <Test> for <Tb>`) declaration.
 #[derive(Debug, Clone)]
 pub struct TestSchema {
+    pub id: TestId,
     pub name: String,
     pub testbench: TestbenchId,
     pub run: FunctionId,
@@ -1606,12 +1765,18 @@ pub struct ClockSpec {
 /// testbench` always resolves.
 #[derive(Debug, Clone)]
 pub struct TestbenchSchema {
+    /// Canonical source testbench type shared by every `impl` of that type.
+    pub type_id: TestbenchTypeId,
     pub name: String,
     /// Test-scope field holding the DUT pointer — `"dut"` today.
     pub dut_field: String,
     /// Resolved DUT type name (string; HARC does not port-type, the
     /// DUT schema lives with the backend).
     pub dut_type: String,
+    /// Probe capabilities declared by this testbench instance. These are
+    /// stable ids into `TbProgram::probes`; the verifier uses the list to
+    /// reject cross-test capability leaks after lowering passes mutate IR.
+    pub probes: Vec<ProbeId>,
     /// Covergroup-typed testbench fields (field name, covgroup).
     pub cov_fields: Vec<(String, CovgroupId)>,
     /// Scalar (integer/bool) testbench fields, in declaration order.
@@ -1637,24 +1802,23 @@ pub struct TestbenchSchema {
     /// owning function.
     pub record_fields: Vec<(String, RecordId)>,
     /// Test-scope bus bindings (`let <field> : <Bus> = bind dut`), in
-    /// declaration order. Carried on the schema (like `cov_fields`)
-    /// because `CallTarget::TransactorMethod { bus_field, .. }` call
-    /// edges are deliberately NOT inlined at the IR level — emission
-    /// resolves the edge against this table to learn the method's wire
-    /// names. The design doc's skeleton hangs bus metadata off a
-    /// `BusId` table; v0 inlines the (small) per-binding method list
-    /// here instead since bindings are per-test, not global.
+    /// declaration order. Direct bus operations retain a typed binding id;
+    /// emission resolves that id against this per-test adapter table.
     pub bus_bindings: Vec<BusBindingSchema>,
+    /// Typed association between a bound component/transactor instance and
+    /// the concrete bus binding it uses in this testbench. Shared callable
+    /// bodies retain `PortOrigin::BoundBus`; renderers resolve that origin
+    /// only through this table.
+    pub bound_bus_instances: Vec<BoundBusInstanceSchema>,
     /// Transactor-typed testbench fields (field name, transactor), in
     /// declaration order.
     pub transactor_fields: Vec<(String, TransactorId)>,
     /// The subset of `transactor_fields` declared `passive`. A passive
     /// instance exposes only its passive surface — persistent state
     /// fields (and any always-on `on` handlers) — never its `when active`
-    /// methods, so the type-shared method bodies are NOT filled with a
-    /// passive instance name. Codegen consults this so a transactor type
-    /// with ONLY passive instances emits no (unfilled, uncallable) method
-    /// lambdas (#494 P0a/P1b). Keyed by field name.
+    /// methods. Codegen consults this so a transactor type with only passive
+    /// instances emits no unreachable active-method slots. Keyed by field
+    /// name.
     pub passive_transactor_fields: std::collections::HashSet<String>,
     /// Scoreboard-typed testbench fields (field name, scoreboard), in
     /// declaration order. Each lowers to a default-constructed member of
@@ -1711,6 +1875,67 @@ pub struct TestbenchSchema {
     /// the body when the predicate satisfies the requested edge mode. Empty
     /// for a testbench without cycle-trigger handlers.
     pub cycle_services: Vec<TbCycleServiceSchema>,
+}
+
+impl TestbenchSchema {
+    pub fn bus_binding(&self, id: BusBindingId) -> Option<&BusBindingSchema> {
+        self.bus_bindings
+            .get(id.index())
+            .filter(|binding| binding.id == id)
+    }
+
+    pub fn bound_bus_binding(
+        &self,
+        owner: BoundBusOwner,
+    ) -> Result<Option<&BusBindingSchema>, String> {
+        let matches = self
+            .bound_bus_instances
+            .iter()
+            .filter(|entry| entry.owner == owner)
+            .collect::<Vec<_>>();
+        let Some(first) = matches.first() else {
+            return Ok(None);
+        };
+        if matches.iter().any(|entry| entry.binding != first.binding) {
+            return Err(format!(
+                "bound callable owner {owner:?} has multiple concrete bus bindings"
+            ));
+        }
+        self.bus_binding(first.binding).map(Some).ok_or_else(|| {
+            format!(
+                "bound callable owner {owner:?} references missing binding bb{}",
+                first.binding.0
+            )
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TestbenchTypeSchema {
+    pub name: String,
+    pub methods: Vec<TestbenchMethodSchema>,
+    /// Component-valued fields declared on this reusable testbench type.
+    /// Per-test `let` component instances are not part of this receiver ABI.
+    pub component_fields: Vec<(String, ComponentId)>,
+}
+
+impl TestbenchTypeSchema {
+    pub fn method(&self, name: &str) -> Option<&TestbenchMethodSchema> {
+        self.methods.iter().find(|method| method.name == name)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TestbenchMethodSchema {
+    pub name: String,
+    pub function: FunctionId,
+    pub param_names: Vec<String>,
+    pub param_tys: Vec<IrType>,
+    /// A module-typed parameter is carried as the current test's DUT handle.
+    /// Value parameters have `None` in the corresponding slot.
+    pub module_param_types: Vec<Option<String>>,
+    pub ret_ty: Option<IrType>,
+    pub hookable: bool,
 }
 
 /// One testbench-scoped `on <N> cycles ... end on` periodic handler
@@ -1774,6 +1999,19 @@ pub struct ComponentFieldBinding {
     /// effective mode; on a structural root it is inheritance context for
     /// nested transactors.
     pub mode: Option<ComponentInstanceMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum BoundBusOwner {
+    Transactor(TransactorId),
+    Component(ComponentId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundBusInstanceSchema {
+    pub field: String,
+    pub owner: BoundBusOwner,
+    pub binding: BusBindingId,
 }
 
 /// One bound-to target-side TLM responder instance (`let target :
@@ -1896,8 +2134,10 @@ pub enum StateFieldKind {
 /// The binding name doubles as the flat signal prefix on the DUT
 /// (`axil` → `axil_aw_valid`, `axil_read_req_valid`, ...), mirroring
 /// arch-com §19.6 / v1's `bus_bindings` convention.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BusBindingSchema {
+    /// Stable index within the owning testbench's `bus_bindings` table.
+    pub id: BusBindingId,
     /// Binding field name == flat DUT signal prefix.
     pub field: String,
     /// Bus type name (diagnostics + trace events).
@@ -1932,33 +2172,159 @@ impl BusBindingSchema {
 /// One `tlm_method` on a bound bus — the call-edge metadata emission
 /// needs to expand a `CallTarget::TransactorMethod` into the canonical
 /// ARCH-compatible req/rsp wire protocol.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlmMethodSchema {
     pub name: String,
     /// Declared argument names, in order. Each maps to the request
     /// payload wire `<binding>_<method>_<arg>`.
     pub args: Vec<String>,
+    /// Exact declared request argument types, parallel to `args`.
+    pub arg_types: Vec<IrType>,
     /// True when the method declares a return type — the response
     /// carries a `<binding>_<method>_rsp_data` wire.
     pub has_ret: bool,
+    /// Exact declared response payload type when present.
+    pub ret_type: Option<IrType>,
+    /// Declared request concurrency contract.
+    pub mode: TlmMethodMode,
 }
 
-/// Function kinds. `Run`/`Check` are test phases; `SamplerAuto` is the
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TlmMethodMode {
+    Blocking,
+    OutOfOrder { tags: u64 },
+}
+
+/// Stable phase identity within one test declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TestCallableMember {
+    Run,
+    Check,
+}
+
+impl TestCallableMember {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Check => "check",
+        }
+    }
+}
+
+/// Stable owner of one statement-position callback registration.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TestHookSiteOwner {
+    pub test: String,
+    pub member: TestCallableMember,
+}
+
+/// Owner-scoped callback-site identity. The ordinal is local to one named
+/// run/check body, so unrelated tests cannot renumber this site.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TestHookSiteId {
+    pub owner: TestHookSiteOwner,
+    pub ordinal: u32,
+}
+
+impl TestHookSiteId {
+    pub fn index(&self) -> usize {
+        self.ordinal as usize
+    }
+
+    pub fn symbol(&self) -> String {
+        format!("{}_hs{}", self.owner.member.symbol(), self.ordinal)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TestHookMember {
+    EventSubscription(TestHookSiteId),
+    MethodSubscription(TestHookSiteId),
+    StatementCycle(TestHookSiteId),
+    RegblockWrite { binding: String, register: String },
+    TestbenchPeriodic { service: u32 },
+    TestbenchCycle { service: u32 },
+    Pending,
+}
+
+impl TestHookMember {
+    pub fn symbol(&self) -> String {
+        match self {
+            Self::EventSubscription(site) => format!("event_{}", site.symbol()),
+            Self::MethodSubscription(site) => format!("method_{}", site.symbol()),
+            Self::StatementCycle(site) => format!("cycle_{}", site.symbol()),
+            Self::RegblockWrite { binding, register } => format!(
+                "regblock_b{}_{binding}_r{}_{register}",
+                binding.len(),
+                register.len()
+            ),
+            Self::TestbenchPeriodic { service } => format!("tb_periodic_{service}"),
+            Self::TestbenchCycle { service } => format!("tb_cycle_{service}"),
+            Self::Pending => "pending".to_string(),
+        }
+    }
+
+    /// Deterministic source-member spelling used to bind a callback body to
+    /// its registration site independently of its `FunctionId` allocation.
+    pub fn function_name(&self, test_name: &str) -> String {
+        match self {
+            Self::EventSubscription(site) => {
+                format!("{}_on_event_{}", site.owner.test, site.symbol())
+            }
+            Self::MethodSubscription(site) => {
+                format!("{}_on_method_hook_{}", site.owner.test, site.symbol())
+            }
+            Self::StatementCycle(site) => {
+                format!("{}_on_handler_{}", site.owner.test, site.symbol())
+            }
+            Self::RegblockWrite { binding, register } => {
+                format!(
+                    "{test_name}_regblock_b{}_{binding}_r{}_{register}_cb",
+                    binding.len(),
+                    register.len()
+                )
+            }
+            Self::TestbenchPeriodic { service } => {
+                format!("{test_name}_tb_periodic_{service}")
+            }
+            Self::TestbenchCycle { service } => format!("{test_name}_tb_cycle_{service}"),
+            Self::Pending => "_pending_test_hook".to_string(),
+        }
+    }
+}
+
+/// Function kinds. `TestBody` owns run/check phases; `SamplerAuto` is the
 /// synthesized covergroup auto-sampler; `Helper` is a free function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FunctionKind {
-    Run,
-    Check,
+    /// One test-owned phase body. The typed test and member identity prevents
+    /// a same-ABI run/check body from being rebound to another test schema.
+    TestBody {
+        test: TestId,
+        member: TestCallableMember,
+        name: String,
+    },
     SamplerAuto {
         covgroup: CovgroupId,
     },
     Helper,
+    /// One method declared on a reusable testbench type. Calls carry the
+    /// canonical function identity and an explicit testbench receiver.
+    TestbenchMethod {
+        testbench: TestbenchTypeId,
+        method: TestbenchMethodId,
+        /// Source member name paired with `method`; verifier and placement
+        /// reject coordinated FunctionId swaps between same-ABI methods.
+        name: String,
+    },
     /// One transactor method body (design doc §"Function-kind
     /// handling": one `TbFunction` per method). `params` are the
     /// method's declared parameters; the owning transactor and the
     /// method name live in `TbProgram::transactors[transactor]`.
     TransactorBody {
         transactor: TransactorId,
+        member: TransactorCallableId,
+        name: String,
     },
     /// One composite-component method body (env/agent cluster). `params`
     /// are the method's declared parameters; bodies address fields self-
@@ -1968,6 +2334,10 @@ pub enum FunctionKind {
     /// `emit_component_method` shape).
     ComponentMethod {
         component: ComponentId,
+        member: ComponentCallableId,
+        /// Ordinary method members carry their source name. Lifecycle/event
+        /// handler members carry `None` and are identified by their typed slot.
+        method_name: Option<String>,
     },
     /// One `tseq` declaration body — a transaction-sequence generator.
     /// `elem` is the element type (`TSeq<Record>` → `TseqElem::Record`,
@@ -1992,33 +2362,15 @@ pub enum FunctionKind {
     /// dispatch). This is the host-state-promotion mechanism that lets
     /// the function-per-CFG IR express v1's reference-capturing hook
     /// closures.
-    TestHook,
+    TestHook {
+        member: TestHookMember,
+    },
     /// A reusable testbench lifecycle phase body — `setup`/`check`/
-    /// `teardown` declared on a bound `testbench`. Owned by the
-    /// testbench, NOT by any one bound test: the intent (issue #619
-    /// M4a) is to lower each phase ONCE and invoke it from every owning
-    /// test via an explicit call edge, in the order of issue #619
-    /// §"Lifecycle Ordering". `testbench` indexes
-    /// `TbProgram::testbenches`.
-    ///
-    /// Not yet produced by lowering: the tbir path still reuses v1's
-    /// lifecycle-copying `desugar_impl_for_test_in_file`, which inlines
-    /// these bodies into each test's `Run`/`Check` before the IR is
-    /// built. The native lowering that constructs this variant lands in
-    /// a later M4a slice — see docs/619-m4a-ir-ownership.md. Until then
-    /// the variant is part of the IR vocabulary only; no emitter path
-    /// consumes it.
+    /// `teardown` declared on a bound `testbench`, lowered once and invoked
+    /// from each owning test through `Terminator::TbLifecycleCall`.
     TestbenchLifecycle {
         testbench: TestbenchId,
         phase: crate::ast::LifecyclePhase,
-    },
-    /// A reusable testbench helper method body, owned by the testbench
-    /// and shared across every bound test (issue #619 M4a). Same
-    /// not-yet-produced status as [`FunctionKind::TestbenchLifecycle`]:
-    /// today such a method is inlined per test by the desugaring.
-    /// `testbench` indexes `TbProgram::testbenches`.
-    TestbenchMethod {
-        testbench: TestbenchId,
     },
 }
 
@@ -2036,6 +2388,17 @@ pub struct TypedLocal {
     pub ty: IrType,
 }
 
+/// Typed provenance for a synthetic local that denotes a record-valued
+/// testbench field. The local exists for record type checking; renderers use
+/// this identity to select the explicit testbench receiver instead of
+/// inferring ownership from its spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TbRecordLocalBinding {
+    pub local: LocalId,
+    pub field: String,
+    pub record: RecordId,
+}
+
 /// IR-level value types. Widths are `Option` because HARC's v0 front
 /// end does not type-check; `Unknown` is the common case today.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2043,6 +2406,10 @@ pub enum IrType {
     UInt(Option<u32>),
     SInt(Option<u32>),
     Bool,
+    /// Immutable NUL-terminated text carried across host-side callable
+    /// boundaries. The C++ ABI is `const char*`; String is deliberately not
+    /// part of the numeric, constraint, coverage, event, or queue families.
+    String,
     /// A transaction value-record local (`let t : TxnType`).
     Record(RecordId),
     /// A transaction-sequence local: an ordered list of record values
@@ -2073,12 +2440,11 @@ pub enum IrType {
         elem: Box<IrType>,
         len: usize,
     },
-    /// A composite-component value local — a method parameter typed by a
-    /// component name (`observe(addr: uint<8>, model: ProtocolModel)`).
-    /// Taken by value as the component's C++ struct; method calls on it
-    /// (`model.predict_read(addr)`) dispatch through `ComponentBase::Local`.
-    /// Only ever a parameter local in this subset — never a `let` body
-    /// local — so it has no value-construction or randomize support.
+    /// A composite-component local — a method parameter, an explicitly typed
+    /// value copy, or a default-constructed local instance. Stored by value as
+    /// the component's C++ struct; method calls on it dispatch through
+    /// `ComponentBase::Local`. A default construction is represented by
+    /// `Stmt::ComponentInit`, which also carries its instance mode.
     Component(ComponentId),
     /// Internal carrier for a whole DUT port sampled before an impure lane
     /// selector. Codegen declares it with `auto` at the `DutRead` site so
@@ -2096,6 +2462,83 @@ pub enum IrType {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ValueAbiClass {
+    Bool,
+    Unsigned64,
+    Signed64,
+    Wide128,
+    WideWords(u32),
+    Record(RecordId),
+}
+
+/// Classifies value types by the storage carrier shared across codegen
+/// layouts. Types in the same class have the same emitted value ABI; language
+/// compatibility can then apply its directional width rules independently of
+/// backend spelling.
+pub(crate) fn value_abi_class(ty: &IrType) -> Option<ValueAbiClass> {
+    match ty {
+        IrType::Bool => Some(ValueAbiClass::Bool),
+        IrType::UInt(Some(width)) if *width > 128 => {
+            Some(ValueAbiClass::WideWords(width.div_ceil(32)))
+        }
+        IrType::SInt(Some(width)) if *width > 128 => {
+            Some(ValueAbiClass::WideWords(width.div_ceil(32)))
+        }
+        IrType::UInt(Some(width)) | IrType::SInt(Some(width)) if *width > 64 => {
+            Some(ValueAbiClass::Wide128)
+        }
+        IrType::UInt(_) => Some(ValueAbiClass::Unsigned64),
+        IrType::SInt(_) => Some(ValueAbiClass::Signed64),
+        IrType::Record(record) => Some(ValueAbiClass::Record(*record)),
+        IrType::String
+        | IrType::RecordSeq(_)
+        | IrType::Seq(_)
+        | IrType::FixedVec { .. }
+        | IrType::Component(_)
+        | IrType::PortSnapshot
+        | IrType::Event(_)
+        | IrType::Unknown => None,
+    }
+}
+
+/// Whether an element of `actual` can enter a sequence slot declared as
+/// `expected` without changing the emitted container carrier.
+pub(crate) fn sequence_element_compatible(expected: &IrType, actual: &IrType) -> bool {
+    if let (
+        IrType::FixedVec {
+            elem: expected_elem,
+            len: expected_len,
+        },
+        IrType::FixedVec {
+            elem: actual_elem,
+            len: actual_len,
+        },
+    ) = (expected, actual)
+    {
+        return expected_len == actual_len
+            && sequence_element_compatible(expected_elem, actual_elem);
+    }
+    let Some(expected_class) = value_abi_class(expected) else {
+        return false;
+    };
+    if Some(expected_class) != value_abi_class(actual) {
+        return false;
+    }
+    if expected == actual {
+        return true;
+    }
+    let widthless = |ty: &IrType| matches!(ty, IrType::UInt(None) | IrType::SInt(None));
+    if widthless(expected) || widthless(actual) {
+        return true;
+    }
+    match (expected, actual) {
+        (IrType::UInt(Some(expected)), IrType::UInt(Some(actual)))
+        | (IrType::SInt(Some(expected)), IrType::SInt(Some(actual))) => actual <= expected,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TbFunction {
     pub id: FunctionId,
@@ -2110,6 +2553,8 @@ pub struct TbFunction {
     pub blocks: Vec<BasicBlock>,
     pub entry: BlockId,
     pub owner: Option<TestbenchId>,
+    /// Record-valued testbench fields represented as typed synthetic locals.
+    pub testbench_record_locals: Vec<TbRecordLocalBinding>,
     /// Return-value slot for `kind == Helper` functions with a declared
     /// return type: `return e` lowers to `Assign(ret, e); Return`, and
     /// the backend emits `return <ret>;` at `Terminator::Return`.
@@ -2360,12 +2805,14 @@ pub enum Stmt {
     /// declared at test scope so the pushed closure outlives the block
     /// that registered it.
     EventSubscribe {
+        site: TestHookSiteId,
         event: EventChannelRef,
         handler: FunctionId,
     },
     /// Register a pre/post subscriber on a hookable method at this
     /// statement's runtime position.
     MethodHookSubscribe {
+        site: TestHookSiteId,
         target: MethodHookTarget,
         side: crate::ast::HookSide,
         handler: FunctionId,
@@ -2485,7 +2932,18 @@ pub enum Stmt {
         base: ComponentBase,
         component: ComponentId,
         method: String,
+        function: FunctionId,
         args: Vec<Expr>,
+        dest: Option<LocalId>,
+    },
+    /// Direct call to a canonical reusable testbench method. The receiver is
+    /// the owning testbench state object; `dest` receives a declared result.
+    TestbenchCall {
+        function: FunctionId,
+        args: Vec<Expr>,
+        /// Argument positions that carry the current DUT handle rather than
+        /// an ordinary value expression.
+        dut_args: Vec<usize>,
         dest: Option<LocalId>,
     },
     /// `<base>.<queue>.push(value)` on a composite-component `queue<T>`
@@ -2508,15 +2966,28 @@ pub enum Stmt {
         queue: String,
         dest: LocalId,
     },
-    /// `<dst>.<field> = <src>` — a whole composite-component value copy of
-    /// a test-scope sub-component (`checker.sb = sb` / `responder.model =
-    /// model`). `dst` resolves the receiver holding the sub-component
-    /// field; `src` resolves the source component value (another test-scope
-    /// component). Emitted as `<dst>.<field> = <src>;` — a plain C++ struct
-    /// copy (mirrors v1's `_tb.checker.sb = _tb.sb;`).
+    /// `let local : Component [mode]` — default-construct a component
+    /// instance at the declaration's execution point. `mode` is the root
+    /// active/passive context inherited by nested transactors.
+    ComponentInit {
+        local: LocalId,
+        component: ComponentId,
+        mode: Option<ComponentInstanceMode>,
+    },
+    /// `<dst>.<field> = <src>` — a whole composite-component value copy.
+    /// The destination receiver and source may be test-scope paths,
+    /// self-relative paths, or component-typed locals. Only declared user
+    /// state is copied; receiver-owned callback and lifecycle metadata stays
+    /// attached to the destination instance.
     ComponentSubAssign {
         dst: ComponentBase,
         field: String,
+        src: ComponentBase,
+    },
+    /// `<dst> = <src>` — a whole composite-component value copy where the
+    /// destination is itself a testbench-owned component binding.
+    ComponentAssign {
+        dst: ComponentBase,
         src: ComponentBase,
     },
     /// `yield t` inside a `tseq` body — append a record value onto the
@@ -2566,8 +3037,8 @@ pub enum EventChannelRef {
 /// Hookable method targeted by a statement-position subscription.
 #[derive(Debug, Clone)]
 pub enum MethodHookTarget {
-    /// A method on a direct transactor testbench field. Transactor hook
-    /// vectors are type-scoped, matching v1's `<Type>_<method>_pre/post`.
+    /// A method on a direct transactor testbench field. The field identity
+    /// selects that concrete instance's hook registry.
     Transactor {
         field: String,
         transactor: TransactorId,
@@ -2590,6 +3061,8 @@ pub enum MethodHookTarget {
 pub struct TlmForkDesc {
     /// Bus-binding field name (== flat DUT signal prefix).
     pub bus_field: String,
+    /// Typed concrete or shared-bound adapter identity.
+    pub target: TransactorMethodTarget,
     /// `tlm_method` name on the bound bus.
     pub method: String,
     /// Request payload expressions, in declared-arg order. Port-hoisted
@@ -2806,6 +3279,9 @@ pub enum Expr {
         value: u64,
         ty: IrType,
     },
+    /// A source string literal used as an ordinary host-side value. Message
+    /// literals remain represented by `FmtArgs`, preserving lazy formatting.
+    StringLiteral(String),
     /// An integer literal wider than 64 bits, as LSB-first 32-bit
     /// words (always > 2 words). General expression emission mirrors
     /// v1's `c_value_literal` (`_harc_u128` composite up to 128 bits,
@@ -2866,7 +3342,7 @@ pub enum Expr {
         slot: u32,
         kind: TemporalFn,
     },
-    /// `_tb.<field>.size()` / `_tb.<field>.empty()` on a testbench-owned
+    /// `_tb.<field>.size()` / `.empty()` / `.front()` on a testbench-owned
     /// typed FIFO. `pop()` mutates, so it lowers only as `Stmt::TbQueuePop`.
     TbQueueQuery {
         field: String,
@@ -2902,10 +3378,11 @@ pub enum Expr {
     },
     /// A value-producing read on a bound-to target transactor's
     /// persistent `queue<T>` state field: `pending.size()` /
-    /// `pending.empty()`. Host state — allowed wherever a `Local` is.
+    /// `pending.empty()` / `pending.front()`. Host state — allowed wherever
+    /// a `Local` is.
     /// `.pop()` is NOT here (it mutates) — it lowers to
     /// `Stmt::TransactorStateQueuePop`. Mirrors `ScoreboardQuery` /
-    /// `ComponentQueueQuery` (`query` carries `QueueSize`/`QueueEmpty`).
+    /// `ComponentQueueQuery` (`query` carries the typed queue read).
     /// `instance` names the bound testbench-field instance (placeholder
     /// in a method body, filled at test-binding).
     TransactorStateQueueQuery {
@@ -2915,7 +3392,7 @@ pub enum Expr {
     },
     /// A value-producing scoreboard read on a scoreboard-typed testbench
     /// field: `sb.writes` (scalar), `sb.expected.size()`,
-    /// `sb.expected.empty()`. Host state — allowed wherever a `Local`
+    /// `sb.expected.empty()`, `sb.expected.front()`. Host state — allowed wherever a `Local`
     /// is. `.pop()` is NOT here (it mutates) — it lowers to
     /// `Stmt::ScoreboardOp { op: QueuePop, .. }`.
     ScoreboardQuery {
@@ -2966,11 +3443,11 @@ pub enum Expr {
         base: ComponentBase,
     },
     /// A value-producing read on a composite-component `queue<T>` field:
-    /// `<base>.<queue>.size()` / `.empty()`. Host state — allowed wherever
-    /// a `Local` is. `.pop()` is NOT here (it mutates) — it lowers to
+    /// `<base>.<queue>.size()` / `.empty()` / `.front()`. Host state —
+    /// allowed wherever a `Local` is. `.pop()` is NOT here (it mutates) — it lowers to
     /// `Stmt::ComponentQueuePop`. Mirrors `ScoreboardQuery` for the
     /// method-bearing-scoreboard / component-field queue (`query` carries
-    /// the queue-field name via `QueueSize`/`QueueEmpty`).
+    /// the queue-field name and exact front-element type).
     ComponentQueueQuery {
         base: ComponentBase,
         query: ScoreboardQuery,
@@ -3181,6 +3658,31 @@ pub enum ScoreboardQuery {
     QueueSize { queue: String },
     /// `sb.<queue>.empty()` — true when no elements (lowers to `bool`).
     QueueEmpty { queue: String },
+    /// `sb.<queue>.front()` — non-destructive read of the first element.
+    /// The exact element type travels with the query so every owner can
+    /// type nested arguments, returns, assignments, and width operations
+    /// without reconstructing the owning schema later.
+    QueueFront { queue: String, elem: QueueElem },
+}
+
+impl ScoreboardQuery {
+    pub fn queue(&self) -> Option<&str> {
+        match self {
+            Self::Scalar { .. } => None,
+            Self::QueueSize { queue }
+            | Self::QueueEmpty { queue }
+            | Self::QueueFront { queue, .. } => Some(queue),
+        }
+    }
+
+    pub fn value_type(&self) -> Option<IrType> {
+        match self {
+            Self::Scalar { .. } => None,
+            Self::QueueSize { .. } => Some(IrType::UInt(None)),
+            Self::QueueEmpty { .. } => Some(IrType::Bool),
+            Self::QueueFront { elem, .. } => Some(elem.ir_type()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3188,6 +3690,7 @@ pub enum CallTarget {
     /// Pure helper call plus the declared return type used by caller-side
     /// local inference and signed/width-sensitive expression emission.
     Helper {
+        function: FunctionId,
         name: String,
         ret: IrType,
     },
@@ -3199,11 +3702,15 @@ pub enum CallTarget {
     /// declaration is emitted file-scope by `emit_extern_fn_decls`.
     ExternFn {
         name: String,
+        /// Declared parameter types retained so the verifier can validate
+        /// call-boundary type safety after IR-mutating passes.
+        params: Vec<IrType>,
         ret: IrType,
     },
     TransactorMethod {
         bus_field: String,
         method: String,
+        target: TransactorMethodTarget,
     },
     /// Synchronous call from one method of a DUT-poking transactor to
     /// another method on the same transactor type. Unlike
@@ -3211,14 +3718,47 @@ pub enum CallTarget {
     /// emits as a direct `<Transactor>_<method>(args...)` call inside the
     /// enclosing transactor method lambda.
     TransactorSelfMethod {
-        transactor: String,
+        transactor: TransactorId,
+        transactor_name: String,
         method: String,
+        function: FunctionId,
     },
     /// Call a `tseq` generator by name — `let txns = RandomTxns(5)`.
     /// Resolves to the `FunctionKind::Tseq` function of that name; the
     /// result is an `IrType::RecordSeq` assigned into a test-scope local.
     /// Emitted as a direct `<name>(args)` lambda call (v1's tseq lambda).
-    Tseq(String),
+    Tseq {
+        function: FunctionId,
+        name: String,
+    },
+}
+
+/// Semantic target of a lowered bus/transactor call edge. The source field
+/// spelling is retained separately for diagnostics and receiver selection;
+/// ownership and dependency analysis consume this typed identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TransactorMethodTarget {
+    /// Direct protocol call through a concrete testbench bus binding.
+    ConcreteBusBinding {
+        binding: BusBindingId,
+        field: String,
+    },
+    /// Direct protocol call from a canonical reusable testbench method.
+    /// The concrete binding index is implementation-owned; the reusable body
+    /// retains only its declaring type and logical field identity.
+    TestbenchBusField {
+        testbench: TestbenchTypeId,
+        field: String,
+        bus: String,
+    },
+    /// Protocol call from a shared bound-bus body. A concrete adapter must be
+    /// supplied by the owning testcase before rendering.
+    BoundBus,
+    /// Call of a declared transactor method on a typed receiver instance.
+    Callable {
+        transactor: TransactorId,
+        function: FunctionId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3253,13 +3793,16 @@ pub enum UnOp {
     BitNotHost,
 }
 
-/// Structured handle to a DUT signal. Codegen never re-parses port
-/// names. Direction/width are `Option` because the MVP lowering does
-/// not consult a DUT port table yet.
+/// Structured handle to a DUT signal. Lowering retains source identity without
+/// consulting an HDL port table; a later verified access plan resolves the
+/// optional direction/width metadata before common emission.
 #[derive(Debug, Clone)]
 pub struct PortRef {
     /// Test-scope field holding the DUT (`"dut"`).
     pub testbench_field: String,
+    /// Semantic source of the DUT signal. Bus accesses retain binding
+    /// identity independently of their flattened C++ spelling.
+    pub origin: PortOrigin,
     /// Dotted path below the DUT field (`["count_out"]`).
     pub port_path: Vec<String>,
     /// True when multi-segment paths are aggregate member accesses
@@ -3273,7 +3816,14 @@ pub struct PortRef {
     pub deferred_bus_binding: Option<DeferredBusBinding>,
     pub direction: Option<PortDirection>,
     pub width: Option<u32>,
+    /// Exact scalar value type when known. Probe references always carry it;
+    /// ordinary DUT/bus ports remain `None` until a typed DUT interface is
+    /// available.
+    pub value_type: Option<IrType>,
     pub access: PortAccess,
+    /// Stable catalog identity for `Probe`/`Force` references. Ordinary DUT
+    /// ports must leave this `None`.
+    pub probe: Option<ProbeId>,
     /// Lane index for `dut.<port>[i]` accesses. Both constant and
     /// variable (runtime-evaluated) indices are in the lowered subset.
     /// Emission routes lanes of packed multi-lane ports (the `--sv`
@@ -3288,6 +3838,19 @@ pub struct PortRef {
 pub enum DeferredBusBinding {
     Unresolved,
     Selected(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PortOrigin {
+    /// A direct DUT port or aggregate member.
+    Dut,
+    /// A concrete bus binding owned by the current testbench schema.
+    BusBinding {
+        binding: BusBindingId,
+        field: String,
+    },
+    /// A bus-relative port in a shared bound component/transactor body.
+    BoundBus,
 }
 
 /// Lane index on a `dut.<port>[i]` access. v1 carries the raw `&Expr`

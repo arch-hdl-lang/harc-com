@@ -21,12 +21,22 @@ use crate::ast::*;
 /// where the cost is visible.
 pub fn merge_for_sim(files: Vec<SourceFile>, pick: Option<&str>) -> Result<SourceFile, String> {
     // Index test bases by name and collect extends targeting tests.
-    let mut tests: std::collections::HashMap<String, TestDecl> = std::collections::HashMap::new();
-    let mut test_extends: Vec<(String, Vec<TestItem>)> = Vec::new();
-    let mut other_items: Vec<Item> = Vec::new();
+    let mut tests: std::collections::HashMap<String, (TestDecl, SourceId)> =
+        std::collections::HashMap::new();
+    let mut test_extends: Vec<(String, Vec<TestItem>, SourceId)> = Vec::new();
+    let mut other_items: Vec<(Item, SourceId)> = Vec::new();
+    let mut sources = Vec::new();
 
     for file in files {
-        for it in file.items {
+        let SourceFile {
+            items: file_items,
+            item_sources: file_item_sources,
+            sources: file_sources,
+            ..
+        } = file;
+        sources.extend(file_sources);
+        assert_eq!(file_items.len(), file_item_sources.len());
+        for (it, source) in file_items.into_iter().zip(file_item_sources) {
             match it {
                 Item::Test(t) => {
                     if tests.contains_key(&t.name.name) {
@@ -35,7 +45,7 @@ pub fn merge_for_sim(files: Vec<SourceFile>, pick: Option<&str>) -> Result<Sourc
                             t.name.name
                         ));
                     }
-                    tests.insert(t.name.name.clone(), t);
+                    tests.insert(t.name.name.clone(), (t, source));
                 }
                 Item::Extend(e) => {
                     let target = e
@@ -45,23 +55,25 @@ pub fn merge_for_sim(files: Vec<SourceFile>, pick: Option<&str>) -> Result<Sourc
                         .map(|s| s.name.clone())
                         .unwrap_or_default();
                     if let ExtendBody::Test(items) = e.body {
-                        test_extends.push((target, items));
+                        test_extends.push((target, items, source));
                     } else {
                         // Non-test extends pass through — they apply at
                         // type/component resolution, not test merge time.
-                        other_items.push(Item::Extend(e));
+                        other_items.push((Item::Extend(e), source));
                     }
                 }
-                other => other_items.push(other),
+                other => other_items.push((other, source)),
             }
         }
     }
 
     // Apply test extends.
-    for (target, items) in test_extends {
-        let test = tests.get_mut(&target).ok_or_else(|| {
+    for (target, items, source) in test_extends {
+        let (test, _) = tests.get_mut(&target).ok_or_else(|| {
             format!("`extend {target}` has no matching base `test {target}` in input files")
         })?;
+        test.item_sources
+            .extend(std::iter::repeat_n(source, items.len()));
         test.items.extend(items);
     }
 
@@ -84,14 +96,18 @@ pub fn merge_for_sim(files: Vec<SourceFile>, pick: Option<&str>) -> Result<Sourc
     // Synthetic file: ALL tests plus all other items, in stable order
     // (alphabetical-by-name for tests to keep emitted output
     // deterministic across runs).
-    let mut items = other_items;
+    let (mut items, mut item_sources): (Vec<_>, Vec<_>) = other_items.into_iter().unzip();
     let mut test_names: Vec<String> = tests.keys().cloned().collect();
     test_names.sort();
     for name in test_names {
-        items.push(Item::Test(tests.remove(&name).unwrap()));
+        let (test, source) = tests.remove(&name).unwrap();
+        items.push(Item::Test(test));
+        item_sources.push(source);
     }
     Ok(SourceFile {
         items,
+        item_sources,
+        sources,
         inner_doc: None,
         frontmatter: None,
     })
@@ -105,14 +121,19 @@ pub fn merge_for_sim(files: Vec<SourceFile>, pick: Option<&str>) -> Result<Sourc
 pub fn filter_tests_for_codegen(file: &SourceFile, pick: &str) -> Result<SourceFile, String> {
     let mut found = false;
     let mut items = Vec::with_capacity(file.items.len());
-    for item in &file.items {
+    let mut item_sources = Vec::with_capacity(file.items.len());
+    for (index, item) in file.items.iter().enumerate() {
         match item {
             Item::Test(t) if t.name.name == pick => {
                 found = true;
                 items.push(item.clone());
+                item_sources.push(file.item_source(index));
             }
             Item::Test(_) => {}
-            _ => items.push(item.clone()),
+            _ => {
+                items.push(item.clone());
+                item_sources.push(file.item_source(index));
+            }
         }
     }
     if !found {
@@ -120,6 +141,8 @@ pub fn filter_tests_for_codegen(file: &SourceFile, pick: &str) -> Result<SourceF
     }
     Ok(SourceFile {
         items,
+        item_sources,
+        sources: file.sources.clone(),
         inner_doc: file.inner_doc.clone(),
         frontmatter: file.frontmatter.clone(),
     })

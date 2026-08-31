@@ -12,11 +12,13 @@
 //!   are: cycle-anchored Tier-0 pin work.
 //! * **`tlm_method` calls retain protocol seams.** A blocking method call
 //!   lowers to `Assign(dest, Expr::Call(CallTarget::TransactorMethod
-//!   { bus_field, method }, args))` and is NEVER inlined at the IR level.
-//!   A direct `out_of_order` call lowers to an adjacent tagged `TlmFork` /
-//!   one-entry `TlmJoinAll`, reusing the existing asynchronous protocol seam
-//!   synchronously. Placement and the verifier enforce both shapes; backends
-//!   expand their req/rsp wire protocols.
+//!   { bus_field, method, target }, args))` and is never inlined at the IR
+//!   level — the sequence→transactor boundary is the Tier-1/Tier-0
+//!   placement cut (docs/tb-ir-design.md §CallTarget), and the verifier
+//!   enforces the seam. A direct `out_of_order` call lowers to an adjacent
+//!   tagged `TlmFork` / one-entry `TlmJoinAll`, reusing the existing
+//!   asynchronous protocol seam synchronously. Backends expand their req/rsp
+//!   wire protocols.
 
 use super::{not_implemented, FuncBuilder, LowerError, V1Status};
 use crate::ast::{
@@ -47,6 +49,8 @@ pub(crate) enum BusCallDest<'a> {
 pub(super) fn lower_bus_binding(
     l: &LetStmt,
     decl: &BusDecl,
+    id: ir::BusBindingId,
+    record_ids: &std::collections::HashMap<String, ir::RecordId>,
 ) -> Result<(ir::BusBindingSchema, BusDecl), LowerError> {
     let bind = &l.name.name;
     if !l.probes.is_empty() {
@@ -69,9 +73,8 @@ pub(super) fn lower_bus_binding(
     // access (`bus.<ch>.<sig>` / `.send` / `.recv`) honor the remap. A
     // channel access lowers to a `PortRef` whose 3-segment path
     // `[binding, channel, signal]` is collapsed to the override's flat
-    // name when `(channel, signal)` is mapped — at lowering for direct
-    // test-scope access, and at bind time (`fill_initiator_bus_prefix`)
-    // for placeholder-prefixed initiator-BFM / event-component bodies.
+    // name when `(channel, signal)` is mapped — directly for test-scope
+    // access or through a typed adapter for a shared bound callable body.
     // Already-flattened `<ch>_<sig>` access and plain `<bind>.<sig>`
     // access are NOT remapped, mirroring v1's `try_emit_bus_field_access`.
     let mut remap: Vec<((String, String), String)> = Vec::new();
@@ -144,14 +147,55 @@ pub(super) fn lower_bus_binding(
     let methods = decl
         .tlm_methods
         .iter()
-        .map(|m| ir::TlmMethodSchema {
-            name: m.name.name.clone(),
-            args: m.args.iter().map(|(n, _)| n.name.clone()).collect(),
-            has_ret: m.ret.is_some(),
+        .map(|m| {
+            let mode = match m.mode.name.as_str() {
+                "blocking" => ir::TlmMethodMode::Blocking,
+                "out_of_order" => {
+                    let tags = m
+                        .out_of_order_tags
+                        .as_ref()
+                        .and_then(super::exprs::parse_int_literal_expr)
+                        .ok_or_else(|| {
+                            LowerError::Invalid(format!(
+                                "bus `{}` tlm_method `{}` requires a literal positive `tags` count",
+                                decl.name.name, m.name.name
+                            ))
+                        })?;
+                    if tags == 0 {
+                        return Err(LowerError::Invalid(format!(
+                            "bus `{}` tlm_method `{}` requires a positive `tags` count",
+                            decl.name.name, m.name.name
+                        )));
+                    }
+                    ir::TlmMethodMode::OutOfOrder { tags }
+                }
+                other => {
+                    return Err(LowerError::Invalid(format!(
+                        "bus `{}` tlm_method `{}` has unsupported mode `{other}`",
+                        decl.name.name, m.name.name
+                    )))
+                }
+            };
+            Ok(ir::TlmMethodSchema {
+                name: m.name.name.clone(),
+                args: m.args.iter().map(|(n, _)| n.name.clone()).collect(),
+                arg_types: m
+                    .args
+                    .iter()
+                    .map(|(_, ty)| super::helpers::slot_ir_type(Some(ty), record_ids))
+                    .collect(),
+                has_ret: m.ret.is_some(),
+                ret_type: m
+                    .ret
+                    .as_ref()
+                    .map(|ty| super::helpers::slot_ir_type(Some(ty), record_ids)),
+                mode,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, LowerError>>()?;
     Ok((
         ir::BusBindingSchema {
+            id,
             field: bind.clone(),
             bus: decl.name.name.clone(),
             methods,
@@ -162,26 +206,50 @@ pub(super) fn lower_bus_binding(
 }
 
 impl FuncBuilder<'_> {
-    /// PortRef for a `<bind>.<channel>.<signal>` handshake access,
-    /// honoring a `bind ... with { ch.sig: "port" }` remap. When the
-    /// binding has a `(channel, signal)` override the path collapses to
-    /// the single override flat name (so the backend's `port_path.join
-    /// ("_")` yields exactly that name); otherwise it is the canonical
-    /// 3-segment `[bind, channel, signal]` path. Mirrors v1's
-    /// `bus_signal_name`, which remaps the channel form only.
+    /// PortRef for a `<bind>.<channel>.<signal>` handshake access. The IR
+    /// retains this logical path; the selected test's typed binding applies
+    /// any concrete DUT-port remap during emission.
     fn bus_channel_port(&self, bind: &str, ch: &str, sig: &str) -> PortRef {
-        if let Some(remap) = self.ctx.bus_remaps.get(bind) {
-            if let Some((_, port)) = remap
+        let channel = self.ctx.bus_bindings.get(bind).and_then(|bus| {
+            bus.handshakes
                 .iter()
-                .find(|((rch, rsig), _)| rch == ch && rsig == sig)
-            {
-                // The override is the FULL flat DUT port name — emit it
-                // as a single-segment path so `join("_")` reproduces it
-                // verbatim (no `<bind>_` prefix).
-                return bus_port_flat(port);
-            }
-        }
-        bus_port(bind, &[ch, sig])
+                .find(|channel| channel.name.name == ch)
+        });
+        let value_type = channel
+            .and_then(|channel| {
+                if matches!(sig, "valid" | "ready") {
+                    Some(IrType::Bool)
+                } else {
+                    channel
+                        .payload
+                        .iter()
+                        .find(|signal| signal.name.name == sig)
+                        .map(|signal| super::helpers::ir_type_of(Some(&signal.ty)))
+                }
+            })
+            .unwrap_or(IrType::Unknown);
+        let direction = channel.map(|channel| match (channel.role, sig) {
+            (crate::ast::HandshakeRole::Send, "ready")
+            | (crate::ast::HandshakeRole::Receive, "valid") => ir::PortDirection::Out,
+            (crate::ast::HandshakeRole::Send, _)
+            | (crate::ast::HandshakeRole::Receive, "ready") => ir::PortDirection::In,
+            (crate::ast::HandshakeRole::Receive, _) => ir::PortDirection::Out,
+        });
+        bus_port(
+            bind,
+            &[ch, sig],
+            self.bus_origin(bind),
+            value_type,
+            direction,
+        )
+    }
+
+    fn bus_origin(&self, bind: &str) -> crate::ir::PortOrigin {
+        self.ctx
+            .bus_origins
+            .get(bind)
+            .cloned()
+            .unwrap_or(crate::ir::PortOrigin::BoundBus)
     }
 
     /// `Some(PortRef)` when `e` is a dotted access rooted at a bus
@@ -202,7 +270,24 @@ impl FuncBuilder<'_> {
                 return Ok(None);
             };
             if bus.signals.iter().any(|s| s.name.name == name.name) {
-                return Ok(Some(bus_port(&id.name, &[&name.name])));
+                let signal = bus
+                    .signals
+                    .iter()
+                    .find(|signal| signal.name.name == name.name)
+                    .expect("checked above");
+                let value_type = super::helpers::ir_type_of(Some(&signal.ty));
+                let direction = match signal.direction {
+                    crate::ast::Direction::In => Some(ir::PortDirection::Out),
+                    crate::ast::Direction::Out => Some(ir::PortDirection::In),
+                    crate::ast::Direction::InOut => None,
+                };
+                return Ok(Some(bus_port(
+                    &id.name,
+                    &[&name.name],
+                    self.bus_origin(&id.name),
+                    value_type,
+                    direction,
+                )));
             }
             // Already-flattened `<ch>_<sig>` form.
             for h in &bus.handshakes {
@@ -212,7 +297,33 @@ impl FuncBuilder<'_> {
                         || tail == "ready"
                         || h.payload.iter().any(|s| s.name.name == tail)
                     {
-                        return Ok(Some(bus_port(&id.name, &[&name.name])));
+                        let value_type = if matches!(tail, "valid" | "ready") {
+                            IrType::Bool
+                        } else {
+                            h.payload
+                                .iter()
+                                .find(|signal| signal.name.name == tail)
+                                .map(|signal| super::helpers::ir_type_of(Some(&signal.ty)))
+                                .unwrap_or(IrType::Unknown)
+                        };
+                        let direction = Some(match (h.role, tail) {
+                            (crate::ast::HandshakeRole::Send, "ready")
+                            | (crate::ast::HandshakeRole::Receive, "valid") => {
+                                ir::PortDirection::Out
+                            }
+                            (crate::ast::HandshakeRole::Send, _)
+                            | (crate::ast::HandshakeRole::Receive, "ready") => {
+                                ir::PortDirection::In
+                            }
+                            (crate::ast::HandshakeRole::Receive, _) => ir::PortDirection::Out,
+                        });
+                        return Ok(Some(bus_port(
+                            &id.name,
+                            &[&name.name],
+                            self.bus_origin(&id.name),
+                            value_type,
+                            direction,
+                        )));
                     }
                 }
             }
@@ -618,10 +729,17 @@ impl FuncBuilder<'_> {
             &declared,
             &format!("a `bus.{}(...)` call", m.name.name),
         )?;
+        let arg_effects: Vec<bool> = args
+            .iter()
+            .map(|arg| self.expr_has_effectful_value_prelude(call_arg_expr(arg)))
+            .collect();
         let mut lowered = Vec::with_capacity(args.len());
-        for (a, (aname, decl_ty)) in args.iter().zip(m.args.iter()) {
+        for (index, (a, (aname, decl_ty))) in args.iter().zip(m.args.iter()).enumerate() {
             let hint = super::helpers::ir_type_of(Some(decl_ty));
-            let v = self.lower_expr_no_ports_hinted(call_arg_expr(a), Some(hint))?;
+            let mut v = self.lower_expr_no_ports_hinted(call_arg_expr(a), Some(hint))?;
+            if arg_effects[index + 1..].iter().any(|effect| *effect) {
+                v = self.materialize_ordered_value(v);
+            }
             // The bus spelling of the parameter slot rule. This path had
             // the declared type in hand already — as a WIDTH hint one
             // line up — and never asked whether the argument belonged in
@@ -641,6 +759,16 @@ impl FuncBuilder<'_> {
                     ),
                 )?;
             }
+            if matches!(want, IrType::String) {
+                return Err(not_implemented(
+                    &format!(
+                        "String parameter `{}` of bus method `{}` crossing a TLM request wire",
+                        aname.name, m.name.name
+                    ),
+                    "String values are host-side callable arguments; TLM request wires carry packed numeric or record values",
+                    V1Status::EmitsUncompilable,
+                ));
+            }
             self.check_slot_ir(
                 &v,
                 &want,
@@ -648,10 +776,43 @@ impl FuncBuilder<'_> {
             )?;
             lowered.push(v);
         }
+        let logical_bus = self
+            .ctx
+            .bus_bindings
+            .get(bind)
+            .map(|bus| bus.name.name.clone())
+            .ok_or_else(|| {
+                LowerError::Invalid(format!(
+                    "bus method `{}.{}` lost its declared bus type",
+                    bind, m.name.name
+                ))
+            })?;
         let call = Expr::Call(
             crate::ir::CallTarget::TransactorMethod {
                 bus_field: bind.to_string(),
                 method: m.name.name.clone(),
+                target: match self.bus_origin(bind) {
+                    crate::ir::PortOrigin::BusBinding { binding, field } => self
+                        .testbench_method_owner
+                        .map(
+                            |testbench| crate::ir::TransactorMethodTarget::TestbenchBusField {
+                                testbench,
+                                field: field.clone(),
+                                bus: logical_bus.clone(),
+                            },
+                        )
+                        .unwrap_or(crate::ir::TransactorMethodTarget::ConcreteBusBinding {
+                            binding,
+                            field,
+                        }),
+                    crate::ir::PortOrigin::BoundBus => crate::ir::TransactorMethodTarget::BoundBus,
+                    crate::ir::PortOrigin::Dut => {
+                        return Err(LowerError::Invalid(format!(
+                            "bus method `{}.{}` lost its typed binding provenance",
+                            bind, m.name.name
+                        )))
+                    }
+                },
             },
             lowered,
         );
@@ -671,6 +832,19 @@ impl FuncBuilder<'_> {
                     m.name.name
                 ),
             )?;
+        }
+        if m.ret
+            .as_ref()
+            .is_some_and(|ret| matches!(super::helpers::ir_type_of(Some(ret)), IrType::String))
+        {
+            return Err(not_implemented(
+                &format!(
+                    "String return from bus method `{}` crossing a TLM response wire",
+                    m.name.name
+                ),
+                "String values are host-side callable results; TLM response wires carry packed numeric or record values",
+                V1Status::EmitsUncompilable,
+            ));
         }
         match dest {
             BusCallDest::Declare(name) => {
@@ -781,8 +955,24 @@ impl FuncBuilder<'_> {
         let tag = match m.mode.name.as_str() {
             "blocking" => None,
             "out_of_order" => {
+                let tags = m
+                    .out_of_order_tags
+                    .as_ref()
+                    .and_then(super::exprs::parse_int_literal_expr)
+                    .ok_or_else(|| {
+                        LowerError::Invalid(format!(
+                            "`{bind}.{}` requires a literal positive `out_of_order tags N` count",
+                            m.name.name
+                        ))
+                    })?;
                 let key = (bind.clone(), m.name.name.clone());
                 let next = self.next_tlm_fork_tag.entry(key).or_insert(0);
+                if *next >= tags {
+                    return Err(LowerError::Invalid(format!(
+                        "`{bind}.{}` exceeds its {tags} outstanding tag slot(s) before `join_all`",
+                        m.name.name
+                    )));
+                }
                 let tag = *next;
                 *next += 1;
                 Some(tag)
@@ -834,9 +1024,16 @@ impl FuncBuilder<'_> {
                 format!("a `bus.{}(...)` call", m.name.name)
             },
         )?;
+        let arg_effects: Vec<bool> = args
+            .iter()
+            .map(|arg| self.expr_has_effectful_value_prelude(call_arg_expr(arg)))
+            .collect();
         let mut lowered = Vec::with_capacity(args.len());
-        for (a, (aname, decl_ty)) in args.iter().zip(m.args.iter()) {
-            let v = self.lower_expr_no_ports(call_arg_expr(a))?;
+        for (index, (a, (aname, decl_ty))) in args.iter().zip(m.args.iter()).enumerate() {
+            let mut v = self.lower_expr_no_ports(call_arg_expr(a))?;
+            if arg_effects[index + 1..].iter().any(|effect| *effect) {
+                v = self.materialize_ordered_value(v);
+            }
             // The FORK spelling of the parameter check one screen up.
             // Same declared types, same rule; the blocking and fork
             // request sides emit the same `harc_assign` into the same
@@ -853,6 +1050,16 @@ impl FuncBuilder<'_> {
                         m.name.name
                     ),
                 )?;
+            }
+            if matches!(want, IrType::String) {
+                return Err(not_implemented(
+                    &format!(
+                        "String parameter `{}` of forked bus method `{}` crossing a TLM request wire",
+                        aname.name, m.name.name
+                    ),
+                    "String values are host-side callable arguments; TLM request wires carry packed numeric or record values",
+                    V1Status::EmitsUncompilable,
+                ));
             }
             self.check_slot_ir(
                 &v,
@@ -880,6 +1087,19 @@ impl FuncBuilder<'_> {
                 ),
             )?;
         }
+        if m.ret
+            .as_ref()
+            .is_some_and(|ret| matches!(super::helpers::ir_type_of(Some(ret)), IrType::String))
+        {
+            return Err(not_implemented(
+                &format!(
+                    "String return from forked bus method `{}` crossing a TLM response wire",
+                    m.name.name
+                ),
+                "String values are host-side callable results; TLM response wires carry packed numeric or record values",
+                V1Status::EmitsUncompilable,
+            ));
+        }
         let dest_local = match dest {
             BusCallDest::Declare(name) => {
                 let id = self.declare(name);
@@ -902,8 +1122,42 @@ impl FuncBuilder<'_> {
             }
             BusCallDest::Discard => None,
         };
+        let logical_bus = self
+            .ctx
+            .bus_bindings
+            .get(&bind)
+            .map(|bus| bus.name.name.clone())
+            .ok_or_else(|| {
+                LowerError::Invalid(format!(
+                    "forked bus method `{}.{}` lost its declared bus type",
+                    bind, m.name.name
+                ))
+            })?;
+        let target = match self.bus_origin(&bind) {
+            crate::ir::PortOrigin::BusBinding { binding, field } => self
+                .testbench_method_owner
+                .map(
+                    |testbench| crate::ir::TransactorMethodTarget::TestbenchBusField {
+                        testbench,
+                        field: field.clone(),
+                        bus: logical_bus.clone(),
+                    },
+                )
+                .unwrap_or(crate::ir::TransactorMethodTarget::ConcreteBusBinding {
+                    binding,
+                    field,
+                }),
+            crate::ir::PortOrigin::BoundBus => crate::ir::TransactorMethodTarget::BoundBus,
+            crate::ir::PortOrigin::Dut => {
+                return Err(LowerError::Invalid(format!(
+                    "forked bus method `{}.{}` lost its typed binding provenance",
+                    bind, m.name.name
+                )))
+            }
+        };
         let desc = crate::ir::TlmForkDesc {
             bus_field: bind,
+            target,
             method: m.name.name.clone(),
             args: lowered,
             dest: dest_local,
@@ -1013,19 +1267,32 @@ fn lit(v: u64) -> Expr {
 /// PortRef for a bus-bound flat signal: `bus_port("axil", ["aw",
 /// "valid"])` → path `["axil", "aw", "valid"]`, which backends join
 /// with `_` into the arch-com §19.6 flat name `axil_aw_valid`.
-fn bus_port(bind: &str, tail: &[&str]) -> PortRef {
+pub(super) fn bus_port(
+    bind: &str,
+    tail: &[&str],
+    origin: crate::ir::PortOrigin,
+    value_type: IrType,
+    direction: Option<ir::PortDirection>,
+) -> PortRef {
     let mut port_path = Vec::with_capacity(1 + tail.len());
     port_path.push(bind.to_string());
     port_path.extend(tail.iter().map(|s| s.to_string()));
     PortRef {
         testbench_field: "dut".to_string(),
+        origin,
         port_path,
         aggregate_path: false,
         deferred_bus_binding: (bind == super::transactors::INITIATOR_BUS_PLACEHOLDER)
             .then_some(crate::ir::DeferredBusBinding::Unresolved),
-        direction: None,
-        width: None,
+        direction,
+        width: match &value_type {
+            IrType::Bool => Some(1),
+            IrType::UInt(width) | IrType::SInt(width) => *width,
+            _ => None,
+        },
+        value_type: Some(value_type),
         access: PortAccess::Port,
+        probe: None,
         lane: None,
     }
 }
@@ -1036,12 +1303,15 @@ fn bus_port(bind: &str, tail: &[&str]) -> PortRef {
 pub(crate) fn bus_port_flat(flat: &str) -> PortRef {
     PortRef {
         testbench_field: "dut".to_string(),
+        origin: crate::ir::PortOrigin::Dut,
         port_path: vec![flat.to_string()],
         aggregate_path: false,
         deferred_bus_binding: None,
         direction: None,
         width: None,
+        value_type: None,
         access: PortAccess::Port,
+        probe: None,
         lane: None,
     }
 }

@@ -79,11 +79,13 @@ fn fn1 comp_method_1 [kind=ComponentMethod(c1)]
   locals:
     %0 addr : uint<8>
     %1 model : component(c0)
-    %2 r : record(r0)
+    %2 __t0 : record(r0)
+    %3 r : record(r0)
   entry = b0
 
   b0:
-    ComponentCall(%r = local(l1).c0::predict_read([%addr]))
+    ComponentCall(%__t0 = local(l1).c0::predict_read([%addr]))
+    Assign(%r, %__t0)
     AssertCheck { cond: (%r.matched != 0), on_fail: "scoreboard saw unexpected addr 0x%02llx", %addr }
     ComponentFieldWrite(self.seen_count, (self.seen_count + 1))
     ComponentFieldWrite(self.last_expected, %r.data)
@@ -94,8 +96,9 @@ fn fn2 comp_periodic_2 [kind=ComponentMethod(c2)]
     %0 __t0 : unknown
     %1 __t1 : unknown
     %2 __t2 : unknown
-    %3 r : record(r0)
-    %4 __t3 : unknown
+    %3 __t3 : record(r0)
+    %4 r : record(r0)
+    %5 __t4 : unknown
   entry = b0
 
   b0:
@@ -133,10 +136,11 @@ fn fn2 comp_periodic_2 [kind=ComponentMethod(c2)]
 
   b8:
     DutRead(%__t2, dut.req_addr)
-    ComponentCall(%r = self.model.c0::predict_read([%__t2]))
+    ComponentCall(%__t3 = self.model.c0::predict_read([%__t2]))
+    Assign(%r, %__t3)
     AssertCheck { cond: (%r.matched != 0), on_fail: "unexpected read addr=0x%02llx", dut.req_addr }
-    DutRead(%__t3, dut.req_addr)
-    ComponentCall(self.sb.c1::observe([%__t3, ComponentValue(self.model)]))
+    DutRead(%__t4, dut.req_addr)
+    ComponentCall(self.sb.c1::observe([%__t4, ComponentValue(self.model)]))
     -> Branch((self.pending == 0), b11, b12)
 
   b9:

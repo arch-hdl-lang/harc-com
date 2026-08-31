@@ -105,13 +105,23 @@ fn write_suite(dir: &Path, tb: &str) -> PathBuf {
 /// Run `harc sim --sv … --codegen v1 --cpp-split tests
 /// --cpp-split-layout common` and return (success, combined output).
 fn run_common_split(tb: &Path, sv: &Path, outdir: &Path, extra_args: &[&str]) -> (bool, String) {
+    run_common_split_codegen("v1", tb, sv, outdir, extra_args)
+}
+
+fn run_common_split_codegen(
+    codegen: &str,
+    tb: &Path,
+    sv: &Path,
+    outdir: &Path,
+    extra_args: &[&str],
+) -> (bool, String) {
     let mut cmd = Command::new(harc_bin());
     cmd.arg("sim")
         .arg(tb)
         .arg("--sv")
         .arg(sv)
         .arg("--codegen")
-        .arg("v1")
+        .arg(codegen)
         .arg("--cpp-split")
         .arg("tests")
         .arg("--cpp-split-layout")
@@ -131,29 +141,42 @@ fn run_common_split(tb: &Path, sv: &Path, outdir: &Path, extra_args: &[&str]) ->
 }
 
 #[test]
-fn common_layout_requires_v1_and_tests_mode() {
+fn common_layout_requires_tests_mode_and_tbir_accepts_multi_test_suites() {
     let dir = fresh_outdir("gates");
     let tb = write_suite(&dir, TB_THREE_TESTS);
 
-    // Default (tbir) codegen is now supported for common layout (M1, issue #619).
-    // Explicit tbir should succeed.
-    let out = Command::new(harc_bin())
-        .arg("sim")
-        .arg(&tb)
-        .arg("--sv")
-        .arg(dir.join("dut.sv"))
-        .arg("--codegen")
-        .arg("tbir")
-        .arg("--cpp-split")
-        .arg("tests")
-        .arg("--cpp-split-layout")
-        .arg("common")
-        .arg("--outdir")
-        .arg(dir.join("o1"))
-        .arg("--emit-only")
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "tbir + common should be accepted after M1: got {}", String::from_utf8_lossy(&out.stderr));
+    // The default backend is TB-IR, and explicit TB-IR selection must expose
+    // the same multi-test common-layout surface.
+    for explicit_codegen in [false, true] {
+        let outdir = if explicit_codegen {
+            dir.join("o1_explicit")
+        } else {
+            dir.join("o1_default")
+        };
+        let mut cmd = Command::new(harc_bin());
+        cmd.arg("sim").arg(&tb).arg("--sv").arg(dir.join("dut.sv"));
+        if explicit_codegen {
+            cmd.arg("--codegen").arg("tbir");
+        }
+        let out = cmd
+            .arg("--cpp-split")
+            .arg("tests")
+            .arg("--cpp-split-layout")
+            .arg("common")
+            .arg("--outdir")
+            .arg(&outdir)
+            .arg("--emit-only")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "TB-IR common emit failed: {text}");
+        assert!(outdir.join("tb__runtime.cpp").is_file(), "got: {text}");
+        assert!(outdir.join("tb__registry.cpp").is_file(), "got: {text}");
+    }
 
     // The layout flag requires `--cpp-split tests`.
     let out = Command::new(harc_bin())
@@ -220,9 +243,21 @@ fn common_layout_emits_expected_artifacts_without_duplication() {
 
     // Manifest records both fingerprints and the exact test list.
     let manifest = fs::read_to_string(outdir.join("tb__artifacts.json")).unwrap();
-    assert!(manifest.contains("\"schema_version\":1"));
-    assert!(manifest.contains("\"interface_abi\""));
-    assert!(manifest.contains("\"build_profile\""));
+    let manifest_json: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+    assert_eq!(manifest_json["schema_version"], 2);
+    assert_eq!(manifest_json["backend"], "v1");
+    assert_eq!(manifest_json["layout"], "common");
+    assert!(manifest_json["interface_abi"].is_string());
+    assert!(manifest_json["build_profile"].is_string());
+    assert!(manifest_json["artifacts"]
+        .as_array()
+        .is_some_and(|artifacts| artifacts.iter().all(|artifact| {
+            artifact["filename"].is_string()
+                && artifact["role"].is_string()
+                && artifact["owner"].is_string()
+                && artifact["tests"].is_array()
+                && artifact["dependencies"].is_array()
+        })));
     for t in ["T1Add", "T2Add", "T3Add"] {
         assert!(manifest.contains(&format!("\"{t}\"")));
     }
@@ -236,7 +271,8 @@ fn common_layout_emits_expected_artifacts_without_duplication() {
             "{t} capsule missing its run entry"
         );
         assert!(capsule.contains("HarcSuiteRuntime ctx;"));
-        assert!(capsule.contains("harc_rt_current_run = &ctx;"));
+        assert!(!capsule.contains("thread_local"));
+        assert!(!capsule.contains("harc_rt_current_run"));
         assert!(
             !capsule.contains("struct HarcSuiteRuntime {"),
             "capsule must not redefine the runtime"
@@ -301,6 +337,155 @@ fn common_layout_emits_expected_artifacts_without_duplication() {
     fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn v1_common_probe_stub_is_typed_and_manifest_owned() {
+    let dir = fresh_outdir("v1_probe_manifest");
+    let sv = dir.join("probe.sv");
+    fs::write(
+        &sv,
+        "module ProbeTop(input logic clk); logic internal_status; endmodule\n",
+    )
+    .unwrap();
+    let tb = dir.join("probe.harc");
+    fs::write(
+        &tb,
+        r#"test ProbeTest
+    let dut : ProbeTop
+        probe status : uint<1> at internal_status
+    end let dut
+    run
+        wait 1 cycle
+        assert dut.status == 0
+    end run
+end test ProbeTest
+"#,
+    )
+    .unwrap();
+    let outdir = dir.join("out");
+    let (ok, msg) = run_common_split(&tb, &sv, &outdir, &["--emit-only"]);
+    assert!(ok, "{msg}");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(outdir.join("probe__artifacts.json")).unwrap())
+            .unwrap();
+    assert!(manifest["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|artifact| {
+            artifact["filename"] == "probe__probe_stub.sv" && artifact["role"] == "probe_stub"
+        }));
+    assert!(outdir.join("probe__probe_stub.sv").is_file());
+    assert!(!outdir.join("__harc_probe_ProbeTop.sv").exists());
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn common_manifest_owns_every_bundled_runtime_header() {
+    let runtime_headers = [
+        "harc_thread_rt.h",
+        "harc_random_rt.h",
+        "harc_queue_rt.h",
+        "harc_trace_rt.h",
+        "harc_log_rt.h",
+        "harc_z3_rt.h",
+    ];
+
+    for codegen in ["v1", "tbir"] {
+        let dir = fresh_outdir(&format!("runtime_header_manifest_{codegen}"));
+        let tb = write_suite(&dir, TB_THREE_TESTS);
+        let outdir = dir.join("out");
+        let (ok, msg) =
+            run_common_split_codegen(codegen, &tb, &dir.join("dut.sv"), &outdir, &["--emit-only"]);
+        assert!(ok, "{codegen} common emit failed: {msg}");
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(outdir.join("tb__artifacts.json")).unwrap())
+                .unwrap();
+        let artifacts = manifest["artifacts"].as_array().unwrap();
+        for header in runtime_headers {
+            assert!(
+                artifacts.iter().any(|artifact| {
+                    artifact["filename"] == header && artifact["role"] == "runtime_header"
+                }),
+                "{codegen} manifest does not own {header}: {manifest}"
+            );
+            assert!(outdir.join(header).is_file(), "missing {codegen} {header}");
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[test]
+fn runtime_header_promotion_failure_never_publishes_a_manifest() {
+    for codegen in ["v1", "tbir"] {
+        let dir = fresh_outdir(&format!("runtime_header_failure_{codegen}"));
+        let tb = write_suite(&dir, TB_THREE_TESTS);
+        let outdir = dir.join("out");
+        fs::create_dir_all(outdir.join("harc_trace_rt.h")).unwrap();
+
+        let (ok, msg) =
+            run_common_split_codegen(codegen, &tb, &dir.join("dut.sv"), &outdir, &["--emit-only"]);
+        assert!(
+            !ok,
+            "{codegen} runtime-header failure unexpectedly passed: {msg}"
+        );
+        assert!(
+            !outdir.join("tb__artifacts.json").exists(),
+            "{codegen} published a trusted manifest before all runtime headers"
+        );
+        assert!(outdir.join(".tb__artifacts.json.pending").is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[test]
+fn trace_macro_mode_changes_the_common_interface_abi() {
+    for codegen in ["v1", "tbir"] {
+        let dir = fresh_outdir(&format!("trace_abi_{codegen}"));
+        let tb = write_suite(&dir, TB_THREE_TESTS);
+        let sv = dir.join("dut.sv");
+        let read_abi = |outdir: &Path| {
+            let manifest: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(outdir.join("tb__artifacts.json")).unwrap(),
+            )
+            .unwrap();
+            manifest["interface_abi"].as_str().unwrap().to_string()
+        };
+
+        let plain = dir.join("plain");
+        let (ok, msg) = run_common_split_codegen(codegen, &tb, &sv, &plain, &["--emit-only"]);
+        assert!(ok, "{codegen} no-trace emit failed: {msg}");
+
+        let vcd = dir.join("vcd");
+        let (ok, msg) = run_common_split_codegen(
+            codegen,
+            &tb,
+            &sv,
+            &vcd,
+            &["--emit-only", "--waves", "--wave-format", "vcd"],
+        );
+        assert!(ok, "{codegen} VCD emit failed: {msg}");
+
+        let fst = dir.join("fst");
+        let (ok, msg) = run_common_split_codegen(
+            codegen,
+            &tb,
+            &sv,
+            &fst,
+            &["--emit-only", "--waves", "--wave-format", "fst"],
+        );
+        assert!(ok, "{codegen} FST emit failed: {msg}");
+
+        assert_ne!(
+            read_abi(&plain),
+            read_abi(&vcd),
+            "{codegen} no-trace/VCD ABI"
+        );
+        assert_ne!(read_abi(&vcd), read_abi(&fst), "{codegen} VCD/FST ABI");
+        fs::remove_dir_all(&dir).ok();
+    }
+}
+
 /// Determinism: two clean emissions are byte-identical.
 #[test]
 fn common_layout_emission_is_deterministic() {
@@ -325,6 +510,581 @@ fn common_layout_emission_is_deterministic() {
         let b = fs::read(o2.join(n)).unwrap_or_else(|_| panic!("{n} missing in run2"));
         assert_eq!(a, b, "{n} differs across identical runs");
     }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn manifest_sources_reports_only_typed_owned_native_units() {
+    let dir = fresh_outdir("manifest_sources");
+    let tb = write_suite(&dir, TB_THREE_TESTS);
+    let outdir = dir.join("out");
+    let (ok, msg) = run_common_split(&tb, &dir.join("dut.sv"), &outdir, &["--emit-only"]);
+    assert!(ok, "{msg}");
+    let stale = outdir.join("tb__test_Stale.cpp");
+    fs::write(&stale, "this must never be compiled\n").unwrap();
+
+    let output = Command::new(harc_bin())
+        .arg("manifest-sources")
+        .arg(outdir.join("tb__artifacts.json"))
+        .output()
+        .expect("read manifest source list");
+    assert!(
+        output.status.success(),
+        "manifest reader failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sources = String::from_utf8(output.stdout).unwrap();
+    let expected = [
+        "tb__runtime.cpp",
+        "tb__test_T1Add.cpp",
+        "tb__test_T2Add.cpp",
+        "tb__test_T3Add.cpp",
+        "tb__registry.cpp",
+    ];
+    assert_eq!(
+        sources.lines().collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|name| outdir.join(name).display().to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(!sources.contains("Stale"));
+
+    let output = Command::new(harc_bin())
+        .arg("manifest-sources")
+        .arg("--all-artifacts")
+        .arg(outdir.join("tb__artifacts.json"))
+        .output()
+        .expect("read complete manifest build-input list");
+    assert!(
+        output.status.success(),
+        "manifest all-artifact reader failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let build_inputs = String::from_utf8(output.stdout).unwrap();
+    for name in [
+        "tb__suite_api.hpp",
+        "tb__runtime.cpp",
+        "tb__test_T1Add.cpp",
+        "tb__test_T2Add.cpp",
+        "tb__test_T3Add.cpp",
+        "tb__registry.cpp",
+        "harc_thread_rt.h",
+        "harc_random_rt.h",
+        "harc_queue_rt.h",
+        "harc_trace_rt.h",
+        "harc_log_rt.h",
+        "harc_z3_rt.h",
+    ] {
+        assert!(
+            build_inputs
+                .lines()
+                .any(|path| path == outdir.join(name).display().to_string()),
+            "manifest build inputs omitted {name}: {build_inputs}"
+        );
+    }
+    assert!(!build_inputs.contains("Stale"));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn manifest_sources_remains_backward_compatible_with_schema_one() {
+    let dir = fresh_outdir("manifest_sources_v1");
+    let tb = write_suite(&dir, TB_THREE_TESTS);
+    let outdir = dir.join("out");
+    let (ok, msg) = run_common_split(&tb, &dir.join("dut.sv"), &outdir, &["--emit-only"]);
+    assert!(ok, "{msg}");
+    let manifest_path = outdir.join("tb__artifacts.json");
+    let current: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let artifacts = current["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|artifact| artifact["role"] != "runtime_header")
+        .map(|artifact| artifact["filename"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    let legacy = serde_json::json!({
+        "schema_version": 1,
+        "interface_abi": current["interface_abi"],
+        "build_profile": current["build_profile"],
+        "tests": current["tests"],
+        "artifacts": artifacts,
+    });
+    fs::write(
+        &manifest_path,
+        format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+    )
+    .unwrap();
+
+    let output = Command::new(harc_bin())
+        .arg("manifest-sources")
+        .arg(&manifest_path)
+        .output()
+        .expect("read schema-one manifest source list");
+    assert!(
+        output.status.success(),
+        "schema-one manifest reader failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "tb__runtime.cpp",
+            "tb__test_T1Add.cpp",
+            "tb__test_T2Add.cpp",
+            "tb__test_T3Add.cpp",
+            "tb__registry.cpp",
+        ]
+        .iter()
+        .map(|name| outdir.join(name).display().to_string())
+        .collect::<Vec<_>>()
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn common_native_build_ignores_unowned_lookalike_sources() {
+    if !verilator_present() {
+        eprintln!("skipping: verilator not on PATH");
+        return;
+    }
+    let dir = fresh_outdir("manifest_build_sources");
+    let tb = write_suite(&dir, TB_THREE_TESTS);
+    let sv = dir.join("dut.sv");
+    let outdir = dir.join("out");
+    let (ok, msg) = run_common_split(&tb, &sv, &outdir, &["--emit-only"]);
+    assert!(ok, "{msg}");
+    fs::write(
+        outdir.join("tb__test_Unowned.cpp"),
+        "#error unowned lookalike source was compiled\n",
+    )
+    .unwrap();
+
+    let (ok, msg) = run_common_split(&tb, &sv, &outdir, &[]);
+    assert!(ok, "native build consumed an unowned source:\n{msg}");
+    assert!(outdir.join("tb__test_Unowned.cpp").is_file());
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn switching_common_and_self_contained_layouts_invalidates_native_objects() {
+    if !verilator_present() {
+        eprintln!("skipping: verilator not on PATH");
+        return;
+    }
+    let dir = fresh_outdir("layout_switch");
+    let tb = write_suite(&dir, TB_THREE_TESTS);
+    let sv = dir.join("dut.sv");
+    let outdir = dir.join("out");
+    let (ok, msg) = run_common_split(&tb, &sv, &outdir, &[]);
+    assert!(ok, "{msg}");
+    let stale_marker = outdir.join("obj_dir/stale-common-object.o");
+    fs::write(&stale_marker, "stale").unwrap();
+
+    let output = Command::new(harc_bin())
+        .arg("sim")
+        .arg(&tb)
+        .arg("--sv")
+        .arg(&sv)
+        .arg("--codegen")
+        .arg("v1")
+        .arg("--cpp-split")
+        .arg("tests")
+        .arg("--cpp-split-layout")
+        .arg("self-contained")
+        .arg("--cpp-split-group-size")
+        .arg("1")
+        .arg("--outdir")
+        .arg(&outdir)
+        .output()
+        .expect("switch layout");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "layout switch failed:\n{log}");
+    assert!(
+        !stale_marker.exists(),
+        "layout switch reused the common-object build directory"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn switching_v1_tbir_common_and_tbir_self_contained_never_reuses_native_objects() {
+    if !verilator_present() {
+        eprintln!("skipping: verilator not on PATH");
+        return;
+    }
+    let dir = fresh_outdir("backend_layout_switch");
+    let tb = write_suite(&dir, TB_THREE_TESTS);
+    let sv = dir.join("dut.sv");
+    let outdir = dir.join("out");
+
+    let (ok, msg) = run_common_split(&tb, &sv, &outdir, &[]);
+    assert!(ok, "v1 common build failed:\n{msg}");
+    let stale_v1 = outdir.join("obj_dir/stale-v1-common-object.o");
+    fs::write(&stale_v1, "stale").unwrap();
+
+    let (ok, msg) = run_common_split_codegen("tbir", &tb, &sv, &outdir, &[]);
+    assert!(ok, "TBIR common build failed after v1 common:\n{msg}");
+    assert!(!stale_v1.exists(), "backend switch reused v1 objects");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(outdir.join("tb__artifacts.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["backend"], "tbir");
+
+    let object_paths = [
+        "tb__runtime.o",
+        "tb__test_T1Add.o",
+        "tb__test_T2Add.o",
+        "tb__test_T3Add.o",
+        "tb__registry.o",
+    ]
+    .map(|name| outdir.join("obj_dir").join(name));
+    let mtimes = object_paths
+        .iter()
+        .map(|path| fs::metadata(path).unwrap().modified().unwrap())
+        .collect::<Vec<_>>();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (ok, msg) = run_common_split_codegen("tbir", &tb, &sv, &outdir, &[]);
+    assert!(ok, "unchanged TBIR common rebuild failed:\n{msg}");
+    for (path, expected) in object_paths.iter().zip(mtimes) {
+        assert_eq!(
+            fs::metadata(path).unwrap().modified().unwrap(),
+            expected,
+            "unchanged TBIR common build recompiled {}",
+            path.display()
+        );
+    }
+
+    let stale_common = outdir.join("obj_dir/stale-tbir-common-object.o");
+    fs::write(&stale_common, "stale").unwrap();
+    let output = Command::new(harc_bin())
+        .arg("sim")
+        .arg(&tb)
+        .arg("--sv")
+        .arg(&sv)
+        .arg("--codegen")
+        .arg("tbir")
+        .arg("--cpp-split")
+        .arg("tests")
+        .arg("--cpp-split-layout")
+        .arg("self-contained")
+        .arg("--cpp-split-group-size")
+        .arg("1")
+        .arg("--outdir")
+        .arg(&outdir)
+        .output()
+        .expect("switch TBIR layout");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "TBIR layout switch failed:\n{log}");
+    assert!(
+        !stale_common.exists(),
+        "TBIR layout switch reused common-layout objects"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn tbir_common_native_incrementality_is_capsule_local_and_ignores_deleted_objects() {
+    if !verilator_present() {
+        eprintln!("skipping: verilator not on PATH");
+        return;
+    }
+    let dir = fresh_outdir("tbir_native_incrementality");
+    let tb = write_suite(&dir, TB_THREE_TESTS);
+    let sv = dir.join("dut.sv");
+    let outdir = dir.join("out");
+    let (ok, msg) = run_common_split_codegen("tbir", &tb, &sv, &outdir, &[]);
+    assert!(ok, "baseline TBIR common build failed:\n{msg}");
+
+    let manifest_profile = || {
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(outdir.join("tb__artifacts.json")).unwrap())
+                .unwrap();
+        manifest["build_profile"].as_str().unwrap().to_string()
+    };
+    let baseline_profile = manifest_profile();
+    let object = |stem: &str| outdir.join("obj_dir").join(format!("{stem}.o"));
+    let stable_objects = ["tb__runtime", "tb__test_T1Add", "tb__test_T3Add"];
+    let stable_mtimes = stable_objects
+        .iter()
+        .map(|stem| fs::metadata(object(stem)).unwrap().modified().unwrap())
+        .collect::<Vec<_>>();
+    let edited_object = object("tb__test_T2Add");
+    let edited_before = fs::metadata(&edited_object).unwrap().modified().unwrap();
+    let registry_object = object("tb__registry");
+    let registry_before = fs::metadata(&registry_object).unwrap().modified().unwrap();
+    let edited = TB_THREE_TESTS.replacen(
+        "dut.a = 10\n        dut.b = 20",
+        "dut.a = 12\n        dut.b = 18",
+        1,
+    );
+    fs::write(&tb, &edited).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (ok, msg) = run_common_split_codegen("tbir", &tb, &sv, &outdir, &[]);
+    assert!(ok, "edited TBIR common build failed:\n{msg}");
+    assert_eq!(manifest_profile(), baseline_profile);
+    for (stem, expected) in stable_objects.iter().zip(&stable_mtimes) {
+        assert_eq!(
+            fs::metadata(object(stem)).unwrap().modified().unwrap(),
+            *expected,
+            "test-body edit recompiled unrelated object {stem}"
+        );
+    }
+    assert!(
+        fs::metadata(&edited_object).unwrap().modified().unwrap() > edited_before,
+        "test-body edit did not recompile its capsule"
+    );
+    assert_eq!(
+        fs::metadata(&registry_object).unwrap().modified().unwrap(),
+        registry_before,
+        "test-body edit recompiled the unchanged registry"
+    );
+
+    let existing_sources = [
+        "tb__runtime.cpp",
+        "tb__test_T1Add.cpp",
+        "tb__test_T2Add.cpp",
+        "tb__test_T3Add.cpp",
+    ];
+    let before_add = existing_sources
+        .iter()
+        .map(|name| fs::read(outdir.join(name)).unwrap())
+        .collect::<Vec<_>>();
+    let registry_before_add = fs::read(outdir.join("tb__registry.cpp")).unwrap();
+    let with_new = format!(
+        "{edited}\ntest A0First\n    let dut : SplitAdder\n    run\n        dut.a = 7\n        dut.b = 8\n        wait 1 cycle\n        assert dut.sum == 15\n    end run\nend test A0First\n"
+    );
+    fs::write(&tb, &with_new).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (ok, msg) = run_common_split_codegen("tbir", &tb, &sv, &outdir, &[]);
+    assert!(ok, "added-test TBIR common build failed:\n{msg}");
+    assert_eq!(manifest_profile(), baseline_profile);
+    for (name, expected) in existing_sources.iter().zip(&before_add) {
+        assert_eq!(
+            fs::read(outdir.join(name)).unwrap(),
+            *expected,
+            "adding a test rewrote existing source {name}"
+        );
+    }
+    assert!(object("tb__test_A0First").is_file());
+    assert_ne!(
+        fs::read(outdir.join("tb__registry.cpp")).unwrap(),
+        registry_before_add,
+        "adding a test did not rewrite the registry"
+    );
+
+    let before_delete = existing_sources
+        .iter()
+        .map(|name| fs::read(outdir.join(name)).unwrap())
+        .collect::<Vec<_>>();
+    fs::write(object("tb__test_A0First"), "not an object file\n").unwrap();
+    fs::write(&tb, &edited).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (ok, msg) = run_common_split_codegen("tbir", &tb, &sv, &outdir, &[]);
+    assert!(
+        ok,
+        "deleted-test TBIR common build linked a stale object:\n{msg}"
+    );
+    assert_eq!(manifest_profile(), baseline_profile);
+    assert!(!outdir.join("tb__test_A0First.cpp").exists());
+    assert_eq!(
+        fs::read(object("tb__test_A0First")).unwrap(),
+        b"not an object file\n",
+        "the stale capsule object was rebuilt or consumed instead of ignored"
+    );
+    for (name, expected) in existing_sources.iter().zip(&before_delete) {
+        assert_eq!(
+            fs::read(outdir.join(name)).unwrap(),
+            *expected,
+            "deleting a test rewrote surviving source {name}"
+        );
+    }
+    let run = Command::new(outdir.join("obj_dir/VSplitAdder"))
+        .args(["--test", "T2Add"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "suite failed after deleting a stale capsule: {}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn artifact_promotion_failure_stops_before_manifest_or_build_and_recovers() {
+    let dir = fresh_outdir("artifact_write_failure");
+    let tb = write_suite(&dir, TB_THREE_TESTS);
+    let outdir = dir.join("out");
+    fs::create_dir_all(&outdir).unwrap();
+    fs::create_dir(outdir.join("tb__runtime.cpp")).unwrap();
+
+    let (ok, msg) = run_common_split(&tb, &dir.join("dut.sv"), &outdir, &[]);
+    assert!(
+        !ok,
+        "second artifact promotion unexpectedly succeeded: {msg}"
+    );
+    assert!(
+        outdir.join("tb__suite_api.hpp").is_file(),
+        "the first planned artifact should have been promoted before the injected failure"
+    );
+    assert!(outdir.join("tb__runtime.cpp").is_dir());
+    assert!(
+        !outdir.join("tb__artifacts.json").exists(),
+        "an incomplete publication must not publish its manifest"
+    );
+    assert!(outdir.join(".tb__artifacts.json.pending").is_file());
+    assert!(
+        !outdir.join("obj_dir").exists(),
+        "native build must not start after an artifact promotion failure"
+    );
+
+    fs::remove_dir(outdir.join("tb__runtime.cpp")).unwrap();
+    let (ok, msg) = run_common_split(&tb, &dir.join("dut.sv"), &outdir, &["--emit-only"]);
+    assert!(
+        ok,
+        "publication did not recover after removing obstacle: {msg}"
+    );
+    assert!(outdir.join("tb__runtime.cpp").is_file());
+    assert!(outdir.join("tb__artifacts.json").is_file());
+    assert!(!outdir.join(".tb__artifacts.json.pending").exists());
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn manifest_replace_failure_stops_before_build_and_recovers() {
+    let dir = fresh_outdir("manifest_replace_failure");
+    let tb = write_suite(&dir, TB_THREE_TESTS);
+    let outdir = dir.join("out");
+    fs::create_dir_all(&outdir).unwrap();
+    fs::create_dir(outdir.join("tb__artifacts.json")).unwrap();
+
+    let (ok, msg) = run_common_split(&tb, &dir.join("dut.sv"), &outdir, &[]);
+    assert!(!ok, "manifest replacement unexpectedly succeeded: {msg}");
+    for artifact in [
+        "tb__suite_api.hpp",
+        "tb__runtime.cpp",
+        "tb__test_T1Add.cpp",
+        "tb__test_T2Add.cpp",
+        "tb__test_T3Add.cpp",
+        "tb__registry.cpp",
+    ] {
+        assert!(
+            !outdir.join(artifact).exists(),
+            "artifact {artifact} escaped staging before manifest-path validation"
+        );
+    }
+    assert!(
+        !outdir.join("obj_dir").exists(),
+        "native build must not start after manifest publication fails"
+    );
+    assert!(outdir.join(".tb__artifacts.json.pending").is_file());
+
+    fs::remove_dir(outdir.join("tb__artifacts.json")).unwrap();
+    let (ok, msg) = run_common_split(&tb, &dir.join("dut.sv"), &outdir, &["--emit-only"]);
+    assert!(ok, "manifest publication did not recover: {msg}");
+    assert!(outdir.join("tb__artifacts.json").is_file());
+    assert!(!outdir.join(".tb__artifacts.json.pending").exists());
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn stale_cleanup_failure_invalidates_manifest_stops_build_and_recovers() {
+    let dir = fresh_outdir("cleanup_failure");
+    let tb = write_suite(&dir, TB_THREE_TESTS);
+    let outdir = dir.join("out");
+    let (ok, msg) = run_common_split(&tb, &dir.join("dut.sv"), &outdir, &["--emit-only"]);
+    assert!(ok, "initial publication failed: {msg}");
+
+    let manifest_path = outdir.join("tb__artifacts.json");
+    let old_manifest = fs::read(&manifest_path).unwrap();
+    let stale = outdir.join("tb__test_T3Add.cpp");
+    fs::remove_file(&stale).unwrap();
+    fs::create_dir(&stale).unwrap();
+    let without_t3 = TB_THREE_TESTS.replace(
+        "test T3Add\n    let dut : SplitAdder\n    run\n        dut.a = 100\n        dut.b = 50\n        wait 1 cycle\n        assert dut.sum == 150\n    end run\nend test T3Add\n",
+        "",
+    );
+    fs::write(&tb, without_t3).unwrap();
+
+    let (ok, msg) = run_common_split(&tb, &dir.join("dut.sv"), &outdir, &[]);
+    assert!(!ok, "stale cleanup unexpectedly succeeded: {msg}");
+    assert!(
+        !manifest_path.exists(),
+        "cleanup failure must not leave a trusted canonical manifest over a partial update"
+    );
+    assert_eq!(
+        fs::read(outdir.join(".tb__artifacts.json.previous")).unwrap(),
+        old_manifest,
+        "cleanup recovery must retain the strictly validated prior ownership manifest"
+    );
+    assert!(outdir.join(".tb__artifacts.json.pending").is_file());
+    assert!(
+        !outdir.join("obj_dir").exists(),
+        "native build must not start after stale cleanup fails"
+    );
+
+    fs::remove_dir(&stale).unwrap();
+    let (ok, msg) = run_common_split(&tb, &dir.join("dut.sv"), &outdir, &["--emit-only"]);
+    assert!(ok, "cleanup did not recover after removing obstacle: {msg}");
+    assert!(!stale.exists());
+    assert!(!outdir.join(".tb__artifacts.json.previous").exists());
+    assert!(!outdir.join(".tb__artifacts.json.pending").exists());
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    assert!(!manifest.contains("T3Add"));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn malformed_and_unknown_manifests_never_authorize_deletion() {
+    let dir = fresh_outdir("untrusted_manifest");
+    let tb = write_suite(&dir, TB_THREE_TESTS);
+
+    let unknown_out = dir.join("unknown");
+    fs::create_dir_all(&unknown_out).unwrap();
+    let unknown_sentinel = unknown_out.join("tb__test_Old.cpp");
+    fs::write(&unknown_sentinel, "do not delete").unwrap();
+    fs::write(
+        unknown_out.join("tb__artifacts.json"),
+        r#"{"schema_version":2,"interface_abi":"0123456789abcdef","build_profile":"fedcba9876543210","tests":["Old"],"artifacts":["tb__test_Old.cpp"]}"#,
+    )
+    .unwrap();
+    let (ok, msg) = run_common_split(&tb, &dir.join("dut.sv"), &unknown_out, &["--emit-only"]);
+    assert!(ok, "unknown-schema recovery failed: {msg}");
+    assert_eq!(
+        fs::read_to_string(&unknown_sentinel).unwrap(),
+        "do not delete"
+    );
+
+    let malformed_out = dir.join("malformed");
+    fs::create_dir_all(&malformed_out).unwrap();
+    let traversal_victim = dir.join("victim.cpp");
+    fs::write(&traversal_victim, "outside output directory").unwrap();
+    fs::write(
+        malformed_out.join("tb__artifacts.json"),
+        r#"{"schema_version":1,"interface_abi":"0123456789abcdef","build_profile":"fedcba9876543210","tests":["Old"],"artifacts":["../victim.cpp"]}"#,
+    )
+    .unwrap();
+    let (ok, msg) = run_common_split(&tb, &dir.join("dut.sv"), &malformed_out, &["--emit-only"]);
+    assert!(ok, "malformed-manifest recovery failed: {msg}");
+    assert_eq!(
+        fs::read_to_string(&traversal_victim).unwrap(),
+        "outside output directory"
+    );
+
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -553,6 +1313,188 @@ fn common_layout_incremental_rewrites_only_required_artifacts() {
     fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn common_layout_distinguishes_shared_body_and_shared_interface_edits() {
+    let dir = fresh_outdir("shared_incrementality");
+    let sv = dir.join("dut.sv");
+    fs::write(&sv, ADDER_SV).unwrap();
+    let tb = dir.join("tb.harc");
+    let baseline_source = r#"function shared_value() -> uint<8>
+    return 1
+end function shared_value
+
+test SharedA
+    let dut : SplitAdder
+    run
+        dut.a = 1
+        dut.b = 2
+        wait 1 cycle
+        assert dut.sum == 3
+    end run
+end test SharedA
+
+test SharedB
+    let dut : SplitAdder
+    run
+        dut.a = 1
+        dut.b = 3
+        wait 1 cycle
+        assert dut.sum == 4
+    end run
+end test SharedB
+"#;
+    for codegen in ["v1", "tbir"] {
+        fs::write(&tb, baseline_source).unwrap();
+        let outdir = dir.join(format!("out_{codegen}"));
+        let (ok, msg) = run_common_split_codegen(codegen, &tb, &sv, &outdir, &["--emit-only"]);
+        assert!(ok, "{codegen}: {msg}");
+        let read = |name: &str| fs::read(outdir.join(name)).unwrap();
+        let baseline_header = read("tb__suite_api.hpp");
+        let baseline_runtime = read("tb__runtime.cpp");
+        let baseline_a = read("tb__test_SharedA.cpp");
+        let baseline_b = read("tb__test_SharedB.cpp");
+        let baseline_registry = read("tb__registry.cpp");
+        let baseline_manifest = read("tb__artifacts.json");
+
+        let body_edit = baseline_source.replace("return 1", "return 2");
+        fs::write(&tb, body_edit).unwrap();
+        let (ok, msg) = run_common_split_codegen(codegen, &tb, &sv, &outdir, &["--emit-only"]);
+        assert!(ok, "{codegen}: {msg}");
+        assert_eq!(read("tb__suite_api.hpp"), baseline_header, "{codegen}");
+        assert_ne!(read("tb__runtime.cpp"), baseline_runtime, "{codegen}");
+        assert_eq!(read("tb__test_SharedA.cpp"), baseline_a, "{codegen}");
+        assert_eq!(read("tb__test_SharedB.cpp"), baseline_b, "{codegen}");
+        assert_eq!(read("tb__registry.cpp"), baseline_registry, "{codegen}");
+        assert_eq!(read("tb__artifacts.json"), baseline_manifest, "{codegen}");
+
+        let interface_edit = baseline_source.replace("-> uint<8>", "-> uint<128>");
+        fs::write(&tb, interface_edit).unwrap();
+        let (ok, msg) = run_common_split_codegen(codegen, &tb, &sv, &outdir, &["--emit-only"]);
+        assert!(ok, "{codegen}: {msg}");
+        assert_ne!(read("tb__suite_api.hpp"), baseline_header, "{codegen}");
+        assert_ne!(read("tb__runtime.cpp"), baseline_runtime, "{codegen}");
+        assert_ne!(read("tb__test_SharedA.cpp"), baseline_a, "{codegen}");
+        assert_ne!(read("tb__test_SharedB.cpp"), baseline_b, "{codegen}");
+        assert_ne!(read("tb__registry.cpp"), baseline_registry, "{codegen}");
+        assert_ne!(read("tb__artifacts.json"), baseline_manifest, "{codegen}");
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn common_layout_runtime_selectors_do_not_change_artifact_identity() {
+    let dir = fresh_outdir("runtime_only_identity");
+    let tb = write_suite(&dir, TB_THREE_TESTS);
+    let sv = dir.join("dut.sv");
+    for codegen in ["v1", "tbir"] {
+        let outdir = dir.join(format!("out_{codegen}"));
+        let trace_a = dir.join(format!("{codegen}_a.jsonl"));
+        let trace_b = dir.join(format!("{codegen}_b.jsonl"));
+        let wave_a = dir.join(format!("{codegen}_a.vcd"));
+        let wave_b = dir.join(format!("{codegen}_b.vcd"));
+        let (ok, msg) = run_common_split_codegen(
+            codegen,
+            &tb,
+            &sv,
+            &outdir,
+            &[
+                "--emit-only",
+                "--test",
+                "T1Add",
+                "--seed",
+                "1",
+                "--record-trace",
+                trace_a.to_str().unwrap(),
+                "--waves",
+                "--wave-format",
+                "vcd",
+                "--wave-file",
+                wave_a.to_str().unwrap(),
+            ],
+        );
+        assert!(ok, "{codegen}: {msg}");
+        let names = [
+            "tb__suite_api.hpp",
+            "tb__runtime.cpp",
+            "tb__test_T1Add.cpp",
+            "tb__test_T2Add.cpp",
+            "tb__test_T3Add.cpp",
+            "tb__registry.cpp",
+            "tb__artifacts.json",
+        ];
+        let before = names
+            .iter()
+            .map(|name| (name, fs::read(outdir.join(name)).unwrap()))
+            .collect::<Vec<_>>();
+
+        let (ok, msg) = run_common_split_codegen(
+            codegen,
+            &tb,
+            &sv,
+            &outdir,
+            &[
+                "--emit-only",
+                "--test",
+                "T2Add",
+                "--seed",
+                "999",
+                "--record-trace",
+                trace_b.to_str().unwrap(),
+                "--waves",
+                "--wave-format",
+                "vcd",
+                "--wave-file",
+                wave_b.to_str().unwrap(),
+            ],
+        );
+        assert!(ok, "{codegen}: {msg}");
+        for (name, expected) in before {
+            assert_eq!(
+                fs::read(outdir.join(name)).unwrap(),
+                expected,
+                "{codegen}: {name}"
+            );
+        }
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn common_layout_external_native_input_changes_only_the_build_profile_identity() {
+    let dir = fresh_outdir("external_profile");
+    let tb = write_suite(&dir, TB_THREE_TESTS);
+    let sv = dir.join("dut.sv");
+    for codegen in ["v1", "tbir"] {
+        let outdir = dir.join(format!("out_{codegen}"));
+        let (ok, msg) = run_common_split_codegen(
+            codegen,
+            &tb,
+            &sv,
+            &outdir,
+            &["--emit-only", "--build-profile-input", "assertions=off"],
+        );
+        assert!(ok, "{codegen}: {msg}");
+        let first: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(outdir.join("tb__artifacts.json")).unwrap())
+                .unwrap();
+
+        let (ok, msg) = run_common_split_codegen(
+            codegen,
+            &tb,
+            &sv,
+            &outdir,
+            &["--emit-only", "--build-profile-input", "assertions=on"],
+        );
+        assert!(ok, "{codegen}: {msg}");
+        let second: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(outdir.join("tb__artifacts.json")).unwrap())
+                .unwrap();
+        assert_eq!(first["interface_abi"], second["interface_abi"], "{codegen}");
+        assert_ne!(first["build_profile"], second["build_profile"], "{codegen}");
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
 /// Suites with suite-level functions that call each other (#301 shape),
 /// a hookable transactor with pre/post hooks, and a watchdog — the
 /// classes of composition the adder suite cannot exercise. Emit-level
@@ -615,8 +1557,18 @@ end test TCompose
 
     // Shared callables defined ONCE in the common TU as glue members.
     let runtime = fs::read_to_string(outdir.join("tb__runtime.cpp")).unwrap();
-    assert_eq!(runtime.matches("uint64_t HarcSuiteGlue::inner(").count(), 1);
-    assert_eq!(runtime.matches("uint64_t HarcSuiteGlue::outer(").count(), 1);
+    assert_eq!(
+        runtime
+            .matches("uint64_t HarcSuiteGlue::harc_user_callable_inner_")
+            .count(),
+        1
+    );
+    assert_eq!(
+        runtime
+            .matches("uint64_t HarcSuiteGlue::harc_user_callable_outer_")
+            .count(),
+        1
+    );
     assert_eq!(runtime.matches("void HarcSuiteGlue::Drv_send(").count(), 1);
     assert_eq!(
         runtime.matches("void HarcSuiteGlue::Drv_watchdog(").count(),
@@ -663,6 +1615,175 @@ end test TCompose
     let (ok, msg) = run_common_split(&tb, &sv, &built, &[]);
     assert!(ok, "compose suite failed to build/run: {msg}");
     assert!(msg.contains("ALL TESTS PASSED"), "{msg}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn common_layout_heartbeat_only_transactor_state_compiles_and_runs() {
+    if !verilator_present() {
+        eprintln!("skipping: verilator not on PATH");
+        return;
+    }
+    let dir = fresh_outdir("heartbeat_only_state");
+    let sv = dir.join("dut.sv");
+    fs::write(
+        &sv,
+        "module IdleDut(input logic clk, input logic [7:0] d, output logic [7:0] q);\n\
+         always_ff @(posedge clk) q <= d;\n\
+         endmodule\n",
+    )
+    .unwrap();
+    let tb = dir.join("tb.harc");
+    fs::write(
+        &tb,
+        r#"transaction _PlainDriver_state
+    value : uint<8>
+end transaction _PlainDriver_state
+
+transaction HarcTransactorState_PlainDriver
+    value : uint<8>
+end transaction HarcTransactorState_PlainDriver
+
+transaction _A_state
+    value : uint<8>
+end transaction _A_state
+
+transaction _A_1_state
+    value : uint<8>
+end transaction _A_1_state
+
+transaction HarcTransactorState_A
+    value : uint<8>
+end transaction HarcTransactorState_A
+
+transactor A
+    dut : IdleDut
+    when active
+        function ping()
+            dut.d = 1
+        end ping
+    end when
+end transactor A
+
+transactor A_1
+    dut : IdleDut
+    when active
+        function ping()
+            dut.d = 2
+        end ping
+    end when
+end transactor A_1
+
+agent _Foo
+    hookable bar_state()
+        log(info, "callable/type collision")
+    end bar_state
+end agent _Foo
+
+transactor Foo_bar
+    dut : IdleDut
+    when active
+        function ping()
+            dut.d = 4
+        end ping
+    end when
+end transactor Foo_bar
+
+transactor PlainDriver
+    dut : IdleDut
+    when active
+        function drive(value: uint<8>)
+            dut.d = value
+        end drive
+    end when
+end transactor PlainDriver
+
+testbench IdleTb
+    dut : IdleDut
+    helper : _Foo
+    driver : PlainDriver active
+    collision_driver : Foo_bar active
+    function driver_idle(cycles: uint<8>) -> bool
+        return driver.idle(cycles)
+    end function driver_idle
+    function collision_driver_idle(cycles: uint<8>) -> bool
+        return collision_driver.idle(cycles)
+    end function collision_driver_idle
+end testbench IdleTb
+
+impl HeartbeatOnlyState for IdleTb
+    clock clk = 10ns
+    run
+        let rec : _PlainDriver_state
+        rec.value = 3
+        assert rec.value == 3 else fail("colliding record type was shadowed")
+        helper.bar_state()
+        collision_driver.ping()
+        driver.drive(7)
+        wait 2 cycles
+        assert driver_idle(1) else fail("heartbeat-only state was not idle")
+        assert collision_driver_idle(1) else fail("callable/type collision state was not idle")
+    end run
+end impl HeartbeatOnlyState
+
+impl HeartbeatOnlyStateSecond for IdleTb
+    clock clk = 10ns
+    run
+        driver.drive(9)
+        wait 2 cycles
+        assert driver_idle(1) else fail("second heartbeat-only state was not idle")
+    end run
+end impl HeartbeatOnlyStateSecond"#,
+    )
+    .unwrap();
+
+    let outdir = dir.join("out");
+    let (ok, msg) = run_common_split_codegen("tbir", &tb, &sv, &outdir, &["--top", "IdleDut"]);
+    assert!(ok, "heartbeat-only common suite failed: {msg}");
+    assert!(msg.contains("ALL TESTS PASSED"), "{msg}");
+    let interface = fs::read_to_string(outdir.join("tb__suite_api.hpp")).unwrap();
+    assert!(
+        interface.contains("struct HarcTransactorState_PlainDriver_1"),
+        "{interface}"
+    );
+    assert!(
+        interface.contains("HarcTransactorState_PlainDriver_1& _harc_tb_transactor_state_driver"),
+        "{interface}"
+    );
+    assert!(interface.contains("struct HarcTransactorState_A_1 {"));
+    assert!(interface.contains("struct HarcTransactorState_A_1_1 {"));
+
+    let self_outdir = dir.join("self");
+    let output = Command::new(harc_bin())
+        .arg("sim")
+        .arg(&tb)
+        .arg("--sv")
+        .arg(&sv)
+        .arg("--top")
+        .arg("IdleDut")
+        .arg("--codegen")
+        .arg("tbir")
+        .arg("--cpp-split")
+        .arg("tests")
+        .arg("--cpp-split-layout")
+        .arg("self-contained")
+        .arg("--cpp-split-group-size")
+        .arg("1")
+        .arg("--outdir")
+        .arg(&self_outdir)
+        .output()
+        .expect("spawn self-contained heartbeat suite");
+    let self_msg = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "heartbeat-only self-contained suite failed: {self_msg}"
+    );
+    assert!(self_msg.contains("ALL TESTS PASSED"), "{self_msg}");
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -748,9 +1869,9 @@ end test TBusBound
     fs::remove_dir_all(&dir).ok();
 }
 
-/// `randomize` state that used to be function-local statics (auto-coverage
-/// state, `[unique]` history) moved into the per-run `_cells` block. Every
-/// reader must follow — a single missed site is an undeclared identifier.
+/// Test-local `randomize` state belongs to the capsule, while immutable
+/// problem descriptors belong to the common runtime TU. Neither is part of
+/// the shared interface ABI.
 #[test]
 fn common_layout_randomize_cells_are_fully_migrated() {
     if !verilator_present() {
@@ -788,7 +1909,34 @@ end test TCells
     assert!(msg.contains("ALL TESTS PASSED"), "{msg}");
 
     let capsule = fs::read_to_string(outdir.join("tb__test_TCells.cpp")).unwrap();
-    // No reader may name a migrated cell without the `ctx._cells.` path.
+    let interface = fs::read_to_string(outdir.join("tb__suite_api.hpp")).unwrap();
+    let runtime = fs::read_to_string(outdir.join("tb__runtime.cpp")).unwrap();
+    for generated in [&interface, &runtime, &capsule] {
+        assert!(!generated.contains("thread_local"), "{generated}");
+        assert!(!generated.contains("harc_rt_current_run"), "{generated}");
+        assert!(
+            !generated.contains("static harc_rt::random::HarcRng"),
+            "{generated}"
+        );
+        assert!(
+            !generated.contains("static harc_rt::random::HarcRuntimeCallSite"),
+            "{generated}"
+        );
+    }
+    assert!(
+        capsule.contains("_harc_randomize_state"),
+        "test-local randomize storage must be owned by the capsule:\n{capsule}"
+    );
+    assert!(
+        !interface.contains("_solver_site_")
+            && !interface.contains("_harc_runtime_random_problem_table"),
+        "test-local cells and immutable descriptors must stay out of the interface:\n{interface}"
+    );
+    assert!(
+        runtime.contains("static constexpr harc_rt::random::HarcRuntimeProblemDescriptor _harc_runtime_random_problem_table_entries[]"),
+        "immutable descriptors must be defined privately in the runtime TU:\n{runtime}"
+    );
+    // No reader may name a migrated cell without the capsule-local path.
     for needle in [
         "harc_unique_clear(_",
         "harc_unique_remember(_",
@@ -801,7 +1949,7 @@ end test TCells
                 .unwrap_or(capsule.len());
             let line = &capsule[pos..line_end];
             assert!(
-                line.contains("ctx._cells."),
+                line.contains("_harc_randomize_state."),
                 "migrated cell referenced without the per-run path: {line}"
             );
         }
@@ -1056,7 +2204,12 @@ end impl LcBumpFive
 ";
 
 /// `harc sim … --codegen tbir --cpp-split tests --cpp-split-layout common`.
-fn run_common_split_tbir(tb: &Path, sv: &Path, outdir: &Path, extra_args: &[&str]) -> (bool, String) {
+fn run_common_split_tbir(
+    tb: &Path,
+    sv: &Path,
+    outdir: &Path,
+    extra_args: &[&str],
+) -> (bool, String) {
     let mut cmd = Command::new(harc_bin());
     cmd.arg("sim")
         .arg(tb)
@@ -1135,8 +2288,13 @@ fn common_layout_shared_lifecycle_defines_body_once_builds_and_runs() {
     let setup_def = "harc_rt::HarcThread _harc_lc__tb_lifecycle_LcSharedTb_Setup(HarcTestContext";
     let check_def = "void _harc_lc__tb_lifecycle_LcSharedTb_Check(HarcTestContext";
 
-    let common = read_by_suffix(&outdir, "__common.cpp");
-    assert_eq!(common.len(), 1, "expected exactly one common TU, got {}", common.len());
+    let common = read_by_suffix(&outdir, "__runtime.cpp");
+    assert_eq!(
+        common.len(),
+        1,
+        "expected exactly one common TU, got {}",
+        common.len()
+    );
     let (_, common_src) = &common[0];
     assert_eq!(
         count(common_src, setup_def),
@@ -1152,7 +2310,7 @@ fn common_layout_shared_lifecycle_defines_body_once_builds_and_runs() {
     // Zero DEFINITIONS in any shard (they only CALL the shared bodies).
     let shards = read_by_suffix(&outdir, ".cpp")
         .into_iter()
-        .filter(|(n, _)| n.contains("__shard"))
+        .filter(|(n, _)| n.contains("__test_"))
         .collect::<Vec<_>>();
     assert!(!shards.is_empty(), "expected at least one shard TU");
     for (n, src) in &shards {
@@ -1170,7 +2328,7 @@ fn common_layout_shared_lifecycle_defines_body_once_builds_and_runs() {
 
     // The suite header carries a prototype for each shared body so shards
     // can call them.
-    let header = read_by_suffix(&outdir, "__suite.hpp");
+    let header = read_by_suffix(&outdir, "__suite_api.hpp");
     assert_eq!(header.len(), 1, "expected exactly one suite header");
     let (_, header_src) = &header[0];
     assert!(

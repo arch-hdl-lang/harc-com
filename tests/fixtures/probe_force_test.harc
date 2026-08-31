@@ -19,7 +19,22 @@
 // through `alu0.a` (combinational forwarding), then releasing and
 // confirming the natural value returns.
 
+agent ProbeForceHelper
+    function read_inject() -> uint<32>
+        return dut.inject_rs1
+    end function read_inject
+
+    function force_inject(value: uint<32>)
+        dut.inject_rs1 = value
+    end function force_inject
+
+    function release_inject()
+        release dut.inject_rs1
+    end function release_inject
+end agent ProbeForceHelper
+
 testbench ProbeForceTb
+    helper : ProbeForceHelper
 end testbench ProbeForceTb
 
 impl ProbeForceTest for ProbeForceTb
@@ -53,17 +68,21 @@ impl ProbeForceTest for ProbeForceTb
         // Natural value flows from rs1_data → decode_rs1_val → alu0.a.
         assert dut.alu_a == 100
             else fail("natural alu_a: expected 100, got ${dut.alu_a}")
+        assert helper.read_inject() == 100
+            else fail("shared helper read: expected 100")
 
         // Force decode_rs1_val to 0xDEADBEEF — should propagate
         // combinationally to alu0.a through the forwarding mux.
-        dut.inject_rs1 = 3735928559   // 0xDEAD_BEEF
+        helper.force_inject(3735928559)   // 0xDEAD_BEEF
         wait 1 cycle
         assert dut.alu_a == 3735928559
             else fail("forced alu_a: expected 0xDEADBEEF, got 0x${dut.alu_a:08x}")
+        assert helper.read_inject() == 3735928559
+            else fail("shared helper force readback failed")
 
         // Release the force and feed a new instruction — natural
         // path takes over again.
-        release dut.inject_rs1
+        helper.release_inject()
         dut.rs1_data = 42
         dut.imem_data = 96
         wait 1 cycle

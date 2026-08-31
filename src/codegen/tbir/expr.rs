@@ -1,9 +1,245 @@
 //! TB-IR expression → C++ text.
 
 use crate::codegen::cpp_tb::EmitError;
-use crate::ir::{BinOp, CallTarget, Expr, FmtArg, PortRef, TbFunction, UnOp, WidthCastKind};
-use std::collections::HashMap;
+use crate::ir::{
+    BinOp, CallTarget, Expr, FmtArg, FunctionId, PortRef, TbFunction, UnOp, WidthCastKind,
+};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
+
+#[derive(Clone, Debug)]
+pub(super) struct TestbenchComponentRenderBinding {
+    pub field: String,
+    pub component: crate::ir::ComponentId,
+    pub receiver: String,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct TestbenchTransactorStateRenderBinding {
+    pub field: String,
+    pub transactor: crate::ir::TransactorId,
+    pub receiver: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct BusSignalAdapterPlan {
+    pub field: String,
+    pub channel: String,
+    pub signal: String,
+    pub ty: crate::ir::IrType,
+    pub symbol: String,
+}
+
+impl BusSignalAdapterPlan {
+    pub fn matches(&self, field: &str, channel: &str, signal: &str) -> bool {
+        self.field == field && self.channel == channel && self.signal == signal
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TestbenchBusAdapterPlan {
+    pub function: crate::ir::FunctionId,
+    pub signals: Vec<BusSignalAdapterPlan>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BusAdapterRenderBindings<'a> {
+    pub current: Option<&'a TestbenchBusAdapterPlan>,
+    pub callables: &'a [TestbenchBusAdapterPlan],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RuntimeCellRenderBinding<'a> {
+    pub plan: &'a crate::ir::passes::runtime_cells::RuntimeCellPlan,
+    pub test: &'a crate::ir::TestSchema,
+    pub receiver: &'a str,
+}
+
+impl<'a> RuntimeCellRenderBinding<'a> {
+    fn test_cell(
+        self,
+        kind: &crate::ir::passes::runtime_cells::RuntimeCellKind,
+    ) -> Result<&'a crate::ir::passes::runtime_cells::RuntimeCell, EmitError> {
+        self.plan.find_for_test(self.test.id, kind).ok_or_else(|| {
+            EmitError(format!(
+                "tbir: test `{}` has no planned runtime cell {kind:?}",
+                self.test.name
+            ))
+        })
+    }
+
+    pub fn require(
+        self,
+        kind: &crate::ir::passes::runtime_cells::RuntimeCellKind,
+    ) -> Result<&'a str, EmitError> {
+        self.test_cell(kind)?;
+        Ok(self.receiver)
+    }
+
+    pub fn field(
+        self,
+        kind: &crate::ir::passes::runtime_cells::RuntimeCellKind,
+    ) -> Result<String, EmitError> {
+        Ok(format!(
+            "{}.{}",
+            self.receiver,
+            self.test_cell(kind)?.symbol()
+        ))
+    }
+
+    pub fn constraint_field(self, site: crate::ir::ConstraintRef) -> Result<String, EmitError> {
+        let kind = crate::ir::passes::runtime_cells::RuntimeCellKind::ConstraintState { site };
+        let cell = self
+            .plan
+            .find_for_test(self.test.id, &kind)
+            .or_else(|| self.plan.find_for_testbench(self.test.testbench, &kind))
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: test `{}` has no planned constraint runtime cell c{}",
+                    self.test.name, site.0
+                ))
+            })?;
+        Ok(format!("{}.{}", self.receiver, cell.symbol()))
+    }
+
+    pub fn persistent_local(
+        self,
+        function: &TbFunction,
+        local: crate::ir::LocalId,
+    ) -> Result<String, EmitError> {
+        let member = match function.kind {
+            crate::ir::FunctionKind::TestBody { member, .. } => member,
+            _ => {
+                return Err(EmitError(format!(
+                    "tbir: persistent local %{} belongs to non-test function `{}`",
+                    local.0, function.name
+                )))
+            }
+        };
+        let kind =
+            crate::ir::passes::runtime_cells::RuntimeCellKind::PersistentLocal { member, local };
+        let cell = self
+            .plan
+            .find_for_test(self.test.id, &kind)
+            .or_else(|| {
+                self.plan.find_for_test(
+                    self.test.id,
+                    &crate::ir::passes::runtime_cells::RuntimeCellKind::LocalEventSubscribers {
+                        member,
+                        event: local,
+                    },
+                )
+            })
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: test `{}` has no planned persistent local fn{} %{}",
+                    self.test.name, function.id.0, local.0
+                ))
+            })?;
+        Ok(format!("{}.{}", self.receiver, cell.symbol()))
+    }
+
+    pub fn test_hook(self, function: FunctionId) -> Result<String, EmitError> {
+        let member = self
+            .plan
+            .cells()
+            .iter()
+            .find_map(|cell| match cell.kind() {
+                crate::ir::passes::runtime_cells::RuntimeCellKind::TestHookClosure {
+                    function: owner,
+                    member,
+                } if *owner == function => Some(member.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: test `{}` has no planned callback body fn{}",
+                    self.test.name, function.0
+                ))
+            })?;
+        let kind =
+            crate::ir::passes::runtime_cells::RuntimeCellKind::TestHookClosure { function, member };
+        let planned = match &kind {
+            crate::ir::passes::runtime_cells::RuntimeCellKind::TestHookClosure {
+                member:
+                    crate::ir::TestHookMember::EventSubscription(_)
+                    | crate::ir::TestHookMember::MethodSubscription(_)
+                    | crate::ir::TestHookMember::StatementCycle(_),
+                ..
+            } => self.plan.find_for_test(self.test.id, &kind),
+            _ => self.plan.find_for_testbench(self.test.testbench, &kind),
+        };
+        let planned = planned.ok_or_else(|| {
+            EmitError(format!(
+                "tbir: test `{}` has no planned callback body fn{}",
+                self.test.name, function.0
+            ))
+        })?;
+        Ok(format!("{}.{}", self.receiver, planned.symbol()))
+    }
+
+    pub fn testbench_field(
+        self,
+        kind: &crate::ir::passes::runtime_cells::RuntimeCellKind,
+    ) -> Result<String, EmitError> {
+        let cell = self
+            .plan
+            .find_for_testbench(self.test.testbench, kind)
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: test `{}` has no planned testbench runtime cell {kind:?}",
+                    self.test.name
+                ))
+            })?;
+        Ok(format!("{}.{}", self.receiver, cell.symbol()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct CallableRenderBindings<'a> {
+    /// Explicit suite runtime parameter for out-of-line common callables.
+    pub run_context: Option<&'a str>,
+    /// Explicit DUT receiver for common callables. Self-contained emission
+    /// may retain its lexical `dut` binding, while common code must name the
+    /// run-owned receiver deliberately.
+    pub dut_receiver: Option<&'a str>,
+    /// Explicit component receiver substitution for bodies rendered outside
+    /// their lexical `self` scope.
+    pub self_receiver: Option<&'a str>,
+    /// Concrete per-test schema used while rendering a canonical testbench
+    /// method into a self-contained test body.
+    pub testbench_owner: Option<crate::ir::TestbenchId>,
+    /// Explicit receiver for record-valued testbench-field locals.
+    pub testbench_receiver: Option<&'a str>,
+    /// Concrete per-test adapter for `PortOrigin::BoundBus` references in a
+    /// reusable component/transactor body.
+    pub bound_bus: Option<&'a crate::ir::BusBindingSchema>,
+    /// Canonical logical-field adapters for an out-of-line reusable
+    /// testbench method. Common emission must resolve bus-relative ports from
+    /// this closed plan instead of selecting an arbitrary implementation.
+    pub testbench_bus_bindings: Option<&'a [crate::ir::BusBindingSchema]>,
+    /// Logical signal adapters used by a shared reusable method and by its
+    /// callers. Each capsule supplies physical DUT members explicitly.
+    pub bus_adapters: Option<BusAdapterRenderBindings<'a>>,
+    /// The current test's ordered clock bindings for a canonical callable
+    /// containing a clock-qualified wait.
+    pub clocks: Option<&'a [crate::ir::ClockSpec]>,
+    /// Scheduler slot owned by the coroutine currently rendering this body.
+    /// Nested blocking bus calls suspend this slot instead of advancing the
+    /// DUT from an actor worker.
+    pub actor_slot: Option<&'a str>,
+    /// Canonical testbench component members passed as explicit receivers to
+    /// an out-of-line common method.
+    pub testbench_components: Option<&'a [TestbenchComponentRenderBinding]>,
+    /// Per-instance transactor state passed explicitly to an out-of-line
+    /// common testbench method.
+    pub testbench_transactor_states: Option<&'a [TestbenchTransactorStateRenderBinding]>,
+    /// Explicit testcase-owned persistent-cell block for statement callbacks.
+    pub runtime_cells: Option<RuntimeCellRenderBinding<'a>>,
+    /// Persistent callbacks in a common capsule capture only the run-owned
+    /// state and context, never coroutine-local aliases.
+    pub durable_callbacks: bool,
+}
 
 /// Per-function emission context: the function (for diagnostics), the
 /// emitted local names, and the `--sv` packed-lane width table
@@ -22,20 +258,21 @@ pub(super) struct ECx<'a> {
     /// finding 6 + residual). `None` only in contexts that are
     /// scalar-only by construction (pure helpers).
     pub prog: Option<&'a crate::ir::TbProgram>,
-    /// Simple name of the DUT type (`CpuPipe`). Used to form the
-    /// Verilator-mangled probe accessor `dut->rootp-><DutType>__DOT__
-    /// harc_probes__DOT__<name>` for `PortAccess::Probe`/`Force` reads
-    /// and writes. Empty (`""`) in contexts that can never host a probe
-    /// access (pure helpers, tseqs, transactor methods, component
-    /// lambdas — probes are test-scope only); the probe-accessor path is
-    /// structurally unreachable there.
+    /// Simple name of the DUT type (`CpuPipe`). Used to form a
+    /// Verilator-mangled probe accessor in self-contained emission. Common
+    /// emission takes the DUT type and probe identity from `dut_access`.
+    /// Empty (`""`) only in callable contexts that cannot access the DUT.
     pub dut_type: &'a str,
+    /// Immutable verified DUT/probe access plan. Common emission requires it
+    /// for every direct DUT access so probe identity is resolved by ProbeId,
+    /// never reconstructed from a source spelling.
+    pub dut_access: Option<&'a crate::ir::passes::dut_access::DutAccessPlan>,
     /// When `Some`, a `ComponentField`/`ComponentIdle` with a `SelfField`
     /// base renders against this instance path instead of the literal
     /// `self`. Used when a watchdog/periodic clause expr (lowered in the
     /// component-self context) is emitted inside a per-instance
     /// `_checkers` closure, which has no `self` in scope.
-    pub self_subst: Option<&'a str>,
+    pub bindings: CallableRenderBindings<'a>,
     /// Component-instance context for `tlm_call` trace events emitted by
     /// a bus-call edge inside this body (v1's
     /// `current_component_instance`). Empty (`""`) at test-run scope; the
@@ -55,6 +292,12 @@ pub(super) struct ECx<'a> {
     /// Widths of the current concurrent check's temporal latch slots.
     /// Empty outside property/cover emission.
     pub temporal_widths: &'a [Option<u32>],
+    /// Explicit previous-value field prefix for the current concurrent check.
+    pub temporal_cell_prefix: Option<&'a str>,
+    /// `Some` only while emitting the common-object layout. Every tseq call
+    /// then targets its externally linked `harc_tseq_*` symbol; membership
+    /// means the callee's verified body needs the explicit per-run context.
+    pub common_contextual_tseqs: Option<&'a BTreeSet<FunctionId>>,
 }
 
 /// C++ symbol for a lowered pure-helper function. Prefixed so a HARC
@@ -62,6 +305,10 @@ pub(super) struct ECx<'a> {
 /// keywords.
 pub(super) fn helper_cpp_name(name: &str) -> String {
     format!("harc_helper_{name}")
+}
+
+pub(super) fn tseq_cpp_name(name: &str) -> String {
+    format!("harc_tseq_{name}")
 }
 
 /// C-escape a string for placement inside a C++ string literal.
@@ -80,10 +327,10 @@ pub(super) fn escape_c(s: &str) -> String {
     out
 }
 
-/// `dut-><flat_port_name>` — dotted sub-paths flatten with `_`, the
-/// same convention the v1 backend uses for bus-bundle members. The
-/// bare signal, with no lane applied (lane handling is per call site:
-/// reads via `port_read`, writes in `func.rs`).
+/// Resolve one verified DUT signal against the current callable's typed DUT
+/// receiver. The immutable access plan owns the emitted path spelling,
+/// including flattened bundle members and aggregate member paths. Lane
+/// handling remains per call site (`port_read` and `func.rs`).
 ///
 /// For a `PortAccess::Probe`/`Force` reference, the signal is NOT a
 /// top-level DUT port but a DUT-internal value surfaced through the SV
@@ -91,29 +338,316 @@ pub(super) fn escape_c(s: &str) -> String {
 /// harc_probes__DOT__<name>` (the read-side accessor; force probes
 /// additionally carry `_drv`/`_en` siblings handled in `func.rs`).
 /// Mirrors v1's `Emitter::probes` lowering. See docs/probe-signals.md.
-pub(super) fn port_signal(cx: &ECx<'_>, p: &PortRef) -> String {
+pub(super) fn port_signal(cx: &ECx<'_>, p: &PortRef) -> Result<String, EmitError> {
     match p.access {
         crate::ir::PortAccess::Port => {
-            let sep = if p.aggregate_path { "." } else { "_" };
-            format!("dut->{}", p.port_path.join(sep))
+            let bus_binding = match &p.origin {
+                crate::ir::PortOrigin::Dut => None,
+                crate::ir::PortOrigin::BusBinding { binding, field } => {
+                    if let Some((channel, signal)) = bus_port_logical_signal(p, field) {
+                        if let Some(symbol) = bus_adapter_signal(cx, field, channel, signal) {
+                            return Ok(symbol.to_string());
+                        }
+                    }
+                    let planned = cx.bindings.testbench_bus_bindings.and_then(|bindings| {
+                        bindings.iter().find(|candidate| candidate.field == *field)
+                    });
+                    let resolved = if planned.is_some() {
+                        planned
+                    } else {
+                        let owner = owner_tb(cx).ok_or_else(|| {
+                            EmitError(format!(
+                                "tbir: bus-bound port in {} has no owning testbench or planned adapter",
+                                cx.func.name
+                            ))
+                        })?;
+                        let by_field = owner
+                            .bus_bindings
+                            .iter()
+                            .find(|candidate| candidate.field == *field);
+                        if matches!(
+                            cx.func.kind,
+                            crate::ir::FunctionKind::TestbenchMethod { .. }
+                        ) {
+                            by_field
+                        } else {
+                            owner
+                                .bus_bindings
+                                .get(binding.index())
+                                .filter(|candidate| candidate.field == *field)
+                        }
+                    };
+                    Some(resolved.ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: bus-bound port in {} references missing typed binding `{field}` (bb{})",
+                            cx.func.name, binding.0
+                        ))
+                    })?)
+                }
+                crate::ir::PortOrigin::BoundBus => {
+                    if let Some((channel, signal)) = bound_bus_logical_signal(p) {
+                        if let Some(symbol) = bus_adapter_signal(cx, "bus", channel, signal) {
+                            return Ok(symbol.to_string());
+                        }
+                    }
+                    Some(cx.bindings.bound_bus.ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: bound-bus port in {} has no callable bus adapter",
+                            cx.func.name
+                        ))
+                    })?)
+                }
+            };
+            if let Some(binding) = bus_binding {
+                let receiver = match (cx.bindings.dut_receiver, cx.dut_access) {
+                    (Some(receiver), _) => receiver,
+                    (None, None) => "dut",
+                    (None, Some(_)) => {
+                        return Err(EmitError(format!(
+                            "tbir: bus-bound DUT access in {} has no typed receiver binding",
+                            cx.func.name
+                        )))
+                    }
+                };
+                let logical = match p.port_path.as_slice() {
+                    [only] if only != &binding.field && only != "bus" => only.clone(),
+                    [_, channel, signal] => binding.wire_name(channel, signal),
+                    [_, tail @ ..] if !tail.is_empty() => {
+                        format!("{}_{}", binding.field, tail.join("_"))
+                    }
+                    _ => {
+                        return Err(EmitError(format!(
+                            "tbir: bus-bound port in {} has an empty logical path",
+                            cx.func.name
+                        )))
+                    }
+                };
+                return Ok(format!("{receiver}->{logical}"));
+            }
+            let receiver = port_dut_receiver(cx, p)?;
+            let resolved = cx
+                .dut_access
+                .map(|plan| plan.resolve(p))
+                .transpose()
+                .map_err(|error| EmitError(format!("tbir: {error}")))?;
+            let (path, aggregate) = resolved
+                .map(|access| (access.path(), access.aggregate()))
+                .unwrap_or((&p.port_path, p.aggregate_path));
+            let sep = if aggregate { "." } else { "_" };
+            Ok(format!("{receiver}->{}", path.join(sep)))
         }
         crate::ir::PortAccess::Probe | crate::ir::PortAccess::Force => {
-            format!("dut->rootp->{}", probe_read_accessor(cx.dut_type, p))
+            let receiver = port_dut_receiver(cx, p)?;
+            Ok(format!(
+                "{receiver}->rootp->{}",
+                probe_read_accessor(cx, p)?
+            ))
         }
     }
+}
+
+fn bus_port_logical_signal<'a>(port: &'a PortRef, field: &str) -> Option<(&'a str, &'a str)> {
+    match port.port_path.as_slice() {
+        [root, channel, signal] if root == field => Some((channel, signal)),
+        [root, signal] if root == field => Some(("", signal)),
+        [signal] => Some(("", signal)),
+        _ => None,
+    }
+}
+
+fn bound_bus_logical_signal(port: &PortRef) -> Option<(&str, &str)> {
+    match port.port_path.as_slice() {
+        [root, channel, signal] if root == "bus" => Some((channel, signal)),
+        [root, signal] if root == "bus" => Some(("", signal)),
+        [signal] => Some(("", signal)),
+        _ => None,
+    }
+}
+
+pub(super) fn bus_adapter_signal<'a>(
+    cx: &'a ECx<'_>,
+    field: &str,
+    channel: &str,
+    signal: &str,
+) -> Option<&'a str> {
+    cx.bindings
+        .bus_adapters?
+        .current?
+        .signals
+        .iter()
+        .find(|candidate| candidate.matches(field, channel, signal))
+        .map(|candidate| candidate.symbol.as_str())
+}
+
+pub(super) fn dut_receiver<'a>(cx: &'a ECx<'_>) -> Result<&'a str, EmitError> {
+    if let Some(receiver) = cx.bindings.dut_receiver {
+        return Ok(receiver);
+    }
+    if cx.dut_access.is_none() && !cx.dut_type.is_empty() {
+        return Ok("dut");
+    }
+    Err(EmitError(format!(
+        "tbir: DUT access in {} has no typed receiver binding",
+        cx.func.name
+    )))
+}
+
+fn port_dut_receiver(cx: &ECx<'_>, port: &PortRef) -> Result<String, EmitError> {
+    let Some(prog) = cx.prog else {
+        return dut_receiver(cx).map(str::to_string);
+    };
+    match cx.func.kind {
+        crate::ir::FunctionKind::TestbenchMethod {
+            testbench, method, ..
+        } => {
+            let schema = prog.testbench_types.get(testbench.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: DUT access in {} references missing testbench type tbt{}",
+                    cx.func.name, testbench.0
+                ))
+            })?;
+            let method = schema.methods.get(method.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: DUT access in {} references missing testbench method tbm{}",
+                    cx.func.name, method.0
+                ))
+            })?;
+            if let Some((index, _)) = method
+                .param_names
+                .iter()
+                .zip(&method.module_param_types)
+                .enumerate()
+                .find(|(_, (name, module))| *name == &port.testbench_field && module.is_some())
+            {
+                return cx.names.get(index).cloned().ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: DUT access in {} references missing module parameter {}",
+                        cx.func.name,
+                        index + 1
+                    ))
+                });
+            }
+        }
+        crate::ir::FunctionKind::ComponentMethod { component, .. } => {
+            let schema = prog.components.get(component.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: DUT access in {} references missing component c{}",
+                    cx.func.name, component.0
+                ))
+            })?;
+            if schema.fields.iter().any(|field| {
+                field.name == port.testbench_field
+                    && matches!(field.kind, crate::ir::ComponentFieldKind::Dut { .. })
+            }) {
+                let receiver = cx.bindings.self_receiver.ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: component DUT access in {} has no typed component receiver",
+                        cx.func.name
+                    ))
+                })?;
+                return Ok(format!("{receiver}.{}", port.testbench_field));
+            }
+        }
+        _ => {}
+    }
+    dut_receiver(cx).map(str::to_string)
+}
+
+/// Resolve a local through its typed testbench-field provenance. Ordinary
+/// locals retain their generated name; synthetic record-field locals use the
+/// explicit receiver supplied by the callable renderer.
+pub(super) fn local_cpp_name(cx: &ECx<'_>, local: crate::ir::LocalId) -> Result<String, EmitError> {
+    let name = cx.names.get(local.index()).cloned().ok_or_else(|| {
+        EmitError(format!(
+            "tbir: dangling local %{} in {}",
+            local.0, cx.func.name
+        ))
+    })?;
+    let Some(binding) = cx
+        .func
+        .testbench_record_locals
+        .iter()
+        .find(|binding| binding.local == local)
+    else {
+        return Ok(name);
+    };
+    match cx.bindings.testbench_receiver {
+        Some(receiver) => Ok(format!("{receiver}.{}", binding.field)),
+        None => Err(EmitError(format!(
+            "tbir: testbench field local %{} `{}` in {} has no typed testbench receiver",
+            local.0, binding.field, cx.func.name
+        ))),
+    }
+}
+
+pub(super) fn local_ir_type<'a>(
+    cx: &'a ECx<'_>,
+    local: crate::ir::LocalId,
+) -> Option<&'a crate::ir::IrType> {
+    let declared = &cx.func.locals.get(local.index())?.ty;
+    if matches!(declared, crate::ir::IrType::Unknown) {
+        cx.dut_access
+            .and_then(|plan| plan.inferred_local_type(cx.func.id, local))
+            .or(Some(declared))
+    } else {
+        Some(declared)
+    }
+}
+
+pub(super) fn required_testbench_receiver<'a>(
+    cx: &'a ECx<'_>,
+    what: &str,
+) -> Result<&'a str, EmitError> {
+    cx.bindings.testbench_receiver.ok_or_else(|| {
+        EmitError(format!(
+            "tbir: {what} in {} has no typed testbench receiver",
+            cx.func.name
+        ))
+    })
 }
 
 /// Verilator-mangled read-side accessor for a probe (`<DutType>__DOT__
 /// harc_probes__DOT__<name>`). `name` is the single-segment probe name
 /// in `port_path`. Matches `crate::codegen::sv_stub::mangled_accessor`.
-pub(super) fn probe_read_accessor(dut_type: &str, p: &PortRef) -> String {
-    crate::codegen::sv_stub::mangled_accessor(dut_type, &p.port_path.join("_"))
+pub(super) fn probe_read_accessor(cx: &ECx<'_>, p: &PortRef) -> Result<String, EmitError> {
+    let (dut_type, probe_name) = match cx.dut_access {
+        Some(plan) => (
+            plan.dut_type(),
+            plan.probe_for_port(p)
+                .map_err(|error| EmitError(format!("tbir: {error}")))?
+                .name(),
+        ),
+        None => (
+            cx.dut_type,
+            p.port_path.first().map(String::as_str).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: probe access in {} has an empty path",
+                    cx.func.name
+                ))
+            })?,
+        ),
+    };
+    Ok(crate::codegen::sv_stub::mangled_accessor(
+        dut_type, probe_name,
+    ))
 }
 
 pub(super) fn port_read(cx: &ECx<'_>, p: &PortRef) -> Result<String, EmitError> {
-    let sig = port_signal(cx, p);
+    let sig = port_signal(cx, p)?;
+    let resolved_type = port_value_type(cx, p)?;
     Ok(match &p.lane {
-        None => format!("harc_rt::harc_read({sig})"),
+        None => match resolved_type {
+            Some(crate::ir::IrType::Bool) => {
+                format!("(harc_rt::harc_read({sig}) != 0)")
+            }
+            Some(crate::ir::IrType::SInt(Some(width))) if width <= 64 => format!(
+                "static_cast<int64_t>(harc_rt::harc_sext_u128(static_cast<_harc_u128>(harc_rt::harc_read({sig})), {width}, 64))"
+            ),
+            Some(crate::ir::IrType::SInt(Some(width))) if width <= 128 => format!(
+                "harc_rt::harc_sext_u128(static_cast<_harc_u128>(harc_rt::harc_read({sig})), {width}, 128)"
+            ),
+            _ => format!("harc_rt::harc_read({sig})"),
+        },
         // Packed multi-lane port: bit-extract through the runtime
         // helper. True unpacked-array port: raw subscript (correct on
         // both backends; v1 emits the same, with no harc_read wrap).
@@ -121,11 +655,18 @@ pub(super) fn port_read(cx: &ECx<'_>, p: &PortRef) -> Result<String, EmitError> 
         // v1's `dut_packed_lane` re-renders an arbitrary `&Expr` here.
         Some(lane) => {
             let idx = lane_index_cpp(cx, lane)?;
-            match lane_width(cx, p) {
+            let lane = match lane_width(cx, p) {
                 Some(w) => {
                     format!("harc_rt::harc_vec_lane_read<{w}>({sig}, (std::size_t)({idx}))")
                 }
                 None => format!("{sig}[{idx}]"),
+            };
+            match resolved_type {
+                Some(crate::ir::IrType::Bool) => format!("(({lane}) != 0)"),
+                Some(crate::ir::IrType::SInt(Some(width))) if width <= 64 => format!(
+                    "static_cast<int64_t>(harc_rt::harc_sext_u128(static_cast<_harc_u128>({lane}), {width}, 64))"
+                ),
+                _ => lane,
             }
         }
     })
@@ -146,10 +687,30 @@ pub(super) fn lane_index_cpp(
 /// Lane width when the port is in the packed-lane table (single-
 /// segment DUT ports only — the table is keyed by top-level names).
 pub(super) fn lane_width(cx: &ECx<'_>, p: &PortRef) -> Option<u32> {
+    if matches!(p.origin, crate::ir::PortOrigin::Dut) {
+        if let Some(plan) = cx.dut_access {
+            return plan.resolve(p).ok()?.packed_lane_width();
+        }
+    }
     match p.port_path.as_slice() {
         [name] => cx.lanes.get(name).copied(),
         _ => None,
     }
+}
+
+pub(super) fn port_value_type<'a>(
+    cx: &'a ECx<'_>,
+    p: &'a PortRef,
+) -> Result<Option<crate::ir::IrType>, EmitError> {
+    if matches!(p.origin, crate::ir::PortOrigin::Dut) {
+        if let Some(plan) = cx.dut_access {
+            return plan
+                .resolve(p)
+                .map(|entry| entry.value_type_for(p))
+                .map_err(|error| EmitError(format!("tbir: {error}")));
+        }
+    }
+    Ok(p.value_type.clone())
 }
 
 /// Resolve the C++ receiver for a transactor-state access. A non-empty source
@@ -166,6 +727,13 @@ pub(super) fn resolve_state_instance(cx: &ECx<'_>, instance: &str) -> Result<Str
         return Ok(receiver.to_string());
     }
     if !instance.is_empty() {
+        if let Some(binding) = cx
+            .bindings
+            .testbench_transactor_states
+            .and_then(|bindings| bindings.iter().find(|binding| binding.field == instance))
+        {
+            return Ok(binding.receiver.clone());
+        }
         if let Some(storage) = owner_tb(cx).and_then(|tb| {
             tb.unbound_state_actors
                 .iter()
@@ -193,6 +761,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             crate::ir::IrType::UInt(_) => format!("((uint64_t)({value}))"),
             _ => format!("{value}"),
         },
+        Expr::StringLiteral(value) => crate::codegen::cpp_tb::string_value_literal_cpp(value),
         // The framework-provided cycle counter — emitted as the in-scope
         // `cycle_count` (a captured `ctx.cycle_count` reference), matching
         // v1's bare-ident emission of `cycle_count`.
@@ -201,9 +770,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // source locals named `errors` cannot shadow assertion accounting.
         Expr::ErrorCount => "ctx.errors".to_string(),
         Expr::WideLiteral(words) => wide_literal_cpp(words),
-        Expr::Local(l) => cx.names.get(l.index()).cloned().ok_or_else(|| {
-            EmitError(format!("tbir: dangling local %{} in {}", l.0, cx.func.name))
-        })?,
+        Expr::Local(l) => local_cpp_name(cx, *l)?,
         Expr::Port(p) => port_read(cx, p)?,
         // Record-field read on a record-typed local: `t.tag`. The
         // lowering validated the field against the schema.
@@ -214,12 +781,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             mid_indices,
             index,
         } => {
-            let name = cx.names.get(local.index()).cloned().ok_or_else(|| {
-                EmitError(format!(
-                    "tbir: dangling local %{} in {}",
-                    local.0, cx.func.name
-                ))
-            })?;
+            let name = local_cpp_name(cx, *local)?;
             record_access_cpp(cx, &name, field, path, mid_indices, index.as_deref())?
         }
         // Register-level frontdoor read in a general expression position
@@ -242,14 +804,69 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                 ))
             })?;
             if *reads_bus {
-                format!("({name}.{field} = {helper_ty}_read({offset}))")
+                let prog = cx.prog.ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: register read in {} has no program type catalog",
+                        cx.func.name
+                    ))
+                })?;
+                let local = cx.func.locals.get(mirror.index()).ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: register read in {} references missing mirror local %{}",
+                        cx.func.name, mirror.0
+                    ))
+                })?;
+                let owner = owner_tb(cx).ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: register read through `{helper_ty}` in {} has no owning testbench",
+                        cx.func.name
+                    ))
+                })?;
+                let binding = owner
+                    .regblock_bindings
+                    .iter()
+                    .find(|binding| binding.field == local.name)
+                    .ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: register read in {} has no binding for mirror `{}`",
+                            cx.func.name, local.name
+                        ))
+                    })?;
+                let (transactor, schema) = prog
+                    .transactors
+                    .iter()
+                    .enumerate()
+                    .find(|(_, schema)| schema.name == *helper_ty)
+                    .ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: register read in {} references missing helper `{helper_ty}`",
+                            cx.func.name
+                        ))
+                    })?;
+                let method = schema.method("read").ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: register read in {} references helper `{helper_ty}` without `read`",
+                        cx.func.name
+                    ))
+                })?;
+                let mut args = super::func::transactor_call_context_args(
+                    cx,
+                    &binding.helper_field,
+                    crate::ir::TransactorId(transactor as u32),
+                    method.function,
+                )?;
+                args.push(offset.to_string());
+                format!("({name}.{field} = {helper_ty}_read({}))", args.join(", "))
             } else {
                 format!("{name}.{field}")
             }
         }
         // Scalar testbench field read — a `_tb` struct member (scalar
         // fields exist only on non-synthetic testbenches).
-        Expr::TbField(field) => format!("_tb.{field}"),
+        Expr::TbField(field) => format!(
+            "{}.{field}",
+            required_testbench_receiver(cx, "testbench field read")?
+        ),
         // Fixed-vector testbench field element read — `_tb.mem[i]` (and
         // `_tb.mem[i][j]` for a nested `Vec<Vec<..>>`). Mirrors v1's
         // `_tb.<field>[i]` subscript on the `std::array` member.
@@ -258,53 +875,73 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             index,
             inner_index,
         } => {
-            let mut member = format!("_tb.{field}[{}]", expr_cpp(cx, index)?);
+            let mut member = format!(
+                "{}.{field}[{}]",
+                required_testbench_receiver(cx, "testbench vector read")?,
+                expr_cpp(cx, index)?
+            );
             if let Some(inner) = inner_index {
                 member = format!("{member}[{}]", expr_cpp(cx, inner)?);
             }
             member
         }
-        // Latch readings render against the per-closure cells the
-        // concurrent-check emitter declares (`func::emit_property_check`
-        // / `emit_cover_check`). `_harc_ps<i>` is the `static` previous
-        // value, `_harc_cur<i>` this cycle's — both scoped to the one
-        // `_checkers` closure, so plain indexed names cannot collide
-        // across checks the way v1's span-tagged names guard against.
-        Expr::TemporalSlot { slot, kind } => match kind {
-            crate::ir::TemporalFn::Past => format!("_harc_ps{slot}"),
-            crate::ir::TemporalFn::Rose
-                if cx
-                    .temporal_widths
-                    .get(*slot as usize)
-                    .copied()
-                    .flatten()
-                    .is_some_and(|width| width > 128) =>
-            {
-                format!(
-                    "(harc_rt::harc_wide_is_zero(_harc_ps{slot}) && !harc_rt::harc_wide_is_zero(_harc_cur{slot}))"
+        // Latch readings use the explicit per-run cell prefix supplied by the
+        // concurrent-check emitter. The current-value local remains scoped to
+        // the checker closure.
+        Expr::TemporalSlot { slot, kind } => {
+            let prefix = cx.temporal_cell_prefix.ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: temporal slot {slot} in {} has no runtime-cell binding",
+                    cx.func.name
+                ))
+            })?;
+            let previous = format!("{prefix}_{slot}");
+            match kind {
+                crate::ir::TemporalFn::Past => previous,
+                crate::ir::TemporalFn::Rose
+                    if cx
+                        .temporal_widths
+                        .get(*slot as usize)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|width| width > 128) =>
+                {
+                    format!(
+                    "(harc_rt::harc_wide_is_zero({previous}) && !harc_rt::harc_wide_is_zero(_harc_cur{slot}))"
                 )
-            }
-            crate::ir::TemporalFn::Fell
-                if cx
-                    .temporal_widths
-                    .get(*slot as usize)
-                    .copied()
-                    .flatten()
-                    .is_some_and(|width| width > 128) =>
-            {
-                format!(
-                    "(!harc_rt::harc_wide_is_zero(_harc_ps{slot}) && harc_rt::harc_wide_is_zero(_harc_cur{slot}))"
+                }
+                crate::ir::TemporalFn::Fell
+                    if cx
+                        .temporal_widths
+                        .get(*slot as usize)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|width| width > 128) =>
+                {
+                    format!(
+                    "(!harc_rt::harc_wide_is_zero({previous}) && harc_rt::harc_wide_is_zero(_harc_cur{slot}))"
                 )
+                }
+                crate::ir::TemporalFn::Rose => format!("(!{previous} && _harc_cur{slot})"),
+                crate::ir::TemporalFn::Fell => format!("({previous} && !_harc_cur{slot})"),
+                crate::ir::TemporalFn::Stable => format!("({previous} == _harc_cur{slot})"),
             }
-            crate::ir::TemporalFn::Rose => format!("(!_harc_ps{slot} && _harc_cur{slot})"),
-            crate::ir::TemporalFn::Fell => format!("(_harc_ps{slot} && !_harc_cur{slot})"),
-            crate::ir::TemporalFn::Stable => format!("(_harc_ps{slot} == _harc_cur{slot})"),
-        },
+        }
         Expr::TbQueueQuery { field, query } => match query {
             crate::ir::ScoreboardQuery::QueueSize { .. } => {
-                format!("((uint64_t)_tb.{field}.size())")
+                format!(
+                    "((uint64_t){}.{field}.size())",
+                    required_testbench_receiver(cx, "testbench queue read")?
+                )
             }
-            crate::ir::ScoreboardQuery::QueueEmpty { .. } => format!("_tb.{field}.empty()"),
+            crate::ir::ScoreboardQuery::QueueEmpty { .. } => format!(
+                "{}.{field}.empty()",
+                required_testbench_receiver(cx, "testbench queue read")?
+            ),
+            crate::ir::ScoreboardQuery::QueueFront { .. } => format!(
+                "{}.{field}.front()",
+                required_testbench_receiver(cx, "testbench queue read")?
+            ),
             crate::ir::ScoreboardQuery::Scalar { .. } => {
                 return Err(EmitError(format!(
                     "tbir: scalar query on testbench queue `{field}`"
@@ -369,6 +1006,9 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                 ScoreboardQuery::QueueEmpty { .. } => {
                     format!("{instance}.{field}.empty()")
                 }
+                ScoreboardQuery::QueueFront { .. } => {
+                    format!("{instance}.{field}.front()")
+                }
                 // Scalar/pop never appear on a state-queue query (lowering
                 // routes them elsewhere); render defensively.
                 ScoreboardQuery::Scalar { .. } => format!("{instance}.{field}"),
@@ -390,14 +1030,28 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             // `self_subst` (self-relative sub-scoreboard read in a body).
             let base = match nested_path {
                 Some(p) if p.first().map(String::as_str) == Some("self") => {
-                    let root = cx.self_subst.unwrap_or("self");
+                    let root = cx.bindings.self_receiver.ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: self-owned scoreboard read in {} has no typed receiver",
+                            cx.func.name
+                        ))
+                    })?;
                     std::iter::once(root.to_string())
                         .chain(p.iter().skip(1).cloned())
                         .collect::<Vec<_>>()
                         .join(".")
                 }
                 Some(p) => p.join("."),
-                None => format!("_tb.{field}"),
+                None => format!(
+                    "{}.{}",
+                    cx.bindings.testbench_receiver.ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: testbench scoreboard read `{field}` in {} has no typed receiver",
+                            cx.func.name
+                        ))
+                    })?,
+                    field
+                ),
             };
             match query {
                 ScoreboardQuery::Scalar { scalar } => format!("{base}.{scalar}"),
@@ -408,6 +1062,9 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                 }
                 ScoreboardQuery::QueueEmpty { queue } => {
                     format!("{base}.{queue}.empty()")
+                }
+                ScoreboardQuery::QueueFront { queue, .. } => {
+                    format!("{base}.{queue}.front()")
                 }
             }
         }
@@ -612,7 +1269,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         Expr::BitSlice { target, hi, lo } => {
             let t = match &**target {
                 Expr::Port(p) if p.lane.is_none() => {
-                    format!("harc_rt::harc_read({})", port_signal(cx, p))
+                    format!("harc_rt::harc_read({})", port_signal(cx, p)?)
                 }
                 other => format!("({})", expr_cpp(cx, other)?),
             };
@@ -641,7 +1298,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         Expr::BitSliceDyn { target, hi, lo } => {
             let t = match &**target {
                 Expr::Port(p) if p.lane.is_none() => {
-                    format!("harc_rt::harc_read({})", port_signal(cx, p))
+                    format!("harc_rt::harc_read({})", port_signal(cx, p)?)
                 }
                 other => format!("({})", expr_cpp(cx, other)?),
             };
@@ -673,7 +1330,11 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // in the `_tb` struct (cov fields exist only on non-synthetic
         // testbenches, so `_tb` is always in scope here).
         Expr::CovBin { inst, point, bin } => {
-            format!("_tb.{}.{point}.{bin}", inst.tb_field)
+            format!(
+                "{}.{}.{point}.{bin}",
+                required_testbench_receiver(cx, "covergroup bin read")?,
+                inst.tb_field
+            )
         }
         // Hook-param cover target (`cover t.burst`). The `param` name is
         // the hookable method's by-value closure argument, so it renders as
@@ -697,7 +1358,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // component local (`env.sb.count`). Both name plain by-value C++
         // struct members (v1's `emit_component_struct` shape).
         Expr::ComponentField { base, field } => {
-            format!("{}.{field}", comp_base_cpp_subst_cx(cx, base))
+            format!("{}.{field}", comp_base_cpp_subst_cx(cx, base)?)
         }
         Expr::ComponentVecElement {
             base,
@@ -713,18 +1374,18 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             if let Some(inner) = inner_index {
                 member = format!("{member}[{}]", expr_cpp(cx, inner)?);
             }
-            format!("{}.{}", comp_base_cpp_subst_cx(cx, base), member)
+            format!("{}.{}", comp_base_cpp_subst_cx(cx, base)?, member)
         }
         // A whole composite-component value passed by value as a method
         // arg (`sb.observe(addr, model)` reads `model` here). Render the
         // receiver — a plain C++ struct value, copied at the call.
-        Expr::ComponentValue { base } => comp_base_cpp_subst_cx(cx, base),
+        Expr::ComponentValue { base } => comp_base_cpp_subst_cx(cx, base)?,
         // Composite-component `queue<T>` size()/empty() read — mirrors the
         // `ScoreboardQuery` queue reads but resolves the receiver via the
         // component base (self-relative or test-scope path).
         Expr::ComponentQueueQuery { base, query } => {
             use crate::ir::ScoreboardQuery;
-            let recv = comp_base_cpp_subst(base, cx.self_subst);
+            let recv = comp_base_cpp_subst_cx(cx, base)?;
             match query {
                 // A scalar query never reaches a queue field — defensive.
                 ScoreboardQuery::Scalar { scalar } => format!("{recv}.{scalar}"),
@@ -733,6 +1394,9 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                 }
                 ScoreboardQuery::QueueEmpty { queue } => {
                     format!("{recv}.{queue}.empty()")
+                }
+                ScoreboardQuery::QueueFront { queue, .. } => {
+                    format!("{recv}.{queue}.front()")
                 }
             }
         }
@@ -754,41 +1418,79 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             kind,
             n,
         } => {
-            let mut recv = comp_base_cpp_subst_cx(cx, base);
+            let mut recv = comp_base_cpp_subst_cx(cx, base)?;
             if !subpath.is_empty() {
                 recv.push('.');
                 recv.push_str(&subpath.join("."));
             }
             let n = bounded_count_expr_cpp(cx, n, u64::MAX)?;
+            let (input_heartbeat, output_heartbeat) =
+                component_idle_heartbeat_fields(cx, base, subpath)?;
             match kind {
                 crate::ir::IdleKind::In => {
-                    format!("(((uint64_t)cycle_count - {recv}._last_in_cycle) >= (uint64_t)({n}))")
+                    format!(
+                        "(((uint64_t)cycle_count - {recv}.{input_heartbeat}) >= (uint64_t)({n}))"
+                    )
                 }
                 crate::ir::IdleKind::Out => {
-                    format!("(((uint64_t)cycle_count - {recv}._last_out_cycle) >= (uint64_t)({n}))")
+                    format!(
+                        "(((uint64_t)cycle_count - {recv}.{output_heartbeat}) >= (uint64_t)({n}))"
+                    )
                 }
                 crate::ir::IdleKind::Both => format!(
-                    "((((uint64_t)cycle_count - {recv}._last_in_cycle) >= (uint64_t)({n})) \
-                     && (((uint64_t)cycle_count - {recv}._last_out_cycle) >= (uint64_t)({n})))"
+                    "((((uint64_t)cycle_count - {recv}.{input_heartbeat}) >= (uint64_t)({n})) \
+                     && (((uint64_t)cycle_count - {recv}.{output_heartbeat}) >= (uint64_t)({n})))"
                 ),
             }
         }
         Expr::TransactorIdle {
-            storage, kind, n, ..
+            field,
+            transactor,
+            storage,
+            kind,
+            n,
+            ..
         } => {
             let n = bounded_count_expr_cpp(cx, n, u64::MAX)?;
+            let prog = cx.prog.ok_or_else(|| {
+                EmitError("tbir: transactor idle predicate has no program binding".into())
+            })?;
+            let schema = prog.transactors.get(transactor.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: transactor idle predicate references missing transactor t{}",
+                    transactor.0
+                ))
+            })?;
+            let input_heartbeat = super::runtime::transactor_heartbeat_field(
+                schema,
+                crate::ir::passes::runtime_cells::ComponentHeartbeat::Input,
+            );
+            let output_heartbeat = super::runtime::transactor_heartbeat_field(
+                schema,
+                crate::ir::passes::runtime_cells::ComponentHeartbeat::Output,
+            );
+            let storage = cx
+                .bindings
+                .testbench_transactor_states
+                .and_then(|bindings| {
+                    bindings.iter().find(|binding| {
+                        binding.field == *field && binding.transactor == *transactor
+                    })
+                })
+                .map(|binding| binding.receiver.as_str())
+                .unwrap_or(storage);
             match kind {
                 crate::ir::IdleKind::In => {
                     format!(
-                        "(((uint64_t)cycle_count - {storage}._last_in_cycle) >= (uint64_t)({n}))"
+                        "(((uint64_t)cycle_count - {storage}.{input_heartbeat}) >= (uint64_t)({n}))"
                     )
                 }
                 crate::ir::IdleKind::Out => format!(
-                    "(((uint64_t)cycle_count - {storage}._last_out_cycle) >= (uint64_t)({n}))"
+                    "(((uint64_t)cycle_count - {storage}.{output_heartbeat}) >= (uint64_t)({n}))"
                 ),
                 crate::ir::IdleKind::Both => format!(
-                    "((((uint64_t)cycle_count - {storage}._last_in_cycle) >= (uint64_t)({n})) \
-                     && (((uint64_t)cycle_count - {storage}._last_out_cycle) >= (uint64_t)({n})))"
+                    "((((uint64_t)cycle_count - {storage}.{input_heartbeat}) >= (uint64_t)({n})) \
+                     && (((uint64_t)cycle_count - {storage}.{output_heartbeat}) >= (uint64_t)({n})))"
                 ),
             }
         }
@@ -814,13 +1516,52 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             format!("{name}[{idx}]")
         }
         Expr::Call(target, args) => {
+            let mut rendered = Vec::with_capacity(args.len() + 1);
+            let parameter_types = match target {
+                CallTarget::ExternFn { params, .. } => Some(params.clone()),
+                CallTarget::Helper { function, .. }
+                | CallTarget::Tseq { function, .. }
+                | CallTarget::TransactorSelfMethod { function, .. } => cx
+                    .prog
+                    .and_then(|prog| prog.functions.get(function.index()))
+                    .filter(|candidate| candidate.id == *function)
+                    .map(|function| {
+                        function
+                            .params
+                            .iter()
+                            .map(|parameter| parameter.ty.clone())
+                            .collect::<Vec<_>>()
+                    }),
+                CallTarget::TransactorMethod {
+                    method,
+                    target:
+                        crate::ir::TransactorMethodTarget::Callable {
+                            transactor,
+                            function,
+                        },
+                    ..
+                } => cx
+                    .prog
+                    .and_then(|prog| prog.transactors.get(transactor.index()))
+                    .and_then(|schema| schema.method(method))
+                    .filter(|schema| schema.function == *function)
+                    .map(|schema| schema.param_tys.clone()),
+                CallTarget::Builtin(_)
+                | CallTarget::TransactorMethod {
+                    target:
+                        crate::ir::TransactorMethodTarget::ConcreteBusBinding { .. }
+                        | crate::ir::TransactorMethodTarget::TestbenchBusField { .. }
+                        | crate::ir::TransactorMethodTarget::BoundBus,
+                    ..
+                } => None,
+            };
             let name = match target {
                 CallTarget::Helper { name, .. } => helper_cpp_name(name),
                 // Extern reference functions emit with the RAW symbol
                 // name (no `harc_helper_` mangling) so the call binds to
                 // the user's `extern "C"` definition supplied via
                 // `--ref-src`; the forward decl is emitted file-scope.
-                CallTarget::ExternFn { name, .. } => name.clone(),
+                CallTarget::ExternFn { name, .. } => format!("::{name}"),
                 CallTarget::Builtin(_) => {
                     return Err(EmitError(
                         "tbir: builtin calls are not emitted yet (lowering should \
@@ -831,46 +1572,85 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                 // A tseq generator call — `RandomTxns(5)`. Emitted as a
                 // direct lambda call (v1's tseq lambda). The result is a
                 // `std::vector<Record>` assigned into a RecordSeq local.
-                CallTarget::Tseq(n) => n.clone(),
-                CallTarget::TransactorMethod { bus_field, method } => {
+                CallTarget::Tseq { function, name } => match cx.common_contextual_tseqs {
+                    Some(contextual) => {
+                        if contextual.contains(function) {
+                            rendered.push("ctx".to_string());
+                        }
+                        tseq_cpp_name(name)
+                    }
+                    None => tseq_cpp_name(name),
+                },
+                CallTarget::TransactorMethod {
+                    bus_field,
+                    method,
+                    target:
+                        crate::ir::TransactorMethodTarget::Callable {
+                            transactor,
+                            function,
+                        },
+                } => {
                     let prog = cx.prog.ok_or_else(|| {
                         EmitError(format!(
-                            "tbir: transactor call edge `{bus_field}.{method}` has no program \
-                             context"
+                            "tbir: transactor predicate call `{bus_field}.{method}` has no program"
                         ))
                     })?;
-                    let (schema, state_storage) = cx
-                        .func
-                        .owner
-                        .and_then(|owner| prog.testbenches.get(owner.index()))
-                        .and_then(|tb| {
-                            tb.transactor_fields
-                                .iter()
-                                .find(|(field, _)| field == bus_field)
-                                .map(|(_, xid)| {
-                                    let storage = tb
-                                        .unbound_state_actors
-                                        .iter()
-                                        .find(|actor| actor.field == *bus_field)
-                                        .map(|actor| actor.storage.clone());
-                                    (prog.transactor(*xid), storage)
-                                })
-                        })
-                        .ok_or_else(|| {
+                    let schema = prog.transactors.get(transactor.index()).ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: transactor predicate call `{bus_field}.{method}` references missing transactor x{}",
+                            transactor.0
+                        ))
+                    })?;
+                    if schema
+                        .method(method)
+                        .is_none_or(|candidate| candidate.function != *function)
+                    {
+                        return Err(EmitError(format!(
+                            "tbir: transactor predicate call `{bus_field}.{method}` carries stale callable fn{}",
+                            function.0
+                        )));
+                    }
+                    if let Some(context) = cx.bindings.run_context {
+                        rendered.push(context.to_string());
+                    }
+                    if super::func::uses_state_receiver(schema) {
+                        let owner = owner_tb(cx).ok_or_else(|| {
                             EmitError(format!(
-                                "tbir: expression-valued transactor call \
-                                 `{bus_field}.{method}` does not resolve through the owner \
-                                 testbench"
+                                "tbir: transactor predicate call `{bus_field}.{method}` has no owner testbench"
                             ))
                         })?;
-                    let mut rendered = Vec::with_capacity(args.len() + 1);
-                    if super::func::uses_state_receiver(schema) {
-                        rendered.push(state_storage.ok_or_else(|| {
-                            EmitError(format!(
-                                "tbir: stateful expression-valued transactor call \
-                                 `{bus_field}.{method}` has no receiver storage"
-                            ))
-                        })?);
+                        let explicit = cx
+                            .bindings
+                            .testbench_transactor_states
+                            .and_then(|bindings| {
+                                bindings.iter().find(|binding| {
+                                    binding.field == *bus_field && binding.transactor == *transactor
+                                })
+                            })
+                            .map(|binding| binding.receiver.clone());
+                        let receiver = explicit
+                            .or_else(|| {
+                                owner
+                                    .unbound_state_actors
+                                    .iter()
+                                    .find(|actor| {
+                                        actor.field == *bus_field
+                                            && actor.transactor == *transactor
+                                    })
+                                    .map(|actor| {
+                                        if cx.bindings.durable_callbacks {
+                                            format!("_harc_run_state.{}", actor.storage)
+                                        } else {
+                                            actor.storage.clone()
+                                        }
+                                    })
+                            })
+                            .ok_or_else(|| {
+                                EmitError(format!(
+                                    "tbir: stateful transactor predicate call `{bus_field}.{method}` has no typed state receiver"
+                                ))
+                            })?;
+                        rendered.push(receiver);
                     }
                     for arg in args {
                         rendered.push(expr_cpp(cx, arg)?);
@@ -881,13 +1661,55 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                         rendered.join(", ")
                     ));
                 }
-                CallTarget::TransactorSelfMethod { transactor, method } => {
-                    let mut rendered = Vec::with_capacity(args.len() + 1);
+                CallTarget::TransactorMethod {
+                    bus_field,
+                    method,
+                    target:
+                        crate::ir::TransactorMethodTarget::ConcreteBusBinding { .. }
+                        | crate::ir::TransactorMethodTarget::TestbenchBusField { .. }
+                        | crate::ir::TransactorMethodTarget::BoundBus,
+                } => {
+                    return Err(EmitError(format!(
+                        "tbir: bus-bound transactor call `{bus_field}.{method}` cannot emit in expression position"
+                    )));
+                }
+                CallTarget::TransactorSelfMethod {
+                    transactor,
+                    transactor_name,
+                    method,
+                    function,
+                } => {
+                    let prog = cx.prog.ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: transactor sibling predicate call `{transactor_name}.{method}` has no program"
+                        ))
+                    })?;
+                    let schema = prog.transactors.get(transactor.index()).ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: transactor sibling predicate call `{transactor_name}.{method}` references missing transactor x{}",
+                            transactor.0
+                        ))
+                    })?;
+                    if schema.name != *transactor_name
+                        || schema
+                            .method(method)
+                            .is_none_or(|candidate| candidate.function != *function)
+                    {
+                        return Err(EmitError(format!(
+                            "tbir: transactor sibling predicate call `{transactor_name}.{method}` carries stale callable fn{}",
+                            function.0
+                        )));
+                    }
+                    if let Some(context) = cx.bindings.run_context {
+                        rendered.push(context.to_string());
+                    }
                     if let Some(receiver) = cx.state_receiver {
                         rendered.push(receiver.to_string());
                     }
-                    for arg in args {
-                        rendered.push(expr_cpp(cx, arg)?);
+                    if cx.bindings.run_context.is_some() && schema.bound_bus.is_some() {
+                        rendered.extend(super::func::testbench_bus_adapter_args(
+                            cx, *function, None,
+                        )?);
                     }
                     let symbol = cx
                         .prog
@@ -902,9 +1724,13 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                     return Ok(format!("{symbol}_{method}({})", rendered.join(", ")));
                 }
             };
-            let mut rendered = Vec::with_capacity(args.len());
-            for a in args {
-                rendered.push(expr_cpp(cx, a)?);
+            for (index, arg) in args.iter().enumerate() {
+                rendered.push(
+                    match parameter_types.as_ref().and_then(|types| types.get(index)) {
+                        Some(destination) => scalar_assignment_expr_cpp(cx, arg, destination)?,
+                        None => expr_cpp(cx, arg)?,
+                    },
+                );
             }
             format!("{name}({})", rendered.join(", "))
         }
@@ -961,7 +1787,7 @@ fn wide_eq_cpp(
     // (prefer treating rhs as the literal, like v1).
     let sig_side = if rhs_words.is_some() { lhs } else { rhs };
     let sig = match sig_side {
-        Expr::Port(p) if p.lane.is_none() => port_signal(cx, p),
+        Expr::Port(p) if p.lane.is_none() => port_signal(cx, p)?,
         other => expr_cpp(cx, other)?,
     };
     let list = words
@@ -1387,16 +2213,12 @@ pub(super) fn scalar_assignment_expr_cpp(
     destination: &crate::ir::IrType,
 ) -> Result<String, EmitError> {
     let rendered = expr_cpp(cx, value)?;
-    let crate::ir::IrType::UInt(Some(target_width)) = destination else {
-        return Ok(rendered);
+    let target_width = match destination {
+        crate::ir::IrType::UInt(Some(width)) | crate::ir::IrType::SInt(Some(width)) => width,
+        _ => return Ok(rendered),
     };
-    if *target_width <= 128 {
-        return Ok(rendered);
-    }
+    let source_width = expr_binary_operand_width(cx, value);
     let source_signed = match value {
-        // Widthless positive literals are contextual unsigned values for an
-        // unsigned destination. `expr_is_signed` classifies them as signed
-        // for C++ arithmetic promotion, which is a different question.
         Expr::Literal {
             ty: crate::ir::IrType::Unknown,
             ..
@@ -1404,12 +2226,19 @@ pub(super) fn scalar_assignment_expr_cpp(
         | Expr::Unary(UnOp::Not, _) => false,
         _ => expr_is_signed(cx, value),
     };
-    let coerced = wide_operand_cpp(
-        rendered,
-        expr_binary_operand_width(cx, value),
-        source_signed,
-        *target_width,
-    );
+    if *target_width <= 128 {
+        if *target_width > 64
+            && source_signed
+            && source_width.is_some_and(|source_width| source_width < *target_width)
+        {
+            return Ok(format!(
+                "harc_rt::harc_sext_u128(static_cast<_harc_u128>({rendered}), {}, {target_width})",
+                source_width.expect("checked")
+            ));
+        }
+        return Ok(rendered);
+    }
+    let coerced = wide_operand_cpp(rendered, source_width, source_signed, *target_width);
     Ok(format!(
         "harc_rt::harc_wide_mask_bits({coerced}, {target_width})"
     ))
@@ -1482,12 +2311,18 @@ pub(super) fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
     match e {
         Expr::Literal { ty, .. } => ir_type_width(ty),
         Expr::WideLiteral(words) => words.len().checked_mul(32).map(|width| width as u32),
-        Expr::Local(id) => cx
-            .func
-            .locals
-            .get(id.0 as usize)
-            .and_then(|l| ir_type_width(&l.ty)),
-        Expr::Port(p) => p.width,
+        Expr::Local(id) => local_ir_type(cx, *id).and_then(ir_type_width),
+        Expr::Port(p) => cx
+            .dut_access
+            .and_then(|plan| plan.resolve(p).ok().map(|access| access.width_for(p)))
+            .or(p.width),
+        Expr::PortSnapshotLane { port, .. } => cx
+            .dut_access
+            .and_then(|plan| plan.resolve(port).ok())
+            .and_then(|access| access.lane_value_type())
+            .as_ref()
+            .and_then(ir_type_width)
+            .or_else(|| lane_width(cx, port)),
         Expr::RecordField {
             local, field, path, ..
         } => cx
@@ -1565,6 +2400,30 @@ pub(super) fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
                 crate::ir::ScoreboardFieldKind::Scalar { ty, .. } => ir_type_width(ty),
                 _ => None,
             }),
+        Expr::TbQueueQuery { query, .. }
+        | Expr::TransactorStateQueueQuery { query, .. }
+        | Expr::ComponentQueueQuery { query, .. }
+        | Expr::ScoreboardQuery { query, .. } => {
+            query.value_type().as_ref().and_then(ir_type_width)
+        }
+        Expr::SeqIndex { seq, .. } => cx
+            .func
+            .locals
+            .get(seq.index())
+            .and_then(|local| match &local.ty {
+                crate::ir::IrType::RecordSeq(record) => Some(crate::ir::IrType::Record(*record)),
+                crate::ir::IrType::Seq(element) => Some((**element).clone()),
+                _ => None,
+            })
+            .as_ref()
+            .and_then(ir_type_width),
+        Expr::RegRead { mirror, field, .. } => cx
+            .func
+            .locals
+            .get(mirror.index())
+            .and_then(|local| record_path_type(cx, local.ty.clone(), std::iter::once(field)))
+            .as_ref()
+            .and_then(ir_type_width),
         Expr::TemporalSlot {
             slot,
             kind: crate::ir::TemporalFn::Past,
@@ -1591,7 +2450,12 @@ pub(super) fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
         Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
             ir_type_width(ret)
         }
-        Expr::CycleCount => Some(64),
+        Expr::Call(CallTarget::TransactorSelfMethod { function, .. }, _) => {
+            callable_return_ir_type(cx, *function)
+                .as_ref()
+                .and_then(ir_type_width)
+        }
+        Expr::CycleCount | Expr::ErrorCount => Some(64),
         _ => None,
     }
 }
@@ -1647,7 +2511,7 @@ fn expr_shift_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
     }
 }
 
-fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
+pub(super) fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
     match e {
         Expr::Literal { value, ty } => {
             matches!(ty, crate::ir::IrType::SInt(_))
@@ -1658,13 +2522,27 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
                 // `(signed_value + 0) >> 1`).
                 || matches!(ty, crate::ir::IrType::Unknown) && *value <= i64::MAX as u64
         }
-        Expr::Local(id) => cx
-            .func
-            .locals
-            .get(id.0 as usize)
-            .is_some_and(|l| matches!(l.ty, crate::ir::IrType::SInt(_))),
+        Expr::Local(id) => {
+            local_ir_type(cx, *id).is_some_and(|ty| matches!(ty, crate::ir::IrType::SInt(_)))
+        }
+        Expr::Port(port) => cx
+            .dut_access
+            .and_then(|plan| plan.resolve(port).ok())
+            .and_then(|access| access.value_type_for(port))
+            .or_else(|| port.value_type.clone())
+            .is_some_and(|ty| matches!(ty, crate::ir::IrType::SInt(_))),
+        Expr::PortSnapshotLane { port, .. } => cx
+            .dut_access
+            .and_then(|plan| plan.resolve(port).ok())
+            .and_then(|access| access.lane_value_type())
+            .or_else(|| port.value_type.clone())
+            .is_some_and(|ty| matches!(ty, crate::ir::IrType::SInt(_))),
         Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
             matches!(ret, crate::ir::IrType::SInt(_))
+        }
+        Expr::Call(CallTarget::TransactorSelfMethod { function, .. }, _) => {
+            callable_return_ir_type(cx, *function)
+                .is_some_and(|ty| matches!(ty, crate::ir::IrType::SInt(_)))
         }
         // Host-state member reads are real C++ struct members whose C
         // type already carries the declared signedness (`int64_t` for a
@@ -1763,6 +2641,27 @@ fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
                     }
                 )
             }),
+        Expr::TbQueueQuery { query, .. }
+        | Expr::TransactorStateQueueQuery { query, .. }
+        | Expr::ComponentQueueQuery { query, .. }
+        | Expr::ScoreboardQuery { query, .. } => query
+            .value_type()
+            .is_some_and(|ty| matches!(ty, crate::ir::IrType::SInt(_))),
+        Expr::SeqIndex { seq, .. } => cx
+            .func
+            .locals
+            .get(seq.index())
+            .and_then(|local| match &local.ty {
+                crate::ir::IrType::Seq(element) => Some((**element).clone()),
+                _ => None,
+            })
+            .is_some_and(|ty| matches!(ty, crate::ir::IrType::SInt(_))),
+        Expr::RegRead { mirror, field, .. } => cx
+            .func
+            .locals
+            .get(mirror.index())
+            .and_then(|local| record_path_type(cx, local.ty.clone(), std::iter::once(field)))
+            .is_some_and(|ty| matches!(ty, crate::ir::IrType::SInt(_))),
         Expr::Unary(UnOp::Not, _) => false,
         // `BitNotHost` is v1's UNMASKED host `~`; its signedness is that of
         // its operand under C++ usual-arithmetic conversion, exactly like the
@@ -1797,6 +2696,20 @@ fn record_path_is_sint<'a>(
     segs: impl Iterator<Item = &'a String>,
 ) -> bool {
     record_path_type(cx, ty, segs).is_some_and(|ty| matches!(ty, crate::ir::IrType::SInt(_)))
+}
+
+fn callable_return_ir_type(
+    cx: &ECx<'_>,
+    function: crate::ir::FunctionId,
+) -> Option<crate::ir::IrType> {
+    let function = cx.prog?.functions.get(function.index())?;
+    let ret = function.ret?;
+    match function.locals.get(ret.index())?.ty.clone() {
+        crate::ir::IrType::Unknown => cx
+            .dut_access
+            .and_then(|plan| plan.inferred_local_type(function.id, ret).cloned()),
+        ty => Some(ty),
+    }
 }
 
 /// Peel a `FixedVec` `IrType` to the element type a `TbFieldVecElement`
@@ -1885,15 +2798,27 @@ fn record_path_type<'a>(
 }
 
 /// The testbench schema owning the function being emitted, when known.
-fn owner_tb<'a>(cx: &ECx<'a>) -> Option<&'a crate::ir::TestbenchSchema> {
-    cx.prog?.testbenches.get(cx.func.owner?.index())
+pub(super) fn owner_tb<'a>(cx: &ECx<'a>) -> Option<&'a crate::ir::TestbenchSchema> {
+    let prog = cx.prog?;
+    if let Some(owner) = cx.bindings.testbench_owner.or(cx.func.owner) {
+        return prog.testbenches.get(owner.index());
+    }
+    let crate::ir::FunctionKind::TestbenchMethod { testbench, .. } = cx.func.kind else {
+        return None;
+    };
+    prog.testbenches
+        .iter()
+        .find(|schema| schema.type_id == testbench)
 }
 
 /// The transactor schema owning `instance`'s persistent state. An empty
 /// instance means we are inside a shared method/responder body (the
 /// state-receiver ABI) — resolve by the body's own function id instead
 /// of the (not-yet-bound) instance name.
-fn state_transactor<'a>(cx: &ECx<'a>, instance: &str) -> Option<&'a crate::ir::TransactorSchema> {
+pub(super) fn state_transactor<'a>(
+    cx: &ECx<'a>,
+    instance: &str,
+) -> Option<&'a crate::ir::TransactorSchema> {
     let prog = cx.prog?;
     // Inside a shared method/responder body the state field belongs to
     // the transactor owning the body itself — resolve by function id.
@@ -1906,6 +2831,14 @@ fn state_transactor<'a>(cx: &ECx<'a>, instance: &str) -> Option<&'a crate::ir::T
     });
     if by_fn.is_some() || instance.is_empty() {
         return by_fn;
+    }
+    if let Some(transactor) = cx
+        .bindings
+        .testbench_transactor_states
+        .and_then(|bindings| bindings.iter().find(|binding| binding.field == instance))
+        .map(|binding| binding.transactor)
+    {
+        return prog.transactors.get(transactor.index());
     }
     let tb = owner_tb(cx)?;
     // A stateful instance can be declared three ways: a transactor-typed
@@ -1992,6 +2925,77 @@ fn component_of_base<'a>(
     }
 }
 
+fn component_idle_heartbeat_fields(
+    cx: &ECx<'_>,
+    base: &crate::ir::ComponentBase,
+    subpath: &[String],
+) -> Result<(String, String), EmitError> {
+    use crate::ir::passes::runtime_cells::ComponentHeartbeat;
+    use crate::ir::ComponentFieldKind;
+
+    let prog = cx.prog.ok_or_else(|| {
+        EmitError(format!(
+            "tbir: component idle predicate in {} has no typed program binding",
+            cx.func.name
+        ))
+    })?;
+    let mut component = component_of_base(cx, base).ok_or_else(|| {
+        EmitError(format!(
+            "tbir: component idle predicate in {} has an unresolved receiver",
+            cx.func.name
+        ))
+    })?;
+    for (index, segment) in subpath.iter().enumerate() {
+        let terminal = index + 1 == subpath.len();
+        let field = component.field(segment).ok_or_else(|| {
+            EmitError(format!(
+                "tbir: component idle predicate in {} has unresolved path segment `{segment}`",
+                cx.func.name
+            ))
+        })?;
+        match field.kind {
+            ComponentFieldKind::Sub {
+                component: next, ..
+            } => {
+                component = prog.components.get(next.index()).ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: component idle predicate in {} reaches missing component c{}",
+                        cx.func.name, next.0
+                    ))
+                })?;
+            }
+            ComponentFieldKind::ScoreboardSub { scoreboard } if terminal => {
+                let scoreboard = prog.scoreboards.get(scoreboard.index()).ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: component idle predicate in {} reaches a missing scoreboard",
+                        cx.func.name
+                    ))
+                })?;
+                return Ok((
+                    super::runtime::scoreboard_heartbeat_field(
+                        scoreboard,
+                        ComponentHeartbeat::Input,
+                    ),
+                    super::runtime::scoreboard_heartbeat_field(
+                        scoreboard,
+                        ComponentHeartbeat::Output,
+                    ),
+                ));
+            }
+            _ => {
+                return Err(EmitError(format!(
+                    "tbir: component idle predicate in {} has invalid path segment `{segment}`",
+                    cx.func.name
+                )))
+            }
+        }
+    }
+    Ok((
+        super::runtime::component_heartbeat_field(component, ComponentHeartbeat::Input),
+        super::runtime::component_heartbeat_field(component, ComponentHeartbeat::Output),
+    ))
+}
+
 fn ir_type_width(ty: &crate::ir::IrType) -> Option<u32> {
     match ty {
         crate::ir::IrType::UInt(w) | crate::ir::IrType::SInt(w) => *w,
@@ -2009,30 +3013,21 @@ fn signed_literal_cpp(value: u64) -> String {
     }
 }
 
-/// Render a composite-component access receiver. `SelfField` → `self`
-/// (the method lambda's first parameter); `Path` → the dot-joined
-/// test-scope path (`env.source`), all by-value struct members.
-pub(super) fn comp_base_cpp(base: &crate::ir::ComponentBase) -> String {
-    comp_base_cpp_subst(base, None)
-}
-
-/// As `comp_base_cpp`, but `self_subst = Some(inst)` renders a
-/// `SelfField` base as the instance path `inst` instead of `self` — for
+/// Render a component base, with `self_subst = Some(inst)` selecting the
+/// instance path `inst` instead of `self` for a `SelfField` base — for
 /// clause exprs lowered self-relatively but emitted in a `_checkers`
 /// closure that has no `self` (watchdog/periodic period + max_idle).
 ///
 /// A `ComponentBase::Local` arises inside a method body (a
 /// component-typed parameter receiver) for method calls and predicates. The
 /// cx-aware [`comp_base_cpp_subst_cx`] is used to render it via the local-name
-/// table. This name-less variant therefore never sees a `Local` and renders it
-/// to a deliberately-invalid sentinel rather than threading a names table
-/// everywhere — the call paths that can produce a `Local` base all route
-/// through the cx-aware variant.
+/// table. The name-less variant rejects a `Local`; callers that accept local
+/// component values use the context-aware renderer.
 pub(super) fn comp_base_cpp_subst(
     base: &crate::ir::ComponentBase,
     self_subst: Option<&str>,
-) -> String {
-    match base {
+) -> Result<String, EmitError> {
+    Ok(match base {
         crate::ir::ComponentBase::SelfField => self_subst.unwrap_or("self").to_string(),
         // A `self`-rooted path (`self.sb`) is a self-relative sub-component
         // access lowered inside a component/handler body — re-root the
@@ -2051,24 +3046,217 @@ pub(super) fn comp_base_cpp_subst(
         crate::ir::ComponentBase::Path(path) => path.join("."),
         // Unreachable: a `Local` base requires the local-name table; every
         // emission site that can produce one uses `comp_base_cpp_subst_cx`.
-        crate::ir::ComponentBase::Local(l) => {
-            format!("/*BUG:component-local l{} without names*/", l.0)
+        crate::ir::ComponentBase::Local(local) => {
+            return Err(EmitError(format!(
+                "tbir: component local %{} reached a renderer without typed local bindings",
+                local.0
+            )))
         }
-    }
+    })
 }
 
 /// cx-aware component-base resolver: handles `ComponentBase::Local` by
 /// rendering the parameter local's C++ name, and delegates every other
 /// base shape to the name-less [`comp_base_cpp_subst`] (carrying the
 /// `self_subst` from the emission context).
-pub(super) fn comp_base_cpp_subst_cx(cx: &ECx<'_>, base: &crate::ir::ComponentBase) -> String {
+pub(super) fn comp_base_cpp_subst_cx(
+    cx: &ECx<'_>,
+    base: &crate::ir::ComponentBase,
+) -> Result<String, EmitError> {
     match base {
-        crate::ir::ComponentBase::Local(l) => cx
-            .names
-            .get(l.index())
-            .cloned()
-            .unwrap_or_else(|| format!("/*BUG:l{}*/", l.0)),
-        other => comp_base_cpp_subst(other, cx.self_subst),
+        crate::ir::ComponentBase::Local(local) => local_cpp_name(cx, *local),
+        crate::ir::ComponentBase::Path(path) => {
+            if let Some((head, tail)) = path.split_first() {
+                if let Some(binding) = cx
+                    .bindings
+                    .testbench_components
+                    .and_then(|bindings| bindings.iter().find(|binding| binding.field == *head))
+                {
+                    return Ok(std::iter::once(binding.receiver.clone())
+                        .chain(tail.iter().cloned())
+                        .collect::<Vec<_>>()
+                        .join("."));
+                }
+                if head == "self" && cx.bindings.self_receiver.is_none() {
+                    return Err(EmitError(format!(
+                        "tbir: self-relative component path in {} has no typed receiver",
+                        cx.func.name
+                    )));
+                }
+                if cx.bindings.run_context.is_some()
+                    && matches!(
+                        cx.func.kind,
+                        crate::ir::FunctionKind::TestbenchMethod { .. }
+                    )
+                    && cx.prog.is_some_and(|prog| {
+                        let crate::ir::FunctionKind::TestbenchMethod { testbench, .. } =
+                            cx.func.kind
+                        else {
+                            return false;
+                        };
+                        prog.testbench_types
+                            .get(testbench.index())
+                            .is_some_and(|schema| {
+                                schema
+                                    .component_fields
+                                    .iter()
+                                    .any(|(field, _)| field == head)
+                            })
+                    })
+                {
+                    return Err(EmitError(format!(
+                        "tbir: testbench component field `{head}` in {} has no typed receiver binding",
+                        cx.func.name
+                    )));
+                }
+            }
+            comp_base_cpp_subst(base, cx.bindings.self_receiver)
+        }
+        crate::ir::ComponentBase::SelfField if cx.bindings.self_receiver.is_none() => {
+            Err(EmitError(format!(
+                "tbir: self-relative component access in {} has no typed receiver",
+                cx.func.name
+            )))
+        }
+        other => comp_base_cpp_subst(other, cx.bindings.self_receiver),
+    }
+}
+
+#[cfg(test)]
+mod render_binding_tests {
+    use super::*;
+    use crate::ir::{
+        BasicBlock, BlockId, ComponentBase, FunctionKind, IrType, LocalId, PortAccess, PortOrigin,
+        PortRef, RecordId, TbFunction, TbRecordLocalBinding, Terminator, TypedLocal,
+    };
+
+    fn function() -> TbFunction {
+        TbFunction {
+            id: FunctionId(0),
+            name: "binding_probe".to_string(),
+            kind: FunctionKind::Helper,
+            params: Vec::new(),
+            locals: vec![TypedLocal {
+                name: "saved".to_string(),
+                ty: IrType::Record(RecordId(0)),
+            }],
+            blocks: vec![BasicBlock {
+                stmts: Vec::new(),
+                terminator: Terminator::Return,
+            }],
+            entry: BlockId(0),
+            owner: None,
+            testbench_record_locals: vec![TbRecordLocalBinding {
+                local: LocalId(0),
+                field: "saved".to_string(),
+                record: RecordId(0),
+            }],
+            ret: None,
+            implicit_returns: vec![BlockId(0)],
+        }
+    }
+
+    #[test]
+    fn missing_typed_callable_receivers_fail_closed() {
+        let function = function();
+        let names = vec!["saved".to_string()];
+        let lanes = HashMap::new();
+        let cx = ECx {
+            prog: None,
+            func: &function,
+            names: &names,
+            lanes: &lanes,
+            bindings: CallableRenderBindings::default(),
+            dut_type: "",
+            dut_access: None,
+            trace_component: "",
+            state_receiver: None,
+            temporal_widths: &[],
+            temporal_cell_prefix: None,
+            common_contextual_tseqs: None,
+        };
+        assert!(local_cpp_name(&cx, LocalId(0))
+            .unwrap_err()
+            .0
+            .contains("no typed testbench receiver"));
+        assert!(comp_base_cpp_subst(&ComponentBase::Local(LocalId(0)), None)
+            .unwrap_err()
+            .0
+            .contains("without typed local bindings"));
+        assert!(comp_base_cpp_subst_cx(&cx, &ComponentBase::SelfField)
+            .unwrap_err()
+            .0
+            .contains("no typed receiver"));
+        assert!(comp_base_cpp_subst_cx(
+            &cx,
+            &ComponentBase::Path(vec!["self".to_string(), "child".to_string()])
+        )
+        .unwrap_err()
+        .0
+        .contains("no typed receiver"));
+        assert!(
+            comp_base_cpp_subst_cx(&cx, &ComponentBase::Local(LocalId(99)))
+                .unwrap_err()
+                .0
+                .contains("dangling local")
+        );
+        assert!(expr_cpp(
+            &cx,
+            &Expr::TemporalSlot {
+                slot: 0,
+                kind: crate::ir::TemporalFn::Past,
+            },
+        )
+        .unwrap_err()
+        .0
+        .contains("no runtime-cell binding"));
+        let port = PortRef {
+            testbench_field: "dut".to_string(),
+            origin: PortOrigin::Dut,
+            port_path: vec!["status".to_string()],
+            aggregate_path: true,
+            direction: None,
+            width: None,
+            value_type: None,
+            access: PortAccess::Port,
+            probe: None,
+            lane: None,
+        };
+        assert!(port_signal(&cx, &port)
+            .unwrap_err()
+            .0
+            .contains("no typed receiver binding"));
+    }
+
+    #[test]
+    fn runtime_cell_binding_rejects_an_unplanned_cell() {
+        let source = crate::parser::parse_source(
+            r#"test BindingProbe
+    let dut : Top
+    clock clk = 10ns
+    run
+        wait 1 cycle
+    end run
+end test BindingProbe
+"#,
+        )
+        .expect("source parses");
+        let program = crate::ir::lower::lower_program(&source).expect("source lowers");
+        crate::ir::verify::verify_program(&program).expect("program verifies");
+        let plan = crate::ir::passes::runtime_cells::analyze(&program).expect("runtime plan");
+        let binding = RuntimeCellRenderBinding {
+            plan: &plan,
+            test: &program.tests[0],
+            receiver: "runtime_cells",
+        };
+        let error = binding
+            .require(
+                &crate::ir::passes::runtime_cells::RuntimeCellKind::PropertyImplicationPrevious {
+                    property: crate::ir::PropertyCheckId(0),
+                },
+            )
+            .expect_err("an unplanned cell must not acquire a generated name");
+        assert!(error.0.contains("no planned runtime cell"), "{error}");
     }
 }
 

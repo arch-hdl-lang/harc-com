@@ -68,7 +68,9 @@ fn fn1 comp_periodic_1 [kind=ComponentMethod(c1)]
 
 fn fn2 run_ScoreboardTypedQueueTest [kind=Run, owner=tb0]
   locals:
-    %0 err : record(r0)
+    %0 errors_before_front : uint
+    %1 __t0 : record(r0)
+    %2 err : record(r0)
   entry = b0
 
   b0:
@@ -87,6 +89,10 @@ fn fn2 run_ScoreboardTypedQueueTest [kind=Run, owner=tb0]
     -> Jump(b2)
 
   b4:
+    Assign(%errors_before_front, ComponentQueueQuery(checker.sb.errors.size()))
+    Assign(%__t0, ComponentQueueQuery(checker.sb.errors.front()))
+    AssertCheck { cond: (%__t0.code == 4097), on_fail: "front did not preserve the typed queue record" }
+    AssertCheck { cond: (ComponentQueueQuery(checker.sb.errors.size()) == %errors_before_front), on_fail: "front removed the typed queue record" }
     ComponentQueuePop(%err = checker.sb.errors.pop())
     AssertCheck { cond: (%err.checker_id == 1), on_fail: "bad checker id" }
     AssertCheck { cond: (%err.code == 4097), on_fail: "bad error code" }

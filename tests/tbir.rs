@@ -100,6 +100,22 @@ fn emit_cpp_src(src: &str) -> String {
     tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits")
 }
 
+fn v1_user_symbol(cpp: &str, kind: &str, source_name: &str) -> String {
+    let prefix = format!("harc_user_{kind}_{source_name}_");
+    cpp.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .find(|token| token.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no generated `{kind}` symbol for `{source_name}` in:\n{cpp}"))
+        .to_string()
+}
+
+fn v1_const_symbol(cpp: &str, source_name: &str) -> String {
+    v1_user_symbol(cpp, "const", source_name)
+}
+
+fn v1_callable_symbol(cpp: &str, source_name: &str) -> String {
+    v1_user_symbol(cpp, "callable", source_name)
+}
+
 /// Every `connect` wiring line each backend emits, sorted. The claim
 /// worth making about an owner-relative endpoint is that tbir wires it
 /// the way v1 does — so DERIVE v1's lines here rather than pasting a
@@ -376,28 +392,158 @@ end test T"#,
     );
 }
 
-/// An operand whose width is not statically known still cannot be folded
-/// — the `const` table carries values, not declared types, so a
-/// reference to another `const` has no width. v1 rejects the same shape,
-/// so the two backends accept and reject the same set.
+/// A reference to an earlier typed constant retains its declared width while
+/// folding a wrapping initializer.
 #[test]
-fn const_wrap_operator_needs_known_operand_widths() {
-    let err = lower_src(
+fn const_wrap_operator_uses_referenced_constant_width() {
+    let prog = lower_src(
         r#"const W : uint<8> = 255
-const BAD : uint<8> = W +% 1
+const WRAPPED : uint<8> = W +% 1
 
 test T
     let dut : Top
     run
-        assert BAD == 0 else fail("x")
+        assert WRAPPED == 0 else fail("x")
     end run
 end test T"#,
     )
-    .expect_err("unknown-width const wrap must fail lowering");
+    .expect("a typed const reference supplies the wrapping width");
+    let text = format!("{prog}");
+    assert!(
+        text.contains("(0 == 0)"),
+        "the referenced uint<8> width must mask 255 +% 1 to zero: {text}"
+    );
+}
+
+/// Typed file-scope constants keep their declared widths and signedness when
+/// substituted into ordinary TB-IR expressions. This is the suite blocker:
+/// a uint<32> field/local combined with a uint<32> constant must not be
+/// promoted to the widthless host ABI and diagnosed as a 64-to-32 narrowing.
+#[test]
+fn typed_const_substitution_keeps_declared_ir_type() {
+    let prog = lower_src(
+        r#"const SYSTEMATIC_COUNT : uint<32> = 64
+const SIGNED_STEP : sint<8> = -2
+
+test T
+    let dut : Top
+    run
+        let epoch : uint<32> = 100
+        let tail_index : uint<32> = epoch - SYSTEMATIC_COUNT
+        let signed_next : sint<8> = SIGNED_STEP + SIGNED_STEP
+        assert tail_index == 36 else fail("tail")
+        assert signed_next == -4 else fail("signed")
+    end run
+end test T"#,
+    )
+    .expect("same-width typed constant arithmetic lowers");
+    verify::verify_program(&prog).expect("typed constant IR verifies");
+
+    let run = prog.function(prog.tests[0].run);
+    let mut saw_unsigned = false;
+    let mut saw_signed = false;
+    for stmt in run.blocks.iter().flat_map(|block| &block.stmts) {
+        let ir::Stmt::Assign(_, ir::Expr::Binary(_, lhs, rhs)) = stmt else {
+            continue;
+        };
+        for value in [lhs.as_ref(), rhs.as_ref()] {
+            match value {
+                ir::Expr::Literal {
+                    value: 64,
+                    ty: ir::IrType::UInt(Some(32)),
+                } => saw_unsigned = true,
+                ir::Expr::Literal {
+                    ty: ir::IrType::SInt(Some(8)),
+                    ..
+                } => saw_signed = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        saw_unsigned,
+        "uint<32> provenance must reach the IR literal"
+    );
+    assert!(saw_signed, "sint<8> provenance must reach the IR literal");
+}
+
+/// Every scalar operator family must consume the same typed-constant
+/// provenance, including the component-field write path used by large suites.
+#[test]
+fn typed_constants_keep_type_across_scalar_operator_matrix() {
+    let src = r#"
+const U : uint<32> = 64
+const V : uint<32> = 3
+const S : sint<16> = -8
+
+scoreboard Counts
+    total : uint<32> default 0
+    hookable exercise()
+        total = total + U
+        total = total - V
+        total = total * V
+        total = total / V
+        total = total % V
+        total = total << V
+        total = total >> V
+        total = total & U
+        total = total | V
+        total = total ^ V
+        total = U +% V
+        total = U -% V
+        total = U *% V
+        let narrow : uint<8> = U.trunc<8>()
+        let wide : uint<40> = U.zext<40>()
+        let signed : sint<16> = S >> V
+        assert U > V else fail("compare")
+    end exercise
+end scoreboard Counts
+
+testbench Tb
+    dut : Top
+    counts : Counts
+end testbench Tb
+
+impl T for Tb
+    run
+        counts.exercise()
+    end run
+end impl T
+"#;
+    let prog = lower_src(src).expect("typed constants lower across scalar operators");
+    verify::verify_program(&prog).expect("operator-matrix IR verifies");
+}
+
+/// Retaining provenance must strengthen genuine narrowing checks rather than
+/// weakening them: a declared uint<48> constant cannot enter uint<32> state.
+#[test]
+fn typed_constant_genuine_narrowing_remains_rejected() {
+    let err = lower_src(
+        r#"const TOO_WIDE : uint<48> = 1
+
+scoreboard Counts
+    total : uint<32> default 0
+    hookable set()
+        total = TOO_WIDE
+    end set
+end scoreboard Counts
+
+testbench Tb
+    dut : Top
+    counts : Counts
+end testbench Tb
+
+impl T for Tb
+    run
+        counts.set()
+    end run
+end impl T"#,
+    )
+    .expect_err("declared-width narrowing must remain an error");
     let msg = assert_invalid(&err);
     assert!(
-        msg.contains("statically known bit-width"),
-        "must name the unknown-width operand; got: {msg}"
+        msg.contains("48-bit") && msg.contains("declared 32 bits"),
+        "{msg}"
     );
 }
 
@@ -410,7 +556,7 @@ end test T"#,
 #[test]
 fn const_and_enum_assign_to_typed_local() {
     let cpp = emit_cpp_src(
-        r#"const K : uint<32> = 5
+        r#"const K : uint<8> = 5
 const NEG : sint<8> = -1
 enum Color { RED, GREEN, BLUE }
 
@@ -577,10 +723,7 @@ end test T"#;
         assert!(text.contains(folded), "missing `{folded}` in:\n{text}");
     }
 
-    let multi_stmt = src.replace(
-        "return a + b",
-        "let sum = a + b\n    return sum",
-    );
+    let multi_stmt = src.replace("return a + b", "let sum = a + b\n    return sum");
     let msg = assert_not_implemented(
         &lower_src(&multi_stmt).expect_err("multi-statement helpers remain outside const folding"),
         lower::V1Status::EmitsUncompilable,
@@ -672,8 +815,7 @@ const RESULT : bool = negative_time() < 0"#,
         let source = format!(
             "{helper}\n\ntest T\n    let dut : Top\n    run\n        assert RESULT == false else fail(\"{label}\")\n    end run\nend test T"
         );
-        let prog = lower_src(&source)
-            .unwrap_or_else(|err| panic!("{label} helper folds: {err}"));
+        let prog = lower_src(&source).unwrap_or_else(|err| panic!("{label} helper folds: {err}"));
         let text = format!("{prog}");
         assert!(
             text.contains("(0 == 0)"),
@@ -721,11 +863,11 @@ end test T"#,
         cpp.contains("((uint64_t)(((uint64_t)(((int64_t)(-1)))))) >> 1"),
         "uint relabel casts must use logical right shift; got:\n{cpp}"
     );
-    // The inner `(uint64_t)` narrows before the signed relabel (a
-    // `HarcWide` receiver is otherwise an ambiguous conversion); it is
-    // value-transparent here — `(int64_t)((uint64_t)(-1))` is `-1`.
+    // The declared sint<8> source width reaches `.sext<64>()`, so the
+    // emitter performs an explicit 8-to-64 sign extension before the
+    // arithmetic shift.
     assert!(
-        cpp.contains("((int64_t)(((int64_t)((uint64_t)(((int64_t)(-1))))))) >> 1"),
+        cpp.contains("((uint64_t)(((int64_t)(-1))) << 56)") && cpp.contains(">> 56)))) >> 1"),
         "sext results must use arithmetic right shift; got:\n{cpp}"
     );
     assert!(
@@ -1232,6 +1374,299 @@ fn testbench_owned_probes_lower() {
     );
 }
 
+#[test]
+fn probe_scalar_types_survive_lowering_and_drive_typed_reads() {
+    let src = r#"test T
+    let dut : Top
+        probe signed_value : sint<8> at core.signed_value
+        probe raw_bits : bits<8> at core.raw_bits
+        probe flag : bool at core.flag
+    end let dut
+    run
+        let signed_copy : sint<8> = dut.signed_value
+        let raw_copy : uint<8> = dut.raw_bits
+        let bool_copy : bool = dut.flag
+        assert (signed_copy >> 1) == signed_copy
+        assert raw_copy == 0
+        assert bool_copy == false
+    end run
+end test T"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("typed probes lower");
+    verify::verify_program(&prog).expect("typed probes verify");
+    assert_eq!(prog.probes.len(), 3);
+    assert_eq!(prog.probes[0].ty, ir::ProbeScalarType::SInt(8));
+    assert_eq!(prog.probes[1].ty, ir::ProbeScalarType::Bits(8));
+    assert_eq!(prog.probes[2].ty, ir::ProbeScalarType::Bool);
+
+    let run = prog.tests[0].run;
+    let read_types: Vec<_> = prog.functions[run.index()]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .filter_map(|stmt| match stmt {
+            ir::Stmt::DutRead(local, port) => Some((
+                prog.functions[run.index()].locals[local.index()].ty.clone(),
+                port.value_type.clone(),
+                port.probe,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert!(read_types.contains(&(
+        ir::IrType::SInt(Some(8)),
+        Some(ir::IrType::SInt(Some(8))),
+        Some(ir::ProbeId(0)),
+    )));
+    assert!(read_types.contains(&(
+        ir::IrType::UInt(Some(8)),
+        Some(ir::IrType::UInt(Some(8))),
+        Some(ir::ProbeId(1)),
+    )));
+    assert!(read_types.contains(&(
+        ir::IrType::Bool,
+        Some(ir::IrType::Bool),
+        Some(ir::ProbeId(2)),
+    )));
+
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("typed probes emit");
+    assert!(cpp.contains("harc_sext_u128"), "{cpp}");
+    assert!(
+        cpp.contains("Top__DOT__harc_probes__DOT__flag) != 0"),
+        "{cpp}"
+    );
+}
+
+#[test]
+fn untyped_direct_probe_lets_infer_catalog_types_in_shared_components() {
+    let src = r#"agent ProbeReader
+    function sample()
+        let unsigned_value = dut.unsigned_value
+        let signed_value = dut.signed_value
+        let raw_bits = dut.raw_bits
+        let flag = dut.flag
+        let widened : uint<32> = dut.unsigned_value
+        let extended : uint<16> = unsigned_value.zext<16>()
+        let sign_extended : sint<16> = signed_value.sext<16>()
+        assert raw_bits == 0
+        assert flag == false
+        assert widened == extended
+        assert sign_extended < 0
+    end function sample
+end agent ProbeReader
+
+testbench ProbeTb
+    let dut : Top
+        probe unsigned_value : uint<8> at core.unsigned_value
+        probe signed_value : sint<8> at core.signed_value
+        probe raw_bits : bits<8> at core.raw_bits
+        probe flag : bool at core.flag
+    end let dut
+    reader : ProbeReader
+end testbench ProbeTb
+
+impl ProbeTest for ProbeTb
+    run
+        reader.sample()
+    end run
+end impl ProbeTest"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("untyped direct probe lets lower");
+    verify::verify_program(&prog).expect("untyped direct probe lets verify");
+
+    let reads: Vec<_> = prog
+        .functions
+        .iter()
+        .flat_map(|function| {
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .filter_map(move |stmt| match stmt {
+                    ir::Stmt::DutRead(local, port) => Some((
+                        function.locals[local.index()].name.as_str(),
+                        function.locals[local.index()].ty.clone(),
+                        port.value_type.clone(),
+                    )),
+                    _ => None,
+                })
+        })
+        .collect();
+    for (name, expected) in [
+        ("unsigned_value", ir::IrType::UInt(Some(8))),
+        ("signed_value", ir::IrType::SInt(Some(8))),
+        ("raw_bits", ir::IrType::UInt(Some(8))),
+        ("flag", ir::IrType::Bool),
+    ] {
+        assert!(
+            reads.iter().any(|(local, ty, port_ty)| {
+                *local == name && ty == &expected && port_ty.as_ref() == Some(&expected)
+            }),
+            "missing exact direct read for {name}: {reads:?}"
+        );
+    }
+    assert!(
+        reads.iter().any(|(local, ty, port_ty)| {
+            *local == "widened"
+                && *ty == ir::IrType::UInt(Some(32))
+                && *port_ty == Some(ir::IrType::UInt(Some(8)))
+        }),
+        "explicit widening must retain both destination and source types: {reads:?}"
+    );
+
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("typed direct probe lets emit");
+    assert!(cpp.contains("harc_sext_u128"), "{cpp}");
+}
+
+#[test]
+fn direct_probe_let_rejects_explicit_narrowing() {
+    let src = r#"agent ProbeReader
+    function sample()
+        let narrowed : uint<8> = dut.wide_value
+    end function sample
+end agent ProbeReader
+
+testbench ProbeTb
+    let dut : Top
+        probe wide_value : uint<32> at core.wide_value
+    end let dut
+    reader : ProbeReader
+end testbench ProbeTb
+
+impl ProbeTest for ProbeTb
+    run
+        reader.sample()
+    end run
+end impl ProbeTest"#;
+    let error = lower_src(src).expect_err("narrow direct probe let must fail in lowering");
+    assert!(error.to_string().contains("narrows"), "{error}");
+}
+
+#[test]
+fn untyped_ordinary_dut_port_let_stays_unknown_without_context() {
+    let src = r#"test T
+    let dut : Top
+    run
+        let unknown = dut.raw_port
+        let typed : uint<8> = dut.typed_port
+    end run
+end test T"#;
+    let prog = lower_src(src).expect("ordinary direct port lets lower");
+    verify::verify_program(&prog).expect("ordinary direct port lets verify");
+    let run = &prog.functions[prog.tests[0].run.index()];
+    let local_type = |name: &str| {
+        run.locals
+            .iter()
+            .find(|local| local.name == name)
+            .map(|local| local.ty.clone())
+    };
+    assert_eq!(local_type("unknown"), Some(ir::IrType::Unknown));
+    assert_eq!(local_type("typed"), Some(ir::IrType::UInt(Some(8))));
+}
+
+#[test]
+fn verifier_rejects_corrupted_probe_identity_path_width_and_type() {
+    fn first_probe_port(prog: &mut ir::TbProgram) -> &mut ir::PortRef {
+        prog.functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|stmt| match stmt {
+                ir::Stmt::DutRead(_, port) if port.probe.is_some() => Some(port),
+                _ => None,
+            })
+            .expect("probe read exists")
+    }
+
+    fn first_probe_read_dest(prog: &ir::TbProgram) -> (usize, ir::LocalId) {
+        prog.functions
+            .iter()
+            .enumerate()
+            .find_map(|(function_index, function)| {
+                function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.stmts)
+                    .find_map(|stmt| match stmt {
+                        ir::Stmt::DutRead(local, port) if port.probe.is_some() => {
+                            Some((function_index, *local))
+                        }
+                        _ => None,
+                    })
+            })
+            .expect("probe read exists")
+    }
+
+    fn assert_bad_probe(prog: &ir::TbProgram, needle: &str) {
+        let errors = verify::verify_program(prog).expect_err("corrupted probe IR must fail");
+        assert!(
+            errors.iter().any(|error| {
+                matches!(error, verify::VerifyError::BadProbeRef { detail, .. } if detail.contains(needle))
+            }),
+            "expected `{needle}` in {errors:?}"
+        );
+    }
+
+    let src = r#"test T
+    let dut : Top
+        probe signed_value : sint<8> at core.signed_value
+    end let dut
+    run
+        let value : sint<8> = dut.signed_value
+        assert value < 0
+    end run
+end test T"#;
+    let base = lower_src(src).expect("probe fixture lowers");
+    verify::verify_program(&base).expect("baseline verifies");
+
+    let mut broken = base.clone();
+    let (function_index, local) = first_probe_read_dest(&broken);
+    broken.functions[function_index].locals[local.index()].ty = ir::IrType::Unknown;
+    let errors = verify::verify_program(&broken).expect_err("unknown probe destination must fail");
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            verify::VerifyError::TypeMismatch {
+                expected: ir::IrType::Unknown,
+                actual: ir::IrType::SInt(Some(8)),
+                ..
+            }
+        )),
+        "expected an unknown probe destination mismatch in {errors:?}"
+    );
+
+    let mut broken = base.clone();
+    first_probe_port(&mut broken).probe = None;
+    assert_bad_probe(&broken, "without a probe id");
+
+    let mut broken = base.clone();
+    first_probe_port(&mut broken).probe = Some(ir::ProbeId(99));
+    assert_bad_probe(&broken, "missing probe p99");
+
+    let mut broken = base.clone();
+    first_probe_port(&mut broken).port_path[0] = "invented".to_string();
+    assert_bad_probe(&broken, "does not match catalog name");
+
+    let mut broken = base.clone();
+    first_probe_port(&mut broken)
+        .port_path
+        .push("illegal_segment".to_string());
+    assert_bad_probe(&broken, "does not match catalog name");
+
+    let mut broken = base.clone();
+    first_probe_port(&mut broken).width = Some(7);
+    assert_bad_probe(&broken, "does not match catalog width");
+
+    let mut broken = base.clone();
+    first_probe_port(&mut broken).value_type = Some(ir::IrType::UInt(Some(8)));
+    assert_bad_probe(&broken, "does not match catalog type");
+
+    let mut broken = base;
+    broken.testbenches[0].probes.clear();
+    assert_bad_probe(&broken, "does not declare probe");
+}
+
 /// Writing a read-only `probe` is a hard error (not a `--codegen v1`
 /// fallback): only `probe force` opts into the SV procedural-force path.
 #[test]
@@ -1273,6 +1708,348 @@ end impl Tst"#;
     let msg = err.to_string();
     assert!(matches!(err, lower::LowerError::Invalid(_)), "{err:?}");
     assert!(msg.contains("read-only probe"), "{msg}");
+}
+
+#[test]
+fn shared_component_methods_read_force_and_release_suite_probes() {
+    let src = r#"agent ProbeUser
+    function read_probe() -> uint<32>
+        return dut.inject
+    end function read_probe
+
+    function force_probe(value: uint<32>)
+        dut.inject = value
+    end function force_probe
+
+    function release_probe()
+        release dut.inject
+    end function release_probe
+end agent ProbeUser
+
+testbench ProbeTb
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    user : ProbeUser
+end testbench ProbeTb
+
+impl ProbeTest for ProbeTb
+    run
+        let before : uint<32> = user.read_probe()
+        user.force_probe(before + 1)
+        user.release_probe()
+    end run
+end impl ProbeTest"#;
+    let mut prog = lower_src(src).expect("shared probe methods lower");
+    verify::verify_program(&prog).expect("shared probe methods verify");
+    let dump = format!("{prog}");
+    assert!(dump.contains("dut.inject (force)"), "{dump}");
+    assert!(dump.contains("ProbeRelease(dut.inject (force))"), "{dump}");
+
+    let cpp = tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
+        .expect("shared probe methods emit");
+    let accessor = "Top__DOT__harc_probes__DOT__inject";
+    assert!(
+        cpp.contains(accessor),
+        "missing probe read accessor:\n{cpp}"
+    );
+    assert!(
+        cpp.contains(&format!("{accessor}_drv")) && cpp.contains(&format!("{accessor}_en")),
+        "missing force/release accessors:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("rootp->__DOT__harc_probes"),
+        "shared-method emission lost the DUT type:\n{cpp}"
+    );
+
+    let release = prog
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ProbeRelease(port) => Some(port),
+            _ => None,
+        })
+        .expect("release IR exists");
+    release.access = ir::PortAccess::Probe;
+    assert!(
+        verify::verify_program(&prog).is_err(),
+        "the verifier must reject a non-force ProbeRelease"
+    );
+}
+
+#[test]
+fn standalone_transactor_methods_read_force_and_release_suite_probes() {
+    let src = r#"transactor ProbeDriver
+    dut : Top
+    when active
+        hookable read_probe() -> uint<32>
+            return dut.inject
+        end read_probe
+        hookable force_probe(value: uint<32>)
+            dut.inject = value
+        end force_probe
+        hookable release_probe()
+            release dut.inject
+        end release_probe
+    end when
+end transactor ProbeDriver
+
+testbench ProbeTb
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    driver : ProbeDriver active
+end testbench ProbeTb
+
+impl ProbeTest for ProbeTb
+    run
+        driver.dut = dut
+        let before : uint<32> = driver.read_probe()
+        driver.force_probe(before + 1)
+        driver.release_probe()
+    end run
+end impl ProbeTest"#;
+    let prog = lower_src(src).expect("standalone transactor probe methods lower");
+    verify::verify_program(&prog).expect("standalone transactor probe methods verify");
+    let cpp = tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
+        .expect("standalone transactor probe methods emit");
+    let accessor = "Top__DOT__harc_probes__DOT__inject";
+    assert!(
+        cpp.contains(accessor),
+        "missing transactor probe accessor:\n{cpp}"
+    );
+    assert!(cpp.contains(&format!("{accessor}_drv")), "{cpp}");
+    assert!(cpp.contains(&format!("{accessor}_en")), "{cpp}");
+}
+
+#[test]
+fn verifier_rejects_a_write_through_a_readonly_probe() {
+    let src = r#"test T
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    run
+        dut.inject = 7
+    end run
+end test T"#;
+    let mut prog = lower_src(src).expect("force write lowers");
+    let port = prog
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::DutWrite(port, _) if port.access == ir::PortAccess::Force => Some(port),
+            _ => None,
+        })
+        .expect("force write IR exists");
+    port.access = ir::PortAccess::Probe;
+    assert!(
+        verify::verify_program(&prog).is_err(),
+        "the verifier must reject a read-only probe write"
+    );
+}
+
+#[test]
+fn shared_component_probe_must_be_declared_by_every_test() {
+    for (label, method) in [
+        (
+            "read",
+            "function use_probe() -> uint<32>\n        return dut.inject\n    end function use_probe",
+        ),
+        (
+            "write",
+            "function use_probe()\n        dut.inject = 1\n    end function use_probe",
+        ),
+        (
+            "release",
+            "function use_probe()\n        release dut.inject\n    end function use_probe",
+        ),
+    ] {
+        let src = format!(
+            r#"agent ProbeUser
+    {method}
+end agent ProbeUser
+
+test A
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    let user : ProbeUser
+    run
+        wait 1 cycle
+    end run
+end test A
+
+test B
+    let dut : Top
+    let user : ProbeUser
+    run
+        wait 1 cycle
+    end run
+end test B"#
+        );
+        let err = lower_src(&src)
+            .expect_err("one test cannot authorize a shared method for another");
+        let msg = err.to_string();
+        assert!(msg.contains("shared DUT access `dut.inject`"), "{label}: {msg}");
+        assert!(msg.contains("every test"), "{label}: {msg}");
+    }
+}
+
+#[test]
+fn standalone_transactor_probe_must_be_declared_by_every_test() {
+    for (label, method) in [
+        (
+            "read",
+            "hookable use_probe() -> uint<32>\n            return dut.inject\n        end use_probe",
+        ),
+        (
+            "write",
+            "hookable use_probe()\n            dut.inject = 1\n        end use_probe",
+        ),
+        (
+            "release",
+            "hookable use_probe()\n            release dut.inject\n        end use_probe",
+        ),
+    ] {
+        let src = format!(
+            r#"transactor ProbeDriver
+    dut : Top
+    when active
+        {method}
+    end when
+end transactor ProbeDriver
+
+test A
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    let driver : ProbeDriver active
+    run
+        driver.dut = dut
+        wait 1 cycle
+    end run
+end test A
+
+test B
+    let dut : Top
+    let driver : ProbeDriver active
+    run
+        driver.dut = dut
+        wait 1 cycle
+    end run
+end test B"#
+        );
+        let err = lower_src(&src)
+            .expect_err("one test cannot authorize a shared transactor for another");
+        let msg = err.to_string();
+        assert!(msg.contains("shared DUT access `dut.inject`"), "{label}: {msg}");
+        assert!(msg.contains("every test"), "{label}: {msg}");
+    }
+}
+
+#[test]
+fn synthesized_testbench_probe_diagnostic_keeps_its_source() {
+    let tb = harc::parser::parse_source_named(
+        "probe_tb.harc",
+        r#"testbench ProbeTb
+    let dut : Top
+        probe bad : Vec<uint<8>, 2> at core.bad
+    end let dut
+end testbench ProbeTb"#,
+    )
+    .unwrap();
+    let test = harc::parser::parse_source_named(
+        "probe_test.harc",
+        r#"impl ProbeTest for ProbeTb
+    run
+        wait 1 cycle
+    end run
+end impl ProbeTest"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(vec![tb, test], None).expect("merge");
+    let err = lower::lower_program_diagnostic(&merged).expect_err("probe type must be rejected");
+    let source = merged
+        .source_for_id(err.source_id())
+        .expect("diagnostic source remains available");
+    assert_eq!(&*source.name, "probe_tb.harc");
+}
+
+#[test]
+fn recovered_message_lowering_does_not_mask_a_later_assignment_diagnostic() {
+    let component = harc::parser::parse_source_named(
+        "message_model.harc",
+        r#"agent MessageModel
+    value : uint<8> = 0
+
+    function read() -> uint<8>
+        return value
+    end read
+
+    function check_value()
+        assert true else fail("value=${read()}")
+    end check_value
+end agent MessageModel"#,
+    )
+    .unwrap();
+    let testbench_source = r#"agent Leaf
+    value : uint<8> = 0
+end agent Leaf
+
+agent Holder
+    leaf : Leaf
+end agent Holder
+
+agent OtherLeaf
+    value : uint<8> = 0
+end agent OtherLeaf
+
+testbench CopyTb
+    dut : Top
+    destination : OtherLeaf
+    holder : Holder
+
+    function reset()
+        destination = holder.leaf
+    end reset
+end testbench CopyTb"#;
+    let testbench = harc::parser::parse_source_named("copy_tb.harc", testbench_source).unwrap();
+    let test = harc::parser::parse_source_named(
+        "copy_test.harc",
+        r#"impl CopyTest for CopyTb
+    run
+        reset()
+    end run
+end impl CopyTest"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(vec![component, testbench, test], None).expect("merge");
+
+    let err = lower::lower_program_diagnostic(&merged)
+        .expect_err("a recovered message must not mask a later component schema mismatch");
+    let source = merged
+        .source_for_id(err.source_id())
+        .expect("diagnostic source remains available");
+    assert_eq!(&*source.name, "copy_tb.harc");
+    assert!(err.to_string().contains("Leaf"), "{err}");
+    assert!(err.to_string().contains("OtherLeaf"), "{err}");
+
+    let target = "destination = holder.leaf";
+    let expected_offset = testbench_source
+        .find("        destination = holder.leaf")
+        .expect("assignment is in source")
+        + 8;
+    let label = miette::Diagnostic::labels(&err)
+        .and_then(|mut labels| labels.next())
+        .expect("lowering diagnostic has a source label");
+    assert_eq!(
+        (label.offset(), label.len()),
+        (expected_offset, target.len())
+    );
 }
 
 /// harc-com#493: a bus type named by `use` that never resolved (here,
@@ -1520,7 +2297,10 @@ fn bound_monitor_handshake_handlers_lower_passive() {
         .expect("bound handshake monitor")
         .phase = ir::HandlerPhase::PostEval;
     let msg = format!("{:?}", verify::verify_program(&bad).unwrap_err());
-    assert!(msg.contains("bound handshake monitor scheduled at post_eval"), "{msg}");
+    assert!(
+        msg.contains("bound handshake monitor scheduled at post_eval"),
+        "{msg}"
+    );
 }
 
 /// A `passive` bound instance of a PURE-DRIVER transactor (no monitor
@@ -1633,7 +2413,7 @@ fn tseq_basic_fixture_lowers() {
     let has_tseq_call = run.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
         matches!(
             s,
-            ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::Tseq(_), _))
+            ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::Tseq { .. }, _))
         )
     });
     assert!(
@@ -1726,7 +2506,7 @@ fn watchdog_quiesce_dump_ir_snapshot() {
 
 /// Locks the emitted tbir C++ for the watchdog fixture: the zero-arg
 /// `<Comp>_watchdog<fid>` body lambda, and the per-instance `_checkers`
-/// closure that gates on the period static, runs the body, then the
+/// closure that gates on the per-instance period cell, runs the body, then the
 /// `max_idle` idle check + FAIL diagnostic.
 #[test]
 fn watchdog_quiesce_emitted_cpp_snapshot() {
@@ -2105,9 +2885,9 @@ fn tbir_emit_wait_until_runtime_calls() {
 
 /// `randomize(t)` now lowers to a `Terminator::Randomize` carrying a
 /// `ConstraintRef` into the program's constraint-site table, and the
-/// tbir backend splices in v1's Z3-solve snippet (the constraint-IR
-/// seam — `docs/tbir-mvp.md` §"randomize"). A bare `randomize(t)` of a
-/// keep-free transaction routes through the unconstrained-PRNG shell.
+/// tbir backend renders the typed solver plan at the terminator. A bare
+/// `randomize(t)` of a keep-free transaction routes through the
+/// unconstrained-PRNG shell.
 #[test]
 fn randomize_lowers_to_terminator() {
     let src = r#"
@@ -2141,7 +2921,8 @@ end test RandTest
             .any(|b| matches!(b.terminator, ir::Terminator::Randomize { .. })),
         "a Randomize terminator is present"
     );
-    // tbir emits the v1 Z3-solve block (constraint-IR seam reused).
+    // TBIR emits the typed Z3 solve block with all mutable state owned by the
+    // selected run context.
     let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
     assert!(cpp.contains("z3::solver"), "Z3 solve block emitted");
     assert!(
@@ -2152,13 +2933,27 @@ end test RandTest
         cpp.contains("trace.randomize("),
         "randomize trace event emitted"
     );
+    for forbidden in [
+        "thread_local",
+        "static harc_rt::random::HarcRng",
+        "static harc_rt::random::HarcRuntimeCallSite",
+        "static harc_rt::random::HarcUniqueHistory",
+        "static harc_rt::random::HarcAutoCovState",
+    ] {
+        assert!(
+            !cpp.contains(forbidden),
+            "mutable state escaped the run: {forbidden}"
+        );
+    }
 }
 
-/// Retargeting a reused v1 randomize snippet must rename only the
-/// randomized object, not record-field members with the same spelling.
+/// TB-IR binds the randomized object by LocalId and keeps generated runtime
+/// receivers separate from adversarial source names.
 #[test]
 fn randomize_snippet_retarget_preserves_record_field_names() {
-    let src = r#"
+    for target in ["ctx", "rng", "errors", "_cells"] {
+        let src = format!(
+            r#"
 transaction Req
     errors : uint<8>
     keep errors in [1..3]
@@ -2167,24 +2962,32 @@ end transaction Req
 test RandNameCollisionTest
     let dut : Top
     run
-        let errors : Req
-        randomize(errors)
-        assert errors.errors >= 1
+        let {target} : Req
+        randomize({target})
+        assert {target}.errors >= 1
     end run
 end test RandNameCollisionTest
-"#;
-    let merged = merged_src(src);
-    let prog = lower::lower_program(&merged).expect("lowers");
-    verify::verify_program(&prog).expect("verifies");
-    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
-    assert!(
-        cpp.contains("_u_errors.errors"),
-        "object local is sanitized while record field name is preserved:\n{cpp}"
-    );
-    assert!(
-        !cpp.contains("_u_errors._u_errors"),
-        "retargeting must not rewrite member names:\n{cpp}"
-    );
+"#
+        );
+        let merged = merged_src(&src);
+        let prog = lower::lower_program(&merged).expect("lowers");
+        verify::verify_program(&prog).expect("verifies");
+        let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
+        let emitted = if matches!(target, "ctx" | "errors") {
+            format!("_u_{target}")
+        } else {
+            target.to_string()
+        };
+        assert!(
+            cpp.contains(&format!("{emitted}.errors")),
+            "target `{target}` must retain its typed identity while the record field is preserved:\n{cpp}"
+        );
+        assert!(cpp.contains("ctx.rng.initial_seed"), "{target}: {cpp}");
+        assert!(
+            !cpp.contains('\u{1e}'),
+            "internal binding sentinel leaked: {cpp}"
+        );
+    }
 }
 
 #[test]
@@ -3768,13 +4571,16 @@ end impl VecQueueTargetTest
     };
     for (expr, needle) in [
         ("let bad = observed + 1", "scalar binary operator"),
-        (
-            "values.push(observed + observed)",
-            "scalar binary operator",
-        ),
+        ("values.push(observed + observed)", "scalar binary operator"),
         ("let bad = !observed", "scalar unary operator"),
-        ("if observed\n            wait 1 cycle\n        end if", "must be a scalar value"),
-        ("let bad = 1 ? observed : 1", "ternary mixing a fixed-vector"),
+        (
+            "if observed\n            wait 1 cycle\n        end if",
+            "must be a scalar value",
+        ),
+        (
+            "let bad = 1 ? observed : 1",
+            "ternary mixing a fixed-vector",
+        ),
         ("log(info, \"bad=${observed}\")", "aggregate interpolation"),
         ("let bad = take_scalar(observed)", "fixed-vector value"),
         ("sink.put(observed)", "fixed-vector value"),
@@ -3867,6 +4673,7 @@ end impl VecQueueTargetTest
         .iter()
         .find(|function| function.name == "take_scalar")
         .expect("fixture has scalar helper");
+    let take_scalar_id = take_scalar.id;
     let ret = take_scalar
         .ret
         .and_then(|local| take_scalar.locals.get(local.index()))
@@ -3885,6 +4692,7 @@ end impl VecQueueTargetTest
             scalar_dest,
             ir::Expr::Call(
                 ir::CallTarget::Helper {
+                    function: take_scalar_id,
                     name: "take_scalar".to_string(),
                     ret,
                 },
@@ -4288,6 +5096,7 @@ end impl ListQueueTargetTest
         .iter()
         .find(|function| function.name == "take_scalar")
         .expect("fixture has scalar helper");
+    let helper_id = helper.id;
     let ret = helper
         .ret
         .and_then(|local| helper.locals.get(local.index()))
@@ -4306,6 +5115,7 @@ end impl ListQueueTargetTest
             scalar_dest,
             ir::Expr::Call(
                 ir::CallTarget::Helper {
+                    function: helper_id,
                     name: "take_scalar".to_string(),
                     ret,
                 },
@@ -4378,8 +5188,8 @@ end impl RecordListQueueTest
             elem: Box::new(ir::IrType::Record(beat)),
         }
     );
-    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
-        .expect("record-list queue emits");
+    let cpp =
+        tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("record-list queue emits");
     assert!(
         cpp.contains("harc_rt::HarcQueue<std::vector<Beat>> values;")
             && cpp.contains("std::vector<Beat> observed{};"),
@@ -5494,14 +6304,14 @@ end impl MTest
     for direction in ["in", "inout"] {
         for out_event in [false, true] {
             // Active-only handler: `active` is the only mode that subscribes.
-            let prog = lower_src(&consumer(direction, out_event, true, "active"))
-                .unwrap_or_else(|e| {
+            let prog =
+                lower_src(&consumer(direction, out_event, true, "active")).unwrap_or_else(|e| {
                     panic!("direction={direction} out_event={out_event}: active lowers: {e:?}")
                 });
             verify::verify_program(&prog).expect("verifies");
             let src = consumer(direction, out_event, true, "active");
-            let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
-                .expect("emits");
+            let cpp =
+                tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default()).expect("emits");
             assert!(
                 cpp.contains("req.push_back"),
                 "direction={direction} out_event={out_event}: the active instance subscribes"
@@ -5509,13 +6319,11 @@ end impl MTest
 
             let src = consumer(direction, out_event, true, "passive");
             let prog = lower_src(&src).unwrap_or_else(|e| {
-                panic!(
-                    "direction={direction} out_event={out_event}: passive lowers: {e:?}"
-                )
+                panic!("direction={direction} out_event={out_event}: passive lowers: {e:?}")
             });
             verify::verify_program(&prog).expect("verifies");
-            let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
-                .expect("emits");
+            let cpp =
+                tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default()).expect("emits");
             assert!(
                 !cpp.contains("req.push_back"),
                 "direction={direction} out_event={out_event}: passive must omit the active-only subscriber"
@@ -5534,8 +6342,8 @@ end impl MTest
                     "direction={direction} out_event={out_event}: always-on passive lowers: {e:?}"
                 )
             });
-            let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
-                .expect("emits");
+            let cpp =
+                tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default()).expect("emits");
             assert!(
                 cpp.contains("req.push_back"),
                 "direction={direction} out_event={out_event}: an always-on handler wires a passive instance"
@@ -6176,12 +6984,14 @@ end test VecOfBadRecordTest
 "#;
     let prog = lower_src(src).expect("nested Vec leaf lowers through a record-element Vec");
     verify::verify_program(&prog).expect("transitive nested Vec schema verifies");
-    let inner = prog.records.iter().find(|record| record.name == "Inner").unwrap();
+    let inner = prog
+        .records
+        .iter()
+        .find(|record| record.name == "Inner")
+        .unwrap();
     assert!(
-        matches!(
-            inner.fields[0].ty,
-            ir::IrType::FixedVec { len: 2, .. }
-        ) && inner.fields[0].vec_len == Some(4),
+        matches!(inner.fields[0].ty, ir::IrType::FixedVec { len: 2, .. })
+            && inner.fields[0].vec_len == Some(4),
         "inner record retains both Vec dimensions: {inner:?}"
     );
     let cpp = emit_cpp_src(src);
@@ -6772,7 +7582,6 @@ end test T
             "`{bad}`: v1 emits it (and g++ refuses)"
         );
     }
-
 }
 
 /// The sanctioned whole-`Vec` field copy (`dst.data = src.data`, same
@@ -8913,8 +9722,14 @@ end impl T"#
             "let axil : BusAxiLite = bind dut",
             "let bus   : BusAxiLite = bind dut\n    let other : BusAxiLite = bind dut",
         )
-        .replace("let drv  : AxilXactor active  = bind axil", "let drv  : AxilXactor active  = bind bus")
-        .replace("let mon  : AxilXactor passive = bind axil", "let mon  : AxilXactor passive = bind other");
+        .replace(
+            "let drv  : AxilXactor active  = bind axil",
+            "let drv  : AxilXactor active  = bind bus",
+        )
+        .replace(
+            "let mon  : AxilXactor passive = bind axil",
+            "let mon  : AxilXactor passive = bind other",
+        );
     let msg = assert_unsupported(&lower_with_stdlib_bus_src(&split_bindings).unwrap_err());
     assert!(
         msg.contains("more than one bus binding")
@@ -9146,7 +9961,15 @@ end impl T"#
     let got = lowered
         .functions
         .iter()
-        .find(|f| matches!(f.kind, ir::FunctionKind::Run))
+        .find(|f| {
+            matches!(
+                f.kind,
+                ir::FunctionKind::TestBody {
+                    member: ir::TestCallableMember::Run,
+                    ..
+                }
+            )
+        })
         .expect("run fn")
         .locals
         .iter()
@@ -10202,7 +11025,15 @@ end impl T"#
         let ys = prog
             .functions
             .iter()
-            .find(|f| matches!(f.kind, ir::FunctionKind::Run))
+            .find(|f| {
+                matches!(
+                    f.kind,
+                    ir::FunctionKind::TestBody {
+                        member: ir::TestCallableMember::Run,
+                        ..
+                    }
+                )
+            })
             .expect("run fn")
             .locals
             .iter()
@@ -10361,19 +11192,11 @@ end impl T"#
     }
 }
 
-/// Two spellings of one unbuildable program must not get two different
-/// verdicts. When the `tseq` slot learned its declared types, a record
-/// parameter started resolving to `Record(Beat)` — so `Wrap(s)` MATCHED
-/// and lowered, while `Wrap(7)` was still refused for being the wrong
-/// shape. Neither compiles anywhere: v1 renders a record `tseq`
-/// parameter as `[&](VBeat* seed)` ("`VBeat` has not been declared") and
-/// tbir as `[&](uint64_t seed)`. The defect is the PARAMETER, so that is
-/// where it is named — once, for every call.
-///
-/// `NotImplemented` rather than `Invalid`, because the declaration alone
-/// is fine under tbir: an uncalled one compiles there.
+/// TSeq record parameters preserve their exact record slot and reject a
+/// scalar at the call boundary. Extern-function record parameters remain a
+/// distinct unsupported ABI surface below.
 #[test]
-fn a_record_typed_parameter_is_refused_on_the_parameter_not_the_argument() {
+fn a_record_typed_tseq_parameter_is_checked_at_the_argument() {
     let tseq_decl = |call: &str| {
         format!(
             r#"domain SysDomain
@@ -10404,16 +11227,17 @@ impl T for Tb
 end impl T"#
         )
     };
-    // Uncalled: tbir compiles it, so there is nothing to refuse.
+    // Both an uncalled declaration and a correctly typed call are legal.
     lower_src(&tseq_decl("")).expect("an uncalled record-parameter tseq lowers");
-    for call in ["        let ys = Wrap(s)", "        let ys = Wrap(7)"] {
-        let err = lower_src(&tseq_decl(call)).unwrap_err();
-        let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
-        assert!(
-            msg.contains("record-typed parameter `seed` on `tseq Wrap`"),
-            "`{call}` names the parameter, not the argument: {msg}"
-        );
-    }
+    lower_src(&tseq_decl("        let ys = Wrap(s)")).expect("a matching record argument lowers");
+    let msg = assert_invalid(
+        &lower_src(&tseq_decl("        let ys = Wrap(7)"))
+            .expect_err("a scalar cannot enter a record TSeq parameter"),
+    );
+    assert!(
+        msg.contains("parameter of tseq `Wrap`") && msg.contains("was given a non-record value"),
+        "{msg}"
+    );
 
     // The extern-fn spelling is NOT the same rule, and calling it the
     // same was the mistake. `emit_extern_fn_decls` is shared — tbir
@@ -10963,13 +11787,11 @@ end impl T"#
     }
 }
 
-/// `pop()` in a nested expression stays refused, and this pins WHY so the
-/// obvious "fix" is foreclosed. Lowering an expression-position call means
-/// hoisting it into a statement, and for a MUTATING call that is only
-/// equivalent when the expression evaluates it unconditionally, exactly
-/// once. C++ short-circuits, so v1 does too.
+/// A queue pop in a lazy expression uses the same explicit CFG seam as a
+/// value-producing component call. The pop remains in the taken branch, while
+/// `wait until` rejects it because that predicate must be re-evaluated.
 #[test]
-fn a_nested_pop_is_refused_because_hoisting_it_would_change_when_it_runs() {
+fn a_nested_pop_preserves_short_circuit_laziness() {
     let src = r#"domain SysDomain
   freq_mhz: 100
 end domain SysDomain
@@ -10993,31 +11815,184 @@ impl T for Tb
         wait 2 cycles
     end run
 end impl T"#;
-    let msg = assert_unsupported(&lower_src(src).unwrap_err());
+    let prog = lower_src(src).expect("nested queue pop lowers");
+    verify::verify_program(&prog).expect("lazy queue-pop CFG verifies");
+    let run = prog.function(prog.tests[0].run);
+    let pop_block = run
+        .blocks
+        .iter()
+        .position(|block| {
+            block.stmts.iter().any(|stmt| {
+                matches!(
+                    stmt,
+                    ir::Stmt::ScoreboardOp {
+                        op: ir::ScoreboardOp::QueuePop { queue, .. },
+                        ..
+                    } if queue == "q"
+                )
+            })
+        })
+        .map(|index| ir::BlockId(index as u32))
+        .expect("one branch contains the queue pop");
     assert!(
-        msg.contains("in a nested expression"),
-        "refused for its position: {msg}"
+        !run.blocks[run.entry.index()]
+            .stmts
+            .iter()
+            .any(|stmt| matches!(
+                stmt,
+                ir::Stmt::ScoreboardOp {
+                    op: ir::ScoreboardOp::QueuePop { .. },
+                    ..
+                }
+            )),
+        "the pop must not be hoisted before the guard:\n{run}"
     );
+    assert!(run.blocks.iter().any(|block| matches!(
+        block.terminator,
+        ir::Terminator::Branch(_, taken, skipped)
+            if taken == pop_block && skipped != pop_block
+    )));
 
-    // The evidence. v1 emits the pop INSIDE the `&&`, so with `guard == 0`
-    // it never runs and the queue keeps its element. Hoisting it — the
-    // only way TB-IR could lower an expression-position call — would pop
-    // first and fail an assert v1 passes.
+    let tbir = emit_cpp_src(src);
+    assert!(
+        tbir.contains(".q.pop()"),
+        "TB-IR emits the branch-local pop:\n{tbir}"
+    );
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits");
     assert!(
         v1.contains("guard == 1 && _tb.sb.q.pop() == 7"),
         "the pop sits under the short circuit in v1's output:\n{v1}"
     );
 
-    // …and the `let`-bound form, which is what the diagnostic asks for,
-    // lowers and emits from both backends.
-    let bound = src.replacen(
+    let wait = src.replacen(
         "        assert (guard == 1 && sb.q.pop() == 7) || sb.q.size() == 1\n            else fail(\"queue was popped despite the short circuit\")",
-        "        let v = sb.q.pop()\n        assert v == 7 else fail(\"popped ${v}\")",
+        "        wait until sb.q.pop() == 7",
         1,
     );
-    emit_cpp_src(&bound);
-    cpp_tb::emit(&merged_src(&bound)).expect("v1 emits the bound form");
+    let msg = assert_unsupported(&lower_src(&wait).unwrap_err());
+    assert!(
+        msg.contains("queue pop") && msg.contains("wait until"),
+        "wait predicates keep their repeated-evaluation guard: {msg}"
+    );
+
+    let message = src.replacen(
+        "        assert (guard == 1 && sb.q.pop() == 7) || sb.q.size() == 1\n            else fail(\"queue was popped despite the short circuit\")",
+        "        assert false else fail(\"popped=${sb.q.pop()}\")",
+        1,
+    );
+    let msg = assert_unsupported(&lower_src(&message).unwrap_err());
+    assert!(
+        msg.contains("inside a message") && msg.contains("hoist the pop"),
+        "lazy diagnostic formatting keeps a precise queue-pop error: {msg}"
+    );
+}
+
+#[test]
+fn every_queue_flavor_lowers_nested_pop_and_front_values() {
+    let owners = r#"
+scoreboard Sb
+    q : queue<uint<8>>
+end scoreboard Sb
+
+agent Model
+    q : queue<uint<8>>
+end agent Model
+
+testbench Tb
+    dut : Top
+    q : queue<uint<8>>
+    sb : Sb
+    model : Model
+end testbench Tb
+
+impl T for Tb
+    run
+        q.push(1)
+        sb.q.push(2)
+        model.q.push(3)
+        let fronts = q.front() + sb.q.front() + model.q.front()
+        assert fronts == 6 else fail("queue-front sum")
+        let total = q.pop() + sb.q.pop() + model.q.pop()
+        assert total == 6 else fail("nested queue-pop sum")
+    end run
+end impl T
+"#;
+    let prog = lower_src(owners).expect("all host-owned nested pops lower");
+    verify::verify_program(&prog).expect("all host-owned nested pops verify");
+    let run = prog.function(prog.tests[0].run);
+    assert!(run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .any(|stmt| matches!(stmt, ir::Stmt::TbQueuePop { field, .. } if field == "q")));
+    assert!(run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .any(|stmt| matches!(
+            stmt,
+            ir::Stmt::ScoreboardOp {
+                op: ir::ScoreboardOp::QueuePop { queue, .. },
+                ..
+            } if queue == "q"
+        )));
+    assert!(run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .any(|stmt| matches!(stmt, ir::Stmt::ComponentQueuePop { queue, .. } if queue == "q")));
+    let run_dump = format!("{run}");
+    for query in [
+        "_tb.q.front()",
+        "ScoreboardQuery(sb0.sb.q.front())",
+        "ComponentQueueQuery(model.q.front())",
+    ] {
+        assert!(
+            run_dump.contains(query),
+            "all host-owned queue fronts must lower through typed query IR; missing `{query}`:\n{run_dump}"
+        );
+    }
+
+    let target_state = fixture("target_nonscalar_state_test.harc")
+        .replace(
+            "        let out : Beat = pending.pop()",
+            "        let front_data = pending.front().data\n        let out_data = pending.pop().data\n        assert front_data == out_data",
+        )
+        .replace("        return out.data", "        return out_data")
+        .replace(
+            "        let logged = responder.log_addrs.pop()",
+            "        let front_logged = responder.log_addrs.front() + 0\n        let logged = responder.log_addrs.pop() + 0\n        assert front_logged == logged",
+        );
+    let prog = lower_src(&target_state).expect("both target-state nested pops lower");
+    verify::verify_program(&prog).expect("both target-state nested pops verify");
+    let mut saw_pending = false;
+    let mut saw_instance = false;
+    for stmt in prog
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.stmts)
+    {
+        if let ir::Stmt::TransactorStateQueuePop {
+            instance, field, ..
+        } = stmt
+        {
+            saw_pending |= field == "pending";
+            saw_instance |= instance == "responder" && field == "log_addrs";
+        }
+    }
+    assert!(saw_pending, "bare target-state pop must materialize");
+    assert!(saw_instance, "instance target-state pop must materialize");
+    let dump = prog
+        .functions
+        .iter()
+        .map(|function| format!("{function}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        dump.contains(".pending.front()") && dump.contains("responder.log_addrs.front()"),
+        "both target-state front-query spellings must lower:\n{dump}"
+    );
 }
 
 /// Whole-`Vec` equality — `r.data == s.data`. v1 emits `r.data == s.data`
@@ -12219,8 +13194,7 @@ impl T for Tb
     end run
 end impl T
 "#;
-    lower_with_stdlib_bus_src(initiator)
-        .expect("fixed-vector state lowers on the initiator owner");
+    lower_with_stdlib_bus_src(initiator).expect("fixed-vector state lowers on the initiator owner");
 
     // A DIRECTIONAL field on the INITIATOR owner. The suite had none,
     // so reinstating the pre-check that used to shadow the shared rule
@@ -12344,7 +13318,10 @@ end impl T"#;
     assert!(cpp.contains("target.shadow = target.bundle.data;"), "{cpp}");
     assert!(cpp.contains("target.lanes[1] = 9;"), "{cpp}");
     assert!(cpp.contains("target.matrix[1][0] = 11;"), "{cpp}");
-    assert!(cpp.contains("target.matrix[target.cursor][1] = addr;"), "{cpp}");
+    assert!(
+        cpp.contains("target.matrix[target.cursor][1] = addr;"),
+        "{cpp}"
+    );
     assert!(cpp.contains("target.cursor = 1;"), "{cpp}");
     assert!(
         cpp_tb::emit(&merged_src(target))
@@ -12658,8 +13635,7 @@ end impl T"#;
     let matching_record_element = wrong_record_element.replace("value: B", "value: A");
     let nested_record_prog = lower_src(&matching_record_element)
         .expect("nested state vector accepts its declared record leaf");
-    verify::verify_program(&nested_record_prog)
-        .expect("nested record-leaf state vector verifies");
+    verify::verify_program(&nested_record_prog).expect("nested record-leaf state vector verifies");
     assert!(
         emit_cpp_src(&matching_record_element).contains("values[0][1] = value;"),
         "every nested selection reaches the record element write"
@@ -12689,8 +13665,8 @@ impl T for Tb
         wait 1 cycle
     end run
 end impl T"#;
-    let port_prog = lower_src(port_indexed_write)
-        .expect("DUT-port nested state indices and value lower");
+    let port_prog =
+        lower_src(port_indexed_write).expect("DUT-port nested state indices and value lower");
     verify::verify_program(&port_prog)
         .expect("DUT-port nested state indices and value are hoisted before verification");
     let capture = port_prog.function(
@@ -12756,8 +13732,7 @@ impl T for Tb
 end impl T"#;
     let prog = lower_src(unbound).expect("fixed-vector unbound state lowers");
     verify::verify_program(&prog).expect("fixed-vector unbound state verifies");
-    assert!(emit_cpp_src(unbound)
-        .contains("std::array<std::array<uint64_t, 2>, 2> lanes{};"));
+    assert!(emit_cpp_src(unbound).contains("std::array<std::array<uint64_t, 2>, 2> lanes{};"));
 
     let initiator = r#"
 use BusAxiLite
@@ -12779,8 +13754,8 @@ impl T for Tb
         wait 1 cycle
     end run
 end impl T"#;
-    let prog = lower_with_stdlib_bus_src(initiator)
-        .expect("fixed-vector initiator-side state lowers");
+    let prog =
+        lower_with_stdlib_bus_src(initiator).expect("fixed-vector initiator-side state lowers");
     verify::verify_program(&prog).expect("fixed-vector initiator-side state verifies");
 }
 
@@ -12906,8 +13881,9 @@ end test T
             }
             _ => unreachable!(),
         }
-        verify::verify_program(&broken)
-            .expect_err(&format!("corrupted boolean event {corrupt} must not verify"));
+        verify::verify_program(&broken).expect_err(&format!(
+            "corrupted boolean event {corrupt} must not verify"
+        ));
     }
 }
 
@@ -15214,8 +16190,7 @@ end impl T"#
     let list_prog = lower_src(&list_src).expect("list control lowers");
     for corrupt in ["element"] {
         let mut broken = list_prog.clone();
-        let ir::ScoreboardFieldKind::List { elem, .. } =
-            &mut broken.scoreboards[0].fields[0].kind
+        let ir::ScoreboardFieldKind::List { elem, .. } = &mut broken.scoreboards[0].fields[0].kind
         else {
             panic!("control field is a list")
         };
@@ -16552,20 +17527,22 @@ test T
 end test T"#
         )
     };
-    for (src, resolves_to) in [
-        (
-            shadowed("", "    u     : uint<8>  default 7"),
-            "tagger.seen + tagger.u;",
-        ),
-        (shadowed("\nconst u = 9\n", ""), "tagger.seen + u;"),
+    for (src, field_shadow) in [
+        (shadowed("", "    u     : uint<8>  default 7"), true),
+        (shadowed("\nconst u = 9\n", ""), false),
     ] {
         assert_not_implemented(
             &lower_src(&src).unwrap_err(),
             lower::V1Status::SilentlyMisLowers,
         );
         let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
+        let resolves_to = if field_shadow {
+            "tagger.seen + tagger.u;".to_string()
+        } else {
+            format!("tagger.seen + {};", v1_const_symbol(&v1, "u"))
+        };
         assert!(
-            v1.contains(resolves_to),
+            v1.contains(&resolves_to),
             "v1 silently binds `u` to `{resolves_to}`: {v1}"
         );
     }
@@ -16641,8 +17618,13 @@ fn lazy_helper_messages_lower_while_bad_module_arguments_still_reject() {
             "{what}: failure arm emits one unconditional diagnostic:\n{run}"
         );
         let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: {e}"));
+        let needle = if what == "impure helper" {
+            format!("{}(dut, 1)", v1_callable_symbol(&v1, "cur_plus"))
+        } else {
+            needle.to_string()
+        };
         assert!(
-            v1.contains(&format!("sim_log_line(\"FAIL\"")) && v1.contains(needle),
+            v1.contains(&format!("sim_log_line(\"FAIL\"")) && v1.contains(&needle),
             "{what}: v1 calls it at the failure site, which is what makes the suggestion honest"
         );
     }
@@ -16686,8 +17668,9 @@ end test T"#;
     );
     assert!(msg.contains("helper parameter `d`"), "{msg}");
     let v1 = cpp_tb::emit(&merged_src(&helper.replace("ARG", "m"))).expect("v1 emits");
+    let touch = v1_callable_symbol(&v1, "touch");
     assert!(
-        v1.contains("auto touch = [&](VTop* d)") && v1.contains("touch(m)"),
+        v1.contains(&format!("auto {touch} = [&](VTop* d)")) && v1.contains(&format!("{touch}(m)")),
         "v1 passes a component to a `VTop*` lambda: {v1}"
     );
 
@@ -16959,8 +17942,10 @@ end test PureHelperTest
     );
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the positive control");
+    let mk = v1_callable_symbol(&v1, "mk");
     assert!(
-        v1.contains("auto mk = [&](uint64_t seed) -> uint64_t") && v1.contains("Req Req;"),
+        v1.contains(&format!("auto {mk} = [&](uint64_t seed) -> uint64_t"))
+            && v1.contains("Req Req;"),
         "v1 emits the same record-local helper shape:\n{v1}"
     );
 
@@ -16978,8 +17963,10 @@ end test PureHelperTest
     );
     assert!(msg.contains("record return from pure helper `mk`"), "{msg}");
     let v1 = cpp_tb::emit(&merged_src(&record_return)).expect("v1 emits the broken control");
+    let mk = v1_callable_symbol(&v1, "mk");
     assert!(
-        v1.contains("auto mk = [&](uint64_t seed) -> VReq*") && v1.contains("return Req;"),
+        v1.contains(&format!("auto {mk} = [&](uint64_t seed) -> VReq*"))
+            && v1.contains("return Req;"),
         "v1 returns a record through a module-pointer ABI:\n{v1}"
     );
 
@@ -16994,8 +17981,10 @@ end test PureHelperTest
     );
     let v1 = cpp_tb::emit(&merged_src(&record_into_scalar_return))
         .expect("v1 emits the broken scalar return");
+    let mk = v1_callable_symbol(&v1, "mk");
     assert!(
-        v1.contains("auto mk = [&](uint64_t seed) -> uint64_t") && v1.contains("return Req;"),
+        v1.contains(&format!("auto {mk} = [&](uint64_t seed) -> uint64_t"))
+            && v1.contains("return Req;"),
         "v1 returns a record through a scalar ABI:\n{v1}"
     );
 
@@ -17024,18 +18013,18 @@ end test PureHelperUntypedRecordArgTest
         .replace("accept_untyped(x)", "accept_string(x: String)")
         .replace("accept_untyped(value)", "accept_string(value)")
         .replace("end function accept_untyped", "end function accept_string");
-    for (label, source, helper, v1_signature) in [
+    for (label, source, helper, v1_param) in [
         (
             "untyped",
             untyped_record_arg.to_string(),
             "accept_untyped",
-            "auto accept_untyped = [&](int64_t x)",
+            "int64_t x",
         ),
         (
             "declared String",
             declared_unknown_record_arg,
             "accept_string",
-            "auto accept_string = [&](const char* x)",
+            "const char* x",
         ),
     ] {
         let msg = assert_not_implemented(
@@ -17048,8 +18037,10 @@ end test PureHelperUntypedRecordArgTest
             "{label}: {msg}"
         );
         let v1 = cpp_tb::emit(&merged_src(&source)).expect("v1 emits the broken call");
+        let helper_symbol = v1_callable_symbol(&v1, helper);
         assert!(
-            v1.contains(v1_signature) && v1.contains(&format!("{helper}(value)")),
+            v1.contains(&format!("auto {helper_symbol} = [&]({v1_param})"))
+                && v1.contains(&format!("{helper_symbol}(value)")),
             "{label}: v1 passes a record to the non-record parameter:\n{v1}"
         );
     }
@@ -17110,11 +18101,11 @@ fn fixed_vector_pure_helper_signatures_are_typed_end_to_end() {
     );
 
     let wrong_shape = src
+        .replace("expected : Vec<uint<8>, 2>", "expected : Vec<uint<8>, 3>")
         .replace(
-            "expected : Vec<uint<8>, 2>",
-            "expected : Vec<uint<8>, 3>",
-        )
-        .replace("expected[1] = 7", "expected[1] = 7\n        expected[2] = 9");
+            "expected[1] = 7",
+            "expected[1] = 7\n        expected[2] = 9",
+        );
     let err = lower_src(&wrong_shape)
         .expect_err("a different fixed-vector shape cannot enter a helper parameter");
     assert!(assert_invalid(&err).contains("expects FixedVec"), "{err}");
@@ -17127,7 +18118,10 @@ fn fixed_vector_pure_helper_signatures_are_typed_end_to_end() {
         .replace("return values", "return spare");
     let err = lower_src(&bad_return)
         .expect_err("a different vector shape cannot satisfy the helper return");
-    assert!(assert_invalid(&err).contains("matching whole-vector value"), "{err}");
+    assert!(
+        assert_invalid(&err).contains("matching whole-vector value"),
+        "{err}"
+    );
 
     let nested_ty = ir::IrType::FixedVec {
         elem: Box::new(ir::IrType::FixedVec {
@@ -17143,7 +18137,9 @@ fn fixed_vector_pure_helper_signatures_are_typed_end_to_end() {
         .expect("nested-vector helper exists");
     assert_eq!(echo_grid.params[0].ty, nested_ty);
     assert_eq!(
-        echo_grid.ret.map(|ret| echo_grid.locals[ret.index()].ty.clone()),
+        echo_grid
+            .ret
+            .map(|ret| echo_grid.locals[ret.index()].ty.clone()),
         Some(nested_ty.clone())
     );
     assert!(
@@ -17243,7 +18239,8 @@ end impl RecordVecPureHelperTest"#;
     let errs = verify::verify_program(&missing_helper)
         .expect_err("ordinary helper calls must resolve their helper");
     assert!(
-        errs.iter().any(|err| err.to_string().contains("missing helper")),
+        errs.iter()
+            .any(|err| err.to_string().contains("missing helper")),
         "{errs:?}"
     );
 
@@ -17254,9 +18251,7 @@ end impl RecordVecPureHelperTest"#;
         .iter_mut()
         .flat_map(|block| &mut block.stmts)
         .find_map(|stmt| match stmt {
-            ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::Helper { .. }, args)) => {
-                Some(args)
-            }
+            ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::Helper { .. }, args)) => Some(args),
             _ => None,
         })
         .expect("run contains an ordinary helper call");
@@ -17264,7 +18259,8 @@ end impl RecordVecPureHelperTest"#;
     let errs = verify::verify_program(&bad_arity)
         .expect_err("ordinary helper calls must retain exact arity");
     assert!(
-        errs.iter().any(|err| err.to_string().contains("arity mismatch")),
+        errs.iter()
+            .any(|err| err.to_string().contains("arity mismatch")),
         "{errs:?}"
     );
 
@@ -17441,7 +18437,10 @@ end impl T"#;
     let prog = lower_src(src).expect("a composed fixed-vector return lowers");
     verify::verify_program(&prog).expect("a composed fixed-vector return verifies");
     let cpp = emit_cpp_src(src);
-    assert!(cpp.contains("__ret = harc_helper_echo_vec(values);"), "{cpp}");
+    assert!(
+        cpp.contains("__ret = harc_helper_echo_vec(values);"),
+        "{cpp}"
+    );
 }
 
 /// harc#745 Finding 2, honesty guard (independent review F1): a helper
@@ -17499,7 +18498,9 @@ end impl T"#;
     lower_src(src).expect("tbir lowers the matched composition");
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the composition");
     assert!(
-        v1.contains("vec_matches(echo_vec(_tb.values), _tb.values)"),
+        v1.contains("harc_user_callable_vec_matches_")
+            && v1.contains("(harc_user_callable_echo_vec_")
+            && v1.contains("(_tb.values), _tb.values)"),
         "v1 must compose the nested helper calls (std::array into std::array); got:\n{v1}"
     );
 }
@@ -17595,6 +18596,374 @@ fn helper_categorization_pure_vs_impure() {
         })
     });
     assert!(calls_double_it, "pure call survives as Expr::Call:\n{run}");
+}
+
+/// CFG-inlined free helpers and direct testbench-method calls are value
+/// preludes. Lazy operators must therefore place each effect in the selected
+/// branch, including when impurity is reached through a nested call.
+#[test]
+fn impure_helpers_in_lazy_expressions_lower_to_branch_local_cfg() {
+    let prog = lower_src(&fixture("lazy_impure_helper_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("lazy helper CFG verifies");
+    let run = prog.function(prog.tests[0].run);
+    let branches = run
+        .blocks
+        .iter()
+        .filter(|block| matches!(block.terminator, ir::Terminator::Branch(..)))
+        .count();
+    assert_eq!(
+        branches, 10,
+        "each impure short-circuit or ternary gets one lazy branch; pure helper stays compact:\n{run}"
+    );
+    let (first_taken, first_skipped) = run
+        .blocks
+        .iter()
+        .find_map(|block| match &block.terminator {
+            ir::Terminator::Branch(_, taken, skipped) => Some((*taken, *skipped)),
+            _ => None,
+        })
+        .expect("the first lazy helper has a guard branch");
+    assert!(
+        run.blocks[first_taken.index()]
+            .stmts
+            .iter()
+            .any(|stmt| matches!(
+                stmt,
+                ir::Stmt::DutWrite(port, ir::Expr::Literal { value: 1, .. })
+                    if port.port_path == ["en"]
+            )),
+        "the false-&& helper body belongs to the taken successor:\n{run}"
+    );
+    assert!(
+        !run.blocks[first_skipped.index()]
+            .stmts
+            .iter()
+            .any(|stmt| matches!(
+                stmt,
+                ir::Stmt::DutWrite(port, ir::Expr::Literal { value: 1, .. })
+                    if port.port_path == ["en"]
+            )),
+        "the false-&& skipped successor must bypass the helper body:\n{run}"
+    );
+    assert_eq!(
+        run.blocks
+            .iter()
+            .filter(|block| matches!(block.terminator, ir::Terminator::WaitCyclesSync(..)))
+            .count(),
+        9,
+        "each waiting free-helper source call is lowered exactly once:\n{run}"
+    );
+    assert_eq!(
+        run.blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter(|stmt| matches!(stmt, ir::Stmt::TestbenchCall { .. }))
+            .count(),
+        9,
+        "each testbench-method source call has one direct call edge:\n{run}"
+    );
+    let standalone_helpers: Vec<_> = prog
+        .functions
+        .iter()
+        .filter(|function| function.kind == ir::FunctionKind::Helper)
+        .map(|function| function.name.as_str())
+        .collect();
+    assert!(
+        !standalone_helpers.contains(&"wait_once")
+            && !standalone_helpers.contains(&"nested_wait"),
+        "a no-parameter wrapper around a waiting helper must inherit impurity: {standalone_helpers:?}"
+    );
+
+    let statements: Vec<_> = run.blocks.iter().flat_map(|block| &block.stmts).collect();
+    let shared_record = run
+        .locals
+        .iter()
+        .position(|local| local.name == "shared_record")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("shared testbench record local");
+    let (record_snapshot_position, record_snapshot) = statements
+        .iter()
+        .enumerate()
+        .find_map(|(position, stmt)| match stmt {
+            ir::Stmt::Assign(dest, ir::Expr::Local(source)) if *source == shared_record => {
+                Some((position, *dest))
+            }
+            _ => None,
+        })
+        .expect("shared record is sampled before the impure testbench call");
+    assert!(matches!(
+        run.local(record_snapshot).ty,
+        ir::IrType::Record(_)
+    ));
+    let record_mutator = prog.testbench_types[0]
+        .method("mutate_shared_record")
+        .expect("record mutator method")
+        .function;
+    let record_call_position = statements
+        .iter()
+        .enumerate()
+        .find_map(|(position, stmt)| match stmt {
+            ir::Stmt::TestbenchCall { function, .. } if *function == record_mutator => {
+                Some(position)
+            }
+            _ => None,
+        })
+        .expect("run directly calls the record mutator");
+    assert!(record_snapshot_position < record_call_position);
+    let record_mutator = prog.function(record_mutator);
+    assert!(
+        record_mutator
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .any(|stmt| matches!(stmt, ir::Stmt::RecordFieldWrite { field, value: ir::Expr::Literal { value: 2, .. }, .. } if field == "value")),
+        "canonical method owns the shared-record mutation:\n{record_mutator}"
+    );
+
+    let (scalar_snapshot_position, scalar_snapshot) = statements
+        .iter()
+        .enumerate()
+        .find_map(|(position, stmt)| match stmt {
+            ir::Stmt::Assign(dest, ir::Expr::TbField(field)) if field == "shared_scalar" => {
+                Some((position, *dest))
+            }
+            _ => None,
+        })
+        .expect("shared scalar is sampled before the impure testbench call");
+    assert_eq!(run.local(scalar_snapshot).ty, ir::IrType::UInt(Some(32)));
+    let scalar_mutator = prog.testbench_types[0]
+        .method("mutate_shared_scalar")
+        .expect("scalar mutator method")
+        .function;
+    let scalar_call_position = statements
+        .iter()
+        .enumerate()
+        .find_map(|(position, stmt)| match stmt {
+            ir::Stmt::TestbenchCall { function, .. } if *function == scalar_mutator => {
+                Some(position)
+            }
+            _ => None,
+        })
+        .expect("run directly calls the scalar mutator");
+    assert!(scalar_snapshot_position < scalar_call_position);
+    let scalar_mutator = prog.function(scalar_mutator);
+    assert!(
+        scalar_mutator
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .any(|stmt| matches!(stmt, ir::Stmt::TbFieldWrite { field, value: ir::Expr::Literal { value: 2, .. } } if field == "shared_scalar")),
+        "canonical method owns the shared-scalar mutation:\n{scalar_mutator}"
+    );
+
+    let pure = r#"
+function pure_true() -> bool
+    return true
+end function pure_true
+
+test PureLazyTest
+    let dut : Top
+    run
+        let skipped = false && pure_true()
+        let selected = true ? pure_true() : false
+        assert !skipped && selected
+    end run
+end test PureLazyTest
+"#;
+    let prog = lower_src(pure).expect("pure lazy helpers lower");
+    verify::verify_program(&prog).expect("pure compact expressions verify");
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.blocks
+            .iter()
+            .all(|block| !matches!(block.terminator, ir::Terminator::Branch(..))),
+        "pure helper calls remain compact lazy expressions:\n{run}"
+    );
+
+    let waiting = fixture("lazy_impure_helper_test.harc").replace(
+        "        let free_and = false && nested_tick(dut)",
+        "        wait until nested_tick(dut)",
+    );
+    let msg = assert_unsupported(
+        &lower_src(&waiting).expect_err("an impure helper cannot run inside wait-until"),
+    );
+    assert!(
+        msg.contains("wait until") && msg.contains("statement materialization"),
+        "wait-until keeps its repeated-evaluation diagnostic: {msg}"
+    );
+}
+
+/// Bound and sibling transactor value calls are hoisted into call statements.
+/// Lazy operators must select their call edge with CFG before that hoist.
+#[test]
+fn transactor_value_calls_in_lazy_expressions_lower_to_branch_local_cfg() {
+    let prog = lower_src(&fixture("lazy_transactor_value_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("lazy transactor CFG verifies");
+    let run = prog.function(prog.tests[0].run);
+    assert_eq!(
+        run.blocks
+            .iter()
+            .filter(|block| matches!(block.terminator, ir::Terminator::Branch(..)))
+            .count(),
+        4,
+        "each bound transactor lazy expression gets one branch:\n{run}"
+    );
+    let (first_taken, first_skipped) = run
+        .blocks
+        .iter()
+        .find_map(|block| match &block.terminator {
+            ir::Terminator::Branch(_, taken, skipped) => Some((*taken, *skipped)),
+            _ => None,
+        })
+        .expect("the first bound call has a guard branch");
+    let has_bound_call = |block: &ir::BasicBlock| {
+        block.stmts.iter().any(|stmt| {
+            matches!(
+                stmt,
+                ir::Stmt::TransactorCall {
+                    call: ir::Expr::Call(
+                        ir::CallTarget::TransactorMethod { method, .. },
+                        _
+                    ),
+                    ..
+                } if method == "nested_readv"
+            )
+        })
+    };
+    assert!(
+        has_bound_call(&run.blocks[first_taken.index()]),
+        "the false-&& call belongs to the taken successor:\n{run}"
+    );
+    assert!(
+        !has_bound_call(&run.blocks[first_skipped.index()]),
+        "the false-&& skipped successor bypasses the call:\n{run}"
+    );
+    assert_eq!(
+        run.blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter(|stmt| matches!(
+                stmt,
+                ir::Stmt::TransactorCall {
+                    call: ir::Expr::Call(
+                        ir::CallTarget::TransactorMethod { method, .. },
+                        _
+                    ),
+                    ..
+                } if matches!(method.as_str(), "readv" | "nested_readv")
+            ))
+            .count(),
+        6,
+        "each bound source call is represented exactly once:\n{run}"
+    );
+
+    let schema = prog
+        .transactors
+        .iter()
+        .find(|schema| schema.name == "LazyValueXactor")
+        .expect("transactor schema");
+    let exercise = schema
+        .method("exercise_sibling_lazy")
+        .expect("sibling-lazy method");
+    let body = prog.function(exercise.function);
+    assert_eq!(
+        body.blocks
+            .iter()
+            .filter(|block| matches!(block.terminator, ir::Terminator::Branch(..)))
+            .count(),
+        4,
+        "each sibling transactor lazy expression gets one branch:\n{body}"
+    );
+    assert_eq!(
+        body.blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter(|stmt| matches!(
+                stmt,
+                ir::Stmt::TransactorSelfCall {
+                    call: ir::Expr::Call(
+                        ir::CallTarget::TransactorSelfMethod { method, .. },
+                        _
+                    ),
+                    ..
+                } if matches!(method.as_str(), "readv" | "nested_readv")
+            ))
+            .count(),
+        6,
+        "each sibling source call is represented exactly once:\n{body}"
+    );
+}
+
+#[test]
+fn lazy_transactor_value_calls_preserve_activation_mode_checks() {
+    let sibling = r#"
+transactor Xt
+    dut : Top
+
+    hookable outer() -> bool
+        return false && active_only()
+    end outer
+
+    when active
+        hookable active_only() -> bool
+            return true
+        end active_only
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt : Xt active
+end testbench XtTb
+
+impl LazySiblingModeTest for XtTb
+    run
+        xt.dut = dut
+        let skipped = xt.outer()
+    end run
+end impl LazySiblingModeTest
+"#;
+    let msg = assert_unsupported(&lower_src(sibling).expect_err(
+        "an always-on method cannot hide an active-only sibling behind a lazy operator",
+    ));
+    assert!(
+        msg.contains("active_only") && msg.contains("when active") && msg.contains("outer"),
+        "{msg}"
+    );
+
+    let bound = r#"
+transactor Relay
+    observed : out event<uint<8>>
+
+    hookable publish(value: uint<8>)
+        emit observed(value)
+    end publish
+
+    when active
+        hookable active_only() -> bool
+            return true
+        end active_only
+    end when
+end transactor Relay
+
+testbench RelayTb
+    dut : Top
+    relay : Relay passive
+end testbench RelayTb
+
+impl LazyBoundModeTest for RelayTb
+    run
+        let skipped = false && relay.active_only()
+    end run
+end impl LazyBoundModeTest
+"#;
+    let msg = assert_invalid(
+        &lower_src(bound).expect_err("a passive binding cannot lazily call an active-only method"),
+    );
+    assert!(
+        msg.contains("relay") && msg.contains("active-only") && msg.contains("passive"),
+        "{msg}"
+    );
 }
 
 /// Declared call-result metadata participates in invariant 15 just like
@@ -17968,7 +19337,7 @@ end impl SnapshotTest
         .find("SnapshotDriver_report =")
         .expect("method lambda emitted");
     let decl = cpp[method..]
-        .find("decltype(harc_rt::harc_port_snapshot(dut->count_out))")
+        .find("decltype(harc_rt::harc_port_snapshot(self.dut->count_out))")
         .expect("method-local snapshot declaration");
     let first_case = cpp[method..].find("case 0:").expect("method switch");
     assert!(
@@ -18008,7 +19377,9 @@ end impl SignedFmtTest
     let cpp = tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
         .expect("signed transactor capture emits");
     assert!(
-        cpp.contains("std::function<int64_t()> SignedFmtDriver_negative"),
+        cpp.contains(
+            "std::function<int64_t(struct _SignedFmtDriver_state&)> SignedFmtDriver_negative"
+        ),
         "{cpp}"
     );
     assert!(cpp.contains(">> 1"), "{cpp}");
@@ -18149,7 +19520,9 @@ fn wide_transactor_method_returns_keep_their_declared_type() {
     assert_eq!(method.ret_ty, Some(ir::IrType::UInt(Some(128))));
     let function = &prog.functions[method.function.index()];
     assert_eq!(
-        function.ret.map(|ret| function.locals[ret.index()].ty.clone()),
+        function
+            .ret
+            .map(|ret| function.locals[ret.index()].ty.clone()),
         Some(ir::IrType::UInt(Some(128)))
     );
     let run = &prog.functions[prog.tests[0].run.index()];
@@ -18164,13 +19537,13 @@ fn wide_transactor_method_returns_keep_their_declared_type() {
     let cpp = emit_cpp_src(&src);
     assert!(
         cpp.contains(
-            "std::function<_harc_u128(_WideReturnSource_state&)> WideReturnSource_value;"
+            "std::function<_harc_u128(struct _WideReturnSource_state&)> WideReturnSource_value;"
         ),
         "{cpp}"
     );
     assert!(
         cpp.contains(
-            "WideReturnSource_value = [&](_WideReturnSource_state& self_state) -> _harc_u128"
+            "WideReturnSource_value = [&](struct _WideReturnSource_state& self_state) -> _harc_u128"
         ),
         "{cpp}"
     );
@@ -18181,7 +19554,7 @@ fn wide_transactor_method_returns_keep_their_declared_type() {
     let wider_cpp = emit_cpp_src(&wider);
     assert!(
         wider_cpp.contains(
-            "std::function<harc_rt::HarcWide<8>(_WideReturnSource_state&)> WideReturnSource_value;"
+            "std::function<harc_rt::HarcWide<8>(struct _WideReturnSource_state&)> WideReturnSource_value;"
         ),
         "{wider_cpp}"
     );
@@ -18202,8 +19575,7 @@ fn wide_transactor_method_returns_keep_their_declared_type() {
         .find(|method| method.name == "value")
         .unwrap();
     method.ret_ty = Some(ir::IrType::UInt(Some(64)));
-    verify::verify_program(&broken)
-        .expect_err("method schema and wide return slot must agree");
+    verify::verify_program(&broken).expect_err("method schema and wide return slot must agree");
 
     let bound = r#"use BusAxiLite
 transactor BoundWideReturn bound to BusAxiLite
@@ -18221,14 +19593,13 @@ impl BoundTest for BoundTb
         wait 1 cycle
     end run
 end impl BoundTest"#;
-    let bound = lower_with_stdlib_bus_src(bound)
-        .expect("bound-initiator wide return declaration lowers");
+    let bound =
+        lower_with_stdlib_bus_src(bound).expect("bound-initiator wide return declaration lowers");
     verify::verify_program(&bound).expect("bound-initiator wide return verifies");
     assert!(bound.transactors.iter().any(|schema| {
         schema.name == "BoundWideReturn"
             && schema.methods.iter().any(|method| {
-                method.name == "value"
-                    && method.ret_ty == Some(ir::IrType::UInt(Some(128)))
+                method.name == "value" && method.ret_ty == Some(ir::IrType::UInt(Some(128)))
             })
     }));
 }
@@ -18315,26 +19686,30 @@ fn fixed_vector_transactor_params_are_typed_end_to_end() {
                 if a == "values" && b == "expected" && c == "wrong_shape"))
     }));
     let relay = prog.function(schema.method("relay").unwrap().function);
-    assert!(relay.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
-        matches!(stmt, ir::Stmt::TransactorSelfCall { call: ir::Expr::Call(_, args), .. }
+    assert!(relay
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .any(|stmt| {
+            matches!(stmt, ir::Stmt::TransactorSelfCall { call: ir::Expr::Call(_, args), .. }
             if matches!(args.as_slice(), [ir::Expr::Local(_), ir::Expr::Local(_)]))
-    }));
+        }));
 
     let cpp = emit_cpp_src(&src);
     assert!(
-        cpp.contains("std::function<void(_VecParamSink_state&, std::array<uint64_t, 2>, std::array<uint64_t, 2>, std::array<uint64_t, 3>)> VecParamSink_relay;")
-            && cpp.contains("VecParamSink_relay = [&](_VecParamSink_state& self_state, std::array<uint64_t, 2> values, std::array<uint64_t, 2> expected, std::array<uint64_t, 3> spare) -> void"),
+        cpp.contains("std::function<void(struct _VecParamSink_state&, std::array<uint64_t, 2>, std::array<uint64_t, 2>, std::array<uint64_t, 3>)> VecParamSink_relay;")
+            && cpp.contains("VecParamSink_relay = [&](struct _VecParamSink_state& self_state, std::array<uint64_t, 2> values, std::array<uint64_t, 2> expected, std::array<uint64_t, 3> spare) -> void"),
         "{cpp}"
     );
     assert!(
-        cpp.contains("std::function<std::array<uint64_t, 2>(_VecParamSink_state&)> VecParamSink_snapshot;")
-            && cpp.contains("VecParamSink_snapshot = [&](_VecParamSink_state& self_state) -> std::array<uint64_t, 2>")
-            && cpp.contains("std::function<std::array<uint64_t, 2>(_VecParamSink_state&, std::array<uint64_t, 2>)> VecParamSink_echo;"),
+        cpp.contains("std::function<std::array<uint64_t, 2>(struct _VecParamSink_state&)> VecParamSink_snapshot;")
+            && cpp.contains("VecParamSink_snapshot = [&](struct _VecParamSink_state& self_state) -> std::array<uint64_t, 2>")
+            && cpp.contains("std::function<std::array<uint64_t, 2>(struct _VecParamSink_state&, std::array<uint64_t, 2>)> VecParamSink_echo;"),
         "{cpp}"
     );
     assert!(
-        cpp.contains("std::function<std::array<std::array<uint64_t, 2>, 2>(_VecParamSink_state&, std::array<std::array<uint64_t, 2>, 2>)> VecParamSink_echo_grid;")
-            && cpp.contains("VecParamSink_echo_grid = [&](_VecParamSink_state& self_state, std::array<std::array<uint64_t, 2>, 2> values) -> std::array<std::array<uint64_t, 2>, 2>"),
+        cpp.contains("std::function<std::array<std::array<uint64_t, 2>, 2>(struct _VecParamSink_state&, std::array<std::array<uint64_t, 2>, 2>)> VecParamSink_echo_grid;")
+            && cpp.contains("VecParamSink_echo_grid = [&](struct _VecParamSink_state& self_state, std::array<std::array<uint64_t, 2>, 2> values) -> std::array<std::array<uint64_t, 2>, 2>"),
         "{cpp}"
     );
 
@@ -18431,11 +19806,7 @@ fn fixed_vector_transactor_params_are_typed_end_to_end() {
         .find_map(|stmt| match stmt {
             ir::Stmt::TransactorCall {
                 dest: Some(dest),
-                call:
-                    ir::Expr::Call(
-                        ir::CallTarget::TransactorMethod { method, .. },
-                        _,
-                    ),
+                call: ir::Expr::Call(ir::CallTarget::TransactorMethod { method, .. }, _),
             } if method == "snapshot" => Some(*dest),
             _ => None,
         })
@@ -18484,7 +19855,7 @@ end impl RecordVecTest"#;
     verify::verify_program(&record_prog).expect("record-vector transactor return verifies");
     let record_cpp = emit_cpp_src(record_return);
     assert!(
-        record_cpp.contains("std::function<std::array<Beat, 2>(_RecordVecSource_state&)>"),
+        record_cpp.contains("std::function<std::array<Beat, 2>(struct _RecordVecSource_state&)>"),
         "{record_cpp}"
     );
 
@@ -18496,7 +19867,7 @@ end impl RecordVecTest"#;
     let nested_record_cpp = emit_cpp_src(&nested_return);
     assert!(
         nested_record_cpp.contains(
-            "std::function<std::array<std::array<Beat, 2>, 2>(_RecordVecSource_state&)>"
+            "std::function<std::array<std::array<Beat, 2>, 2>(struct _RecordVecSource_state&)>"
         ),
         "{nested_record_cpp}"
     );
@@ -18533,8 +19904,7 @@ end impl BoundVecTest"#;
             })
     }));
 
-    let nested_bound_return =
-        bound_src.replace("Vec<uint<8>, 2>", "Vec<Vec<uint<8>, 2>, 2>");
+    let nested_bound_return = bound_src.replace("Vec<uint<8>, 2>", "Vec<Vec<uint<8>, 2>, 2>");
     let nested_bound = lower_with_stdlib_bus_src(&nested_bound_return)
         .expect("bound nested fixed-vector parameters and returns lower");
     verify::verify_program(&nested_bound)
@@ -18542,8 +19912,7 @@ end impl BoundVecTest"#;
     assert!(nested_bound.transactors.iter().any(|schema| {
         schema.name == "BoundVecParam"
             && schema.method("echo").is_some_and(|method| {
-                method.param_tys == vec![nested.clone()]
-                    && method.ret_ty == Some(nested.clone())
+                method.param_tys == vec![nested.clone()] && method.ret_ty == Some(nested.clone())
             })
     }));
 }
@@ -18571,7 +19940,9 @@ fn transactor_tseq_returns_are_typed_end_to_end() {
         let function = prog.function(method.function);
         assert_eq!(function.params[0].ty, expected);
         assert_eq!(
-            function.ret.map(|ret| function.locals[ret.index()].ty.clone()),
+            function
+                .ret
+                .map(|ret| function.locals[ret.index()].ty.clone()),
             Some(function.params[0].ty.clone())
         );
     }
@@ -18593,8 +19964,10 @@ fn transactor_tseq_returns_are_typed_end_to_end() {
 
     let cpp = emit_cpp_src(&src);
     assert!(
-        cpp.contains("std::function<std::vector<Beat>(std::vector<Beat>)> TseqEcho_echo_beats;")
-            && cpp.contains("std::function<std::vector<uint64_t>(std::vector<uint64_t>)> TseqEcho_echo_nums;"),
+        cpp.contains("std::function<std::vector<Beat>(struct _TseqEcho_state&, std::vector<Beat>)> TseqEcho_echo_beats;")
+            && cpp.contains(
+                "std::function<std::vector<uint64_t>(struct _TseqEcho_state&, std::vector<uint64_t>)> TseqEcho_echo_nums;"
+            ),
         "transactor method ABI must retain both sequence carriers:\n{cpp}"
     );
 
@@ -18610,10 +19983,7 @@ fn transactor_tseq_returns_are_typed_end_to_end() {
         "let echoed_nums = (echo.echo_nums(nums))",
         "let echoed_nums : TSeq<uint<8>> = (echo.echo_nums(nums))",
     ] {
-        let parenthesized = src.replace(
-            "let echoed_nums = echo.echo_nums(nums)",
-            declaration,
-        );
+        let parenthesized = src.replace("let echoed_nums = echo.echo_nums(nums)", declaration);
         let parenthesized = lower_src(&parenthesized)
             .unwrap_or_else(|error| panic!("parenthesized sequence result lowers: {error:?}"));
         verify::verify_program(&parenthesized)
@@ -18665,8 +20035,8 @@ impl BoundTest for BoundTb
         wait 1 cycle
     end run
 end impl BoundTest"#;
-    let bound = lower_with_stdlib_bus_src(bound)
-        .expect("bound-initiator TSeq return declaration lowers");
+    let bound =
+        lower_with_stdlib_bus_src(bound).expect("bound-initiator TSeq return declaration lowers");
     verify::verify_program(&bound).expect("bound-initiator TSeq return verifies");
     assert!(bound.transactors.iter().any(|schema| {
         schema.name == "BoundTseqEcho"
@@ -18741,8 +20111,8 @@ end impl SignedTest
         "assert drv.negative() < 0\n        assert drv.is_negative()",
         "let value : sint<16> = (drv.negative())\n        assert value < 0",
     );
-    let prog = lower_src(&parenthesized_widening)
-        .expect("parenthesized widening method result lowers");
+    let prog =
+        lower_src(&parenthesized_widening).expect("parenthesized widening method result lowers");
     verify::verify_program(&prog).expect("parenthesized widening method result verifies");
     let run = prog.function(prog.tests[0].run);
     assert_eq!(
@@ -19279,9 +20649,10 @@ fn verifier_catches_bad_wait_clock() {
 }
 
 /// tbir emission of a clock-qualified wait mirrors v1's inline
-/// eval_clocks_until loop (no coroutine yield): advance to whichever
-/// clock's next edge is sooner until the named clock has seen N more
-/// rising edges, then run the checkers.
+/// eval_clocks_until loop: advance to whichever clock's next edge is
+/// sooner until the named clock has seen N more rising edges, service
+/// actor schedulers on each primary edge without re-entering the active
+/// run slot, then run the checkers.
 #[test]
 fn tbir_emit_wait_on_clock_inline_loop() {
     let merged = merged_src(WAIT_ON_CLOCK_SRC);
@@ -19289,11 +20660,14 @@ fn tbir_emit_wait_on_clock_inline_loop() {
     verify::verify_program(&prog).expect("verifies");
     let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
     for marker in [
-        "{ long long _target = clocks_[1].rising_count + (long long)(2); \
-         while (clocks_[1].rising_count < _target) {",
+        "{ if (_harc_actor_tick_due) { _harc_advance_actors(); \
+         _harc_actor_tick_due = false; } long long _target = \
+         clocks_[1].rising_count + (long long)(2); while \
+         (clocks_[1].rising_count < _target && !_fatal) {",
         "long long _next = clocks_[0].next_edge_ps;",
         "for (auto& _ck : clocks_) if (_ck.next_edge_ps < _next) _next = _ck.next_edge_ps;",
         "eval_clocks_until(_next);",
+        "if (cycle_count != _before_cycle) _harc_advance_actors();",
         "} for (auto& _c : _checkers) _c(); }",
     ] {
         assert!(
@@ -19303,7 +20677,7 @@ fn tbir_emit_wait_on_clock_inline_loop() {
     }
     assert!(
         !cpp.contains("co_await harc_rt::wait_cycles"),
-        "clock-qualified wait must not yield to the scheduler (v1 parity)"
+        "clock-qualified wait must not yield the active run slot"
     );
 }
 
@@ -19394,12 +20768,15 @@ fn verifier_catches_bad_successor_and_use_before_def() {
         ir::Stmt::DutWrite(
             ir::PortRef {
                 testbench_field: "dut".to_string(),
+                origin: ir::PortOrigin::Dut,
                 port_path: vec!["en".to_string()],
                 aggregate_path: false,
                 deferred_bus_binding: None,
                 direction: None,
                 width: None,
+                value_type: None,
                 access: ir::PortAccess::Port,
+                probe: None,
                 lane: None,
             },
             ir::Expr::Local(ghost),
@@ -19425,12 +20802,15 @@ fn verifier_rejects_port_in_assign_value() {
         l,
         ir::Expr::Port(ir::PortRef {
             testbench_field: "dut".to_string(),
+            origin: ir::PortOrigin::Dut,
             port_path: vec!["count_out".to_string()],
             aggregate_path: false,
             deferred_bus_binding: None,
             direction: None,
             width: None,
+            value_type: None,
             access: ir::PortAccess::Port,
+            probe: None,
             lane: None,
         }),
     ));
@@ -19994,6 +21374,53 @@ end impl CovTest
     assert!(msg.contains("nope"), "names the bin: {msg}");
 }
 
+#[test]
+fn verifier_rejects_a_stale_covergroup_bin_identity() {
+    let src = r#"
+covergroup Cov @(posedge dut.clk)
+    cp_mode : cover dut.mode
+        bins
+            idle = {0}
+        end bins
+end covergroup Cov
+
+testbench Tb
+    dut : Top
+    cov : Cov
+end testbench Tb
+
+impl CovTest for Tb
+    run
+        wait 1 cycle
+    end run
+    check
+        assert cov.cp_mode.idle > 0 else fail("hole")
+    end check
+end impl CovTest
+"#;
+    let mut prog = lower_src(src).expect("valid covergroup bin read lowers");
+    let check = prog.tests[0].check.expect("check function");
+    let mut changed = false;
+    for block in &mut prog.functions[check.index()].blocks {
+        for stmt in &mut block.stmts {
+            ir::visit::visit_stmt_exprs_mut(stmt, &mut |root| {
+                ir::visit::walk_expr_mut(root, &mut |expr| {
+                    if let ir::Expr::CovBin { bin, .. } = expr {
+                        *bin = "stale".to_string();
+                        changed = true;
+                    }
+                });
+            });
+        }
+    }
+    assert!(changed, "fixture contains a covergroup bin read");
+    let errors = verify::verify_program(&prog).expect_err("stale covergroup bin must not verify");
+    assert!(
+        format!("{errors:?}").contains("stale covergroup bin `cov.cp_mode.stale`"),
+        "{errors:?}"
+    );
+}
+
 /// tbir emission carries the covergroup contract markers: the struct
 /// with bin counters and auto-cross matrix, report() print calls, the
 /// `_checkers` sampler registration, and the check-phase report/bin
@@ -20010,17 +21437,17 @@ fn tbir_emit_covergroup_contract() {
         "} cp_empty;",
         "uint64_t _auto_cross_cp_empty__cp_full[2][2] = {};",
         "harc_rt::log::harc_print_covergroup_summary(\"FifoCov\", _hit, _total);",
-        "harc_rt::log::harc_cov_json_summary(\"FifoCov\", _hit, _total);",
+        "harc_rt::log::harc_cov_json_summary(log_ctx.coverage_json, \"FifoCov\", _hit, _total);",
         "harc_rt::log::harc_print_covergroup_bin(\"cp_full\", \"no\", cp_full.no);",
-        "harc_rt::log::harc_cov_json_bin(\"FifoCov\", \"cp_full\", \"no\", cp_full.no);",
+        "harc_rt::log::harc_cov_json_bin(log_ctx.coverage_json, \"FifoCov\", \"cp_full\", \"no\", cp_full.no);",
         "harc_rt::log::harc_print_covergroup_cross_summary(\"FifoCov\", \"auto_cross\", \"cp_empty x cp_full\", _cross_hit, 4);",
-        "harc_rt::log::harc_cov_json_cross_summary(\"FifoCov\", \"auto_cross\", \"cp_empty x cp_full\", _cross_hit, 4);",
+        "harc_rt::log::harc_cov_json_cross_summary(log_ctx.coverage_json, \"FifoCov\", \"auto_cross\", \"cp_empty x cp_full\", _cross_hit, 4);",
         "FifoCov cov;",
         "_checkers.push_back([&]() {",
         "uint64_t _v = (uint64_t)(harc_rt::harc_read(dut->empty));",
         "if (((_v == 1))) { _tb.cov.cp_empty.yes++; _cg_hit_cp_empty[0] = true; }",
         "if (_cg_hit_cp_empty[_i] && _cg_hit_cp_full[_j]) _tb.cov._auto_cross_cp_empty__cp_full[_i][_j]++;",
-        "_tb.cov.report();",
+        "_tb.cov.report(log_ctx);",
         "if (!((_tb.cov.cp_empty.yes > 0))) {",
     ] {
         assert!(cpp.contains(marker), "missing covergroup marker `{marker}`");
@@ -20311,8 +21738,8 @@ fn tbir_emit_declared_cross_contract() {
         "if (((_v >= 0 && _v <= 3))) { _tb.cov.cp_count.low++; _cg_hit_cp_count[0] = true; }",
         "if (((_v >= 10 && _v <= 14) || (_v == 15))) { _tb.cov.cp_count.high++; _cg_hit_cp_count[2] = true; }",
         "harc_rt::log::harc_print_covergroup_cross_summary(\"CountCov\", \"cross\", \"cp_count x cp_en\", _cross_hit, 6);",
-        "harc_rt::log::harc_cov_json_cross_summary(\"CountCov\", \"cross\", \"cp_count x cp_en\", _cross_hit, 6);",
-        "harc_rt::log::harc_cov_json_cross_bin(\"CountCov\", \"cross\", \"cp_count x cp_en\", \"cp_count.low x cp_en.en0\", _cross_2_cp_count__cp_en[0]);",
+        "harc_rt::log::harc_cov_json_cross_summary(log_ctx.coverage_json, \"CountCov\", \"cross\", \"cp_count x cp_en\", _cross_hit, 6);",
+        "harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, \"CountCov\", \"cross\", \"cp_count x cp_en\", \"cp_count.low x cp_en.en0\", _cross_2_cp_count__cp_en[0]);",
         "harc_rt::log::harc_print_covergroup_missing_bin(\"cp_count.low x cp_en.en0\")",
         "harc_rt::log::harc_print_covergroup_more_missing(_cross_missing, 16, \"cross\");",
         "if (_cg_hit_cp_count[_i0] && _cg_hit_cp_en[_i1]) {",
@@ -20560,6 +21987,234 @@ fn bus_fork_join_lowers() {
     );
 }
 
+#[test]
+fn empty_tlm_join_all_is_an_explicit_noop_in_both_backends() {
+    let src = r#"
+bus EmptyBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus EmptyBus
+
+testbench EmptyTb
+    dut : TlmMemory
+end testbench EmptyTb
+
+impl EmptyJoinTest for EmptyTb
+    let mem : EmptyBus = bind dut
+    run
+        join_all
+        log(info, "empty join completed")
+    end run
+end impl EmptyJoinTest
+"#;
+    let prog = lower_src(src).expect("an empty join_all lowers");
+    verify::verify_program(&prog).expect("an empty join_all verifies");
+    assert!(
+        format!("{prog}").contains("TlmJoinAll([])"),
+        "the explicit empty barrier must remain visible in TB-IR"
+    );
+    for cpp in [
+        emit_cpp_src(src),
+        cpp_tb::emit(&parse_source(src).expect("empty join source parses"))
+            .expect("v1 emits an empty join"),
+    ] {
+        assert!(
+            cpp.contains("// join_all: no pending forked TLM calls"),
+            "{cpp}"
+        );
+    }
+}
+
+#[test]
+fn blocking_fork_result_is_zero_before_join_and_unjoined_request_is_rejected() {
+    let joined = r#"
+bus BlockingBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus BlockingBus
+
+testbench BlockingTb
+    dut : TlmMemory
+end testbench BlockingTb
+
+impl BlockingForkTest for BlockingTb
+    let mem : BlockingBus = bind dut
+    run
+        let value = fork mem.read(5)
+        assert value == 0 else fail("fork result must be zero before join_all")
+        join_all
+        assert value == 261 else fail("join_all must publish the response")
+    end run
+end impl BlockingForkTest
+"#;
+    let prog = lower_src(joined).expect("pre-join result reads lower");
+    verify::verify_program(&prog).expect("the zero-initialized fork destination is defined");
+    let cpp = emit_cpp_src(joined);
+    assert!(cpp.contains("uint64_t value = 0;"), "{cpp}");
+    assert!(cpp.contains("// join_all bus.read response"), "{cpp}");
+
+    let unjoined = joined.replace(
+        "        join_all\n        assert value == 261 else fail(\"join_all must publish the response\")\n",
+        "",
+    );
+    let message = lower_src(&unjoined)
+        .expect_err("an untagged fork cannot escape its function")
+        .to_string();
+    assert!(
+        message.contains("has no matching `join_all`") && message.contains("read"),
+        "{message}"
+    );
+    let parsed = parse_source(&unjoined).expect("unjoined fork parses for v1");
+    let v1_cpp = cpp_tb::emit(&parsed).expect("v1 preserves its legacy unjoined-fork behavior");
+    assert!(
+        v1_cpp.contains("dut->mem_read_req_valid = 1;")
+            && !v1_cpp.contains("// join_all bus.read response"),
+        "v1's existing contract leaves the request issued without a response drain:\n{v1_cpp}"
+    );
+}
+
+#[test]
+fn bus_ooo_fork_tags_recycle_after_each_join_group() {
+    let src = r#"
+bus OooBus
+    tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
+end bus OooBus
+
+testbench OooTb
+    dut : TlmMemory
+end testbench OooTb
+
+impl OooTest for OooTb
+    let mem : OooBus = bind dut
+    run
+        let a0 = fork mem.read_ooo(1)
+        let a1 = fork mem.read_ooo(2)
+        join_all
+        let b0 = fork mem.read_ooo(3)
+        let b1 = fork mem.read_ooo(4)
+        join_all
+    end run
+end impl OooTest
+"#;
+    let prog = lower_src(src).expect("two completed OOO groups lower");
+    verify::verify_program(&prog).expect("two completed OOO groups verify");
+    let text = format!("{prog}");
+    assert_eq!(text.matches("tag=0").count(), 4, "{text}");
+    assert_eq!(text.matches("tag=1").count(), 4, "{text}");
+    assert!(!text.contains("tag=2"), "{text}");
+    let parsed = parse_source(src).expect("two completed OOO groups parse for v1");
+    let cpp = cpp_tb::emit(&parsed).expect("v1 also recycles completed tag groups");
+    assert_eq!(cpp.matches("dut->mem_read_ooo_req_tag = 0;").count(), 2);
+    assert_eq!(cpp.matches("dut->mem_read_ooo_req_tag = 1;").count(), 2);
+    assert!(!cpp.contains("dut->mem_read_ooo_req_tag = 2;"), "{cpp}");
+}
+
+#[test]
+fn bus_ooo_fork_rejects_more_than_the_declared_outstanding_tags() {
+    let src = r#"
+bus OooBus
+    tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
+end bus OooBus
+
+testbench OooTb
+    dut : TlmMemory
+end testbench OooTb
+
+impl OooTest for OooTb
+    let mem : OooBus = bind dut
+    run
+        let a = fork mem.read_ooo(1)
+        let b = fork mem.read_ooo(2)
+        let c = fork mem.read_ooo(3)
+        join_all
+    end run
+end impl OooTest
+"#;
+    let error = lower_src(src).expect_err("the third request has no legal tag slot");
+    let message = error.to_string();
+    assert!(message.contains("mem.read_ooo"), "{message}");
+    assert!(message.contains("2 outstanding"), "{message}");
+    assert!(message.contains("join_all"), "{message}");
+    let parsed = parse_source(src).expect("over-capacity OOO group parses for v1");
+    let v1_error = cpp_tb::emit(&parsed).expect_err("v1 rejects the same outstanding overflow");
+    let v1_message = v1_error.to_string();
+    assert!(v1_message.contains("mem.read_ooo"), "{v1_message}");
+    assert!(v1_message.contains("2 outstanding"), "{v1_message}");
+    assert!(v1_message.contains("join_all"), "{v1_message}");
+}
+
+#[test]
+fn verifier_rejects_corrupted_fork_tags_against_the_declared_mode() {
+    let source = r#"
+bus OooBus
+    tlm_method read(addr: uint<8>) -> uint<32>: out_of_order tags 2;
+end bus OooBus
+
+testbench OooTb
+    dut : TlmMemory
+end testbench OooTb
+
+impl OooTest for OooTb
+    let mem : OooBus = bind dut
+    run
+        let value = fork mem.read(1)
+        join_all
+    end run
+end impl OooTest
+"#;
+    let program = lower_src(source).expect("valid tagged fork lowers");
+    verify::verify_program(&program).expect("valid tagged fork verifies");
+
+    for bad_tag in [None, Some(2), Some(99)] {
+        let mut corrupted = program.clone();
+        let run = corrupted.tests[0].run;
+        for block in &mut corrupted.functions[run.index()].blocks {
+            for stmt in &mut block.stmts {
+                match stmt {
+                    ir::Stmt::TlmFork(desc) => desc.tag = bad_tag,
+                    ir::Stmt::TlmJoinAll(pending) => {
+                        for desc in pending {
+                            desc.tag = bad_tag;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let errors = verify::verify_program(&corrupted)
+            .expect_err("a missing or out-of-range OOO tag must fail verification");
+        assert!(
+            errors.iter().any(|error| error
+                .to_string()
+                .contains("incompatible with declared mode")),
+            "{bad_tag:?}: {errors:?}"
+        );
+    }
+
+    let blocking = source.replace("out_of_order tags 2", "blocking");
+    let mut corrupted = lower_src(&blocking).expect("valid untagged fork lowers");
+    let run = corrupted.tests[0].run;
+    for block in &mut corrupted.functions[run.index()].blocks {
+        for stmt in &mut block.stmts {
+            match stmt {
+                ir::Stmt::TlmFork(desc) => desc.tag = Some(0),
+                ir::Stmt::TlmJoinAll(pending) => {
+                    for desc in pending {
+                        desc.tag = Some(0);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let errors =
+        verify::verify_program(&corrupted).expect_err("a blocking fork must not carry an OOO tag");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("incompatible with declared mode")),
+        "{errors:?}"
+    );
+}
+
 /// A `fork` with no matching `join_all` leaves its request side hanging
 /// — rejected precisely at the end of the function rather than
 /// mis-lowered.
@@ -20759,6 +22414,120 @@ impl XtTest for XtTb
 end impl XtTest
 "#;
 
+#[test]
+fn transactor_callable_identity_rejects_same_abi_member_swaps() {
+    let mut ordinary = lower_src(
+        r#"
+transactor IdentityXt
+    dut : Top
+    when active
+        hookable first(value: uint<16>) -> uint<16>
+            return value + 1
+        end first
+        hookable second(value: uint<16>) -> uint<16>
+            return value + 2
+        end second
+    end when
+end transactor IdentityXt
+
+testbench IdentityXtTb
+    dut : Top
+end testbench IdentityXtTb
+
+impl IdentityXtTest for IdentityXtTb
+    run
+        wait 1 cycle
+    end run
+end impl IdentityXtTest
+"#,
+    )
+    .expect("ordinary transactor identity fixture lowers");
+    verify::verify_program(&ordinary).expect("ordinary transactor identity fixture verifies");
+    let first = ordinary.transactors[0].methods[0].function;
+    let second = ordinary.transactors[0].methods[1].function;
+    ordinary.transactors[0].methods[0].function = second;
+    ordinary.transactors[0].methods[1].function = first;
+    ordinary.functions[first.index()].kind = ir::FunctionKind::TransactorBody {
+        transactor: ir::TransactorId(0),
+        member: ir::TransactorCallableId(1),
+        name: "first".to_string(),
+    };
+    ordinary.functions[second.index()].kind = ir::FunctionKind::TransactorBody {
+        transactor: ir::TransactorId(0),
+        member: ir::TransactorCallableId(0),
+        name: "second".to_string(),
+    };
+    let errors = verify::verify_program(&ordinary)
+        .expect_err("coordinated ordinary transactor member swap must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.to_string().contains("inconsistent callable identity")),
+        "{errors:?}"
+    );
+    assert!(
+        ir::passes::callable_placement::analyze(&ordinary).is_err(),
+        "placement must independently reject the corrupt owner graph"
+    );
+
+    let mut malformed = lower_src(XACTOR_SRC).expect("transactor control lowers");
+    let pulse = malformed.transactors[0].methods[0].function;
+    malformed.functions[pulse.index()].kind = ir::FunctionKind::TransactorBody {
+        transactor: ir::TransactorId(0),
+        member: ir::TransactorCallableId(u32::MAX),
+        name: "pulse".to_string(),
+    };
+    assert!(
+        verify::verify_program(&malformed).is_err(),
+        "out-of-range transactor member identity must fail verification"
+    );
+    assert!(
+        ir::passes::callable_placement::analyze(&malformed).is_err(),
+        "out-of-range transactor member identity must fail placement without panicking"
+    );
+
+    let mut target = lower_src(&fixture("tlm_pairing_arch_initiator_test.harc"))
+        .expect("target transactor identity fixture lowers");
+    verify::verify_program(&target).expect("target transactor identity fixture verifies");
+    let first_index = target.transactors[0]
+        .target_methods
+        .iter()
+        .position(|method| method.name == "read")
+        .expect("read target method");
+    let second_index = target.transactors[0]
+        .target_methods
+        .iter()
+        .position(|method| method.name == "read_ooo")
+        .expect("read_ooo target method");
+    let first = target.transactors[0].target_methods[first_index].function;
+    let second = target.transactors[0].target_methods[second_index].function;
+    target.transactors[0].target_methods[first_index].function = second;
+    target.transactors[0].target_methods[second_index].function = first;
+    let ordinary_count = target.transactors[0].methods.len();
+    target.functions[first.index()].kind = ir::FunctionKind::TransactorBody {
+        transactor: ir::TransactorId(0),
+        member: ir::TransactorCallableId((ordinary_count + second_index) as u32),
+        name: "read".to_string(),
+    };
+    target.functions[second.index()].kind = ir::FunctionKind::TransactorBody {
+        transactor: ir::TransactorId(0),
+        member: ir::TransactorCallableId((ordinary_count + first_index) as u32),
+        name: "read_ooo".to_string(),
+    };
+    let errors = verify::verify_program(&target)
+        .expect_err("coordinated target transactor member swap must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.to_string().contains("inconsistent callable identity")),
+        "{errors:?}"
+    );
+    assert!(
+        ir::passes::callable_placement::analyze(&target).is_err(),
+        "placement must reject the corrupt target-method owner graph without panicking"
+    );
+}
+
 /// The structural contract: one schema per transactor, one
 /// `TbFunction` (kind `TransactorBody`) per method with mirrored
 /// params and a `ret` slot for `-> T` methods; calls lower to
@@ -20795,7 +22564,9 @@ fn transactor_methods_lower_to_functions_and_call_edges() {
     assert_eq!(
         pf.kind,
         ir::FunctionKind::TransactorBody {
-            transactor: ir::TransactorId(0)
+            transactor: ir::TransactorId(0),
+            member: ir::TransactorCallableId(0),
+            name: "pulse".to_string(),
         }
     );
     assert_eq!(pf.params.len(), 1);
@@ -20831,7 +22602,13 @@ fn transactor_methods_lower_to_functions_and_call_edges() {
         unreachable!()
     };
     assert!(d0.is_none(), "statement call discards");
-    let ir::Expr::Call(ir::CallTarget::TransactorMethod { bus_field, method }, args) = c0 else {
+    let ir::Expr::Call(
+        ir::CallTarget::TransactorMethod {
+            bus_field, method, ..
+        },
+        args,
+    ) = c0
+    else {
         panic!("call edge payload: {c0:?}");
     };
     assert_eq!(
@@ -21070,7 +22847,7 @@ end impl XtWaitUntilSelfCallTest
     if let ir::Expr::Call(ir::CallTarget::TransactorSelfMethod { transactor, .. }, _) =
         wait_pred_mut(&mut broken, wait_ready_id)
     {
-        *transactor = "Other".to_string();
+        *transactor = ir::TransactorId(u32::MAX);
     }
     verify::verify_program(&broken).expect_err("wrong sibling transactor must be rejected");
 
@@ -21121,14 +22898,184 @@ end impl XtWaitUntilSelfCallTest
     verify::verify_program(&broken).expect_err("fixed-vector sibling predicate must be rejected");
 
     let mut broken = prog.clone();
-    broken.transactors[0].methods[ready_index].ret_ty =
-        Some(ir::IrType::Record(ir::RecordId(0)));
+    broken.transactors[0].methods[ready_index].ret_ty = Some(ir::IrType::Record(ir::RecordId(0)));
     verify::verify_program(&broken).expect_err("record sibling predicate must be rejected");
 
     let cpp = emit_cpp_src(&fixture("transactor_wait_self_predicate_test.harc"));
     assert!(
         cpp.contains("CounterWaiter_reached(self_state, harc_rt::harc_read(dut->count_out))"),
         "a sibling predicate forwards state and re-reads its DUT argument:\n{cpp}"
+    );
+}
+
+#[test]
+fn direct_and_nested_transactor_calls_in_wait_until_predicates_are_re_evaluated() {
+    let instance = |predicate: &str| {
+        format!(
+            r#"transactor Xt
+    dut : Top
+
+    when active
+        hookable ready() -> bool
+            return true
+        end ready
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt : Xt active
+end testbench XtTb
+
+impl XtWaitUntilInstanceCallTest for XtTb
+    run
+        xt.dut = dut
+        wait until {predicate}
+    end run
+end impl XtWaitUntilInstanceCallTest
+"#
+        )
+    };
+    for predicate in [
+        "xt.ready()",
+        "true && xt.ready()",
+        "false || xt.ready()",
+        "true ? xt.ready() : false",
+    ] {
+        let src = instance(predicate);
+        let prog = lower_src(&src)
+            .unwrap_or_else(|error| panic!("`wait until {predicate}` must lower: {error}"));
+        verify::verify_program(&prog)
+            .unwrap_or_else(|error| panic!("`wait until {predicate}` must verify: {error:?}"));
+        let run = prog.function(prog.tests[0].run);
+        assert!(
+            !run.blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| matches!(stmt, ir::Stmt::TransactorCall { .. })),
+            "the instance call must remain in the re-evaluated predicate: {run}"
+        );
+        let cpp = emit_cpp_src(&src);
+        assert!(
+            cpp.contains("Xt_ready(__harc_transactor_state_tb0_f0)"),
+            "the instance call must be emitted inside the predicate: {cpp}"
+        );
+    }
+
+    let sibling = |predicate: &str| {
+        format!(
+            r#"transactor Xt
+    dut : Top
+
+    when active
+        hookable ready() -> bool
+            return true
+        end ready
+
+        hookable wait_ready()
+            wait until {predicate}
+        end wait_ready
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt : Xt active
+end testbench XtTb
+
+impl XtWaitUntilSiblingCallTest for XtTb
+    run
+        xt.dut = dut
+        xt.wait_ready()
+    end run
+end impl XtWaitUntilSiblingCallTest
+"#
+        )
+    };
+    for predicate in [
+        "ready()",
+        "true && ready()",
+        "false || ready()",
+        "true ? ready() : false",
+    ] {
+        let src = sibling(predicate);
+        let prog = lower_src(&src)
+            .unwrap_or_else(|error| panic!("`wait until {predicate}` must lower: {error}"));
+        verify::verify_program(&prog)
+            .unwrap_or_else(|error| panic!("`wait until {predicate}` must verify: {error:?}"));
+        let cpp = emit_cpp_src(&src);
+        assert!(
+            cpp.contains("Xt_ready(self_state)"),
+            "the sibling call must be emitted inside the predicate: {cpp}"
+        );
+    }
+}
+
+#[test]
+fn wait_until_transactor_precheck_preserves_activation_errors() {
+    let sibling = r#"transactor Xt
+    dut : Top
+
+    hookable outer()
+        wait until false || active_only()
+    end outer
+
+    when active
+        hookable active_only() -> bool
+            return true
+        end active_only
+    end when
+end transactor Xt
+
+testbench XtTb
+    dut : Top
+    xt : Xt active
+end testbench XtTb
+
+impl XtWaitUntilModeTest for XtTb
+    run
+        xt.dut = dut
+        xt.outer()
+    end run
+end impl XtWaitUntilModeTest
+"#;
+    let msg = assert_unsupported(
+        &lower_src(sibling)
+            .expect_err("an always-on method cannot hide an active-only wait predicate call"),
+    );
+    assert!(
+        msg.contains("active_only") && msg.contains("when active") && msg.contains("outer"),
+        "{msg}"
+    );
+
+    let bound = r#"transactor Relay
+    observed : out event<uint<8>>
+
+    when active
+        hookable active_only() -> bool
+            return true
+        end active_only
+    end when
+end transactor Relay
+
+testbench RelayTb
+    dut : Top
+    relay : Relay passive
+end testbench RelayTb
+
+impl RelayWaitUntilModeTest for RelayTb
+    run
+        wait until true && relay.active_only()
+    end run
+end impl RelayWaitUntilModeTest
+"#;
+    let msg = assert_invalid(
+        &lower_src(bound)
+            .expect_err("a passive binding cannot hide an active-only wait predicate call"),
+    );
+    assert!(
+        msg.contains("relay") && msg.contains("active-only") && msg.contains("passive"),
+        "{msg}"
     );
 }
 
@@ -21358,20 +23305,64 @@ end impl XtHelperWrapperTest
     verify::verify_program(&prog).expect("verifies");
 
     let run = prog.function(prog.tests[0].run);
+    let wrapper = prog.testbench_types[0]
+        .method("apply_pulse")
+        .expect("canonical apply_pulse method");
     assert!(
         run.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+            matches!(
+                s,
+                ir::Stmt::TestbenchCall { function, args, dest: None, .. }
+                    if *function == wrapper.function && args.len() == 1
+            )
+        }),
+        "run should call the canonical testbench wrapper exactly once:\n{run}"
+    );
+    let wrapper_body = prog.function(wrapper.function);
+    assert!(
+        wrapper_body.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
             matches!(
                 s,
                 ir::Stmt::TransactorCall {
                     dest: None,
                     call: ir::Expr::Call(
-                        ir::CallTarget::TransactorMethod { bus_field, method },
+                        ir::CallTarget::TransactorMethod {
+                            bus_field, method, ..
+                        },
                         _
                     )
                 } if bus_field == "xt" && method == "pulse"
             )
         }),
-        "inlined testbench helper should keep xt.pulse() as a TransactorCall:\n{run}"
+        "canonical wrapper should retain xt.pulse() as a TransactorCall:\n{wrapper_body}"
+    );
+
+    let mut corrupted = prog.clone();
+    let wrapper_body = &mut corrupted.functions[wrapper.function.index()];
+    let target = wrapper_body
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorCall {
+                call: ir::Expr::Call(ir::CallTarget::TransactorMethod { target, .. }, _),
+                ..
+            } => Some(target),
+            _ => None,
+        })
+        .expect("typed transactor target");
+    let ir::TransactorMethodTarget::Callable { function, .. } = target else {
+        panic!("wrapper call must carry a callable identity")
+    };
+    *function = prog.tests[0].run;
+    let errors = verify::verify_program(&corrupted)
+        .expect_err("a stale transactor callable identity must fail verification");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.to_string().contains("resolves to fn")
+                && error.to_string().contains("call carries fn")),
+        "{errors:?}"
     );
 }
 
@@ -21426,11 +23417,42 @@ impl XtSiblingEmitTest for XtTb
     end run
 end impl XtSiblingEmitTest
 "#;
+    let prog = lower_src(src).expect("sibling-call source lowers");
+    verify::verify_program(&prog).expect("typed sibling-call identities verify");
+    let mut corrupted = prog.clone();
+    let caller = corrupted.transactors[0]
+        .method("first")
+        .expect("first method")
+        .function;
+    let target = corrupted.functions[caller.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorSelfCall {
+                call: ir::Expr::Call(ir::CallTarget::TransactorSelfMethod { function, .. }, _),
+                ..
+            } => Some(function),
+            _ => None,
+        })
+        .expect("typed sibling callable identity");
+    *target = caller;
+    let errors = verify::verify_program(&corrupted)
+        .expect_err("a stale sibling callable identity must fail verification");
+    assert!(
+        errors.iter().any(|error| {
+            let message = error.to_string();
+            message.contains("sibling method")
+                && message.contains("resolves to fn")
+                && message.contains("call carries fn")
+        }),
+        "{errors:?}"
+    );
     let cpp = emit_cpp_src(src);
 
     // Each method is predeclared as a typed std::function slot.
-    let void_slot = "std::function<void()> Xt_second";
-    let ret_slot = "std::function<uint64_t()> Xt_readv";
+    let void_slot = "std::function<void(struct _Xt_state&)> Xt_second";
+    let ret_slot = "std::function<uint64_t(struct _Xt_state&)> Xt_readv";
     assert!(
         cpp.contains(void_slot),
         "expected predeclared void slot `{void_slot}`:\n{cpp}"
@@ -21452,7 +23474,7 @@ end impl XtSiblingEmitTest
 
     // Sibling calls emit as direct synchronous invocations.
     assert!(
-        cpp.contains("Xt_second();"),
+        cpp.contains("Xt_second(self_state);"),
         "forward sibling call should emit `Xt_second();`:\n{cpp}"
     );
     assert!(
@@ -22009,9 +24031,8 @@ end impl HelperRecordParamTest
 }
 
 /// Issue #494: the same record-vs-module classification must apply to
-/// testbench helper methods. A `function observe(cmd: Cmd)` declared on a
-/// testbench receives `cmd` by value and can read `cmd.value` when inlined
-/// into a bound `impl` body.
+/// testbench methods. A `function observe(cmd: Cmd)` declared on a testbench
+/// has one canonical record-typed function and a direct call from each impl.
 #[test]
 fn testbench_method_record_typed_param_lowers() {
     let src = r#"
@@ -22040,16 +24061,28 @@ end impl TbRecordMethodTest
     let prog = lower_src(src).expect("record-typed testbench method param lowers");
     verify::verify_program(&prog).expect("verifies");
 
+    let method = prog.testbench_types[0]
+        .method("observe")
+        .expect("canonical observe method");
+    let body = prog.function(method.function);
+    assert_eq!(method.param_tys, vec![ir::IrType::Record(ir::RecordId(0))]);
+    assert_eq!(body.params[0].ty, ir::IrType::Record(ir::RecordId(0)));
+    assert!(
+        format!("{body}").contains("%cmd.value"),
+        "canonical testbench method reads the record field:\n{body}"
+    );
     let run = prog.function(prog.tests[0].run);
     assert!(
-        run.locals
+        run.blocks
             .iter()
-            .any(|l| l.name.starts_with("cmd_") && matches!(l.ty, ir::IrType::Record(_))),
-        "inlined testbench method declares a record-typed cmd parameter local:\n{run}"
-    );
-    assert!(
-        format!("{run}").contains("%cmd_2.value"),
-        "inlined testbench method reads the record field:\n{run}"
+            .flat_map(|block| &block.stmts)
+            .any(|stmt| matches!(
+                stmt,
+                ir::Stmt::TestbenchCall { function, args, dest: Some(_), .. }
+                    if *function == method.function
+                        && matches!(args.as_slice(), [ir::Expr::Local(_)])
+            )),
+        "run passes its record local by value to the canonical method:\n{run}"
     );
 }
 
@@ -22153,8 +24186,8 @@ end impl HelperRecordReturnTest
     );
 }
 
-/// Issue #494 follow-up: inlined testbench methods can also return a
-/// record by value without scalar-zero initializing the record temp.
+/// Issue #494 follow-up: canonical testbench methods can return a record by
+/// value without scalar-zero initializing either the result or return slot.
 #[test]
 fn testbench_method_record_typed_param_record_return_lowers() {
     let src = r#"
@@ -22183,19 +24216,30 @@ end impl TbRecordReturnTest
     let prog = lower_src(src).expect("record-returning testbench method lowers");
     verify::verify_program(&prog).expect("verifies");
 
+    let method = prog.testbench_types[0]
+        .method("id_cmd")
+        .expect("canonical id_cmd method");
+    assert_eq!(method.param_tys, vec![ir::IrType::Record(ir::RecordId(0))]);
+    assert_eq!(method.ret_ty, Some(ir::IrType::Record(ir::RecordId(0))));
+    let method_body = prog.function(method.function);
+    assert_no_record_zero_assign(method_body);
     let run = prog.function(prog.tests[0].run);
     assert_no_record_zero_assign(run);
     assert!(
         run.blocks
             .iter()
             .flat_map(|b| &b.stmts)
-            .any(|s| matches!(s, ir::Stmt::RecordInit(_, ir::RecordId(0)))),
-        "record-return temp is default-initialized with RecordInit:\n{run}"
+            .any(|stmt| matches!(stmt, ir::Stmt::TestbenchCall { function, dest: Some(_), .. } if *function == method.function)),
+        "record result is produced by the canonical method call:\n{run}"
     );
     let cpp = emit_cpp_src(src);
     assert!(
-        cpp.contains("__t0 = Cmd{};") && !cpp.contains("__t0 = 0;"),
-        "record-return testbench method must default-initialize the record temp, not scalar-zero it:\n{cpp}"
+        cpp.contains("auto TbRecordReturn_id_cmd =")
+            && cpp.contains("-> Cmd")
+            && cpp.contains("Cmd __ret{};")
+            && cpp.contains("__t0 = TbRecordReturn_id_cmd(_tb, cmd);")
+            && !cpp.contains("__t0 = 0;"),
+        "record-valued testbench ABI must use typed default initialization:\n{cpp}"
     );
 }
 
@@ -22210,55 +24254,48 @@ fn testbench_method_tseq_signatures_are_typed_end_to_end() {
             .iter()
             .filter(|local| matches!(local.ty, ir::IrType::RecordSeq(ir::RecordId(0))))
             .count()
-            >= 4,
-        "record sequence values retain their type:\n{run}"
+            >= 3,
+        "record sequence argument, call result, and inferred local retain their type:\n{run}"
     );
     assert!(
         run.locals
             .iter()
             .filter(|local| matches!(&local.ty, ir::IrType::Seq(elem) if matches!(elem.as_ref(), ir::IrType::UInt(Some(8)))))
             .count()
-            >= 4,
-        "scalar sequence values retain their type:\n{run}"
+            >= 3,
+        "scalar sequence argument, call result, and inferred local retain their type:\n{run}"
     );
+    let call_dests: Vec<_> = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .filter_map(|stmt| match stmt {
+            ir::Stmt::TestbenchCall {
+                dest: Some(dest), ..
+            } => Some(*dest),
+            _ => None,
+        })
+        .collect();
     assert!(
-        run.blocks
+        call_dests
             .iter()
-            .flat_map(|block| &block.stmts)
-            .filter(|stmt| matches!(stmt, ir::Stmt::AggregateInit(_)))
-            .count()
-            >= 2,
-        "both sequence return slots are aggregate-initialized:\n{run}"
+            .any(|dest| matches!(run.locals[dest.index()].ty, ir::IrType::RecordSeq(_)))
+            && call_dests
+                .iter()
+                .any(|dest| matches!(run.locals[dest.index()].ty, ir::IrType::Seq(_))),
+        "both canonical method call destinations retain sequence metadata: {run}"
     );
     let cpp = emit_cpp_src(src);
     assert!(
         cpp.contains("std::vector<Beat>") && cpp.contains("std::vector<uint64_t>"),
         "emitted locals retain record and scalar sequence carriers:\n{cpp}"
     );
-    let init_locals: Vec<_> = run
-        .blocks
-        .iter()
-        .flat_map(|block| &block.stmts)
-        .filter_map(|stmt| match stmt {
-            ir::Stmt::AggregateInit(local) => Some(*local),
-            _ => None,
-        })
-        .collect();
-    for (local, bad_ty) in [
-        (init_locals[0], ir::IrType::RecordSeq(ir::RecordId(999))),
-        (
-            init_locals[1],
-            ir::IrType::Seq(Box::new(ir::IrType::Record(ir::RecordId(0)))),
-        ),
-    ] {
+    for dest in call_dests {
         let mut corrupt = prog.clone();
-        corrupt.functions[prog.tests[0].run.index()].locals[local.index()].ty = bad_ty;
-        let errors = verify::verify_program(&corrupt)
-            .expect_err("malformed sequence AggregateInit metadata is rejected");
-        assert!(
-            errors.iter().any(|error| error.to_string().contains("AggregateInit")),
-            "sequence AggregateInit reports its own verifier error: {errors:?}"
-        );
+        corrupt.functions[prog.tests[0].run.index()].locals[dest.index()].ty =
+            ir::IrType::UInt(Some(8));
+        verify::verify_program(&corrupt)
+            .expect_err("a scalar destination cannot capture a sequence method return");
     }
     let mismatched = src.replace(
         "let echoed_beats = echo_beats(beats)",
@@ -22312,9 +24349,11 @@ fn uninitialized_tseq_locals_start_as_typed_empty_sequences() {
             .map(|index| ir::LocalId(index as u32))
             .unwrap_or_else(|| panic!("missing `{name}` local"));
         assert_eq!(run.locals[local.index()].ty, expected);
-        assert!(run.blocks.iter().flat_map(|block| &block.stmts).any(
-            |stmt| matches!(stmt, ir::Stmt::AggregateInit(found) if *found == local)
-        ));
+        assert!(run
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .any(|stmt| matches!(stmt, ir::Stmt::AggregateInit(found) if *found == local)));
     }
 
     let cpp = emit_cpp_src(src);
@@ -22335,9 +24374,10 @@ fn uninitialized_tseq_locals_start_as_typed_empty_sequences() {
         len: 2,
     }));
     let fixed_vec_run = fixed_vec_prog.function(fixed_vec_prog.tests[0].run);
-    assert!(fixed_vec_run.locals.iter().any(|local| {
-        local.name == "empty_rows" && local.ty == row_seq
-    }));
+    assert!(fixed_vec_run
+        .locals
+        .iter()
+        .any(|local| { local.name == "empty_rows" && local.ty == row_seq }));
     assert!(
         emit_cpp_src(&fixed_vec).contains("std::vector<std::array<uint64_t, 2>> empty_rows{};"),
         "fixed-vector sequences retain their aggregate element carrier"
@@ -22350,7 +24390,10 @@ fn uninitialized_tseq_locals_start_as_typed_empty_sequences() {
             Ok(_) => panic!("unsupported TSeq element `{bad}` must not lower"),
         };
         let message = assert_unsupported(&error);
-        assert!(message.contains("unsupported element type"), "{bad}: {message}");
+        assert!(
+            message.contains("unsupported element type"),
+            "{bad}: {message}"
+        );
     }
 }
 
@@ -22363,10 +24406,7 @@ fn tseq_generators_assign_into_existing_typed_sequence_locals() {
     let run = prog.function(prog.tests[0].run);
     for (name, expected) in [
         ("beats", ir::IrType::RecordSeq(ir::RecordId(0))),
-        (
-            "nums",
-            ir::IrType::Seq(Box::new(ir::IrType::UInt(Some(8)))),
-        ),
+        ("nums", ir::IrType::Seq(Box::new(ir::IrType::UInt(Some(8))))),
     ] {
         let local = run
             .locals
@@ -22375,21 +24415,23 @@ fn tseq_generators_assign_into_existing_typed_sequence_locals() {
             .map(|index| ir::LocalId(index as u32))
             .unwrap_or_else(|| panic!("missing `{name}` local"));
         assert_eq!(run.locals[local.index()].ty, expected);
-        assert!(run.blocks.iter().flat_map(|block| &block.stmts).any(
-            |stmt| matches!(
+        assert!(run
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .any(|stmt| matches!(
                 stmt,
-                ir::Stmt::Assign(dest, ir::Expr::Call(ir::CallTarget::Tseq(_), _))
+                ir::Stmt::Assign(dest, ir::Expr::Call(ir::CallTarget::Tseq { .. }, _))
                     if *dest == local
-            )
-        ));
+            )));
     }
 
     let cpp = emit_cpp_src(src);
     assert!(
         cpp.contains("std::vector<Beat> beats{};")
             && cpp.contains("std::vector<uint64_t> nums{};")
-            && cpp.contains("beats = MakeBeats();")
-            && cpp.contains("nums = MakeNums();"),
+            && cpp.contains("beats = harc_tseq_MakeBeats();")
+            && cpp.contains("nums = harc_tseq_MakeNums();"),
         "typed sequence assignments emit as vector-to-vector copies:\n{cpp}"
     );
 
@@ -22402,10 +24444,7 @@ fn tseq_generators_assign_into_existing_typed_sequence_locals() {
         let message = assert_invalid(&error);
         assert!(message.contains("but tseq"), "{message}");
     }
-    let wrong_width = src.replace(
-        "let nums : TSeq<uint<8>>",
-        "let nums : TSeq<uint<16>>",
-    );
+    let wrong_width = src.replace("let nums : TSeq<uint<8>>", "let nums : TSeq<uint<16>>");
     let error = lower_src(&wrong_width).expect_err("scalar TSeq width mismatch is invalid");
     assert!(assert_invalid(&error).contains("but tseq"));
 }
@@ -22424,9 +24463,12 @@ fn pure_helper_tseq_signatures_are_typed_end_to_end() {
         matches!(
             function.params.first().map(|param| &param.ty),
             Some(ir::IrType::RecordSeq(ir::RecordId(0)))
-        ) && function
-            .ret
-            .is_some_and(|ret| matches!(function.locals[ret.index()].ty, ir::IrType::RecordSeq(ir::RecordId(0))))
+        ) && function.ret.is_some_and(|ret| {
+            matches!(
+                function.locals[ret.index()].ty,
+                ir::IrType::RecordSeq(ir::RecordId(0))
+            )
+        })
     }));
     assert!(helpers.iter().any(|function| {
         matches!(
@@ -22435,12 +24477,20 @@ fn pure_helper_tseq_signatures_are_typed_end_to_end() {
         )
     }));
     let run = prog.function(prog.tests[0].run);
-    assert!(run.locals.iter().any(|local| matches!(local.ty, ir::IrType::RecordSeq(_))));
-    assert!(run.locals.iter().any(|local| matches!(local.ty, ir::IrType::Seq(_))));
+    assert!(run
+        .locals
+        .iter()
+        .any(|local| matches!(local.ty, ir::IrType::RecordSeq(_))));
+    assert!(run
+        .locals
+        .iter()
+        .any(|local| matches!(local.ty, ir::IrType::Seq(_))));
     let cpp = emit_cpp_src(src);
     assert!(
         cpp.contains("static std::vector<Beat> harc_helper_echo_beats(std::vector<Beat> items)")
-            && cpp.contains("static std::vector<uint64_t> harc_helper_echo_nums(std::vector<uint64_t> items)"),
+            && cpp.contains(
+                "static std::vector<uint64_t> harc_helper_echo_nums(std::vector<uint64_t> items)"
+            ),
         "pure-helper sequence ABI must use vectors:\n{cpp}"
     );
     let record_helper = prog
@@ -22464,7 +24514,10 @@ fn pure_helper_tseq_signatures_are_typed_end_to_end() {
         .iter()
         .position(|function| {
             function.kind == ir::FunctionKind::Helper
-                && matches!(function.params.first().map(|param| &param.ty), Some(ir::IrType::Seq(_)))
+                && matches!(
+                    function.params.first().map(|param| &param.ty),
+                    Some(ir::IrType::Seq(_))
+                )
         })
         .expect("scalar-sequence helper");
     let mut corrupt = prog.clone();
@@ -22488,9 +24541,9 @@ fn pure_helper_tseq_signatures_are_typed_end_to_end() {
         ir::IrType::RecordSeq(ir::RecordId(999));
     let errors = verify::verify_program(&corrupt)
         .expect_err("malformed internal helper sequence metadata is rejected");
-    assert!(errors.iter().any(|error| error
-        .to_string()
-        .contains("malformed aggregate type")));
+    assert!(errors
+        .iter()
+        .any(|error| error.to_string().contains("malformed aggregate type")));
 
     let bad_param = src.replace(
         "function echo_nums(items: TSeq<uint<8>>) -> TSeq<uint<8>>",
@@ -22506,7 +24559,9 @@ fn pure_helper_tseq_signatures_are_typed_end_to_end() {
         "let echoed_nums = echo_nums(nums)",
         "let echoed_nums : TSeq<sint<8>> = echo_nums(nums)",
     );
-    assert_invalid(&lower_src(&bad_annotation).expect_err("sequence annotation mismatch is invalid"));
+    assert_invalid(
+        &lower_src(&bad_annotation).expect_err("sequence annotation mismatch is invalid"),
+    );
 }
 
 #[test]
@@ -22555,7 +24610,10 @@ end impl FixedVectorTseqSignatureTest"#;
     }));
     assert!(prog.functions.iter().any(|function| {
         function.kind == ir::FunctionKind::Helper
-            && function.params.first().is_some_and(|param| param.ty == expected)
+            && function
+                .params
+                .first()
+                .is_some_and(|param| param.ty == expected)
             && function
                 .ret
                 .is_some_and(|ret| function.locals[ret.index()].ty == expected)
@@ -22633,7 +24691,12 @@ end impl FixedVectorTseqSignatureTest"#;
         .components
         .iter_mut()
         .find(|component| component.name == "RowRelay")
-        .and_then(|component| component.methods.iter_mut().find(|method| method.name == "relay"))
+        .and_then(|component| {
+            component
+                .methods
+                .iter_mut()
+                .find(|method| method.name == "relay")
+        })
         .unwrap();
     relay_schema.param_tys[0] = bad.clone();
     bad_component_param.functions[relay_function.index()].params[0].ty = bad.clone();
@@ -22649,7 +24712,12 @@ end impl FixedVectorTseqSignatureTest"#;
         .components
         .iter_mut()
         .find(|component| component.name == "RowRelay")
-        .and_then(|component| component.methods.iter_mut().find(|method| method.name == "relay"))
+        .and_then(|component| {
+            component
+                .methods
+                .iter_mut()
+                .find(|method| method.name == "relay")
+        })
         .unwrap();
     relay_schema.ret_ty = Some(ir::IrType::Seq(Box::new(ir::IrType::FixedVec {
         elem: Box::new(ir::IrType::UInt(Some(8))),
@@ -22668,7 +24736,12 @@ end impl FixedVectorTseqSignatureTest"#;
         .components
         .iter_mut()
         .find(|component| component.name == "RowRelay")
-        .and_then(|component| component.methods.iter_mut().find(|method| method.name == "relay"))
+        .and_then(|component| {
+            component
+                .methods
+                .iter_mut()
+                .find(|method| method.name == "relay")
+        })
         .unwrap();
     relay_schema.ret_ty = Some(missing.clone());
     let ret = missing_record_return.functions[relay_function.index()]
@@ -22722,7 +24795,8 @@ impl InlinedRecordLeafTseq for Tb
         wait 1 cycle
     end run
 end impl InlinedRecordLeafTseq"#;
-    let msg = assert_unsupported(&lower_src(inlined).expect_err("inlined helper ABI must reject it"));
+    let msg =
+        assert_unsupported(&lower_src(inlined).expect_err("inlined helper ABI must reject it"));
     assert!(msg.contains("parameter `items` of helper `bad`"), "{msg}");
 
     let testbench_method = r#"transaction Beat
@@ -22839,7 +24913,9 @@ fn inlined_helper_tseq_signatures_are_typed_end_to_end() {
         "let echoed_nums = (echo_nums(dut, nums))",
         "let echoed_nums : TSeq<sint<8>> = (echo_nums(dut, nums))",
     );
-    assert_invalid(&lower_src(&bad_annotation).expect_err("sequence annotation mismatch is invalid"));
+    assert_invalid(
+        &lower_src(&bad_annotation).expect_err("sequence annotation mismatch is invalid"),
+    );
     let port_return = src.replace(
         "return items\nend function echo_nums",
         "return dut.count_out\nend function echo_nums",
@@ -22866,7 +24942,11 @@ fn inlined_helper_fixed_vec_signatures_are_typed_end_to_end() {
         "parameter, return and result retain the vector type:\n{run}"
     );
     assert!(
-        run.locals.iter().filter(|local| local.ty == grid_ty).count() >= 3,
+        run.locals
+            .iter()
+            .filter(|local| local.ty == grid_ty)
+            .count()
+            >= 3,
         "nested parameter, return and result retain the vector type:\n{run}"
     );
     assert!(
@@ -22958,59 +25038,37 @@ fn fixed_vector_testbench_method_signatures_are_typed_end_to_end() {
         len: 2,
     };
     assert!(
-        run.locals
-            .iter()
-            .filter(|local| local.ty == vec_ty)
-            .count()
-            >= 5,
-        "arguments, parameters, return temp, and inferred result retain the exact vector type:\n{run}"
+        run.locals.iter().filter(|local| local.ty == vec_ty).count() >= 4,
+        "call destinations and inferred results retain the exact vector type:\n{run}"
     );
-    assert!(
-        run.blocks
-            .iter()
-            .flat_map(|block| &block.stmts)
-            .any(|stmt| matches!(stmt, ir::Stmt::AggregateInit(local) if run.locals[local.index()].ty == vec_ty)),
-        "the inlined vector return slot is aggregate-initialized:\n{run}"
-    );
-    let cpp = emit_cpp_src(src);
-    assert!(
-        cpp.contains("decltype(__t0){}") && cpp.contains("std::array<uint64_t, 2>"),
-        "the emitted method path uses a default-constructed std::array return slot:\n{cpp}"
-    );
-    assert!(
-        cpp.contains("items_3 = harc_helper_pure_echo_vec(_tb.values);")
-            && cpp.contains("__t3 = harc_helper_pure_echo_vec(items_4);"),
-        "testbench-method argument and return paths compose helper results:\n{cpp}"
-    );
-    let mut corrupt = prog.clone();
-    let run_id = corrupt.tests[0].run;
-    let scalar = corrupt
-        .function(run_id)
-        .locals
-        .iter()
-        .position(|local| !matches!(local.ty, ir::IrType::FixedVec { .. } | ir::IrType::Record(_)))
-        .map(|index| ir::LocalId(index as u32))
-        .expect("fixture has a scalar local");
-    let init = corrupt.functions[run_id.index()]
-        .blocks
-        .iter_mut()
-        .flat_map(|block| &mut block.stmts)
-        .find(|stmt| matches!(stmt, ir::Stmt::AggregateInit(_)))
-        .expect("fixture has aggregate init");
-    *init = ir::Stmt::AggregateInit(scalar);
-    assert!(
-        verify::verify_program(&corrupt).is_err(),
-        "AggregateInit on a scalar local must fail verification"
-    );
-    let init_local = run
+    let call_dest = run
         .blocks
         .iter()
         .flat_map(|block| &block.stmts)
         .find_map(|stmt| match stmt {
-            ir::Stmt::AggregateInit(local) => Some(*local),
+            ir::Stmt::TestbenchCall {
+                dest: Some(dest), ..
+            } if run.locals[dest.index()].ty == vec_ty => Some(*dest),
             _ => None,
         })
-        .expect("fixture has aggregate init");
+        .expect("fixture has a typed fixed-vector method-call destination");
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::array<uint64_t, 2> __t0{};")
+            && cpp.contains("__t0 = FixedVecMethodTb_echo_vec(_tb, _tb.values);"),
+        "the emitted canonical method path uses a typed std::array result:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("harc_helper_pure_echo_vec(items)")
+            && cpp.contains("FixedVecMethodTb_pass_helper_result"),
+        "testbench-method argument and return paths compose helper results:\n{cpp}"
+    );
+    let run_id = prog.tests[0].run;
+    let init_local = call_dest;
+    let mut corrupt = prog.clone();
+    corrupt.functions[run_id.index()].locals[init_local.index()].ty = ir::IrType::UInt(Some(8));
+    verify::verify_program(&corrupt)
+        .expect_err("a scalar destination cannot capture a fixed-vector method return");
     for (bad_ty, label) in [
         (
             ir::IrType::FixedVec {
@@ -23043,10 +25101,10 @@ fn fixed_vector_testbench_method_signatures_are_typed_end_to_end() {
         let mut malformed = prog.clone();
         malformed.functions[run_id.index()].locals[init_local.index()].ty = bad_ty;
         let errs = verify::verify_program(&malformed)
-            .expect_err("malformed recursive AggregateInit metadata must fail verification");
+            .expect_err("malformed recursive method-result metadata must fail verification");
         assert!(
-            errs.iter().any(|err| err.to_string().contains("AggregateInit")),
-            "AggregateInit with {label} metadata must report its own verifier error: {errs:?}"
+            !errs.is_empty(),
+            "method result with {label} metadata must report a verifier error"
         );
     }
     let annotated = src.replace(
@@ -23143,8 +25201,12 @@ end impl RecordVecMethodTest
         len: 2,
     };
     assert!(
-        run.locals.iter().filter(|local| local.ty == nested_ty).count() >= 5,
-        "nested arguments, parameters, return temp, and inferred result retain their type:\n{run}"
+        run.locals
+            .iter()
+            .filter(|local| local.ty == nested_ty)
+            .count()
+            >= 2,
+        "nested method-call destination and inferred result retain their type:\n{run}"
     );
     assert!(cpp.contains("std::array<std::array<uint64_t, 2>, 2>"));
 }
@@ -23543,7 +25605,12 @@ end impl GatedIdxTest
     let merged = merged_src(src);
     let prog = lower::lower_program(&merged).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
-    let err = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).unwrap_err();
+    let mut opts = cpp_tb::EmitOpts::default();
+    opts.dut_interface = Some(
+        ir::passes::dut_access::DutInterfaceCatalog::new("Top", Vec::new())
+            .expect("empty physical catalog is valid for diagnostic ordering"),
+    );
+    let err = tbir::emit(&prog, &merged, &opts).unwrap_err();
     assert!(
         err.to_string().contains("signal `idx` is gated OFF"),
         "expected gated-OFF diagnostic for nested record index: {err}"
@@ -23584,12 +25651,18 @@ end impl GatedSeqIdxTest
             seq: ir::LocalId(0),
             index: Box::new(ir::Expr::Port(ir::PortRef {
                 testbench_field: "dut".to_string(),
+                origin: ir::PortOrigin::BusBinding {
+                    binding: ir::BusBindingId(0),
+                    field: "b".to_string(),
+                },
                 port_path: vec!["b".to_string(), "idx".to_string()],
                 aggregate_path: false,
                 deferred_bus_binding: None,
                 direction: None,
                 width: None,
+                value_type: None,
                 access: ir::PortAccess::Port,
+                probe: None,
                 lane: None,
             })),
         },
@@ -23631,13 +25704,9 @@ end impl RemapTest
     );
 }
 
-/// `bind ... with { ch.sig: "port" }` on a HANDSHAKE-CHANNEL bus now
-/// lowers (previously rejected as a follow-up slice). A mapped
-/// `<channel>.<signal>` access collapses to the single-segment override
-/// flat name (`aw.valid` → `s_axi_awvalid`); an UNMAPPED channel signal
-/// keeps the `<bind>_<ch>_<sig>` convention, and the already-flattened
-/// `<ch>_<sig>` form is never remapped — mirroring v1's
-/// `try_emit_bus_field_access`, which remaps the channel form only.
+/// `bind ... with { ch.sig: "port" }` on a handshake-channel bus lowers
+/// while verified IR retains logical channel/signal identity. The renderer
+/// applies the concrete binding's override for the owning test.
 #[test]
 fn bus_bind_remap_handshake_channel_lowers() {
     let src = r#"
@@ -23664,13 +25733,8 @@ end impl HsTest
 "#;
     let prog = lower_src(src).expect("lowers");
     let dump = format!("{prog}");
-    // Mapped channel signals collapse to the override flat name (a
-    // single-segment path — dump-ir renders it verbatim).
-    assert!(dump.contains("DutWrite(dut.s_axi_awaddr, 7)"), "{dump}");
-    assert!(dump.contains("DutWrite(dut.s_axi_awvalid, 1)"), "{dump}");
-    // Unmapped channel signal (`ready`) keeps the canonical 3-segment
-    // path (dump-ir renders segments dotted; the backend joins with `_`
-    // → `s_axi_aw_ready`).
+    assert!(dump.contains("DutWrite(dut.s_axi.aw.addr, 7)"), "{dump}");
+    assert!(dump.contains("DutWrite(dut.s_axi.aw.valid, 1)"), "{dump}");
     assert!(dump.contains("DutWrite(dut.s_axi.aw.ready, 0)"), "{dump}");
 }
 
@@ -23684,6 +25748,379 @@ fn bind_remap_dump_ir_snapshot() {
     let prog = lower_with_stdlib_bus("bind_remap_test.harc", "BusAxiLite.arch").expect("lowers");
     verify::verify_program(&prog).expect("verifies");
     insta::assert_snapshot!("bind_remap_dump_ir", format!("{prog}"));
+}
+
+#[test]
+fn bound_bus_provenance_is_immutable_across_test_specific_adapters() {
+    let mut src = fixture("bind_remap_test.harc");
+    src.push_str(
+        r#"
+
+testbench BindRemapTbSecond
+    dut : axil_amba
+end testbench BindRemapTbSecond
+
+impl BindRemapTestSecond for BindRemapTbSecond
+    let alternate : BusAxiLite = bind dut with {
+        aw.valid: "alt_awvalid", aw.ready: "alt_awready", aw.addr: "alt_awaddr",
+        w.valid:  "alt_wvalid",  w.ready:  "alt_wready",
+        w.data:   "alt_wdata",   w.strb:   "alt_wstrb",
+        b.valid:  "alt_bvalid",  b.ready:  "alt_bready",  b.resp: "alt_bresp",
+        ar.valid: "alt_arvalid", ar.ready: "alt_arready", ar.addr: "alt_araddr",
+        r.valid:  "alt_rvalid",  r.ready:  "alt_rready",
+        r.data:   "alt_rdata",   r.resp:   "alt_rresp"
+    }
+    let helper_second : AxilHelper active = bind alternate
+
+    run
+        dut.bus_status = 1
+        helper_second.write(4, 23)
+        let observed = helper_second.read(4)
+        assert observed == 23 else fail("observed=${observed}")
+    end run
+end impl BindRemapTestSecond
+"#,
+    );
+    let merged = merged_with_stdlib_bus(&src, "BusAxiLite.arch");
+    let prog = lower::lower_program(&merged).expect("two concrete adapters lower");
+    verify::verify_program(&prog).expect("typed bus provenance verifies");
+
+    assert_eq!(prog.testbenches.len(), 2);
+    for (index, tb) in prog.testbenches.iter().enumerate() {
+        assert_eq!(tb.bus_bindings[0].id, ir::BusBindingId(0));
+        assert_eq!(tb.bound_bus_instances.len(), 1);
+        assert_eq!(
+            tb.bound_bus_instances[0].owner,
+            ir::BoundBusOwner::Transactor(ir::TransactorId(0))
+        );
+        assert_eq!(tb.bound_bus_instances[0].binding, ir::BusBindingId(0));
+        assert_eq!(
+            tb.bound_bus_instances[0].field,
+            if index == 0 {
+                "helper"
+            } else {
+                "helper_second"
+            }
+        );
+    }
+
+    let write = prog.transactors[0].method("write").expect("write method");
+    let body = prog.function(write.function);
+    assert!(body
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .any(|stmt| {
+            matches!(
+                stmt,
+                ir::Stmt::DutWrite(
+                    ir::PortRef {
+                        origin: ir::PortOrigin::BoundBus,
+                        port_path,
+                        ..
+                    },
+                    _
+                ) if port_path.first().map(String::as_str) == Some("bus")
+            )
+        }));
+    let raw_port = prog
+        .function(prog.tests[1].run)
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::DutWrite(port, _) if port.port_path == ["bus_status"] => Some(port),
+            _ => None,
+        })
+        .expect("raw DUT port named bus_status");
+    assert_eq!(raw_port.origin, ir::PortOrigin::Dut);
+
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("suite emits");
+    assert!(
+        cpp.contains("dut->s_axi_awaddr"),
+        "first adapter missing:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("dut->alt_awaddr"),
+        "second adapter missing:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("dut->bus_status"),
+        "raw DUT port was rebound:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("dut->bus_aw_addr"),
+        "placeholder leaked:\n{cpp}"
+    );
+}
+
+#[test]
+fn canonical_testbench_tlm_calls_resolve_logical_binding_per_implementation() {
+    let src = r#"
+bus LogicalBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+    tlm_method read_ooo(addr: uint<8>) -> uint<32>: out_of_order tags 2;
+end bus LogicalBus
+
+testbench LogicalTb
+    dut : TlmMemory
+
+    function direct(addr: uint<8>) -> uint<32>
+        let value = mem.read(addr)
+        return value
+    end function direct
+
+    function forked(addr: uint<8>) -> uint<32>
+        let first = fork mem.read_ooo(addr)
+        let second = fork mem.read_ooo(addr + 1)
+        join_all
+        return first + second
+    end function forked
+end testbench LogicalTb
+
+impl LogicalA for LogicalTb
+    let mem : LogicalBus = bind dut with {
+        read.req_valid: "a_read_req_valid",
+        read_ooo.req_valid: "a_ooo_req_valid"
+    }
+    let spare : LogicalBus = bind dut
+    clock clk = 10ns
+    run
+        let direct_value = direct(1)
+        let forked_value = forked(2)
+        assert direct_value + forked_value == 0 else fail("A")
+    end run
+end impl LogicalA
+
+impl LogicalB for LogicalTb
+    let spare : LogicalBus = bind dut
+    let mem : LogicalBus = bind dut with {
+        read.req_valid: "b_read_req_valid",
+        read_ooo.req_valid: "b_ooo_req_valid"
+    }
+    clock clk = 10ns
+    run
+        let direct_value = direct(3)
+        let forked_value = forked(4)
+        assert direct_value + forked_value == 0 else fail("B")
+    end run
+end impl LogicalB
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("logical TLM fixture lowers");
+    verify::verify_program(&prog).expect("logical TLM fixture verifies");
+
+    assert_eq!(prog.testbenches[0].bus_bindings[0].field, "mem");
+    assert_eq!(prog.testbenches[1].bus_bindings[1].field, "mem");
+    for method in &prog.testbench_types[0].methods {
+        let body = prog.function(method.function);
+        let mut targets = Vec::new();
+        for block in &body.blocks {
+            for stmt in &block.stmts {
+                match stmt {
+                    ir::Stmt::TlmFork(desc) => targets.push(&desc.target),
+                    ir::Stmt::TlmJoinAll(descs) => {
+                        targets.extend(descs.iter().map(|desc| &desc.target));
+                    }
+                    ir::Stmt::Assign(
+                        _,
+                        ir::Expr::Call(ir::CallTarget::TransactorMethod { target, .. }, _),
+                    ) => targets.push(target),
+                    _ => {}
+                }
+            }
+        }
+        assert!(targets.iter().all(|target| matches!(
+            target,
+            ir::TransactorMethodTarget::TestbenchBusField {
+                testbench: ir::TestbenchTypeId(0),
+                field,
+                bus,
+            } if field == "mem" && bus == "LogicalBus"
+        )));
+    }
+
+    let tbir_cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("self-contained TB-IR resolves each implementation's logical adapter");
+    let v1_cpp = cpp_tb::emit(&merged).expect("v1 emits the logical TLM fixture");
+    for wire in [
+        "a_read_req_valid",
+        "a_ooo_req_valid",
+        "b_read_req_valid",
+        "b_ooo_req_valid",
+    ] {
+        assert!(
+            tbir_cpp.contains(wire),
+            "TB-IR omitted `{wire}`:\n{tbir_cpp}"
+        );
+        assert!(v1_cpp.contains(wire), "v1 omitted `{wire}`:\n{v1_cpp}");
+    }
+
+    let mut wrong_bus = prog.clone();
+    wrong_bus.testbenches[1].bus_bindings[1].bus = "OtherBus".to_string();
+    let errors = verify::verify_program(&wrong_bus)
+        .expect_err("every implementation must preserve the logical testbench bus type");
+    assert!(
+        errors.iter().any(|error| {
+            let message = error.to_string();
+            message.contains("reusable testbench bus field `mem`")
+                && message.contains("expected `LogicalBus`")
+        }),
+        "{errors:?}"
+    );
+
+    let mut missing_binding = prog.clone();
+    missing_binding.testbenches[1]
+        .bus_bindings
+        .retain(|binding| binding.field != "mem");
+    let errors = verify::verify_program(&missing_binding)
+        .expect_err("every implementation must bind the logical testbench bus field");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("reusable testbench bus field `mem` is missing")),
+        "{errors:?}"
+    );
+
+    for corrupted_index in [0usize, 1] {
+        let mut divergent = prog.clone();
+        let binding = divergent.testbenches[corrupted_index]
+            .bus_bindings
+            .iter_mut()
+            .find(|binding| binding.field == "mem")
+            .expect("logical binding");
+        binding
+            .methods
+            .iter_mut()
+            .find(|method| method.name == "read")
+            .expect("read method")
+            .ret_type = Some(ir::IrType::SInt(Some(32)));
+        let errors = verify::verify_program(&divergent)
+            .expect_err("one divergent implementation must fail regardless of order");
+        assert!(
+            errors.iter().any(|error| error
+                .to_string()
+                .contains("`mem.read` has divergent schemas")),
+            "corrupted implementation {corrupted_index}: {errors:?}"
+        );
+    }
+
+    let mut wrong_types = prog.clone();
+    for testbench in &mut wrong_types.testbenches {
+        let read = testbench
+            .bus_bindings
+            .iter_mut()
+            .find(|binding| binding.field == "mem")
+            .and_then(|binding| {
+                binding
+                    .methods
+                    .iter_mut()
+                    .find(|method| method.name == "read")
+            })
+            .expect("read method on every implementation");
+        read.arg_types[0] = ir::IrType::SInt(Some(8));
+        read.ret_type = Some(ir::IrType::SInt(Some(32)));
+    }
+    let errors = verify::verify_program(&wrong_types).expect_err(
+        "every applicable implementation must validate exact argument and return types",
+    );
+    let messages = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.contains("`mem.read` argument 1"))
+            .count(),
+        2,
+        "each implementation must validate the argument type: {messages:?}"
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.contains("`mem.read` returns"))
+            .count(),
+        2,
+        "each implementation must validate the return type: {messages:?}"
+    );
+
+    let mut common_opts = cpp_tb::EmitOpts::default();
+    common_opts.dut_interface = Some(
+        ir::passes::dut_access::DutInterfaceCatalog::new(
+            "TlmMemory",
+            vec![
+                ir::passes::dut_access::DutInterfacePort::new(
+                    "clk",
+                    ir::PortDirection::In,
+                    1,
+                    None,
+                    None,
+                ),
+                ir::passes::dut_access::DutInterfacePort::new(
+                    "a_read_req_valid",
+                    ir::PortDirection::In,
+                    1,
+                    None,
+                    None,
+                ),
+                ir::passes::dut_access::DutInterfacePort::new(
+                    "b_read_req_valid",
+                    ir::PortDirection::In,
+                    1,
+                    None,
+                    None,
+                ),
+                ir::passes::dut_access::DutInterfacePort::new(
+                    "a_ooo_req_valid",
+                    ir::PortDirection::In,
+                    1,
+                    None,
+                    None,
+                ),
+                ir::passes::dut_access::DutInterfacePort::new(
+                    "b_ooo_req_valid",
+                    ir::PortDirection::In,
+                    1,
+                    None,
+                    None,
+                ),
+            ]
+            .into_iter()
+            .chain(
+                [
+                    ("mem_read_addr", ir::PortDirection::In, 8),
+                    ("mem_read_req_ready", ir::PortDirection::Out, 1),
+                    ("mem_read_rsp_valid", ir::PortDirection::Out, 1),
+                    ("mem_read_rsp_data", ir::PortDirection::Out, 32),
+                    ("mem_read_rsp_ready", ir::PortDirection::In, 1),
+                    ("mem_read_ooo_addr", ir::PortDirection::In, 8),
+                    ("mem_read_ooo_req_tag", ir::PortDirection::In, 1),
+                    ("mem_read_ooo_req_ready", ir::PortDirection::Out, 1),
+                    ("mem_read_ooo_rsp_valid", ir::PortDirection::Out, 1),
+                    ("mem_read_ooo_rsp_data", ir::PortDirection::Out, 32),
+                    ("mem_read_ooo_rsp_tag", ir::PortDirection::Out, 1),
+                    ("mem_read_ooo_rsp_ready", ir::PortDirection::In, 1),
+                ]
+                .into_iter()
+                .map(|(name, direction, width)| {
+                    ir::passes::dut_access::DutInterfacePort::new(
+                        name, direction, width, None, None,
+                    )
+                }),
+            )
+            .collect(),
+        )
+        .expect("exact DUT interface for logical TLM planning"),
+    );
+    let plan = tbir::common::plan_common_tests(&prog, &common_opts, "suite__")
+        .expect("common planning accepts per-capsule physical TLM adapters");
+    let runtime = tbir::common::emit_common_runtime(&plan)
+        .expect("shared logical TLM methods render through adapter parameters");
+    assert!(!runtime.contains("a_read_req_valid"), "{runtime}");
+    assert!(!runtime.contains("b_read_req_valid"), "{runtime}");
+    for (index, wire) in [(0, "a_read_req_valid"), (1, "b_read_req_valid")] {
+        let capsule = tbir::common::emit_common_capsule(&plan, index)
+            .expect("capsule renders its physical TLM adapter");
+        assert!(capsule.contains(wire), "{capsule}");
+    }
 }
 
 /// Unknown channel signals are hard errors with v1's diagnostic text
@@ -24160,7 +26597,9 @@ fn tlm_target_nested_forwarding_lowers() {
         matches!(
             s,
             ir::Stmt::Assign(_, ir::Expr::Call(
-                ir::CallTarget::TransactorMethod { bus_field, method },
+                ir::CallTarget::TransactorMethod {
+                    bus_field, method, ..
+                },
                 _,
             )) if bus_field == "back" && method == "read"
         )
@@ -24309,7 +26748,10 @@ end impl TestB
     verify::verify_program(&prog).expect("shared responder body verifies");
     assert_eq!(prog.testbenches.len(), 2);
     assert_eq!(prog.testbenches[0].target_tlm_actors[0].instance, "target");
-    assert_eq!(prog.testbenches[1].target_tlm_actors[0].instance, "responder");
+    assert_eq!(
+        prog.testbenches[1].target_tlm_actors[0].instance,
+        "responder"
+    );
 
     let responder = prog
         .transactors
@@ -24480,7 +26922,34 @@ fn verifier_pins_transactor_call_seam() {
     assert!(
         errs.iter().any(|e| matches!(
             e,
-            verify::VerifyError::BadTransactorCall { detail, .. } if detail.contains("no bus binding `ghost`")
+            verify::VerifyError::BadTransactorCall { detail, .. }
+                if detail.contains("mismatched concrete binding field")
+        )),
+        "{errs:?}"
+    );
+
+    // 2b. A valid field spelling cannot mask a corrupted typed binding id.
+    let mut broken = prog.clone();
+    {
+        let f = &mut broken.functions[run_fn];
+        let (bi, si) = find_call(f);
+        if let ir::Stmt::Assign(
+            _,
+            ir::Expr::Call(ir::CallTarget::TransactorMethod { target, .. }, _),
+        ) = &mut f.blocks[bi].stmts[si]
+        {
+            *target = ir::TransactorMethodTarget::ConcreteBusBinding {
+                binding: ir::BusBindingId(99),
+                field: "mem".to_string(),
+            };
+        }
+    }
+    let errs = verify::verify_program(&broken).unwrap_err();
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            verify::VerifyError::BadTransactorCall { detail, .. }
+                if detail.contains("concrete bus binding `mem` bb99")
         )),
         "{errs:?}"
     );
@@ -24893,8 +27362,8 @@ fn packed_vec_lane_dump_ir_snapshot() {
     insta::assert_snapshot!("packed_vec_lane_dump_ir", format!("{prog}"));
 }
 
-/// Testbench helper methods (`_tb.reset()` / `_tb.bump(n)`) CFG-
-/// inlined into two `--test`-selectable tests.
+/// Testbench methods (`_tb.reset()` / `_tb.bump(n)`) lower once as canonical
+/// functions with direct call edges from three `--test`-selectable tests.
 #[test]
 fn testbench_basic_dump_ir_snapshot() {
     let prog = lower_src(&fixture("testbench_basic_test.harc")).expect("lowers");
@@ -25064,8 +27533,7 @@ end test RuntimePromotedLetTest"#;
     let compound_prog = lower_src(&compound_port)
         .expect("a compound untyped promoted DUT expression has a host-scalar type");
     verify::verify_program(&compound_prog).expect("compound promoted DUT expression verifies");
-    let compound_tb =
-        &compound_prog.testbenches[compound_prog.tests[0].testbench.index()];
+    let compound_tb = &compound_prog.testbenches[compound_prog.tests[0].testbench.index()];
     assert_eq!(
         compound_tb
             .scalar_fields
@@ -25183,8 +27651,8 @@ end test RuntimePromotedLetTest"#;
 
 /// Transaction-typed testbench fields are shared host record state. Each
 /// lowered run/check/helper body sees a synthetic record local for normal
-/// `RecordFieldWrite`/`RecordField` lowering, but TBIR C++ declares the
-/// object once at test scope so helper calls mutate one persistent value.
+/// `RecordFieldWrite`/`RecordField` lowering, with typed local provenance
+/// mapping every access to the owning `_tb` receiver.
 #[test]
 fn testbench_transaction_field_lowers_shared_record_state() {
     let src = r#"
@@ -25230,29 +27698,57 @@ end impl TbRecordFieldTest
     let prog = lower_src(src).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
     let run = prog.function(prog.tests[0].run);
-    let body = run
-        .blocks
-        .iter()
-        .map(|b| format!("{b:?}"))
-        .collect::<Vec<_>>()
-        .join("\n");
     assert!(
-        body.contains("RecordInit") && body.contains("RecordFieldWrite"),
-        "shared testbench record field should use ordinary record IR:\n{body}"
+        run.blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .any(|stmt| matches!(stmt, ir::Stmt::RecordInit(_, ir::RecordId(0)))),
+        "the run owns one reference to the persistent record field:\n{run}"
+    );
+    for method_name in ["seed", "bump", "mirror", "check_mirror"] {
+        let method = prog.testbench_types[0]
+            .method(method_name)
+            .unwrap_or_else(|| panic!("canonical {method_name} method"));
+        assert!(
+            run.blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| matches!(
+                    stmt,
+                    ir::Stmt::TestbenchCall { function, .. } if *function == method.function
+                )),
+            "run should call canonical method {method_name}:\n{run}"
+        );
+    }
+    let seed = prog.function(
+        prog.testbench_types[0]
+            .method("seed")
+            .expect("seed method")
+            .function,
+    );
+    assert!(
+        seed.blocks.iter().flat_map(|block| &block.stmts).any(
+            |stmt| matches!(stmt, ir::Stmt::RecordFieldWrite { field, .. } if field == "value")
+        ),
+        "canonical seed method owns the record mutation:\n{seed}"
     );
 
     let cpp = emit_cpp_src(src);
     assert_eq!(
         cpp.matches("Txn cur{};").count(),
         1,
-        "record field should be declared once at test scope:\n{cpp}"
+        "record field should be declared once in the testbench state:\n{cpp}"
     );
     assert!(
-        cpp.contains("cur.value = v;") && cpp.contains("cur.value = (cur.value + 1);"),
-        "helpers should mutate the shared record object:\n{cpp}"
+        cpp.contains("Tb_seed")
+            && cpp.contains("_tb.cur.value = v;")
+            && cpp.contains("_tb.cur.value = (_tb.cur.value + 1);"),
+        "canonical methods should mutate the shared record object:\n{cpp}"
     );
     assert!(
-        cpp.contains("t = cur;") && cpp.contains("__t2 = t.data[1];"),
+        cpp.contains("auto Tb_mirror =")
+            && cpp.contains("__ret = t.data[1];")
+            && cpp.contains("Tb_mirror(_tb, _tb.cur)"),
         "whole-record and indexed Vec reads should resolve through the shared record:\n{cpp}"
     );
 }
@@ -25415,8 +27911,8 @@ end impl TbRecordHookShadowTest
 "#;
     let cpp = emit_cpp_src(src);
     assert!(
-        cpp.contains("std::function<void(Txn)> _on_method_hook_")
-            && cpp.contains("= [&](Txn cur_2) -> void"),
+        cpp.contains("std::function<void(Txn)> test_hook_method_run_hs0;")
+            && cpp.contains("test_hook_method_run_hs0 = [&](Txn cur_2) -> void"),
         "hook parameter should remain first and be renamed away from shared cur:\n{cpp}"
     );
     assert!(
@@ -25469,7 +27965,7 @@ end impl TbRecordRegCbShadowTest
 "#;
     let cpp = emit_cpp_src(src);
     assert!(
-        cpp.contains("TbRecordRegCbShadowTest_regs_A_cb = [&](uint64_t data_2) -> void"),
+        cpp.contains("test_hook_regblock_b4_regs_r1_A = [&](uint64_t data_2) -> void"),
         "reg callback parameter should remain first and be renamed away from shared data:\n{cpp}"
     );
     assert!(
@@ -26050,7 +28546,15 @@ end impl Test
     let run = prog
         .functions
         .iter()
-        .find(|f| matches!(f.kind, ir::FunctionKind::Run))
+        .find(|f| {
+            matches!(
+                f.kind,
+                ir::FunctionKind::TestBody {
+                    member: ir::TestCallableMember::Run,
+                    ..
+                }
+            )
+        })
         .expect("run function");
     let has_regread = run.blocks.iter().any(|b| {
         b.stmts.iter().any(|s| {
@@ -26091,7 +28595,15 @@ fn regblock_basic_corpus_lowers_with_register_read_in_assert() {
     let run = prog
         .functions
         .iter()
-        .find(|f| matches!(f.kind, ir::FunctionKind::Run))
+        .find(|f| {
+            matches!(
+                f.kind,
+                ir::FunctionKind::TestBody {
+                    member: ir::TestCallableMember::Run,
+                    ..
+                }
+            )
+        })
         .expect("run function");
     let mut cond_reads = 0usize;
     let mut fail_arg_reads = 0usize;
@@ -26151,11 +28663,10 @@ fn regblock_access_corpus_lowers_with_initiator_bfm() {
 /// (this slice): `AxilHelper bound to BusAxiLite` with a `read` method
 /// that caches `last_read`/`read_count` across calls. The schema records
 /// the state fields, the method body's bare-name writes lower to
-/// `TransactorStateWrite` instance-filled with the bound instance name,
-/// and the testbench records the instance in `unbound_state_actors` so
-/// emission materializes one per-instance state struct (shared with the
-/// bus-driving method lambdas). End-to-end v1↔tbir trace equivalence is
-/// gated by the registry harness; this asserts lowering structure.
+/// receiver-relative `TransactorStateWrite` nodes, and the testbench records
+/// both its per-instance state object and typed bus adapter. End-to-end
+/// v1↔tbir trace equivalence is gated by the registry harness; this asserts
+/// lowering structure without baking test-specific names into shared IR.
 #[test]
 fn bound_initiator_transactor_with_state_lowers() {
     let prog = lower_with_stdlib_bus(
@@ -26199,6 +28710,16 @@ fn bound_initiator_transactor_with_state_lowers() {
         }],
         "stateful bound-initiator instance recorded for materialization",
     );
+    assert_eq!(prog.testbenches[0].bus_bindings[0].id, ir::BusBindingId(0));
+    assert_eq!(
+        prog.testbenches[0].bound_bus_instances,
+        vec![ir::BoundBusInstanceSchema {
+            field: "helper".to_string(),
+            owner: ir::BoundBusOwner::Transactor(ir::TransactorId(0)),
+            binding: ir::BusBindingId(0),
+        }],
+        "the helper retains its concrete per-test bus adapter",
+    );
 
     // The `read` body's state writes are instance-filled with `helper`
     // (the bound instance name), not the empty pre-bind placeholder.
@@ -26213,7 +28734,9 @@ fn bound_initiator_transactor_with_state_lowers() {
         .blocks
         .iter()
         .flat_map(|b| &b.stmts)
-        .filter(|s| matches!(s, ir::Stmt::TransactorStateWrite { instance, .. } if instance == "helper"))
+        .filter(
+            |s| matches!(s, ir::Stmt::TransactorStateWrite { instance, .. } if instance == "helper"),
+        )
         .count();
     assert_eq!(
         state_writes, 2,
@@ -26226,11 +28749,9 @@ fn bound_initiator_transactor_with_state_lowers() {
 /// first instance's concrete bus ports, and both retain independent state.
 #[test]
 fn multiple_bound_initiator_instances_specialize_bus_and_state() {
-    let same_binding = lower_with_stdlib_bus(
-        "multiple_bound_initiator_test.harc",
-        "BusAxiLite.arch",
-    )
-    .expect("two helpers on one binding lower");
+    let same_binding =
+        lower_with_stdlib_bus("multiple_bound_initiator_test.harc", "BusAxiLite.arch")
+            .expect("two helpers on one binding lower");
     verify::verify_program(&same_binding).expect("same-binding program verifies");
     let tb = &same_binding.testbenches[0];
     assert_eq!(tb.unbound_state_actors.len(), 2);
@@ -26245,8 +28766,8 @@ fn multiple_bound_initiator_instances_specialize_bus_and_state() {
             "    let second : CountingHelper active = bind axil",
             "    let second : CountingHelper active = bind alternate",
         );
-    let distinct = lower_with_stdlib_bus_src(&distinct_src)
-        .expect("two helpers on distinct bindings lower");
+    let distinct =
+        lower_with_stdlib_bus_src(&distinct_src).expect("two helpers on distinct bindings lower");
     verify::verify_program(&distinct).expect("distinct-binding program verifies");
     let dump = format!("{distinct}");
     assert!(
@@ -26285,7 +28806,15 @@ fn regblock_bitbash_corpus_lowers() {
     let run = prog
         .functions
         .iter()
-        .find(|f| matches!(f.kind, ir::FunctionKind::Run))
+        .find(|f| {
+            matches!(
+                f.kind,
+                ir::FunctionKind::TestBody {
+                    member: ir::TestCallableMember::Run,
+                    ..
+                }
+            )
+        })
         .expect("run function");
     // 3 RW registers × 2 patterns = 6 write+read pairs. Count the
     // discarded `Helper.write(...)` call edges (dest=None) the bitbash
@@ -26388,8 +28917,9 @@ fn regblock_record_corpus_lowers_with_callback() {
     let callback = bad_callback_local.testbenches[tbid.index()].regblock_bindings[0].callbacks[0].1;
     bad_callback_local.functions[callback.index()].locals[0].ty =
         ir::IrType::Record(ir::RecordId(0));
-    let errs = verify::verify_program(&bad_callback_local)
-        .expect_err("a callback whose parameter local disagrees with its ABI must fail verification");
+    let errs = verify::verify_program(&bad_callback_local).expect_err(
+        "a callback whose parameter local disagrees with its ABI must fail verification",
+    );
     assert!(
         errs.iter().any(|e| matches!(
             e,
@@ -26398,6 +28928,43 @@ fn regblock_record_corpus_lowers_with_callback() {
         )),
         "{errs:?}"
     );
+}
+
+#[test]
+fn regblock_callback_identity_rejects_same_abi_body_swaps() {
+    let source = fixture("regblock_record_test.harc");
+    let first = "    on regs.MM2S_SA\n        regs.record_write(0x28, data)\n    end on\n";
+    let replacement = format!(
+        "{first}\n    on regs.S2MM_SA\n        log(info, \"second callback ${{data}}\")\n    end on\n"
+    );
+    let source = source.replacen(first, &replacement, 1);
+    let merged = merged_with_stdlib_bus(&source, "BusAxiLite.arch");
+    let mut prog = lower::lower_program(&merged).expect("two regblock callbacks lower");
+    verify::verify_program(&prog).expect("two regblock callbacks verify");
+
+    let callbacks = prog.testbenches[0].regblock_bindings[0].callbacks.clone();
+    assert_eq!(callbacks.len(), 2);
+    let first_function = callbacks[0].1;
+    let second_function = callbacks[1].1;
+    prog.testbenches[0].regblock_bindings[0]
+        .callbacks
+        .swap(0, 1);
+    let first_kind = prog.functions[first_function.index()].kind.clone();
+    let second_kind = prog.functions[second_function.index()].kind.clone();
+    prog.functions[first_function.index()].kind = second_kind;
+    prog.functions[second_function.index()].kind = first_kind;
+
+    let errors = verify::verify_program(&prog).expect_err("swapped regblock hooks verify");
+    assert!(format!("{errors:?}").contains("test-hook"), "{errors:?}");
+    let placement =
+        ir::passes::callable_placement::analyze(&prog).expect_err("swapped regblock hooks place");
+    assert!(
+        placement.0.contains("owner") || placement.0.contains("identity"),
+        "{placement}"
+    );
+    let runtime = ir::passes::runtime_cells::analyze(&prog)
+        .expect_err("swapped regblock hooks receive runtime cells");
+    assert!(runtime.0.contains("invalid body"), "{runtime}");
 }
 
 /// The passive `record_write`/`record_read` API — WITHOUT a per-register
@@ -26431,12 +28998,15 @@ fn regblock_record_api_lowers() {
         "expected matched and unmatched runtime record_write decoders: {dump}"
     );
     let run = &prog.functions[prog.tests[0].run.index()];
-    for dest in run.blocks.iter().flat_map(|b| &b.stmts).filter_map(|s| {
-        match s {
+    for dest in run
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .filter_map(|s| match s {
             ir::Stmt::RecordRead { dest, .. } => Some(*dest),
             _ => None,
-        }
-    }) {
+        })
+    {
         assert_eq!(run.locals[dest.index()].ty, ir::IrType::UInt(None));
     }
 
@@ -26448,7 +29018,10 @@ fn regblock_record_api_lowers() {
     let err = lower_with_stdlib_bus_src(&aggregate_addr)
         .expect_err("an aggregate runtime address must not reach invalid TBIR C++");
     let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
-    assert!(msg.contains("whole-vector") || msg.contains("non-scalar address"), "{msg}");
+    assert!(
+        msg.contains("whole-vector") || msg.contains("non-scalar address"),
+        "{msg}"
+    );
 
     for aggregate_write in [
         "regs.record_write(holder.values, 64)",
@@ -26776,7 +29349,7 @@ fn testbench_periodic_post_eval_dump_ir_snapshot() {
     assert_eq!(svc.phase, ir::HandlerPhase::PostEval, "`phase post_eval`");
     // The service body is a flow-owned zero-param TestHook function.
     let body = prog.function(svc.function);
-    assert!(matches!(body.kind, ir::FunctionKind::TestHook));
+    assert!(matches!(body.kind, ir::FunctionKind::TestHook { .. }));
     assert_eq!(body.owner, Some(ir::TestbenchId(0)));
     assert!(body.params.is_empty(), "the handler body takes no params");
     insta::assert_snapshot!("testbench_periodic_post_eval_dump_ir", format!("{prog}"));
@@ -26796,8 +29369,8 @@ fn testbench_periodic_post_eval_emitted_cpp_snapshot() {
         "registers a post_eval service"
     );
     assert!(
-        cpp.contains("_tbper_"),
-        "uses the per-service last-fire stamp tag"
+        cpp.contains("runtime_cells.tb_periodic_0_last"),
+        "uses the per-run service last-fire cell"
     );
     insta::assert_snapshot!("testbench_periodic_post_eval_emitted_cpp", cpp);
 }
@@ -26856,7 +29429,7 @@ end impl TbCycTest"#;
     );
     let body = prog.function(svc.function);
     assert!(
-        matches!(body.kind, harc::ir::FunctionKind::TestHook),
+        matches!(body.kind, harc::ir::FunctionKind::TestHook { .. }),
         "the handler body is a flow-owned TestHook function"
     );
 }
@@ -26923,20 +29496,1111 @@ end impl ComponentRecordAssignTest
         .position(|l| l.name == "t")
         .map(|idx| ir::LocalId(idx as u32))
         .expect("record local t");
-    let saw_component_assign = run.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
-        matches!(
-            s,
+    let call_dest = run
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .find_map(|s| match s {
             ir::Stmt::ComponentCall {
                 method,
                 dest: Some(dest),
                 ..
-            } if method == "make" && *dest == record_local
-        )
+            } if method == "make" => Some(*dest),
+            _ => None,
+        });
+    let saw_component_assign = call_dest.is_some_and(|call_dest| {
+        run.blocks.iter().flat_map(|b| &b.stmts).any(|s| {
+            matches!(
+                s,
+                ir::Stmt::Assign(dest, ir::Expr::Local(src))
+                    if *dest == record_local && *src == call_dest
+            )
+        })
     });
     assert!(
         saw_component_assign,
-        "assignment form should lower to ComponentCall dest=t:\n{run}"
+        "assignment form should consume the central ComponentCall result temp:\n{run}"
     );
+}
+
+#[test]
+fn component_value_expression_fixture_uses_ordered_call_statements() {
+    let prog = lower_src(&fixture("component_value_expression_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let run = prog.function(prog.tests[0].run);
+    let calls: Vec<_> = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .filter_map(|stmt| match stmt {
+            ir::Stmt::ComponentCall {
+                method,
+                dest: Some(dest),
+                ..
+            } => Some((method.as_str(), *dest)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        calls.len() >= 22,
+        "expected the full value-position matrix: {run}"
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|(_, dest)| !matches!(run.locals[dest.index()].ty, ir::IrType::Unknown)),
+        "every component value call must materialize into a typed temporary: {run}"
+    );
+    assert!(
+        run.blocks
+            .iter()
+            .filter(|block| matches!(block.terminator, ir::Terminator::Branch(..)))
+            .count()
+            >= 7,
+        "short-circuit, ternary, if, and while conditions must be explicit CFG branches: {run}"
+    );
+}
+
+/// An eager by-value component argument must be copied before a later
+/// argument mutates that same instance. The snapshot is a typed value local,
+/// not a newly initialized component, and a call with no later effect stays
+/// direct.
+#[test]
+fn ordered_component_value_argument_is_typed_snapshot_before_later_effect() {
+    let prog = lower_src(&fixture("component_value_expression_test.harc")).expect("lowers");
+    let counter = prog
+        .components
+        .iter()
+        .position(|component| component.name == "CounterModel")
+        .map(|index| ir::ComponentId(index as u32))
+        .expect("CounterModel component");
+    let harness = prog
+        .components
+        .iter()
+        .position(|component| component.name == "Harness")
+        .map(|index| ir::ComponentId(index as u32))
+        .expect("Harness component");
+    let ordered_function = prog.components[harness.index()]
+        .method("ordered_component_value")
+        .expect("ordered_component_value method")
+        .function;
+    let run = prog.function(ordered_function);
+
+    let statements: Vec<_> = run.blocks.iter().flat_map(|block| &block.stmts).collect();
+    let (call_position, snapshot) = statements
+        .iter()
+        .enumerate()
+        .find_map(|(position, stmt)| match stmt {
+            ir::Stmt::ComponentCall { method, args, .. } if method == "combine_model" => {
+                match args.first() {
+                    Some(ir::Expr::Local(local)) => Some((position, *local)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .expect("the effectful combine_model call consumes a component snapshot");
+    assert_eq!(run.local(snapshot).ty, ir::IrType::Component(counter));
+    let snapshot_position = statements
+        .iter()
+        .position(|stmt| {
+            matches!(
+                stmt,
+                ir::Stmt::Assign(
+                    dest,
+                    ir::Expr::ComponentValue {
+                        base: ir::ComponentBase::Path(path),
+                    },
+                ) if *dest == snapshot
+                    && path == &["self".to_string(), "ordered_args".to_string()]
+            )
+        })
+        .expect("ordered_args is copied into the typed component local");
+    assert!(
+        !statements.iter().any(
+            |stmt| matches!(stmt, ir::Stmt::ComponentInit { local, .. } if *local == snapshot)
+        ),
+        "an argument snapshot is a value copy, not a new component instance"
+    );
+    let mutation_position = statements
+        .iter()
+        .enumerate()
+        .skip(snapshot_position + 1)
+        .find_map(|(position, stmt)| match stmt {
+            ir::Stmt::ComponentCall { base, method, .. }
+                if method == "step"
+                    && matches!(base, ir::ComponentBase::Path(path)
+                        if path == &["self".to_string(), "ordered_args".to_string()]) =>
+            {
+                Some(position)
+            }
+            _ => None,
+        })
+        .expect("later ordered_args.step call");
+    assert!(snapshot_position < mutation_position && mutation_position < call_position);
+
+    let direct_function = prog.components[harness.index()]
+        .method("direct_component_value")
+        .expect("direct_component_value method")
+        .function;
+    let direct = prog.function(direct_function);
+    let direct_call = direct
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentCall { method, args, .. }
+                if method == "combine_model"
+                    && matches!(args.get(1), Some(ir::Expr::Literal { value: 99, .. })) =>
+            {
+                Some(args)
+            }
+            _ => None,
+        })
+        .expect("non-effectful component-value control call");
+    assert!(matches!(
+        direct_call.first(),
+        Some(ir::Expr::ComponentValue {
+            base: ir::ComponentBase::Path(path),
+        }) if path == &["self".to_string(), "ordered_args".to_string()]
+    ));
+
+    verify::verify_program(&prog).expect("ordered component snapshot verifies");
+
+    let corrupt_direct_arg = |mut candidate: ir::TbProgram, index: usize, replacement: ir::Expr| {
+        let args = candidate.functions[direct_function.index()]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|stmt| match stmt {
+                ir::Stmt::ComponentCall { method, args, .. } if method == "combine_model" => {
+                    Some(args)
+                }
+                _ => None,
+            })
+            .expect("direct combine_model call");
+        args[index] = replacement;
+        verify::verify_program(&candidate)
+            .expect_err("a corrupt component call argument must not verify")
+    };
+    let errors = corrupt_direct_arg(
+        prog.clone(),
+        0,
+        ir::Expr::ComponentValue {
+            base: ir::ComponentBase::SelfField,
+        },
+    );
+    assert!(
+        errors.iter().any(|error| {
+            let message = error.to_string();
+            message.contains("component method `Harness.combine_model` argument 1")
+                && message.contains("Component(ComponentId(1))")
+                && message.contains("Component(ComponentId(0))")
+        }),
+        "wrong component schema reached the call boundary: {errors:?}"
+    );
+    let errors = corrupt_direct_arg(
+        prog.clone(),
+        1,
+        ir::Expr::ComponentValue {
+            base: ir::ComponentBase::SelfField,
+        },
+    );
+    assert!(
+        errors.iter().any(|error| {
+            let message = error.to_string();
+            message.contains("component method `Harness.combine_model` argument 2")
+                && message.contains("Component(ComponentId(1))")
+                && message.contains("UInt(Some(32))")
+        }),
+        "component value entered a scalar call slot: {errors:?}"
+    );
+
+    let mut corrupt = prog.clone();
+    corrupt.functions[ordered_function.index()].locals[snapshot.index()].ty =
+        ir::IrType::Component(harness);
+    verify::verify_program(&corrupt)
+        .expect_err("a component snapshot with the wrong component type must not verify");
+}
+
+/// Component locals and component-typed parameters are mutable aliases, while
+/// ordinary lexical scalar/record locals are values. Shared testbench record
+/// fields are the other local-shaped alias and must conservatively be sampled
+/// before an effectful sibling.
+#[test]
+fn ordered_local_snapshotting_respects_component_and_shared_record_origins() {
+    let prog = lower_src(&fixture("component_value_expression_test.harc")).expect("lowers");
+    let counter = prog
+        .components
+        .iter()
+        .position(|component| component.name == "CounterModel")
+        .map(|index| ir::ComponentId(index as u32))
+        .expect("CounterModel component");
+    let harness = prog
+        .components
+        .iter()
+        .position(|component| component.name == "Harness")
+        .map(|index| ir::ComponentId(index as u32))
+        .expect("Harness component");
+
+    let assert_component_local_snapshot = |body: &ir::TbFunction, source_name: &str| {
+        let source = body
+            .locals
+            .iter()
+            .position(|local| local.name == source_name)
+            .map(|index| ir::LocalId(index as u32))
+            .unwrap_or_else(|| panic!("missing component local `{source_name}`:\n{body}"));
+        assert_eq!(body.local(source).ty, ir::IrType::Component(counter));
+        let statements: Vec<_> = body.blocks.iter().flat_map(|block| &block.stmts).collect();
+        let (snapshot_position, snapshot) = statements
+            .iter()
+            .enumerate()
+            .find_map(|(position, stmt)| match stmt {
+                ir::Stmt::Assign(dest, ir::Expr::Local(value)) if *value == source => {
+                    Some((position, *dest))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("`{source_name}` was not snapshotted:\n{body}"));
+        assert_eq!(body.local(snapshot).ty, ir::IrType::Component(counter));
+        assert!(
+            !statements.iter().any(
+                |stmt| matches!(stmt, ir::Stmt::ComponentInit { local, .. } if *local == snapshot)
+            ),
+            "the snapshot is a value copy, not a component instance"
+        );
+        let mutation_position = statements
+            .iter()
+            .enumerate()
+            .skip(snapshot_position + 1)
+            .find_map(|(position, stmt)| match stmt {
+                ir::Stmt::ComponentCall {
+                    base: ir::ComponentBase::Local(local),
+                    method,
+                    ..
+                } if *local == source && method == "step" => Some(position),
+                _ => None,
+            })
+            .expect("later mutation of the source component");
+        let call_position = statements
+            .iter()
+            .enumerate()
+            .find_map(|(position, stmt)| match stmt {
+                ir::Stmt::ComponentCall { method, args, .. }
+                    if method == "combine_model"
+                        && matches!(args.first(), Some(ir::Expr::Local(local)) if *local == snapshot) =>
+                {
+                    Some(position)
+                }
+                _ => None,
+            })
+            .expect("combine_model consumes the snapshot");
+        assert!(snapshot_position < mutation_position && mutation_position < call_position);
+        source
+    };
+
+    let run = prog.function(prog.tests[0].run);
+    let local_model = assert_component_local_snapshot(run, "local_model");
+    let direct_local_args = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentCall { method, args, .. }
+                if method == "combine_model"
+                    && matches!(args.get(1), Some(ir::Expr::Literal { value: 99, .. }))
+                    && matches!(args.first(), Some(ir::Expr::Local(local)) if *local == local_model) =>
+            {
+                Some(args)
+            }
+            _ => None,
+        })
+        .expect("component-local no-effect control remains direct");
+    assert!(matches!(
+        direct_local_args.first(),
+        Some(ir::Expr::Local(local)) if *local == local_model
+    ));
+
+    let parameter_function = prog.components[harness.index()]
+        .method("ordered_component_parameter")
+        .expect("ordered_component_parameter method")
+        .function;
+    let parameter_body = prog.function(parameter_function);
+    assert_component_local_snapshot(parameter_body, "model");
+
+    let direct_parameter_function = prog.components[harness.index()]
+        .method("direct_component_parameter")
+        .expect("direct_component_parameter method")
+        .function;
+    let direct_parameter_body = prog.function(direct_parameter_function);
+    let parameter = direct_parameter_body
+        .locals
+        .iter()
+        .position(|local| local.name == "model")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("model parameter");
+    let direct_parameter_args = direct_parameter_body
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentCall { method, args, .. } if method == "combine_model" => Some(args),
+            _ => None,
+        })
+        .expect("component-parameter no-effect control call");
+    assert!(matches!(
+        direct_parameter_args.first(),
+        Some(ir::Expr::Local(local)) if *local == parameter
+    ));
+
+    let result = prog
+        .records
+        .iter()
+        .position(|record| record.name == "Result")
+        .map(|index| ir::RecordId(index as u32))
+        .expect("Result record");
+    let shared_record = run
+        .locals
+        .iter()
+        .position(|local| local.name == "shared_record")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("shared testbench record local");
+    let statements: Vec<_> = run.blocks.iter().flat_map(|block| &block.stmts).collect();
+    let (shared_snapshot_position, shared_snapshot) = statements
+        .iter()
+        .enumerate()
+        .find_map(|(position, stmt)| match stmt {
+            ir::Stmt::Assign(dest, ir::Expr::Local(value)) if *value == shared_record => {
+                Some((position, *dest))
+            }
+            _ => None,
+        })
+        .expect("shared testbench record is snapshotted before mutation");
+    assert_eq!(run.local(shared_snapshot).ty, ir::IrType::Record(result));
+    let shared_effect_position = statements
+        .iter()
+        .enumerate()
+        .skip(shared_snapshot_position + 1)
+        .find_map(|(position, stmt)| match stmt {
+            ir::Stmt::ComponentCall {
+                base: ir::ComponentBase::Path(path),
+                method,
+                ..
+            } if method == "step" && path == &["shared_record_effect".to_string()] => {
+                Some(position)
+            }
+            _ => None,
+        })
+        .expect("later effect after the shared record read");
+    let shared_call_position = statements
+        .iter()
+        .enumerate()
+        .find_map(|(position, stmt)| match stmt {
+            ir::Stmt::ComponentCall { method, args, .. }
+                if method == "combine_result"
+                    && matches!(args.first(), Some(ir::Expr::Local(local)) if *local == shared_snapshot) =>
+            {
+                Some(position)
+            }
+            _ => None,
+        })
+        .expect("combine_result consumes the shared-record snapshot");
+    assert!(
+        shared_snapshot_position < shared_effect_position
+            && shared_effect_position < shared_call_position
+    );
+    assert!(statements.iter().any(|stmt| {
+        matches!(
+            stmt,
+            ir::Stmt::ComponentCall { method, args, .. }
+                if method == "combine_result"
+                    && matches!(args.first(), Some(ir::Expr::Local(local)) if *local == shared_record)
+                    && matches!(args.get(1), Some(ir::Expr::Literal { value: 99, .. }))
+        )
+    }));
+
+    let lexical_record = run
+        .locals
+        .iter()
+        .position(|local| local.name == "lexical_record")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("lexical record local");
+    assert!(statements.iter().any(|stmt| {
+        matches!(
+            stmt,
+            ir::Stmt::ComponentCall { method, args, .. }
+                if method == "combine_result"
+                    && matches!(args.first(), Some(ir::Expr::Local(local)) if *local == lexical_record)
+        )
+    }));
+    assert!(
+        !statements.iter().any(
+            |stmt| matches!(stmt, ir::Stmt::Assign(_, ir::Expr::Local(local)) if *local == lexical_record)
+        ),
+        "an ordinary lexical record remains a stable direct value"
+    );
+
+    let lexical_scalar = run
+        .locals
+        .iter()
+        .position(|local| local.name == "lexical_scalar")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("lexical scalar local");
+    assert!(statements.iter().any(|stmt| {
+        matches!(
+            stmt,
+            ir::Stmt::Assign(
+                _,
+                ir::Expr::Call(ir::CallTarget::Helper { name, .. }, args),
+            ) if name == "add_values"
+                && matches!(args.first(), Some(ir::Expr::Local(local)) if *local == lexical_scalar)
+        )
+    }));
+    assert!(
+        !statements.iter().any(
+            |stmt| matches!(stmt, ir::Stmt::Assign(_, ir::Expr::Local(local)) if *local == lexical_scalar)
+        ),
+        "an ordinary lexical scalar remains a stable direct value"
+    );
+
+    verify::verify_program(&prog).expect("ordered local-origin snapshots verify");
+}
+
+/// The component-value fix lives at the ordered-argument seam shared by every
+/// call family. Keep scalar and record controls here so specializing that seam
+/// cannot regress their existing materialization behavior.
+#[test]
+fn ordered_argument_consumers_share_the_typed_snapshot_seam() {
+    let src = r#"transaction Beat
+    value : uint<32> default 0
+end transaction Beat
+
+function helper_combine(first: uint<32>, second: uint<32>) -> uint<32>
+    return first * 1000 + second
+end function helper_combine
+
+extern function extern_combine(first: uint<32>, second: uint<32>) -> uint<32>
+
+agent Cell
+    value : uint<32> default 0
+    function step(tag: uint<8>) -> uint<32>
+        value = value * 10 + tag
+        return value
+    end function step
+    function peek() -> uint<32>
+        return value
+    end function peek
+end agent Cell
+
+agent Sink
+    function take(snapshot: Cell, latest: uint<32>) -> uint<32>
+        return snapshot.peek() * 1000 + latest
+    end function take
+    function take_record(snapshot: Beat, latest: uint<32>) -> uint<32>
+        return snapshot.value * 1000 + latest
+    end function take_record
+end agent Sink
+
+agent Env
+    cell : Cell
+    sink : Sink
+    record : Beat
+    function component_ordered() -> uint<32>
+        return sink.take(cell, cell.step(3))
+    end function component_ordered
+    function record_ordered() -> uint<32>
+        return sink.take_record(record, cell.step(5))
+    end function record_ordered
+    function component_direct() -> uint<32>
+        return sink.take(cell, 99)
+    end function component_direct
+end agent Env
+
+transactor Driver
+    dut : Top
+    when active
+        hookable take(first: uint<32>, latest: uint<32>) -> uint<32>
+            return first * 1000 + latest
+        end take
+    end when
+end transactor Driver
+
+tseq Make(first: uint<32>, second: uint<32>) -> TSeq<Beat>
+    let beat : Beat
+    beat.value = first + second
+    yield beat
+end tseq Make
+
+testbench Tb
+    dut : Top
+    env : Env
+    driver : Driver active
+end testbench Tb
+
+impl OrderedConsumerTest for Tb
+    run
+        driver.dut = dut
+        let helper_value = helper_combine(env.cell.value, env.cell.step(1))
+        let extern_value = extern_combine(env.cell.value, env.cell.step(2))
+        let component_value = env.component_ordered()
+        let transactor_value = driver.take(env.cell.value, env.cell.step(4))
+        let record_value = env.record_ordered()
+        let sequence = Make(env.cell.value, env.cell.step(6))
+        let direct_component_value = env.component_direct()
+    end run
+end impl OrderedConsumerTest"#;
+
+    let prog = lower_src(src).expect("all ordered-argument consumers lower");
+    verify::verify_program(&prog).expect("all ordered-argument consumers verify");
+    let run = prog.function(prog.tests[0].run);
+    let statements: Vec<_> = run.blocks.iter().flat_map(|block| &block.stmts).collect();
+
+    let scalar_snapshot = |args: &[ir::Expr], family: &str| {
+        let Some(ir::Expr::Local(local)) = args.first() else {
+            panic!("{family} did not receive a materialized first argument: {args:?}");
+        };
+        assert_eq!(
+            run.local(*local).ty,
+            ir::IrType::UInt(Some(32)),
+            "{family} snapshot type"
+        );
+    };
+
+    let helper_args = statements
+        .iter()
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::Helper { name, .. }, args))
+                if name == "helper_combine" =>
+            {
+                Some(args.as_slice())
+            }
+            _ => None,
+        })
+        .expect("helper call");
+    scalar_snapshot(helper_args, "helper");
+
+    let extern_args = statements
+        .iter()
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::ExternFn { name, .. }, args))
+                if name == "extern_combine" =>
+            {
+                Some(args.as_slice())
+            }
+            _ => None,
+        })
+        .expect("extern call");
+    scalar_snapshot(extern_args, "extern");
+
+    let tseq_args = statements
+        .iter()
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::Tseq { name, .. }, args))
+                if name == "Make" =>
+            {
+                Some(args.as_slice())
+            }
+            _ => None,
+        })
+        .expect("tseq call");
+    scalar_snapshot(tseq_args, "tseq");
+
+    let env = prog
+        .components
+        .iter()
+        .position(|component| component.name == "Env")
+        .map(|index| ir::ComponentId(index as u32))
+        .expect("Env component");
+    let component_function = prog.components[env.index()]
+        .method("component_ordered")
+        .expect("component_ordered method")
+        .function;
+    let component_body = prog.function(component_function);
+    let component_args = component_body
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentCall { method, args, .. } if method == "take" => {
+                Some(args.as_slice())
+            }
+            _ => None,
+        })
+        .expect("effectful component call");
+    let Some(ir::Expr::Local(component_snapshot)) = component_args.first() else {
+        panic!("component call did not receive a snapshot: {component_args:?}");
+    };
+    assert!(matches!(
+        component_body.local(*component_snapshot).ty,
+        ir::IrType::Component(_)
+    ));
+
+    let direct_function = prog.components[env.index()]
+        .method("component_direct")
+        .expect("component_direct method")
+        .function;
+    let direct_body = prog.function(direct_function);
+    let direct_args = direct_body
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentCall { method, args, .. } if method == "take" => {
+                Some(args.as_slice())
+            }
+            _ => None,
+        })
+        .expect("direct component call");
+    assert!(matches!(
+        direct_args.first(),
+        Some(ir::Expr::ComponentValue { .. })
+    ));
+
+    let transactor_args = statements
+        .iter()
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorCall {
+                call: ir::Expr::Call(ir::CallTarget::TransactorMethod { method, .. }, args),
+                ..
+            } if method == "take" => Some(args.as_slice()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("transactor call:\n{run}"));
+    scalar_snapshot(transactor_args, "transactor");
+
+    let record_function = prog.components[env.index()]
+        .method("record_ordered")
+        .expect("record_ordered method")
+        .function;
+    let record_body = prog.function(record_function);
+    let record_args = record_body
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentCall { method, args, .. } if method == "take_record" => {
+                Some(args.as_slice())
+            }
+            _ => None,
+        })
+        .expect("record component call");
+    let Some(ir::Expr::Local(record_snapshot)) = record_args.first() else {
+        panic!("record call did not receive a snapshot: {record_args:?}");
+    };
+    assert!(matches!(
+        record_body.local(*record_snapshot).ty,
+        ir::IrType::Record(_)
+    ));
+}
+
+#[test]
+fn component_record_call_results_feed_field_index_and_width_chains() {
+    let prog = lower_src(&fixture("component_value_expression_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let run = prog.function(prog.tests[0].run);
+    let call_results: Vec<_> = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .filter_map(|stmt| match stmt {
+            ir::Stmt::ComponentCall {
+                method,
+                dest: Some(dest),
+                ..
+            } if method == "current_instruction" => Some(*dest),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        call_results.len(),
+        2,
+        "each record-return call must materialize exactly once:\n{run}"
+    );
+
+    let opcode_match = run
+        .locals
+        .iter()
+        .position(|local| local.name == "opcode_matches")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("opcode_matches local");
+    let selected_byte = run
+        .locals
+        .iter()
+        .position(|local| local.name == "selected_byte")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("selected_byte local");
+
+    let opcode_uses_call_result = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .any(|stmt| {
+            matches!(
+                stmt,
+                ir::Stmt::Assign(
+                    dest,
+                    ir::Expr::Binary(
+                        ir::BinOp::Eq,
+                        lhs,
+                        _
+                    )
+                ) if *dest == opcode_match
+                    && matches!(
+                        &**lhs,
+                        ir::Expr::WidthCast {
+                            width: 8,
+                            inner,
+                            ..
+                        } if matches!(
+                            &**inner,
+                            ir::Expr::RecordField {
+                                local,
+                                field,
+                                path,
+                                mid_indices,
+                                index: None,
+                            } if *local == call_results[0]
+                                && field == "opcode"
+                                && path.is_empty()
+                                && mid_indices.is_empty()
+                        )
+                    )
+            )
+        });
+    assert!(
+        opcode_uses_call_result,
+        "`.opcode.zext<8>()` must read the typed component-call result local:\n{run}"
+    );
+
+    let indexed_field_uses_call_result =
+        run.blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .any(|stmt| {
+                matches!(
+                    stmt,
+                    ir::Stmt::Assign(
+                        dest,
+                        ir::Expr::WidthCast {
+                            width: 16,
+                            inner,
+                            ..
+                        }
+                    ) if *dest == selected_byte
+                        && matches!(
+                            &**inner,
+                            ir::Expr::RecordField {
+                                local,
+                                field,
+                                path,
+                                mid_indices,
+                                index: Some(index),
+                            } if *local == call_results[1]
+                                && field == "bytes"
+                                && path.is_empty()
+                                && mid_indices.is_empty()
+                                && matches!(
+                                    &**index,
+                                    ir::Expr::Literal { value: 1, .. }
+                                )
+                        )
+                )
+            });
+    assert!(
+        indexed_field_uses_call_result,
+        "`.bytes[1].zext<16>()` must read the same typed call-result local:\n{run}"
+    );
+}
+
+#[test]
+fn self_subcomponent_queue_query_lowers_in_a_condition() {
+    let prog = lower_src(&fixture("component_value_expression_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let harness = prog
+        .components
+        .iter()
+        .find(|component| component.name == "Harness")
+        .expect("Harness component");
+    let pending_matches = prog.function(
+        harness
+            .method("pending_matches")
+            .expect("pending_matches")
+            .function,
+    );
+    assert!(
+        pending_matches.blocks.iter().any(|block| matches!(
+            &block.terminator,
+            ir::Terminator::Branch(
+                ir::Expr::Binary(ir::BinOp::Ne, lhs, _),
+                _,
+                _
+            ) if matches!(
+                &**lhs,
+                ir::Expr::ComponentQueueQuery {
+                    base: ir::ComponentBase::Path(path),
+                    query: ir::ScoreboardQuery::QueueSize { queue },
+                } if path == &["self".to_string(), "inner".to_string()]
+                    && queue == "pending"
+            )
+        )),
+        "the exact `model.queue.size() != count.zext<64>()` shape must remain a typed condition:\n{pending_matches}"
+    );
+
+    let size_twice = prog.function(
+        harness
+            .method("pending_size_twice")
+            .expect("pending_size_twice")
+            .function,
+    );
+    assert_eq!(
+        format!("{size_twice}")
+            .matches("ComponentQueueQuery(self.inner.pending.size())")
+            .count(),
+        2,
+        "two source queries must remain two independently evaluated reads:\n{size_twice}"
+    );
+}
+
+#[test]
+fn queue_front_queries_keep_exact_types_and_source_order() {
+    let prog = lower_src(&fixture("component_value_expression_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    let harness = prog
+        .components
+        .iter()
+        .find(|component| component.name == "Harness")
+        .expect("Harness component");
+    let front_then_pop = prog.function(
+        harness
+            .method("front_then_pop")
+            .expect("front_then_pop")
+            .function,
+    );
+    let statements: Vec<_> = front_then_pop
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .collect();
+    let front_pos = statements
+        .iter()
+        .position(|stmt| {
+            matches!(
+                stmt,
+                ir::Stmt::Assign(
+                    _,
+                    ir::Expr::WidthCast { inner, .. }
+                ) if matches!(
+                    &**inner,
+                    ir::Expr::ComponentQueueQuery {
+                        base: ir::ComponentBase::Path(path),
+                        query: ir::ScoreboardQuery::QueueFront {
+                            queue,
+                            elem: ir::QueueElem::Scalar {
+                                ty: ir::IrType::UInt(Some(8)),
+                            },
+                        },
+                    } if path == &["self".to_string(), "inner".to_string()]
+                        && queue == "pending"
+                )
+            )
+        })
+        .expect("typed front query snapshot");
+    let pop_pos = statements
+        .iter()
+        .position(|stmt| {
+            matches!(
+                stmt,
+                ir::Stmt::ComponentQueuePop {
+                    base: ir::ComponentBase::Path(path),
+                    queue,
+                    ..
+                } if path == &["self".to_string(), "inner".to_string()]
+                    && queue == "pending"
+            )
+        })
+        .expect("following queue pop");
+    assert!(
+        front_pos < pop_pos,
+        "the front value must be sampled before the later mutating pop:\n{front_then_pop}"
+    );
+
+    let run = prog.function(prog.tests[0].run);
+    for local_name in ["own_front", "scoreboard_front"] {
+        let local = run
+            .locals
+            .iter()
+            .find(|local| local.name == local_name)
+            .unwrap_or_else(|| panic!("missing `{local_name}` local"));
+        assert_eq!(
+            local.ty,
+            ir::IrType::UInt(Some(8)),
+            "`{local_name}` must inherit the queue element type"
+        );
+    }
+    assert!(
+        run.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| matches!(
+            stmt,
+            ir::Stmt::Assign(
+                dest,
+                ir::Expr::ScoreboardQuery {
+                    query: ir::ScoreboardQuery::QueueFront {
+                        elem: ir::QueueElem::Record(_),
+                        ..
+                    },
+                    ..
+                }
+            ) if matches!(run.local(*dest).ty, ir::IrType::Record(_))
+        )),
+        "a record queue front must materialize once with its record identity before field selection:\n{run}"
+    );
+}
+
+#[test]
+fn component_queue_pops_materialize_in_returns_fields_and_lazy_branches() {
+    let prog = lower_src(&fixture("component_value_expression_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+
+    let model = prog
+        .components
+        .iter()
+        .find(|component| component.name == "CounterModel")
+        .expect("CounterModel component");
+    let pop_return = prog.function(model.method("pop_return").expect("pop_return").function);
+    let return_dest = pop_return
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentQueuePop { queue, dest, .. } if queue == "pending" => Some(*dest),
+            _ => None,
+        })
+        .expect("return path pops into a typed temporary");
+    assert_eq!(pop_return.local(return_dest).ty, ir::IrType::UInt(Some(8)));
+    assert!(pop_return
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .any(|stmt| matches!(
+            stmt,
+            ir::Stmt::Assign(dest, ir::Expr::Local(value))
+                if Some(*dest) == pop_return.ret && *value == return_dest
+        )));
+
+    let pop_to_field = prog.function(model.method("pop_to_field").expect("pop_to_field").function);
+    let field_dest = pop_to_field
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentQueuePop { queue, dest, .. } if queue == "pending" => Some(*dest),
+            _ => None,
+        })
+        .expect("field path pops into a typed temporary");
+    assert_eq!(pop_to_field.local(field_dest).ty, ir::IrType::UInt(Some(8)));
+    assert!(pop_to_field.blocks.iter().flat_map(|block| &block.stmts).any(
+        |stmt| matches!(
+            stmt,
+            ir::Stmt::ComponentFieldWrite { field, value, .. }
+                if field == "popped" && matches!(value, ir::Expr::Local(value) if *value == field_dest)
+        )
+    ));
+
+    let run = prog.function(prog.tests[0].run);
+    let pop_blocks: Vec<_> = run
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
+            block
+                .stmts
+                .iter()
+                .any(|stmt| matches!(stmt, ir::Stmt::ComponentQueuePop { queue, .. } if queue == "pending"))
+                .then_some(ir::BlockId(index as u32))
+        })
+        .collect();
+    assert_eq!(
+        pop_blocks.len(),
+        4,
+        "only the selected short-circuit and ternary branches contain pops:\n{run}"
+    );
+    assert!(run.blocks.iter().any(|block| matches!(
+        block.terminator,
+        ir::Terminator::Branch(_, taken, skipped)
+            if pop_blocks.contains(&taken) && !pop_blocks.contains(&skipped)
+    )));
+}
+
+#[test]
+fn component_call_in_message_stays_in_the_failure_branch() {
+    let source = fixture("component_value_expression_test.harc");
+    let source = source.replace(
+        "assert true else fail(\"untaken diagnostic call=${harness.inner.step(2)}\")",
+        "assert false else fail(\"taken diagnostic call=${harness.inner.step(2)}\")",
+    );
+    let prog = lower_src(&source).expect("component diagnostic call lowers lazily");
+    verify::verify_program(&prog).expect("component diagnostic call verifies");
+    let run = prog.function(prog.tests[0].run);
+    let failure = run
+        .blocks
+        .iter()
+        .position(|block| {
+            block.stmts.iter().any(|stmt| {
+                matches!(
+                    stmt,
+                    ir::Stmt::ComponentCall {
+                        method,
+                        args,
+                        dest: Some(_),
+                        ..
+                    } if method == "step"
+                        && matches!(
+                            args.as_slice(),
+                            [ir::Expr::Literal { value: 2, .. }]
+                        )
+                )
+            }) && block.stmts.iter().any(|stmt| {
+                matches!(
+                    stmt,
+                    ir::Stmt::AssertCheck {
+                        cond: ir::Expr::Literal {
+                            value: 0,
+                            ty: ir::IrType::Bool,
+                        },
+                        ..
+                    }
+                )
+            })
+        })
+        .map(|index| ir::BlockId(index as u32))
+        .expect("failure arm contains the diagnostic call");
+    assert!(
+        run.blocks.iter().any(|block| matches!(
+            block.terminator,
+            ir::Terminator::Branch(_, _, target) if target == failure
+        )),
+        "diagnostic component call must be reachable only through an assertion failure edge:\n{run}"
+    );
+
+    let lazy = source.replace(
+        "taken diagnostic call=${harness.inner.step(2)}",
+        "illegal lazy call=${true || harness.inner.step(2) != 0}",
+    );
+    let msg =
+        assert_unsupported(&lower_src(&lazy).expect_err("lazy message call must be rejected"));
+    assert!(
+        msg.contains("inside a message") && msg.contains("hoist"),
+        "{msg}"
+    );
+
+    let wait = fixture("component_value_expression_test.harc").replace(
+        "assert true else fail(\"untaken diagnostic call=${harness.inner.step(2)}\")",
+        "wait until harness.inner.peek() == 66891",
+    );
+    let msg = assert_unsupported(
+        &lower_src(&wait).expect_err("component call in wait predicate must be rejected"),
+    );
+    assert!(msg.contains("`wait until` predicate"), "{msg}");
 }
 
 #[test]
@@ -27016,7 +30680,7 @@ end impl ComponentScalarNarrowLetTest
 "#;
     let err = lower_src(src).expect_err("narrowing method initializer must be rejected");
     let msg = assert_invalid(&err);
-    assert!(msg.contains("incompatible type"), "{msg}");
+    assert!(msg.contains("narrows"), "{msg}");
 }
 
 #[test]
@@ -27047,7 +30711,7 @@ end impl ComponentRecordToScalarLetTest
 "#;
     let err = lower_src(src).expect_err("record method result must not initialize scalar local");
     let msg = assert_invalid(&err);
-    assert!(msg.contains("incompatible type"), "{msg}");
+    assert!(msg.contains("non-record type"), "{msg}");
 }
 
 #[test]
@@ -27077,7 +30741,7 @@ end impl ComponentScalarToRecordAssignTest
 "#;
     let err = lower_src(src).expect_err("scalar method result must not assign to record local");
     let msg = assert_invalid(&err);
-    assert!(msg.contains("incompatible type"), "{msg}");
+    assert!(msg.contains("is not a record"), "{msg}");
 }
 
 #[test]
@@ -27106,7 +30770,7 @@ end impl ComponentScalarToRecordLetTest
 "#;
     let err = lower_src(src).expect_err("scalar method result must not initialize record local");
     let msg = assert_invalid(&err);
-    assert!(msg.contains("incompatible type"), "{msg}");
+    assert!(msg.contains("is not a record"), "{msg}");
 }
 
 #[test]
@@ -27142,7 +30806,7 @@ end impl ComponentWrongRecordAssignTest
 "#;
     let err = lower_src(src).expect_err("wrong record method result must not assign");
     let msg = assert_invalid(&err);
-    assert!(msg.contains("incompatible type"), "{msg}");
+    assert!(msg.contains("value assigned to it is a `B`"), "{msg}");
 }
 
 #[test]
@@ -27177,7 +30841,7 @@ end impl ComponentWrongRecordLetTest
 "#;
     let err = lower_src(src).expect_err("wrong record method result must not initialize local");
     let msg = assert_invalid(&err);
-    assert!(msg.contains("incompatible type"), "{msg}");
+    assert!(msg.contains("value assigned to it is a `B`"), "{msg}");
 }
 /// Issue #452: a test-scope `let` read (un-shadowed) at the top level of the
 /// check phase must still be promoted to a `_tb` host field even when an
@@ -27416,6 +31080,309 @@ end test T"#,
     ] {
         let err = lower_src(src).expect_err("incompatible call result is rejected");
         assert!(err.to_string().contains(want), "{err}");
+    }
+}
+
+/// A testbench method is CFG-inlined, so each source argument becomes an
+/// assignment into a fresh local carrying the declared parameter type.  The
+/// source-level call check must reject a genuinely wider helper result before
+/// that assignment reaches the verifier's internal-error channel.
+#[test]
+fn callable_parameter_widths_are_checked_before_inlined_assignments() {
+    let source = |argument: &str| {
+        format!(
+            r#"const CONST_OFFSET = 9
+const TOO_BIG = 0x10000
+const TYPED_NARROW : uint<16> = 0xffff
+const TYPED_WIDE : uint<64> = 1
+
+function read_offset(raw: uint<64>) -> uint<64>
+    return raw & 0xffff
+end function read_offset
+
+testbench Tb
+    dut : Top
+
+    function program(off: uint<16>)
+        log(info, "off=${{off}}")
+    end function program
+end testbench Tb
+
+impl T for Tb
+    run
+        let narrow : uint<8> = 7
+        let signed_narrow : sint<8> = 0 - 7
+        let raw : uint<64> = 0x1234
+        let flag : uint<1> = 1
+        program({argument})
+    end run
+end impl T"#
+        )
+    };
+
+    let err = lower_src(&source("read_offset(raw)"))
+        .expect_err("a declared uint<64> helper result must not enter uint<16>");
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("parameter `off` of testbench method `program`")
+            && msg.contains("64-bit")
+            && msg.contains("16 bits")
+            && msg.contains("narrows")
+            && msg.contains(".trunc<16>()"),
+        "{msg}"
+    );
+
+    let fixed = source("read_offset(raw)").replace(
+        "-> uint<64>\n    return raw & 0xffff",
+        "-> uint<16>\n    return (raw & 0xffff).trunc<16>()",
+    );
+    let prog = lower_src(&fixed).expect("a helper with the exact field-width contract lowers");
+    verify::verify_program(&prog).expect("the exact-width helper result verifies");
+
+    for argument in [
+        "narrow",
+        "raw & 0xffff",
+        "0xffff",
+        "CONST_OFFSET",
+        "TYPED_NARROW",
+        "narrow + CONST_OFFSET",
+        "flag != 0 ? true : narrow",
+        "read_offset(raw).trunc<16>()",
+    ] {
+        let prog = lower_src(&source(argument))
+            .unwrap_or_else(|e| panic!("legal callable argument `{argument}` rejected: {e}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| {
+            panic!("legal callable argument `{argument}` failed IR verify: {e:?}")
+        });
+    }
+
+    let signed = source("signed_narrow").replace("off: uint<16>", "off: sint<16>");
+    let prog = lower_src(&signed).expect("same-signed widening into a method parameter lowers");
+    verify::verify_program(&prog).expect("same-signed widening verifies");
+
+    let err = lower_src(&source("signed_narrow"))
+        .expect_err("an implicit signed-to-unsigned parameter conversion must be rejected");
+    assert!(err.to_string().contains("Signedness must match"), "{err}");
+
+    let pure_call = r#"function wide_value() -> uint<64>
+    return 7
+end function wide_value
+
+function take16(value: uint<16>) -> uint<16>
+    return value
+end function take16
+
+test T
+    let dut : Top
+    run
+        let value = take16(wide_value())
+    end run
+end test T"#;
+    let err = lower_src(pure_call)
+        .expect_err("pure helper parameters must apply the same narrowing rule");
+    assert!(
+        err.to_string()
+            .contains("parameter `value` of helper `take16`")
+            && err.to_string().contains("narrows"),
+        "{err}"
+    );
+
+    for argument in [
+        "raw + CONST_OFFSET",
+        "raw | CONST_OFFSET",
+        "flag != 0 ? raw : CONST_OFFSET",
+        "flag != 0 ? true : raw",
+        "0x10000",
+        "TOO_BIG",
+        "TYPED_WIDE",
+        "narrow + 0x10000",
+    ] {
+        let err =
+            lower_src(&source(argument)).expect_err("narrowing callable argument must be rejected");
+        assert!(err.to_string().contains("narrows"), "{argument}: {err}");
+    }
+}
+
+#[test]
+fn callable_argument_checks_run_before_ordering_materialization() {
+    let src = r#"testbench Tb
+    dut : Top
+    pending : queue<uint<8>>
+
+    function program(first: uint<16>, second: uint<8>)
+        log(info, "first=${first} second=${second}")
+    end function program
+end testbench Tb
+
+impl T for Tb
+    run
+        let raw : uint<64> = 0x1234
+        pending.push(7)
+        program(raw & 0xffff, pending.pop())
+    end run
+end impl T"#;
+    let prog = lower_src(src).expect("the bounded first argument lowers before queue-pop ordering");
+    verify::verify_program(&prog).expect("ordered callable arguments verify");
+}
+
+#[test]
+fn every_callable_family_rejects_declared_scalar_narrowing() {
+    let helper = r#"function wide_value() -> uint<64>
+    return 7
+end function wide_value
+"#;
+    let test = |body: &str| {
+        format!(
+            r#"{helper}
+test T
+    let dut : Top
+    run
+{body}
+    end run
+end test T"#
+        )
+    };
+    let cases = [
+        (
+            format!(
+                "extern function take16(value: uint<16>) -> uint<16>\n{}",
+                test("        let value = take16(wide_value())")
+            ),
+            "parameter `value` of extern fn `take16`",
+        ),
+        (
+            format!(
+                "agent Sink\n    function take16(value: uint<16>)\n    end function take16\nend agent Sink\n\ntestbench Tb\n    dut : Top\n    sink : Sink\nend testbench Tb\n\n{helper}\nimpl T for Tb\n    run\n        sink.take16(wide_value())\n    end run\nend impl T"
+            ),
+            "parameter `value` of `Sink.take16`",
+        ),
+        (
+            format!(
+                "transactor Driver\n    dut : Top\n    when active\n        hookable take16(value: uint<16>)\n            log(info, \"value=${{value}}\")\n        end hookable\n    end when\nend transactor Driver\n\ntestbench Tb\n    dut : Top\n    drv : Driver active\nend testbench Tb\n\n{helper}\nimpl T for Tb\n    run\n        drv.dut = dut\n        drv.take16(wide_value())\n    end run\nend impl T"
+            ),
+            "parameter `value` of `Driver.take16`",
+        ),
+    ];
+
+    for (source, owner) in cases {
+        let err = lower_src(&source).expect_err("declared uint<64> argument must be rejected");
+        let message = assert_invalid(&err);
+        assert!(
+            message.contains(owner) && message.contains("narrows"),
+            "{owner}: {message}"
+        );
+
+        for legal in [
+            source.replace("take16(wide_value())", "take16(wide_value() & 0xffff)"),
+            source.replace("take16(wide_value())", "take16(wide_value().trunc<16>())"),
+        ] {
+            let prog = lower_src(&legal)
+                .unwrap_or_else(|e| panic!("{owner} rejected a bounded argument: {e}"));
+            verify::verify_program(&prog)
+                .unwrap_or_else(|e| panic!("{owner} emitted invalid bounded-argument IR: {e:?}"));
+        }
+    }
+}
+
+#[test]
+fn tseq_arguments_share_directional_checks_and_ordered_materialization() {
+    let source = |argument: &str| {
+        format!(
+            r#"transaction Beat
+    value : uint<8>
+end transaction Beat
+
+const SMALL = 9
+const BIG = 0x10000
+const TYPED_NARROW : uint<16> = 0xffff
+const TYPED_WIDE : uint<64> = 1
+
+tseq Make(first: uint<16>, second: uint<8>) -> TSeq<Beat>
+    let beat : Beat
+    beat.value = second
+    yield beat
+end tseq Make
+
+testbench Tb
+    dut : Top
+    pending : queue<uint<8>>
+end testbench Tb
+
+impl T for Tb
+    run
+        let wide : uint<64> = 0x1234
+        let narrow : uint<8> = 7
+        let flag : uint<1> = 1
+        pending.push(3)
+        let values = Make({argument}, pending.pop())
+    end run
+end impl T"#
+        )
+    };
+
+    for argument in [
+        "narrow",
+        "wide & 0xffff",
+        "0xffff",
+        "SMALL",
+        "TYPED_NARROW",
+        "flag != 0 ? true : narrow",
+        "wide.trunc<16>()",
+    ] {
+        let prog = lower_src(&source(argument))
+            .unwrap_or_else(|e| panic!("legal tseq argument `{argument}` rejected: {e}"));
+        verify::verify_program(&prog)
+            .unwrap_or_else(|e| panic!("legal tseq argument `{argument}` failed IR verify: {e:?}"));
+    }
+
+    let ordered = lower_src(&source("wide & 0xffff")).expect("ordered tseq call lowers");
+    let run = ordered.function(ordered.tests[0].run);
+    let statements = &run.blocks[run.entry.index()].stmts;
+    let (call_position, first_arg) = statements
+        .iter()
+        .enumerate()
+        .find_map(|(position, stmt)| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::Tseq { name, .. }, args))
+                if name == "Make" =>
+            {
+                match args.first() {
+                    Some(ir::Expr::Local(local)) => Some((position, *local)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .expect("the tseq call consumes a snapshotted first argument");
+    assert_eq!(run.local(first_arg).ty, ir::IrType::UInt(Some(16)));
+    let snapshot_position = statements
+        .iter()
+        .position(|stmt| {
+            matches!(stmt, ir::Stmt::Assign(dest, ir::Expr::Binary(ir::BinOp::BitAnd, _, _)) if *dest == first_arg)
+        })
+        .expect("the bounded first argument has a typed snapshot");
+    let pop_position = statements
+        .iter()
+        .position(|stmt| matches!(stmt, ir::Stmt::TbQueuePop { field, .. } if field == "pending"))
+        .expect("the second argument pops the queue");
+    assert!(snapshot_position < pop_position && pop_position < call_position);
+
+    for argument in [
+        "wide",
+        "wide + SMALL",
+        "wide | SMALL",
+        "flag != 0 ? wide : SMALL",
+        "flag != 0 ? true : wide",
+        "0x10000",
+        "BIG",
+        "TYPED_WIDE",
+        "narrow + 0x10000",
+    ] {
+        let err = lower_src(&source(argument)).expect_err("narrowing tseq argument must reject");
+        let message = assert_invalid(&err);
+        assert!(
+            message.contains("parameter of tseq `Make`") && message.contains("narrows"),
+            "{argument}: {message}"
+        );
     }
 }
 
@@ -27676,9 +31643,9 @@ end test T"#,
     );
 }
 
-/// `past`/`rose`/`fell`/`stable` become latch slots: one `static`
+/// `past`/`rose`/`fell`/`stable` become latch slots: one per-run
 /// previous-value cell plus a per-cycle current-value local, written back
-/// at the end of the closure. Byte-for-byte the state machine v1 emits.
+/// at the end of the closure.
 #[test]
 fn temporal_readings_become_latch_slots() {
     let prog = lower_src(
@@ -27709,12 +31676,12 @@ end test T"#,
 end test T"#,
     );
     for needle in [
-        "static int64_t _harc_ps0 = 0;",
-        "static int64_t _harc_ps1 = 0;",
-        "(!_harc_ps0 && _harc_cur0)",
-        "_harc_ps1",
-        "_harc_ps0 = _harc_cur0;",
-        "_harc_ps1 = _harc_cur1;",
+        "int64_t property_run_s0_temporal_0 = 0;",
+        "int64_t property_run_s0_temporal_1 = 0;",
+        "(!_harc_runtime_cells.property_run_s0_temporal_0 && _harc_cur0)",
+        "_harc_runtime_cells.property_run_s0_temporal_1",
+        "_harc_runtime_cells.property_run_s0_temporal_0 = _harc_cur0;",
+        "_harc_runtime_cells.property_run_s0_temporal_1 = _harc_cur1;",
     ] {
         assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
     }
@@ -27804,10 +31771,9 @@ end test T"#;
     assert!(msg.contains("statement-level step"), "got: {msg}");
 }
 
-/// `cover` registers a witness counter and reports it at end of test. The
-/// counter is FILE-scope, unlike v1's coroutine-local `static` (which the
-/// end-of-test summary cannot see — v1's `cover` emission does not
-/// compile; see docs/tbir-mvp.md).
+/// `cover` registers a per-run witness counter and reports it at end of test.
+/// The counter is shared by the checker closure and end-of-test summary without
+/// leaking across sequential tests in one process.
 #[test]
 fn cover_registers_a_witness_counter_and_reports_it() {
     let src = r#"property hit_max
@@ -27837,19 +31803,14 @@ end test T"#;
     );
 
     let cpp = emit_cpp_src(src);
-    let counter = format!("_cov_{}_hits", prog.cover_checks[0].tag);
+    let counter = "_harc_runtime_cells.cover_run_s0_hits";
     assert!(
-        cpp.contains(&format!("static uint64_t {counter} = 0;")),
-        "the hit counter must be declared at file scope; got:\n{cpp}"
+        cpp.contains("uint64_t cover_run_s0_hits = 0;") && cpp.contains(counter),
+        "the hit counter must be owned by the per-run cell aggregate; got:\n{cpp}"
     );
-    // File scope means it is declared before `run_T`, not inside it.
-    let decl = cpp
-        .find(&format!("static uint64_t {counter} = 0;"))
-        .unwrap();
-    let run_fn = cpp.find("run_T(").expect("the test's run function");
     assert!(
-        decl < run_fn,
-        "the counter must precede the run function so the summary can read it"
+        !cpp.contains("static uint64_t _cov_"),
+        "cover state must not use process-lifetime mutable statics"
     );
     assert!(
         cpp.contains("harc_print_cover_summary(_cov_hit, _cov_total)")
@@ -27873,7 +31834,7 @@ fn cover_bodies_carry_temporal_latches() {
 end test T"#,
     );
     assert!(
-        cpp.contains("(_harc_ps0 && !_harc_cur0)"),
+        cpp.contains("(_harc_runtime_cells.cover_run_s0_temporal_0 && !_harc_cur0)"),
         "`fell` in a cover body must lower to its latch reading; got:\n{cpp}"
     );
 }
@@ -27979,7 +31940,7 @@ end test T"#;
     // lambda that dies with the enclosing `case`.
     for h in &prog.cycle_handlers {
         let f = prog.function(h.function);
-        assert_eq!(f.kind, ir::FunctionKind::TestHook);
+        assert!(matches!(f.kind, ir::FunctionKind::TestHook { .. }));
         assert!(f.params.is_empty());
     }
     let dump = format!("{prog}");
@@ -27990,18 +31951,20 @@ end test T"#;
 
     let cpp = emit_cpp_src(src);
     for needle in [
-        "static bool _onh_0_prev = false;",
-        "if (!_onh_0_prev && _onh_0_curr) {",
-        "_onh_0_prev = _onh_0_curr;",
-        "static int64_t _onh_1_last = 0;",
+        "bool cycle_run_hs0_previous = false;",
+        "if (!_harc_runtime_cells.cycle_run_hs0_previous && _onh_0_curr) {",
+        "_harc_runtime_cells.cycle_run_hs0_previous = _onh_0_curr;",
+        "int64_t cycle_run_hs1_last = 0;",
         "int64_t _onh_1_period = (int64_t)(3);",
-        "if (_onh_1_period > 0 && (int64_t)cycle_count - _onh_1_last >= _onh_1_period) {",
+        "if (_onh_1_period > 0 && (int64_t)cycle_count - _harc_runtime_cells.cycle_run_hs1_last >= _onh_1_period) {",
     ] {
         assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
     }
     // The body lambdas must be declared before the run coroutine, not
     // inside the switch case that registers them.
-    let lambda = cpp.find("_on_handler_0 = [&]").expect("body lambda");
+    let lambda = cpp
+        .find("test_hook_cycle_run_hs0 = [&]")
+        .expect("body lambda");
     let run_lambda = cpp.find("_run_slot_lambda = ").expect("run lambda");
     assert!(
         lambda < run_lambda,
@@ -28029,7 +31992,7 @@ fn on_handler_edge_modes_and_phase_route_like_v1() {
 end test T"#,
     );
     assert!(
-        cpp.contains("if (_onh_0_prev && !_onh_0_curr) {"),
+        cpp.contains("if (_harc_runtime_cells.cycle_run_hs0_previous && !_onh_0_curr) {"),
         "a falling-edge handler must latch the inverse transition; got:\n{cpp}"
     );
     assert!(
@@ -28091,7 +32054,7 @@ impl T for Tb
 end impl T"#;
     let hook_cpp = emit_cpp_src(hook_src);
     assert!(
-        hook_cpp.contains("Drv_send_post.push_back"),
+        hook_cpp.contains("_harc_hook_send_post.push_back"),
         "statement-position hook must emit a runtime registration"
     );
 
@@ -28304,11 +32267,10 @@ end test T"#,
 
 // ── Test-scope event channels (spec §3.4) ────────────────────────────
 //
-// `let e : event<T>` declares a subscriber list local to the enclosing
-// function; `on e(v) ... end on` pushes a subscriber and `emit e(x)` fans
-// out synchronously in subscription order. Same shape v1 emits — a
-// `std::vector<std::function<void(payload)>>` plus a `for` loop — with
-// the subscriber body factored into its own function.
+// `let e : event<T>` declares a subscriber list owned by the run. Because
+// subscribers are persistent callbacks, TB-IR hoists the list into run-owned
+// runtime state. `on e(v) ... end on` pushes a subscriber and `emit e(x)` fans
+// out synchronously in subscription order.
 
 #[test]
 fn test_scope_event_channels_lower() {
@@ -28334,15 +32296,15 @@ end test T"#;
     let handler = prog
         .functions
         .iter()
-        .find(|f| f.kind == ir::FunctionKind::TestHook)
+        .find(|f| matches!(f.kind, ir::FunctionKind::TestHook { .. }))
         .expect("a subscriber body function");
     assert_eq!(handler.params.len(), 1);
 
     let cpp = emit_cpp_src(src);
     for needle in [
-        "std::vector<std::function<void(uint64_t)>> e;",
-        "e.push_back([&](uint64_t _p) { _on_event_0(_p); });",
-        "for (auto& _s : e) _s(3);",
+        "std::vector<std::function<void(uint64_t)>> event_run_n1_e;",
+        "event_run_n1_e.push_back([&](uint64_t _p) { _harc_runtime_cells.test_hook_event_run_hs0(_p); });",
+        "for (auto& _s : _harc_runtime_cells.event_run_n1_e) _s(3);",
     ] {
         assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
     }
@@ -28371,10 +32333,13 @@ test T
 end test T"#,
     );
     assert!(
-        cpp.contains("std::vector<std::function<void(Txn)>> e;"),
+        cpp.contains("std::vector<std::function<void(Txn)>> event_run_n1_e;"),
         "a record payload is carried by value; got:\n{cpp}"
     );
-    assert!(cpp.contains("e.push_back([&](Txn _p)"), "{cpp}");
+    assert!(
+        cpp.contains("event_run_n1_e.push_back([&](Txn _p)"),
+        "{cpp}"
+    );
 }
 
 /// The channel is a value, not a variable: an initializer, a wrong arity,
@@ -28491,7 +32456,7 @@ end impl T"#
 
 /// One source `cover` inlined at two call sites is TWO registrations.
 /// Keying the counter on the source span alone gave both the same
-/// file-scope static name — a C++ redefinition, and a summary that read
+/// per-run cell name — a C++ redefinition, and a summary that read
 /// one counter twice.
 #[test]
 fn covers_inlined_at_two_call_sites_get_distinct_counters() {
@@ -28520,12 +32485,12 @@ end impl T"#;
     );
     assert_ne!(
         prog.cover_checks[0].tag, prog.cover_checks[1].tag,
-        "two file-scope statics may not share a name"
+        "two per-run coverage counters may not share a stable site identity"
     );
     let cpp = emit_cpp_src(src);
     let decls: Vec<&str> = cpp
         .lines()
-        .filter(|l| l.starts_with("static uint64_t _cov_"))
+        .filter(|l| l.trim_start().starts_with("uint64_t cover_run_") && l.contains("_hits = 0;"))
         .collect();
     assert_eq!(decls.len(), 2, "{decls:?}");
     assert_ne!(
@@ -28534,10 +32499,9 @@ end impl T"#;
     );
 }
 
-/// An unqualified cycle `wait` inside a statement-position `on` body becomes
-/// `co_await` in v1's void checker callback, so its generated C++ cannot
-/// compile. Other suspension forms take different paths and remain behind the
-/// conservative shared fence until measured separately.
+/// A synchronous cycle callback cannot advance time: doing so re-enters the
+/// checker pass that invoked it. The rejection is a language-safety rule,
+/// rather than a backend fallback.
 #[test]
 fn a_wait_inside_an_on_handler_body_is_rejected() {
     let src = r#"test T
@@ -28579,35 +32543,595 @@ fn other_suspending_on_handler_shapes_remain_conservatively_unsupported() {
         wait 2 cycles
     end run
 end test T"#,
-        r#"test T
-    let dut : Top
-    run
-        on dut.rst == 1
-            wait 1ps
-        end on
-        wait 2 cycles
-    end run
-end test T"#,
-        r#"function settle(d: Top)
-    d.rst = 0
+    )
+    .expect_err("a suspending handler body must not lower");
+    assert!(matches!(err, lower::LowerError::Invalid(_)), "{err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("statement-position cycle handler"),
+        "got: {msg}"
+    );
+    assert!(msg.contains("must complete without waiting"), "got: {msg}");
+}
+
+#[test]
+fn synchronous_lifecycle_callbacks_reject_transitive_time_advance() {
+    let cases = [
+        (
+            "testbench periodic through helper",
+            r#"function Delay()
     wait 1 cycle
-end function settle
+end function Delay
+
+testbench Tb
+    dut : Top
+    on 1 cycles
+        Delay()
+    end on
+end testbench Tb
+
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#,
+            "testbench periodic service",
+            "T_tb_periodic_0",
+        ),
+        (
+            "testbench cycle through testbench method",
+            r#"testbench Tb
+    dut : Top
+    function Delay()
+        wait 1 cycle
+    end Delay
+    on dut.rst == 1
+        Delay()
+    end on
+end testbench Tb
+
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#,
+            "testbench cycle-trigger service",
+            "Delay",
+        ),
+        (
+            "component periodic through component method",
+            r#"agent Worker
+    function Delay()
+        wait 1 cycle
+    end Delay
+    on 1 cycles
+        Delay()
+    end on
+end agent Worker
 
 test T
     let dut : Top
+    let worker : Worker
     run
-        on dut.rst == 1
-            settle(dut)
+        wait 1 cycle
+    end run
+end test T"#,
+            "component periodic handler",
+            "comp_method_0",
+        ),
+        (
+            "component cycle direct wait",
+            r#"agent Worker
+    armed : uint<1> default 0
+    on armed == 1
+        wait 1 cycle
+    end on
+end agent Worker
+
+test T
+    let dut : Top
+    let worker : Worker
+    run
+        wait 1 cycle
+    end run
+end test T"#,
+            "component cycle-trigger handler",
+            "comp_cycle_0",
+        ),
+        (
+            "component watchdog through TSeq",
+            r#"tseq Delay() -> TSeq<uint<8>>
+    wait 1 cycle
+    yield 1
+end tseq Delay
+
+agent Worker
+    watchdog
+        period 1 cycles
+        let values = Delay()
+    end watchdog
+end agent Worker
+
+test T
+    let dut : Top
+    let worker : Worker
+    run
+        wait 1 cycle
+    end run
+end test T"#,
+            "component watchdog",
+            "Delay",
+        ),
+        (
+            "component periodic through a test event subscriber",
+            r#"agent Worker
+    pulse : out event<uint<8>>
+    on 1 cycles
+        emit pulse(1)
+    end on
+end agent Worker
+
+test T
+    let dut : Top
+    let worker : Worker
+    run
+        on worker.pulse(value)
+            wait 1 cycle
+            log(info, "value=${value}")
         end on
         wait 2 cycles
     end run
 end test T"#,
+            "component periodic handler",
+            "T_on_event_run_hs0",
+        ),
+        (
+            "component periodic through a method-hook subscriber",
+            r#"agent Worker
+    hookable ping()
+        log(info, "ping")
+    end ping
+    on 1 cycles
+        ping()
+    end on
+end agent Worker
+
+test T
+    let dut : Top
+    let worker : Worker
+    run
+        on worker.ping post
+            wait 1 cycle
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+            "component periodic handler",
+            "T_on_method_hook_run_hs0",
+        ),
+        (
+            "component periodic through an event connect",
+            r#"agent Source
+    pulse : out event<uint<8>>
+    on 1 cycles
+        emit pulse(1)
+    end on
+end agent Source
+
+scoreboard Sink
+    hookable consume(value: uint<8>)
+        wait 1 cycle
+        log(info, "value=${value}")
+    end consume
+end scoreboard Sink
+
+env Pipeline
+    source : Source
+    sink : Sink
+    connect
+        source.pulse -> sink.consume
+    end connect
+end env Pipeline
+
+test T
+    let dut : Top
+    let pipeline : Pipeline
+    run
+        wait 2 cycles
+    end run
+end test T"#,
+            "component periodic handler",
+            "comp_method_1",
+        ),
+        (
+            "statement cycle through a blocking TLM call",
+            r#"bus MemoryBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus MemoryBus
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    let mem : MemoryBus = bind dut
+    run
+        on dut.rst == 0
+            let value = mem.read(1)
+            log(info, "value=${value}")
+        end on
+        wait 2 cycles
+    end run
+end impl T"#,
+            "statement-position cycle handler",
+            "blocking TLM call",
+        ),
     ];
-    for src in cases {
-        let err = lower_src(src).expect_err("a suspending handler body must not lower");
-        let msg = assert_unsupported(&err);
-        assert!(msg.contains("per-cycle checker pass"), "got: {msg}");
+
+    for (label, src, callback, dependency) in cases {
+        let err = lower_src(src).expect_err("a suspending callback must be rejected");
+        assert!(
+            matches!(err, lower::LowerError::Invalid(_)),
+            "{label}: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains(callback), "{label}: {message}");
+        assert!(message.contains(dependency), "{label}: {message}");
+        assert!(
+            message.contains("must complete without waiting"),
+            "{label}: {message}"
+        );
     }
+}
+
+#[test]
+fn ordinary_flow_hooks_may_advance_time_without_reentering_lifecycle_dispatch() {
+    lower_src(
+        r#"agent Worker
+    hookable ping()
+        log(info, "ping")
+    end ping
+end agent Worker
+
+test T
+    let dut : Top
+    let worker : Worker
+    run
+        on worker.ping post
+            wait 1 cycle
+        end on
+        worker.ping()
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .expect("a run-triggered hook may advance time outside lifecycle callback dispatch");
+}
+
+#[test]
+fn lifecycle_effect_analysis_preserves_exact_component_receivers() {
+    let hook = r#"agent Child
+    hookable ping()
+        log(info, "ping")
+    end ping
+end agent Child
+
+env Parent
+    left : Child
+    right : Child
+    on 1 cycles
+        left.ping()
+    end on
+end env Parent
+
+test T
+    let dut : Top
+    let parent : Parent
+    run
+        on parent.right.ping post
+            wait 1 cycle
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    lower_src(hook).expect("a waiting hook on the untouched sibling is not reentrant");
+    let matching_hook = hook.replace("on parent.right.ping post", "on parent.left.ping post");
+    let message = lower_src(&matching_hook)
+        .expect_err("a waiting hook on the lifecycle receiver must be rejected")
+        .to_string();
+    assert!(message.contains("component periodic handler"), "{message}");
+    assert!(message.contains("T_on_method_hook_run_hs0"), "{message}");
+
+    let subscription = r#"agent Child
+    pulse : out event<uint<8>>
+    function send()
+        emit pulse(1)
+    end send
+end agent Child
+
+env Parent
+    left : Child
+    right : Child
+    on 1 cycles
+        left.send()
+    end on
+end env Parent
+
+test T
+    let dut : Top
+    let parent : Parent
+    run
+        on parent.right.pulse(value)
+            wait 1 cycle
+            log(info, "value=${value}")
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    lower_src(subscription)
+        .expect("a waiting subscriber on the untouched sibling is not reentrant");
+    let matching_subscription = subscription.replace(
+        "on parent.right.pulse(value)",
+        "on parent.left.pulse(value)",
+    );
+    let message = lower_src(&matching_subscription)
+        .expect_err("a waiting subscriber on the lifecycle event must be rejected")
+        .to_string();
+    assert!(message.contains("component periodic handler"), "{message}");
+    assert!(message.contains("T_on_event_run_hs0"), "{message}");
+
+    let connect = r#"agent Source
+    pulse : out event<uint<8>>
+    function send()
+        emit pulse(1)
+    end send
+end agent Source
+
+scoreboard Sink
+    hookable consume(value: uint<8>)
+        wait 1 cycle
+        log(info, "value=${value}")
+    end consume
+end scoreboard Sink
+
+env Parent
+    left : Source
+    right : Source
+    sink : Sink
+    connect
+        right.pulse -> sink.consume
+    end connect
+    on 1 cycles
+        left.send()
+    end on
+end env Parent
+
+test T
+    let dut : Top
+    let parent : Parent
+    run
+        wait 2 cycles
+    end run
+end test T"#;
+    lower_src(connect).expect("a connect on the untouched sibling is not reentrant");
+    let matching_connect =
+        connect.replace("right.pulse -> sink.consume", "left.pulse -> sink.consume");
+    let message = lower_src(&matching_connect)
+        .expect_err("a lifecycle event feeding a waiting connect sink must be rejected")
+        .to_string();
+    assert!(message.contains("component periodic handler"), "{message}");
+    assert!(message.contains("comp_method_"), "{message}");
+
+    let transactor_hook = r#"transactor Worker
+    hookable ping()
+        log(info, "ping")
+    end ping
+end transactor Worker
+
+testbench Tb
+    dut : Top
+    left : Worker passive
+    right : Worker passive
+    on 1 cycles
+        left.ping()
+    end on
+end testbench Tb
+
+impl T for Tb
+    run
+        on right.ping post
+            wait 1 cycle
+        end on
+        wait 2 cycles
+    end run
+end impl T"#;
+    lower_src(transactor_hook)
+        .expect("a waiting transactor hook on the untouched sibling is not reentrant");
+    let matching_transactor_hook =
+        transactor_hook.replace("on right.ping post", "on left.ping post");
+    let message = lower_src(&matching_transactor_hook)
+        .expect_err("a waiting transactor hook on the lifecycle receiver must be rejected")
+        .to_string();
+    assert!(message.contains("testbench periodic service"), "{message}");
+    assert!(message.contains("T_on_method_hook_run_hs0"), "{message}");
+}
+
+#[test]
+fn lifecycle_effect_analysis_respects_effective_instance_modes() {
+    let active_only_root = r#"transactor Relay
+    ticks : uint<8> default 0
+    when active
+        on 1 cycles
+            wait 1 cycle
+        end on
+    end when
+end transactor Relay
+
+test T
+    let dut : Top
+    let relay : Relay passive
+    run
+        wait 2 cycles
+    end run
+end test T"#;
+    lower_src(active_only_root)
+        .expect("an active-only lifecycle body is not registered on a passive instance");
+    let passive_cpp = emit_cpp_src(active_only_root);
+    assert!(
+        !passive_cpp.contains("_per_relay_"),
+        "passive instance must not register the active-only lifecycle callback:\n{passive_cpp}"
+    );
+    let active_root = active_only_root.replace("Relay passive", "Relay active");
+    let message = lower_src(&active_root)
+        .expect_err("an active lifecycle callback that waits must be rejected")
+        .to_string();
+    assert!(message.contains("component periodic handler"), "{message}");
+
+    let active_only_event_handler = r#"transactor Relay
+    pulse : out event<uint<8>>
+    ticks : uint<8> default 0
+    on 1 cycles
+        emit pulse(1)
+    end on
+    when active
+        on pulse(value)
+            wait 1 cycle
+            ticks = ticks + value
+        end on
+    end when
+end transactor Relay
+
+test T
+    let dut : Top
+    let relay : Relay passive
+    run
+        wait 2 cycles
+    end run
+end test T"#;
+    lower_src(active_only_event_handler)
+        .expect("an active-only event handler is not registered on a passive instance");
+    let active_event_handler = active_only_event_handler.replace("Relay passive", "Relay active");
+    let message = lower_src(&active_event_handler)
+        .expect_err("an enabled event handler that waits must be rejected")
+        .to_string();
+    assert!(message.contains("component periodic handler"), "{message}");
+    assert!(message.contains("comp_on_"), "{message}");
+
+    let active_only_hook = r#"transactor Relay
+    hookable publish(value: uint<8>)
+        log(info, "value=${value}")
+    end publish
+    when active
+        on 1 cycles
+            publish(1)
+        end on
+    end when
+end transactor Relay
+
+test T
+    let dut : Top
+    let active_relay : Relay active
+    let passive_relay : Relay passive
+    run
+        on passive_relay.publish post
+            wait 1 cycle
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    lower_src(active_only_hook)
+        .expect("an inactive sibling hook is outside the active lifecycle path");
+    let matching_hook = active_only_hook.replace(
+        "on passive_relay.publish post",
+        "on active_relay.publish post",
+    );
+    let message = lower_src(&matching_hook)
+        .expect_err("the active lifecycle receiver reaches its waiting hook")
+        .to_string();
+    assert!(message.contains("component periodic handler"), "{message}");
+
+    let active_only_connect = r#"agent Source
+    pulse : out event<uint<8>>
+    on 1 cycles
+        emit pulse(1)
+    end on
+end agent Source
+
+transactor Sink
+    seen : uint<8> default 0
+    when active
+        hookable consume(value: uint<8>)
+            wait 1 cycle
+            log(info, "value=${value}")
+        end consume
+    end when
+end transactor Sink
+
+env Parent
+    source : Source
+    sink : Sink
+    connect
+        source.pulse -> sink.consume
+    end connect
+end env Parent
+
+test T
+    let dut : Top
+    let parent : Parent passive
+    run
+        wait 2 cycles
+    end run
+end test T"#;
+    lower_src(active_only_connect)
+        .expect("a connect into an inactive sink is not installed on a passive parent");
+    let passive_cpp = emit_cpp_src(active_only_connect);
+    assert!(
+        !passive_cpp.contains("parent.source.pulse.push_back"),
+        "a mode-disabled connect must not be registered:\n{passive_cpp}"
+    );
+    let active_connect = active_only_connect.replace("Parent passive", "Parent active");
+    let message = lower_src(&active_connect)
+        .expect_err("the enabled connect reaches its waiting sink")
+        .to_string();
+    assert!(message.contains("component periodic handler"), "{message}");
+    assert!(message.contains("comp_method_"), "{message}");
+}
+
+#[test]
+fn synchronous_lifecycle_rejection_points_at_the_callback_declaration() {
+    let source = r#"testbench Tb
+    dut : Top
+    on 1 cycles phase post_eval
+        wait 1 cycle
+    end on
+end testbench Tb
+
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#;
+    let parsed = harc::parser::parse_source_named("sync_callback.harc", source)
+        .expect("callback source parses");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    let error = lower::lower_program_diagnostic(&merged)
+        .expect_err("a synchronous callback that waits must be rejected");
+    assert_eq!(
+        &*merged
+            .source_for_id(error.source_id())
+            .expect("diagnostic source")
+            .name,
+        "sync_callback.harc"
+    );
+    let label = miette::Diagnostic::labels(&error)
+        .and_then(|mut labels| labels.next())
+        .expect("callback rejection has a source label");
+    let expected = source.find("on 1 cycles").expect("handler offset");
+    assert_eq!(label.offset(), expected);
+    assert!(
+        label.len() >= "on 1 cycles phase post_eval".len(),
+        "label must cover the callback declaration: {label:?}"
+    );
 }
 
 /// A check body may legitimately read a local of the function that
@@ -28750,6 +33274,51 @@ end impl T"#,
     );
 }
 
+#[test]
+fn component_clause_only_probe_reads_pull_the_root_header() {
+    for (label, clause) in [
+        (
+            "periodic period",
+            "    on dut.control cycles\n        log(info, \"periodic\")\n    end on",
+        ),
+        (
+            "cycle trigger",
+            "    on dut.control level\n        log(info, \"trigger\")\n    end on",
+        ),
+        (
+            "watchdog period and max_idle",
+            "    watchdog\n        period dut.control cycles\n        max_idle dut.control cycles\n        log(info, \"watchdog\")\n    end watchdog",
+        ),
+    ] {
+        let src = format!(
+            r#"agent ProbeWatcher
+{clause}
+end agent ProbeWatcher
+
+test T
+    let dut : Top
+        probe control : uint<8> at core.control
+    end let dut
+    let watcher : ProbeWatcher
+    run
+        wait 1 cycle
+    end run
+end test T"#,
+        );
+        let merged = merged_src(&src);
+        let prog = lower::lower_program(&merged)
+            .unwrap_or_else(|error| panic!("{label} lowers: {error}"));
+        verify::verify_program(&prog).unwrap_or_else(|error| panic!("{label} verifies: {error:?}"));
+        let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+            .unwrap_or_else(|error| panic!("{label} emits: {error}"));
+        assert!(cpp.contains("#include \"VTop___024root.h\""), "{label}: {cpp}");
+        assert!(
+            cpp.contains("Top__DOT__harc_probes__DOT__control"),
+            "{label}: {cpp}"
+        );
+    }
+}
+
 /// `for t in S()` — the generator call written inline, rather than bound
 /// to a `let` first. v1's `for (auto& t : S())` binds the returned vector
 /// to a temporary that lives for the whole loop, so the generator runs
@@ -28791,7 +33360,7 @@ end test T"#;
     // The generator is called exactly once, into the materialized local —
     // calling it in the loop header would re-run it every iteration.
     assert_eq!(
-        cpp.matches("= S();").count(),
+        cpp.matches("= harc_tseq_S();").count(),
         1,
         "the generator must run once; got:\n{cpp}"
     );
@@ -29423,7 +33992,8 @@ end impl T"#,
         "{cpp}"
     );
     assert!(
-        cpp.contains("harc_rt::harc_read(dut->a)") && cpp.contains("harc_printf_ll(lo)"),
+        cpp.contains("harc_rt::harc_read(dut->a)")
+            && cpp.contains("harc_printf_ll(_harc_runtime_cells.callback_capture_run_n2_lo)"),
         "both captures render inside the closure:\n{cpp}"
     );
 }
@@ -29522,7 +34092,7 @@ fn a_transactor_call_in_a_slice_bound_is_re_evaluated() {
     verify::verify_program(&prog).expect("nested sibling predicate verifies");
     let cpp = emit_cpp_src(&src);
     assert!(
-        cpp.contains("harc_bits") && cpp.contains("Xt_idx()"),
+        cpp.contains("harc_bits") && cpp.contains("Xt_idx(self_state)"),
         "the slice bound must call the sibling from the predicate closure:\n{cpp}"
     );
 }
@@ -29907,9 +34477,9 @@ end impl T"#,
     assert!(cpp.contains(".seen.pop()"), "{cpp}");
 }
 
-/// A queue method that is not `push`/`pop`/`size`/`empty` is not a v1
+/// A queue method that is not `push`/`pop`/`size`/`empty`/`front` is not a v1
 /// escape hatch, and in EXPRESSION position it is not a subset gap
-/// either: `size`/`empty` lower and `pop` has its own arm, so what
+/// either: `size`/`empty`/`front` lower and `pop` has its own arm, so what
 /// reaches the fallback is `push` (which returns void) or a name
 /// `harc_rt::HarcQueue` never declares. v1 emits `uint64_t z =
 /// <recv>.<name>(...);` for all of them and g++ rejects all of them:
@@ -29917,7 +34487,7 @@ end impl T"#,
 /// | call | g++ |
 /// |---|---|
 /// | `q.push(3)` | "void value not ignored as it ought to be" |
-/// | `q.front()` / `q.clear()` / a typo | "has no member named `front`" |
+/// | `q.back()` / `q.clear()` / a typo | "has no member named `back`" |
 ///
 /// So they are `Invalid`, which is what separates them from the same
 /// names in STATEMENT position — there the value is discarded, so
@@ -29940,23 +34510,23 @@ end impl T"#
         )
     };
     // Statement position: a program error, and the message names the API.
-    let msg = assert_invalid(&lower_src(&tb("q.front()")).unwrap_err());
+    let msg = assert_invalid(&lower_src(&tb("q.back()")).unwrap_err());
     assert!(
         msg.contains("in statement position") && msg.contains("has only"),
         "{msg}"
     );
     // Expression position: also a program error, by a different route.
-    let msg = assert_invalid(&lower_src(&tb("let v = q.front()")).unwrap_err());
+    let msg = assert_invalid(&lower_src(&tb("let v = q.back()")).unwrap_err());
     assert!(
         msg.contains("in expression position") && msg.contains("has only"),
         "{msg}"
     );
     // And v1's own attempt, which is what makes both `Invalid`.
-    for stmt in ["q.front()", "let v = q.front()"] {
+    for stmt in ["q.back()", "let v = q.back()"] {
         let v1 = cpp_tb::emit(&merged_src(&tb(stmt)))
             .unwrap_or_else(|e| panic!("`{stmt}`: v1 emits: {e}"));
         assert!(
-            v1.contains(".q.front();"),
+            v1.contains(".q.back();"),
             "`{stmt}`: v1 emits the call `HarcQueue` has no member for"
         );
     }
@@ -30214,7 +34784,7 @@ end impl T"#;
     errs : queue<uint<32>>
     hookable note(v: uint<32>)
         errs.push(v)
-        let z : uint<32> = errs.front()
+        let z : uint<32> = errs.back()
     end note
 end agent Coll
 
@@ -30232,7 +34802,7 @@ end test CqTest"#
             "bare target-state",
             state.replacen(
                 "            pending.push(value)",
-                "            pending.push(value)\n            let z : uint<8> = pending.front()",
+                "            pending.push(value)\n            let z : uint<8> = pending.back()",
                 1,
             ),
         ),
@@ -30240,7 +34810,7 @@ end test CqTest"#
             "instance-qualified target-state",
             state.replacen(
                 "        model.enqueue(7)",
-                "        model.enqueue(7)\n        let z : uint<8> = model.pending.front()",
+                "        model.enqueue(7)\n        let z : uint<8> = model.pending.back()",
                 1,
             ),
         ),
@@ -30253,7 +34823,7 @@ end test CqTest"#
         );
         let v1 = cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: {e}"));
         assert!(
-            v1.contains(".front();"),
+            v1.contains(".back();"),
             "{what}: v1 emits the call `HarcQueue` has no member for"
         );
     }
@@ -30588,7 +35158,15 @@ end impl T"#,
     let run = prog
         .functions
         .iter()
-        .find(|f| matches!(f.kind, ir::FunctionKind::Run { .. }))
+        .find(|f| {
+            matches!(
+                f.kind,
+                ir::FunctionKind::TestBody {
+                    member: ir::TestCallableMember::Run,
+                    ..
+                }
+            )
+        })
         .expect("run function");
     assert!(
         run.locals.iter().all(|local| local.name != "x"),
@@ -30630,7 +35208,10 @@ end test T"#,
     )
     .expect_err("using the placeholder still fails");
     let msg = format!("{err}");
-    assert!(msg.contains("x"), "the use-site diagnostic names `x`: {msg}");
+    assert!(
+        msg.contains("x"),
+        "the use-site diagnostic names `x`: {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -31748,7 +36329,7 @@ fn a_const_addrmap_base_or_size_folds() {
     // The folded base reaches the emitted ADDRESS, pre-shifted: the SA
     // register sits at offset 0x18, so base 0x60 puts it at 0x78 = 120.
     assert!(
-        literal.contains("AxilHelper_write(120,"),
+        literal.contains("AxilHelper_write(") && literal.contains(", 120, 4660)"),
         "the folded base is pre-shifted into the register address:\n{literal}"
     );
 
@@ -32251,7 +36832,7 @@ end impl TT"#
         );
         let cpp = emit_cpp_src(&declared);
         assert!(
-            cpp.contains(&format!("Drv_{name}(2)")),
+            cpp.contains(&format!("Drv_{name}(__harc_transactor_state_tb0_f0, 2)")),
             "declared `{name}` method must win over heartbeat lowering: {cpp}"
         );
     }
@@ -33124,13 +37705,16 @@ end impl T
         "v1 treats a sized literal whose value fits u64 as a host scalar"
     );
     assert!(
-        run.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
-            matches!(
-                stmt,
-                ir::Stmt::Assign(_, ir::Expr::WideLiteral(words))
-                    if words == &[0, 0, 1]
-            )
-        }),
+        run.blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .any(|stmt| {
+                matches!(
+                    stmt,
+                    ir::Stmt::Assign(_, ir::Expr::WideLiteral(words))
+                        if words == &[0, 0, 1]
+                )
+            }),
         "the 65-bit value lowers to three LSB-first words"
     );
 
@@ -34324,8 +38908,9 @@ fn a_const_coverpoint_target_folds() {
     // v1's side: it declares the constant and samples it, which is why
     // this is a gap to close rather than a divergence to document.
     let v1 = cpp_tb::emit(&merged_src(&with("const K = 7\n\n", "K"))).expect("v1 emits");
+    let k = v1_const_symbol(&v1, "K");
     assert!(
-        v1.contains("(uint64_t)(K)"),
+        v1.contains(&format!("(uint64_t)({k})")),
         "v1 samples the constant:\n{v1}"
     );
 }
@@ -34646,7 +39231,10 @@ fn coverpoint_compositions_preserve_wide_and_wrapping_widths() {
     );
 
     let lanes = fixture("packed_vec_lane_test.harc");
-    for (width, helper) in [(65, "harc_u128_shift_count"), (200, "harc_wide_shift_count")] {
+    for (width, helper) in [
+        (65, "harc_u128_shift_count"),
+        (200, "harc_wide_shift_count"),
+    ] {
         let wide_selector = source(&format!(
             "dut.count_out[(dut.en as uint<{width}>) + 2:(dut.en as uint<{width}>)]"
         ));
@@ -34661,9 +39249,7 @@ fn coverpoint_compositions_preserve_wide_and_wrapping_widths() {
 
         let wide_lane = lanes.replace(
             "cover dut.lane_id_out[2'd0]",
-            &format!(
-                "cover dut.lane_id_out[(dut.lane_valid_out[0] as uint<{width}>)]"
-            ),
+            &format!("cover dut.lane_id_out[(dut.lane_valid_out[0] as uint<{width}>)]"),
         );
         let prog = lower_src(&wide_lane).expect("wide runtime lane selector lowers");
         verify::verify_program(&prog).expect("wide runtime lane selector verifies");
@@ -34906,6 +39492,30 @@ end impl TypedCoverTest
         "unexpected verifier errors: {errs:?}"
     );
 
+    let mut stale_helper = lower_src(&valid).expect("valid helper target lowers");
+    let ir::Expr::Call(ir::CallTarget::Helper { function, .. }, _) =
+        &mut stale_helper.covgroups[0].points[0].target
+    else {
+        panic!("expected helper call")
+    };
+    *function = ir::FunctionId(u32::MAX);
+    let errs = verify::verify_program(&stale_helper)
+        .expect_err("cover helper identity corruption must fail verification");
+    assert!(
+        errs.iter().any(|err| {
+            let message = err.to_string();
+            message.contains("stale helper") && message.contains("fn4294967295")
+        }),
+        "unexpected verifier errors: {errs:?}"
+    );
+    let err = tbir::emit(
+        &stale_helper,
+        &merged_src(&valid),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect_err("cover emission must not recover a stale helper by name");
+    assert!(err.0.contains("stale helper fn4294967295"), "{err:?}");
+
     let mut bad_ternary = lower_src(&valid).expect("valid helper target lowers");
     let ir::Expr::Call(_, args) = &mut bad_ternary.covgroups[0].points[0].target else {
         panic!("expected helper call")
@@ -34947,16 +39557,23 @@ fn clocked_covergroup_passes_matching_wide_helper_argument() {
     opts.dut_port_widths.insert("wide".to_string(), 200);
     let tbir = tbir::emit(&prog, &merged, &opts).expect("tbir emits matching wide helper call");
     let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits matching wide helper call");
-    for cpp in [&tbir, &v1] {
-        assert!(
-            cpp.contains("HarcWide<7>"),
-            "wide carrier is retained:\n{cpp}"
-        );
-        assert!(
-            cpp.contains("classify_wide(harc_rt::harc_read(dut->wide))"),
-            "wide DUT value reaches the typed helper:\n{cpp}"
-        );
-    }
+    assert!(
+        tbir.contains("HarcWide<7>"),
+        "wide carrier is retained:\n{tbir}"
+    );
+    assert!(
+        v1.contains("HarcWide<7>"),
+        "wide carrier is retained:\n{v1}"
+    );
+    assert!(
+        tbir.contains("harc_helper_classify_wide(harc_rt::harc_read(dut->wide))"),
+        "wide DUT value reaches the typed helper:\n{tbir}"
+    );
+    let classify_wide = v1_callable_symbol(&v1, "classify_wide");
+    assert!(
+        v1.contains(&format!("{classify_wide}(harc_rt::harc_read(dut->wide))")),
+        "wide DUT value reaches the typed helper:\n{v1}"
+    );
 }
 
 #[test]
@@ -35384,8 +40001,7 @@ end impl MTest"#;
         // A PRESENT non-`TSeq` return has no `TSeq` args either, so
         // gating on "the args did not resolve" would have let these
         // default silently. The gate is `return_ty` being ABSENT.
-        "Req",
-        "uint<8>",
+        "Req", "uint<8>",
     ] {
         let src = SRC.replace(DECL, &format!("tseq Gen(n: int) -> {ret}"));
         let msg = assert_unsupported(&lower_src(&src).unwrap_err());
@@ -35401,7 +40017,10 @@ end impl MTest"#;
                 "        let t : Req\n        t.a = i\n        yield t\n",
                 "        yield i\n",
             );
-        assert!(emit_cpp_src(&src).contains("std::vector<uint64_t>"), "{ret}");
+        assert!(
+            emit_cpp_src(&src).contains("std::vector<uint64_t>"),
+            "{ret}"
+        );
     }
 
     // The default still applies where it is safe: an unannotated tseq
@@ -35481,7 +40100,7 @@ end impl FixedVectorTseqTest"#;
                 .iter()
                 .flat_map(|block| &block.stmts)
                 .find_map(|stmt| match stmt {
-                    ir::Stmt::Assign(dest, ir::Expr::Call(ir::CallTarget::Tseq(_), _)) => {
+                    ir::Stmt::Assign(dest, ir::Expr::Call(ir::CallTarget::Tseq { .. }, _)) => {
                         Some((fidx, *dest))
                     }
                     _ => None,
@@ -35919,6 +40538,33 @@ fn bound_transactor_thread_and_monitor_share_component_host() {
     );
     assert_eq!(prog.components[0].cycle_handlers.len(), 1);
     assert_eq!(prog.components[0].on_handlers.len(), 1);
+    let monitor = &prog.components[0].cycle_handlers[0];
+    let monitor_body = prog.function(monitor.function);
+    let capture = monitor_body
+        .blocks
+        .iter()
+        .flat_map(|block| block.stmts.iter())
+        .find_map(|stmt| match stmt {
+            ir::Stmt::DutRead(local, port) => Some((*local, port)),
+            _ => None,
+        })
+        .expect("handshake monitor captures its payload");
+    assert_eq!(monitor_body.local(capture.0).ty, ir::IrType::UInt(Some(8)));
+    assert_eq!(capture.1.value_type, Some(ir::IrType::UInt(Some(8))));
+    assert_eq!(capture.1.direction, Some(ir::PortDirection::Out));
+    let ir::Expr::Binary(ir::BinOp::And, valid, ready) = &monitor.trigger else {
+        panic!("handshake monitor trigger must be valid && ready");
+    };
+    let ir::Expr::Port(valid) = valid.as_ref() else {
+        panic!("handshake monitor valid trigger must be a bound bus port");
+    };
+    let ir::Expr::Port(ready) = ready.as_ref() else {
+        panic!("handshake monitor ready trigger must be a bound bus port");
+    };
+    assert_eq!(valid.value_type, Some(ir::IrType::Bool));
+    assert_eq!(valid.direction, Some(ir::PortDirection::Out));
+    assert_eq!(ready.value_type, Some(ir::IrType::Bool));
+    assert_eq!(ready.direction, Some(ir::PortDirection::In));
     assert!(prog.components[0]
         .fields
         .iter()
@@ -36528,7 +41174,7 @@ fn a_statement_position_hook_registers_at_its_runtime_position() {
     let stmt = hook_positions("", "", &pre_hook_on("s.send", "        "));
     let tbir_stmt = emit_cpp_src(&stmt);
     assert!(
-        tbir_stmt.contains("Sender_send_pre.push_back"),
+        tbir_stmt.contains("_harc_hook_send_pre.push_back"),
         "tbir registers the statement-position hook"
     );
 
@@ -36691,7 +41337,7 @@ fn a_nested_hook_path_registers_but_a_non_path_trigger_is_refused() {
     let nested = hook_positions("", &pre_hook_on("e.inner.note", "    "), "");
     let tbir = emit_cpp_src(&nested);
     assert!(
-        tbir.contains("Watcher_note_pre.push_back"),
+        tbir.contains("e.inner._harc_hook_note_pre.push_back"),
         "tbir registers the nested component hook"
     );
     assert!(
@@ -36743,8 +41389,8 @@ fn a_hook_on_a_non_transactor_field_registers() {
     }
     let component_cpp = emit_cpp_src(&hook("w.note"));
     assert!(
-        component_cpp.contains("Watcher_note_pre.push_back"),
-        "component hook must register on its type-scoped vector"
+        component_cpp.contains("w._harc_hook_note_pre.push_back"),
+        "component hook must register on its receiver-owned vector"
     );
     // The transactor case remains the control.
     lower_src(&hook("s.send")).expect("a transactor field lowers");
@@ -37019,7 +41665,7 @@ fn a_period_on_a_hooked_method_path_does_not_change_the_verdict() {
     let stmt = hook_positions("", "", &pre_hook_on("s.send cycles", "        "));
     let tbir = emit_cpp_src(&stmt);
     assert!(
-        tbir.contains("Sender_send_pre.push_back"),
+        tbir.contains("_harc_hook_send_pre.push_back"),
         "tbir wires the statement-position spelling"
     );
     assert!(
@@ -37298,9 +41944,10 @@ fn the_other_two_component_parameter_landings_do_not_agree() {
             .unwrap_or_else(|| panic!("`{needle}` missing from v1's output"))
     };
     // The const precedes the method-body use, so this one compiles.
+    let n = v1_const_symbol(&v1_param, "N");
     assert!(
-        line_of(&v1_param, "static constexpr int64_t N = 15;")
-            < line_of(&v1_param, "axil_w_strb, N)"),
+        line_of(&v1_param, &format!("static constexpr int64_t {n} = 15;"))
+            < line_of(&v1_param, &format!("axil_w_strb, {n})")),
         "the const precedes the use"
     );
     // And `#(N: int = 3)` is invisible: the same source with no
@@ -37373,9 +42020,10 @@ end impl SbTest
     );
     assert!(msg.contains("parameters on scoreboard"), "{msg}");
     let v1_silent = cpp_tb::emit(&merged_src(&silent)).expect("v1 emits");
+    let n = v1_const_symbol(&v1_silent, "N");
     assert!(
-        line_of(&v1_silent, "static constexpr int64_t N = 5;")
-            < line_of(&v1_silent, "_tb.b.hits > N"),
+        line_of(&v1_silent, &format!("static constexpr int64_t {n} = 5;"))
+            < line_of(&v1_silent, &format!("_tb.b.hits > {n}")),
         "the const precedes the handler trigger, so this compiles"
     );
     // Equal-length arguments, so source offsets do not shift and the
@@ -37400,9 +42048,10 @@ end impl SbTest
         lower::V1Status::SilentlyMisLowers,
     );
     let v1_default = cpp_tb::emit(&merged_src(&by_default)).expect("v1 emits");
+    let n = v1_const_symbol(&v1_default, "N");
     assert!(
         line_of(&v1_default, "uint64_t hits = N;")
-            < line_of(&v1_default, "static constexpr int64_t N = 5;"),
+            < line_of(&v1_default, &format!("static constexpr int64_t {n} = 5;")),
         "the field initializer precedes the const, so that position does not compile"
     );
 }
@@ -37569,9 +42218,10 @@ end impl ParamTest
             lower::V1Status::SilentlyMisLowers,
         );
         let v1_default = cpp_tb::emit(&merged_src(&by_default)).expect("v1 emits");
+        let n = v1_const_symbol(&v1_default, "N");
         assert!(
             line_of(&v1_default, "uint64_t limit = N;")
-                < line_of(&v1_default, "static constexpr int64_t N = 9;"),
+                < line_of(&v1_default, &format!("static constexpr int64_t {n} = 9;")),
             "{kind}: the initializer precedes the const, so it cannot compile"
         );
 
@@ -37582,8 +42232,10 @@ end impl ParamTest
             lower::V1Status::SilentlyMisLowers,
         );
         let v1_body = cpp_tb::emit(&merged_src(&by_body)).expect("v1 emits");
+        let n = v1_const_symbol(&v1_body, "N");
         assert!(
-            line_of(&v1_body, "static constexpr int64_t N = 9;") < line_of(&v1_body, "seen + N"),
+            line_of(&v1_body, &format!("static constexpr int64_t {n} = 9;"))
+                < line_of(&v1_body, &format!("seen + {n}")),
             "{kind}: the const precedes the use, so this one compiles"
         );
         // And the anchor that makes it a MIS-lowering rather than a
@@ -37708,9 +42360,10 @@ end impl RecTest
         lower::V1Status::SilentlyMisLowers,
     );
     let v1_default = cpp_tb::emit(&merged_src(&by_default)).expect("v1 emits");
+    let n = v1_const_symbol(&v1_default, "N");
     assert!(
         line_of(&v1_default, "uint64_t tag = N;")
-            < line_of(&v1_default, "static constexpr int64_t N = 5;"),
+            < line_of(&v1_default, &format!("static constexpr int64_t {n} = 5;")),
         "the field initializer precedes the const, so that position does not compile"
     );
 }
@@ -37753,9 +42406,10 @@ end test ParamTest
     assert!(msg.contains("test parameters"), "{msg}");
 
     let v1_shadowed = cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits");
+    let n = v1_const_symbol(&v1_shadowed, "N");
     assert!(
-        v1_shadowed.contains("static constexpr int64_t N = 9;")
-            && v1_shadowed.contains("harc_rt::harc_assign(dut->rst, N);"),
+        v1_shadowed.contains(&format!("static constexpr int64_t {n} = 9;"))
+            && v1_shadowed.contains(&format!("harc_rt::harc_assign(dut->rst, {n});")),
         "the const is emitted and the reference binds to it"
     );
     // The anchor: the same test with NO parameter list emits
@@ -37838,9 +42492,10 @@ end impl TbTest
     // v1 binds it to the const, and the parameter's own default 3
     // reaches nothing — the same shape as the other six landings.
     let v1 = cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits");
+    let n = v1_const_symbol(&v1, "N");
     assert!(
-        v1.contains("static constexpr int64_t N = 9;")
-            && v1.contains("harc_rt::harc_assign(dut->rst, N);"),
+        v1.contains(&format!("static constexpr int64_t {n} = 9;"))
+            && v1.contains(&format!("harc_rt::harc_assign(dut->rst, {n});")),
         "v1 binds the reference to the const"
     );
     let no_param = mk("const N = 9\n\n", "Tb", "N");
@@ -39024,7 +43679,7 @@ fn logf_takes_its_path_by_position_not_by_value() {
         out.lines()
             .filter(|l| l.contains("sim_logf_line(") || l.contains("sim_log_line(\""))
             .filter(|l| !l.contains("seed="))
-            .filter(|l| !l.contains("pop() on an empty queue"))
+            .filter(|l| !l.contains("on an empty queue"))
             .map(|l| l.trim().to_string())
             .collect::<Vec<_>>()
             .join(" ;; ")
@@ -39246,10 +43901,15 @@ fn a_named_argument_in_its_own_position_lowers_for_the_families_that_know_their_
         ("an extern fn", &extern_fn, "ref_add", "ref_add("),
     ] {
         let emitted = |call: &str| -> String {
-            cpp_tb::emit(&merged_src(&src(call)))
-                .unwrap_or_else(|e| panic!("{family}: v1 emits `{call}`: {e}"))
-                .lines()
-                .filter(|l| l.contains(needle))
+            let cpp = cpp_tb::emit(&merged_src(&src(call)))
+                .unwrap_or_else(|e| panic!("{family}: v1 emits `{call}`: {e}"));
+            let needle = if family == "a helper" {
+                format!("{}(", v1_callable_symbol(&cpp, callee))
+            } else {
+                needle.to_string()
+            };
+            cpp.lines()
+                .filter(|l| l.contains(&needle))
                 .map(|l| l.trim().to_string())
                 .collect::<Vec<_>>()
                 .join(" ;; ")
@@ -39321,10 +43981,11 @@ fn a_covergroup_helper_call_judges_a_named_argument_by_its_position() {
         )
     };
     let emitted = |call: &str| -> String {
-        cpp_tb::emit(&merged_src(&src(call)))
-            .unwrap_or_else(|e| panic!("v1 emits `{call}`: {e}"))
-            .lines()
-            .filter(|l| l.contains("pick("))
+        let cpp = cpp_tb::emit(&merged_src(&src(call)))
+            .unwrap_or_else(|e| panic!("v1 emits `{call}`: {e}"));
+        let pick = v1_callable_symbol(&cpp, "pick");
+        cpp.lines()
+            .filter(|l| l.contains(&format!("{pick}(")))
             .map(|l| l.trim().to_string())
             .collect::<Vec<_>>()
             .join(" ;; ")
@@ -39333,7 +43994,7 @@ fn a_covergroup_helper_call_judges_a_named_argument_by_its_position() {
     // v1's behaviour, which the classification rests on.
     let positional = emitted("pick(dut.count_out[3:0], 1)");
     assert!(
-        positional.contains("pick("),
+        positional.contains("harc_user_callable_pick_"),
         "the helper call reaches v1's output"
     );
     assert_eq!(
@@ -39401,7 +44062,7 @@ fn a_statement_position_hook_is_judged_by_resolution_not_shape() {
     cpp_tb::emit(&merged_src(&with("drv.send"))).expect("v1 emits a resolving hook path");
     let tbir = emit_cpp_src(&with("drv.send"));
     assert!(
-        tbir.contains("HookXactor_send_pre.push_back"),
+        tbir.contains("_harc_hook_send_pre.push_back"),
         "tbir emits the resolving runtime hook"
     );
 
@@ -39595,11 +44256,12 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
         let shadowed = format!("const limit = 7\n\n{named}");
         let v1 = cpp_tb::emit(&merged_src(&shadowed))
             .unwrap_or_else(|e| panic!("{what}: v1 emits the shadowed period: {e}"));
+        let limit = v1_const_symbol(&v1, "limit");
         let konst = v1
-            .find("static constexpr int64_t limit = 7;")
+            .find(&format!("static constexpr int64_t {limit} = 7;"))
             .unwrap_or_else(|| panic!("{what}: v1 must emit the const"));
         let used = v1
-            .find("_period = (int64_t)(limit);")
+            .find(&format!("_period = (int64_t)({limit});"))
             .unwrap_or_else(|| panic!("{what}: v1 must emit the named period"));
         let lt = v1
             .find("int64_t limit = 5;")
@@ -39907,11 +44569,7 @@ fn a_single_named_event_payload_binds_to_the_only_slot() {
     );
 
     let self_relative = fixture("analysis_sink_connect_test.harc");
-    let self_named = self_relative.replacen(
-        "emit observed(v)",
-        "emit observed(payload = v)",
-        1,
-    );
+    let self_named = self_relative.replacen("emit observed(v)", "emit observed(payload = v)", 1);
 
     let local = r#"domain SysDomain
   freq_mhz: 100
@@ -39942,11 +44600,7 @@ end test T
             self_named.as_str(),
             "for (auto& _s : self.observed) _s(v);",
         ),
-        (
-            "test-scope local",
-            local,
-            "for (auto& _s : e) _s(7);",
-        ),
+        ("test-scope local", local, "_s(7);"),
     ] {
         let cpp = emit_cpp_src(src);
         assert!(
@@ -40040,7 +44694,10 @@ fn a_component_body_emit_resolves_nested_child_event_paths() {
         &lower_src(&unresolved).unwrap_err(),
         lower::V1Status::EmitsUncompilable,
     );
-    assert!(msg.contains("does not resolve to a component event"), "{msg}");
+    assert!(
+        msg.contains("does not resolve to a component event"),
+        "{msg}"
+    );
 
     for bad in [
         ("emit sink.received(v)", "emit sink.ghost.received(v)"),
@@ -40086,9 +44743,7 @@ end test T
     let active = lower_src(&active_src)
         .expect("an explicit active descendant exposes its active-only event");
     verify::verify_program(&active).expect("the active descendant verifies");
-    let msg = assert_invalid(
-        &lower_src(&mode_src("holder.emitter", "passive")).unwrap_err(),
-    );
+    let msg = assert_invalid(&lower_src(&mode_src("holder.emitter", "passive")).unwrap_err());
     assert!(msg.contains("passive component parameter path"), "{msg}");
 
     let mut broken_mode = active;
@@ -40240,8 +44895,7 @@ end impl T"#,
         let merged = merged_src(&s);
         tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
             .unwrap_or_else(|e| panic!("{what}: TBIR emits a sign mismatch: {e}"));
-        cpp_tb::emit(&merged)
-            .unwrap_or_else(|e| panic!("{what}: v1 emits a sign mismatch: {e}"));
+        cpp_tb::emit(&merged).unwrap_or_else(|e| panic!("{what}: v1 emits a sign mismatch: {e}"));
     }
 }
 
@@ -40299,11 +44953,12 @@ fn a_testbench_periodic_handler_with_a_named_period_is_not_an_escape_hatch() {
     // decided by emission position.
     let shadowed = format!("const per = 7\n\n{named}");
     let v1 = cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits");
+    let per = v1_const_symbol(&v1, "per");
     let konst = v1
-        .find("static constexpr int64_t per = 7;")
+        .find(&format!("static constexpr int64_t {per} = 7;"))
         .expect("v1 emits the const at namespace scope");
     let used = v1
-        .find("_period = (int64_t)(per);")
+        .find(&format!("_period = (int64_t)({per});"))
         .expect("v1 emits the named period");
     let lt = v1.find("int64_t per = 2;").expect("v1 emits the `let`");
     assert!(
@@ -40703,7 +45358,11 @@ end impl SpTest"#
             .find("_onh_0_period = (int64_t)(")
             .unwrap_or_else(|| panic!("{what}: TB-IR must emit the named period"));
         assert!(
-            tbir[tbir_used..].lines().next().unwrap_or("").contains("per"),
+            tbir[tbir_used..]
+                .lines()
+                .next()
+                .unwrap_or("")
+                .contains("per"),
             "{what}: TB-IR period expression must retain the named local"
         );
         assert!(
@@ -40738,8 +45397,9 @@ end impl SpTest"#
     // happens when the registration sits above the `let`.
     let shadowed = src("per", "const per = 7\n\n");
     let v1 = cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits");
+    let per = v1_const_symbol(&v1, "per");
     let konst = v1
-        .find("static constexpr int64_t per = 7;")
+        .find(&format!("static constexpr int64_t {per} = 7;"))
         .expect("v1 emits the const");
     let lt = v1.find("int64_t per = 2;").expect("v1 emits the `let`");
     let used = v1
@@ -40858,7 +45518,10 @@ end impl SpTest"#
             &lower_src(&src(negative, "")).expect_err("negative literals are silent no-ops"),
             lower::V1Status::SilentlyMisLowers,
         );
-        assert!(msg.contains("non-positive literal period"), "{negative}: {msg}");
+        assert!(
+            msg.contains("non-positive literal period"),
+            "{negative}: {msg}"
+        );
     }
 
     // Verifier backstop: a corrupted period expression cannot reference a
@@ -40903,7 +45566,11 @@ end impl SpTest"#
     let owner = aggregate_period
         .functions
         .iter_mut()
-        .find(|f| f.locals.get(period_local.index()).is_some_and(|l| l.name == "per"))
+        .find(|f| {
+            f.locals
+                .get(period_local.index())
+                .is_some_and(|l| l.name == "per")
+        })
         .expect("owning run function");
     owner.locals[period_local.index()].ty = ir::IrType::FixedVec {
         elem: Box::new(ir::IrType::UInt(Some(8))),
@@ -40916,39 +45583,17 @@ end impl SpTest"#
 }
 
 /// Naming a component method that does not exist, and using a `void`
-/// method's result as a value. Six arms across two files said
-/// `Unsupported` for these — "re-run with `--codegen v1`" — and v1
-/// emits both, verbatim and uncompilable:
+/// method's result as a value, are program errors. v1 emits both forms
+/// verbatim and the resulting C++ does not compile:
 ///
 /// | source | v1 emits | g++ |
 /// |---|---|---|
 /// | `let x : uint<32> = c.nosuch(3)` | `uint64_t x = c.nosuch(3);` | "'struct Calc' has no member named 'nosuch'" |
 /// | `let x : uint<32> = c.noret(3)` | `uint64_t x = Calc_noret(c, 3);` | "void value not ignored as it ought to be" |
 ///
-/// Both are type errors: a call to a method that is not there, and a
-/// value taken from something that produces none. No backend runs
-/// either, in any configuration — unlike the `connect` arms, there is
-/// no uninstantiated position for a statement in a run body to hide in.
-/// So `Invalid`, which is what `exprs.rs`'s transactor-shaped sibling
-/// (`transactor \`{}\` has no method \`{}\``) has said all along.
-///
-/// WHAT THIS TEST ACTUALLY REACHES, because six arms is not six
-/// measurements. Mutating each arm in turn and re-running:
-///
-///   * the resolver's path-form arm in `components.rs` — reached, and
-///     the only landing for a missing method. Mutating it fails below.
-///   * the untyped-`let` "returns no value" arm in `stmts.rs` —
-///     reached. Mutating it fails below.
-///   * the three "has no method" arms in `stmts.rs` — UNREACHABLE.
-///     `as_component_method_call` validates the method on every path
-///     that returns `Ok(Some(..))`, so a caller holding a resolved
-///     method always has one. Mutating any of them fails nothing.
-///   * the typed-`let` and assignment "returns no value" arms, and the
-///     parameter-form resolver arm — REACHED, each with a two-line
-///     probe, after an earlier version of this doc recorded all three
-///     as "not probed". They are covered below. The parameter-form arm
-///     in particular means a missing method has TWO landings, not the
-///     one that earlier version claimed.
+/// The receiver resolver reports a missing method. The central
+/// value-materialization seam reports a void result uniformly for typed and
+/// inferred locals, assignments, and nested expressions.
 ///
 /// And the set this arm fires on is "not a DECLARED method", which is
 /// wider than "does not exist": the built-in predicates `idle`,
@@ -41011,6 +45656,11 @@ end test NmTest"#
             "let x = c.noret(3)",
             "returns no value",
         ),
+        (
+            "nested expression, void method",
+            "let x = 1 + c.noret(3)",
+            "returns no value",
+        ),
     ] {
         let s = src(call);
         let msg = assert_invalid(&lower_src(&s).unwrap_err());
@@ -41021,11 +45671,7 @@ end test NmTest"#
         cpp_tb::emit(&merged_src(&s)).unwrap_or_else(|e| panic!("{what}: v1 emits: {e}"));
     }
 
-    // The three arms an earlier version of this test recorded as
-    // unreachable-by-probe. Each takes two lines.
-    //
-    // A RECORD-typed `let` is not claimed by the untyped handler — that
-    // arm is guarded on a record type name.
+    // A record-typed destination uses the same value-position diagnostic.
     let rec = src("let t : TinyTxn = c.noret(3)").replacen(
         "agent Calc",
         "struct TinyTxn\n    a : uint<8> default 0\nend struct TinyTxn\n\nagent Calc",
@@ -41034,7 +45680,7 @@ end test NmTest"#
     let msg = assert_invalid(&lower_src(&rec).unwrap_err());
     assert!(msg.contains("returns no value"), "record let: {msg}");
 
-    // An ASSIGNMENT is not a `let`, so nothing claims it first.
+    // Assignment and nested-expression positions use that seam too.
     let asg = src("let x : uint<32> = 0\n        x = c.noret(3)");
     let msg = assert_invalid(&lower_src(&asg).unwrap_err());
     assert!(msg.contains("returns no value"), "assignment: {msg}");
@@ -41121,12 +45767,7 @@ end test PTest"#;
     }
 
     // A component that DECLARES the name gets its own method, on both
-    // backends — the built-in is a default, not a reserved word. TB-IR
-    // used to reach `as_component_idle` first and emit the heartbeat
-    // against a program whose `idle` returns 7, silently disagreeing
-    // with v1's `Calc_idle(c, 2)`. Now the declaration wins, so the
-    // call is an ordinary component-method call and takes that path's
-    // (pre-existing, name-independent) expression-position gap.
+    // backends — the built-in is a default, not a reserved word.
     for name in ["idle", "idle_in", "idle_out", "quiesced"] {
         let declared = src(&format!("assert c.{name}(2) == 7 else fail(\"o\")")).replacen(
             "agent Calc",
@@ -41136,22 +45777,16 @@ end test PTest"#;
             ),
             1,
         );
-        let msg = format!("{}", lower_src(&declared).unwrap_err());
+        let prog = lower_src(&declared)
+            .unwrap_or_else(|e| panic!("{name}: declared method value lowers: {e}"));
+        verify::verify_program(&prog)
+            .unwrap_or_else(|e| panic!("{name}: declared method value verifies: {e:?}"));
+        let tbir = emit_cpp_src(&declared);
         assert!(
-            msg.contains(&format!("`.{name}(...)`")),
-            "{name}: the declaration must win, leaving the ordinary method-call gap: {msg}"
+            tbir.contains(&format!("Calc_{name}(c, 2)")),
+            "{name}: TB-IR calls the declared method: {tbir}"
         );
-        // The same refusal an ordinary name gets — the point is that it
-        // is name-independent now.
-        let ordinary = declared.replacen(name, "ordinary", 4);
-        let plain = format!("{}", lower_src(&ordinary).unwrap_err());
-        assert_eq!(
-            msg.replace(name, "ordinary"),
-            plain,
-            "{name}: a declared built-in name must refuse exactly like any other method"
-        );
-        // v1 dispatches to the user's method, which is the behaviour
-        // TB-IR now declines to contradict.
+        // v1 dispatches to the user's method, and TB-IR agrees.
         let v1 = cpp_tb::emit(&merged_src(&declared)).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert!(
             v1.contains(&format!("Calc_{name}(c, 2)")),
@@ -41530,11 +46165,11 @@ fn method_hook_subscription_metadata_is_verified() {
 
     let cpp = emit_cpp_src(&src);
     assert!(
-        cpp.contains("std::function<void(int64_t)>")
-            && cpp.contains("MethodHookWatcher_note_pre.push_back([&](int64_t _h0)")
-            && cpp.contains("MethodHookWatcher_note_post.push_back([&](int64_t _h0)")
-            && cpp.contains("std::function<void(int64_t, int64_t&)> _on_method_hook_")
-            && cpp.contains("(_h0, __harc_hook_capture_fn"),
+        cpp.contains("std::vector<std::function<void(int64_t)>> _harc_hook_note_pre;")
+            && cpp.contains("env.watcher._harc_hook_note_pre.push_back([&](int64_t _h0)")
+            && cpp.contains("env.watcher._harc_hook_note_post.push_back([&](int64_t _h0)")
+            && cpp.contains("std::function<void(int64_t, int64_t&)> test_hook_method_run_hs")
+            && cpp.contains("(_h0, _harc_runtime_cells.callback_capture_run"),
         "signed method-hook parameters remain signed:\n{cpp}"
     );
 
@@ -41672,10 +46307,10 @@ end impl ShapeTest
     verify::verify_program(&prog).expect("sequence/component method hooks verify");
     let cpp = emit_cpp_src(src);
     assert!(
-        cpp.contains("std::vector<std::function<void(std::vector<uint64_t>)>> HookShapes_feed_pre")
-            && cpp.contains("std::vector<std::function<void(Provider)>> HookShapes_comp_pre")
-            && cpp.contains("std::function<void(std::vector<uint64_t>)> _on_method_hook_")
-            && cpp.contains("std::function<void(Provider)> _on_method_hook_"),
+        cpp.contains("std::vector<std::function<void(std::vector<uint64_t>)>> _harc_hook_feed_pre")
+            && cpp.contains("std::vector<std::function<void(Provider)>> _harc_hook_comp_pre")
+            && cpp.contains("std::function<void(std::vector<uint64_t>)> test_hook_method_run_hs")
+            && cpp.contains("std::function<void(Provider)> test_hook_method_run_hs"),
         "hook vector and handler signatures must match aggregate method ABIs:\n{cpp}"
     );
 }
@@ -41711,16 +46346,16 @@ end impl PlainTest
 "#;
     let cpp = emit_cpp_src(src);
     assert_eq!(
-        cpp.matches("std::vector<std::function<void()>> SharedHookAgent_ping_pre;")
+        cpp.matches("std::vector<std::function<void()>> _harc_hook_ping_pre;")
             .count(),
         1,
-        "only the owning test should declare the type-scoped hook vector:\n{cpp}"
+        "the component type should declare one receiver-owned hook vector:\n{cpp}"
     );
     assert_eq!(
-        cpp.matches("for (auto& _h : SharedHookAgent_ping_pre) _h();")
+        cpp.matches("for (auto& _h : self._harc_hook_ping_pre) _h();")
             .count(),
         1,
-        "only the owning test should fan out the hook vector:\n{cpp}"
+        "only the subscribed test's method body should fan out the hook vector:\n{cpp}"
     );
 }
 
@@ -41751,7 +46386,7 @@ fn hoisted_method_hook_capture_cannot_shadow_a_check_phase_component() {
     verify::verify_program(&prog).expect("local spelling does not invalidate IR");
     let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
     assert!(
-        cpp.contains("int64_t __harc_hook_capture_fn")
+        cpp.contains("int64_t callback_capture_run")
             && cpp.contains("MethodHookWatcher_note(env.watcher, 3)")
             && !cpp.contains("uint64_t env = 0"),
         "capture storage must not shadow the check-phase component instance:\n{cpp}"
@@ -41763,16 +46398,17 @@ fn hoisted_method_hook_capture_cannot_shadow_a_check_phase_component() {
 /// component queue, bare target-state field, instance-qualified
 /// target-state field — and each splits, because v1 emits the call
 /// against `harc_rt::HarcQueue`, whose whole API is
-/// `push`/`pop`/`size`/`empty`.
+/// `push`/`pop`/`size`/`empty`/`front`.
 ///
 /// | statement | v1 emits | g++ |
 /// |---|---|---|
 /// | `sb.q.size()` | `_tb.sb.q.size();` | compiles — the value is discarded, so it is a legal no-op |
 /// | `sb.q.empty()` | `_tb.sb.q.empty();` | compiles, same |
 /// | `sb.q.clear()` | `_tb.sb.q.clear();` | "'struct harc_rt::HarcQueue<long unsigned int>' has no member named 'clear'" |
-/// | `sb.q.front()` | `_tb.sb.q.front();` | same, no `front` |
+/// | `sb.q.front()` | `_tb.sb.q.front();` | compiles and performs a guarded non-destructive read |
 ///
-/// TB-IR now accepts the `size`/`empty` no-ops; everything else remains a
+/// TB-IR accepts the `size`/`empty` no-ops and executes a discarded `front`
+/// so its empty-queue guard remains observable; everything else remains a
 /// program error no backend runs.
 ///
 /// All FIVE landings were probed independently rather than four
@@ -41881,8 +46517,8 @@ end impl TbQTest"#
         ("bare target-state field", &bare_state),
         ("instance-qualified target-state field", &inst_state),
     ] {
-        // `size`/`empty` — both backends accept the legal no-op.
-        for method in ["size", "empty"] {
+        // The three read-only queries are accepted by both backends.
+        for method in ["size", "empty", "front"] {
             let s = src(method);
             let prog = lower_src(&s)
                 .unwrap_or_else(|e| panic!("{what}/{method}: TB-IR lowers the no-op: {e}"));
@@ -41897,11 +46533,11 @@ end impl TbQTest"#
         }
 
         // Anything else — v1 emits a call `HarcQueue` does not have.
-        for method in ["clear", "front", "nosuch"] {
+        for method in ["clear", "back", "nosuch"] {
             let s = src(method);
             let msg = assert_invalid(&lower_src(&s).unwrap_err());
             assert!(
-                msg.contains("has only `push`, `pop`, `size` and `empty`"),
+                msg.contains("has only `push`, `pop`, `size`, `empty`, and `front`"),
                 "{what}/{method}: {msg}"
             );
             let v1 = cpp_tb::emit(&merged_src(&s))
@@ -41921,7 +46557,13 @@ end impl TbQTest"#
         Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/harc_queue_rt.h"),
     )
     .expect("runtime header readable");
-    for decl in ["void push(", "T pop(", "bool empty(", "size_t size("] {
+    for decl in [
+        "void push(",
+        "T pop(",
+        "T front(",
+        "bool empty(",
+        "size_t size(",
+    ] {
         assert!(hdr.contains(decl), "HarcQueue must still declare `{decl}`");
     }
     // Scan for MEMBER DECLARATIONS, not any occurrence: `pop`'s body
@@ -42016,12 +46658,13 @@ end impl TbQTest"#
         members,
         vec![
             "empty".to_string(),
+            "front".to_string(),
             "pop".to_string(),
             "push".to_string(),
             "size".to_string()
         ],
         "`HarcQueue`'s member set changed; `queue_method_in_statement_position` splits on \
-         `size`/`empty` and calls everything else a program error, so that list has to move \
+         `size`/`empty`/`front` and calls everything else a program error, so that list has to move \
          with the header"
     );
     // What this still does not see, stated rather than implied: an
@@ -43257,7 +47900,15 @@ fn wide_component_scalar_state_keeps_its_declared_type_at_every_seam() {
     let run = prog
         .functions
         .iter()
-        .find(|f| matches!(f.kind, ir::FunctionKind::Run { .. }))
+        .find(|f| {
+            matches!(
+                f.kind,
+                ir::FunctionKind::TestBody {
+                    member: ir::TestCallableMember::Run,
+                    ..
+                }
+            )
+        })
         .expect("the run body is lowered");
 
     // Seam 2 — an UNTYPED read takes the field's exact type. Before
@@ -44784,15 +49435,13 @@ end impl T"#
     let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
         .expect("bound predicate call emits");
     assert!(
-        cpp.contains("Xt_idx()"),
+        cpp.contains("Xt_idx(__harc_transactor_state_tb0_f0)"),
         "the bound call must remain inside the emitted predicate: {cpp}"
     );
 
     let cpp = emit_cpp_src(&fixture("transactor_wait_bound_predicate_test.harc"));
     assert!(
-        cpp.contains(
-            "CounterPredicate_reached(pred, harc_rt::harc_read(dut->count_out))"
-        ),
+        cpp.contains("CounterPredicate_reached(pred, harc_rt::harc_read(dut->count_out))"),
         "the direct bound predicate must forward instance state and re-read its DUT argument: \
          {cpp}"
     );
@@ -45288,8 +49937,8 @@ end impl T"#
     for kind in ["scoreboard", "agent", "env"] {
         for elem in ["Beat", "Vec<Beat, 2>"] {
             let src = mk(kind, elem);
-            let prog = lower_src(&src)
-                .unwrap_or_else(|e| panic!("[{kind}] `Vec<{elem}, 2>` lowers: {e}"));
+            let prog =
+                lower_src(&src).unwrap_or_else(|e| panic!("[{kind}] `Vec<{elem}, 2>` lowers: {e}"));
             verify::verify_program(&prog)
                 .unwrap_or_else(|e| panic!("[{kind}] `Vec<{elem}, 2>` verifies: {e:?}"));
             let cpp = emit_cpp_src(&src);
@@ -45327,7 +49976,10 @@ end impl T"#
                 &mut vec.elem
             };
             *leaf = ir::IrType::Record(ir::RecordId(999));
-            assert!(verify::verify_program(&broken).is_err(), "bad record ref is rejected");
+            assert!(
+                verify::verify_program(&broken).is_err(),
+                "bad record ref is rejected"
+            );
         }
     }
 }
@@ -45399,10 +50051,9 @@ end impl T"#;
     let err = lower_src(&mismatch).expect_err("event vectors require an exact length match");
     assert!(assert_invalid(&err).contains("does not match fixed-vector payload"));
 
-    let width_mismatch =
-        src.replace("values : Vec<uint<8>, 4>", "values : Vec<uint<16>, 4>");
-    let err = lower_src(&width_mismatch)
-        .expect_err("event vectors require an exact element-width match");
+    let width_mismatch = src.replace("values : Vec<uint<8>, 4>", "values : Vec<uint<16>, 4>");
+    let err =
+        lower_src(&width_mismatch).expect_err("event vectors require an exact element-width match");
     assert!(assert_invalid(&err).contains("does not match fixed-vector payload"));
 
     let mut verifier_width_mismatch = prog.clone();
@@ -45499,9 +50150,7 @@ end impl T"#;
     verify::verify_program(&nested_prog).expect("nested fixed-vector event payload verifies");
     let nested_cpp = emit_cpp_src(&nested);
     assert!(
-        nested_cpp.contains(
-            "std::function<void(std::array<std::array<uint64_t, 2>, 4>)>"
-        ),
+        nested_cpp.contains("std::function<void(std::array<std::array<uint64_t, 2>, 4>)>"),
         "{nested_cpp}"
     );
 
@@ -45612,9 +50261,7 @@ end impl T"#;
     verify::verify_program(&nested_prog).expect("nested record-vector event payload verifies");
     let nested_cpp = emit_cpp_src(&nested);
     assert!(
-        nested_cpp.contains(
-            "std::function<void(std::array<std::array<Beat, 2>, 4>)>"
-        ),
+        nested_cpp.contains("std::function<void(std::array<std::array<Beat, 2>, 4>)>"),
         "{nested_cpp}"
     );
 
@@ -45776,7 +50423,9 @@ end impl RT"#;
     assert_eq!(method.ret_ty, Some(expected_return.clone()));
     let function = &aggregate_return.functions[method.function.index()];
     assert_eq!(
-        function.ret.map(|ret| function.locals[ret.index()].ty.clone()),
+        function
+            .ret
+            .map(|ret| function.locals[ret.index()].ty.clone()),
         Some(expected_return.clone())
     );
     let (caller, dest) = aggregate_return
@@ -46270,16 +50919,13 @@ end test T"#
     ];
 
     for (what, src) in &cases {
-        cpp_tb::emit(&merged_src(src))
-            .unwrap_or_else(|e| panic!("v1 must emit {what}: {e}"));
+        cpp_tb::emit(&merged_src(src)).unwrap_or_else(|e| panic!("v1 must emit {what}: {e}"));
         let prog = lower_src(src).unwrap_or_else(|e| panic!("TBIR must lower {what}: {e}"));
-        verify::verify_program(&prog)
-            .unwrap_or_else(|e| panic!("TBIR must verify {what}: {e:?}"));
+        verify::verify_program(&prog).unwrap_or_else(|e| panic!("TBIR must verify {what}: {e:?}"));
         let cpp = tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
             .unwrap_or_else(|e| panic!("TBIR must emit {what}: {e}"));
         assert!(
-            cpp.contains("uint64_t count = 7;")
-                && cpp.contains("if (!((p.count == 7)))"),
+            cpp.contains("uint64_t count = 7;") && cpp.contains("if (!((p.count == 7)))"),
             "{what}: emitted code must retain the state default and assertion read: {cpp}"
         );
         let storage = if *what == "test-scope plain transactor" {
@@ -46287,7 +50933,10 @@ end test T"#
         } else {
             "Poker p;"
         };
-        assert!(cpp.contains(storage), "{what}: missing state owner `{storage}`: {cpp}");
+        assert!(
+            cpp.contains(storage),
+            "{what}: missing state owner `{storage}`: {cpp}"
+        );
     }
 
     for (what, src) in &cases {
@@ -46435,4 +51084,955 @@ end impl T"#;
             "{what}: {msg}"
         );
     }
+}
+#[test]
+fn string_values_lower_verify_and_emit_through_helpers_and_externs() {
+    let src = fixture("string_extern_args_test.harc");
+    let prog = lower_src(&src).expect("String values lower");
+    verify::verify_program(&prog).expect("String values verify");
+
+    let identity = prog
+        .functions
+        .iter()
+        .find(|function| function.name == "identity")
+        .expect("identity helper");
+    assert_eq!(identity.params[0].ty, ir::IrType::String);
+    assert_eq!(
+        identity.locals[identity.ret.expect("identity return").index()].ty,
+        ir::IrType::String
+    );
+
+    let cpp = emit_cpp_src(&src);
+    assert!(
+        cpp.contains("static const char* harc_helper_identity(const char* value)")
+            && cpp.contains(
+                "static const char* harc_helper_choose_text(uint64_t select_first, const char* first, const char* second)"
+            )
+            && cpp.contains(
+                "uint64_t ref_string_choice(const char* key, const char* choices, uint64_t default_index, uint64_t required)"
+            ),
+        "String callable ABI was not preserved:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("select_first ? first : second")
+            && cpp.contains(
+                r#"harc_helper_identity("quote:\" slash:\\ newline:\n carriage:\r tab:\t nul:\000Z literal:\\n unknown:\\q")"#
+            ),
+        "String selection or escaping was not emitted faithfully:\n{cpp}"
+    );
+
+    let mut bad_helper_arg = prog.clone();
+    let helper_args = bad_helper_arg
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::Helper { name, .. }, args))
+                if name == "identity" =>
+            {
+                Some(args)
+            }
+            _ => None,
+        })
+        .expect("identity call");
+    helper_args[0] = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(Some(1)),
+    };
+    let errors = verify::verify_program(&bad_helper_arg)
+        .expect_err("a numeric argument must not cross a String helper parameter");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("helper `identity` argument 1 has type")),
+        "unexpected verifier errors: {errors:?}"
+    );
+
+    let mut unknown_extern_arg = prog.clone();
+    let (function_index, argument_local) = unknown_extern_arg
+        .functions
+        .iter()
+        .enumerate()
+        .find_map(|(function_index, function)| {
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .find_map(|stmt| match stmt {
+                    ir::Stmt::Assign(
+                        _,
+                        ir::Expr::Call(ir::CallTarget::ExternFn { name, .. }, args),
+                    ) if name == "ref_string_choice" => match args.first() {
+                        Some(ir::Expr::Local(local)) => Some((function_index, *local)),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+        })
+        .expect("ref_string_choice call with local argument");
+    unknown_extern_arg.functions[function_index].locals[argument_local.index()].ty =
+        ir::IrType::Unknown;
+    let errors = verify::verify_program(&unknown_extern_arg)
+        .expect_err("Unknown must not bypass a String extern parameter");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("extern function `ref_string_choice` argument 1 has type Unknown")),
+        "unexpected verifier errors: {errors:?}"
+    );
+
+    let mut unknown_helper_param = prog.clone();
+    let identity = unknown_helper_param
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "identity")
+        .expect("identity helper");
+    identity.params[0].ty = ir::IrType::Unknown;
+    identity.locals[0].ty = ir::IrType::Unknown;
+    let errors = verify::verify_program(&unknown_helper_param)
+        .expect_err("String must not bypass an Unknown helper parameter");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("helper `identity` argument 1 has type String, expected Unknown")),
+        "unexpected verifier errors: {errors:?}"
+    );
+
+    let mut unknown_assignment = prog.clone();
+    let (function_index, destination) = unknown_assignment
+        .functions
+        .iter()
+        .enumerate()
+        .find_map(|(function_index, function)| {
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .find_map(|stmt| match stmt {
+                    ir::Stmt::Assign(
+                        destination,
+                        ir::Expr::Call(ir::CallTarget::Helper { name, .. }, _),
+                    ) if name == "identity" => Some((function_index, *destination)),
+                    _ => None,
+                })
+        })
+        .expect("identity assignment");
+    unknown_assignment.functions[function_index].locals[destination.index()].ty =
+        ir::IrType::Unknown;
+    let errors = verify::verify_program(&unknown_assignment)
+        .expect_err("Unknown must not bypass a String assignment destination");
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, verify::VerifyError::TypeMismatch { .. })),
+        "unexpected verifier errors: {errors:?}"
+    );
+
+    let mut bad_extern_arg = prog.clone();
+    let extern_args = bad_extern_arg
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::ExternFn { name, .. }, args))
+                if name == "ref_string_choice" =>
+            {
+                Some(args)
+            }
+            _ => None,
+        })
+        .expect("extern call");
+    extern_args[0] = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(Some(1)),
+    };
+    let errors = verify::verify_program(&bad_extern_arg)
+        .expect_err("a numeric argument must not cross a String extern parameter");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("extern function `ref_string_choice` argument 1 has type")),
+        "unexpected verifier errors: {errors:?}"
+    );
+}
+
+#[test]
+fn string_values_cross_component_and_transactor_method_boundaries() {
+    let src = r#"
+domain D
+    freq_mhz: 100
+end domain D
+
+agent StringModel
+    function choose(flag: uint<1>, first: String, second: String) -> String
+        return flag ? first : second
+    end function choose
+end agent StringModel
+
+transactor StringTransactor
+    dut : Top
+    when active
+        hookable echo(value: String) -> String
+            return value
+        end echo
+    end when
+end transactor StringTransactor
+
+testbench Tb
+    dut : Top
+    model : StringModel
+    tx : StringTransactor active
+end testbench Tb
+
+impl StringMethodTest for Tb
+    clock clk = D
+    run
+        let selected : String = model.choose(1, "first", "second")
+        let echoed : String = tx.echo(selected)
+        wait 1 cycle
+    end run
+end impl StringMethodTest
+"#;
+    let prog = lower_src(src).expect("String method boundaries lower");
+    verify::verify_program(&prog).expect("String method boundaries verify");
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("const char* first")
+            && cpp.contains("const char* second")
+            && cpp.contains("-> const char*")
+            && cpp.contains("const char* value"),
+        "component/transactor String ABI was not emitted:\n{cpp}"
+    );
+
+    let mut bad_component_arg = prog.clone();
+    let component_args = bad_component_arg
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentCall { method, args, .. } if method == "choose" => Some(args),
+            _ => None,
+        })
+        .expect("component call");
+    component_args[1] = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(Some(1)),
+    };
+    let errors = verify::verify_program(&bad_component_arg)
+        .expect_err("a numeric argument must not cross a String component parameter");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("component method `StringModel.choose` argument 2 has type")),
+        "unexpected verifier errors: {errors:?}"
+    );
+
+    let mut bad_transactor_arg = prog.clone();
+    let transactor_args = bad_transactor_arg
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorCall {
+                call: ir::Expr::Call(_, args),
+                ..
+            } => Some(args),
+            _ => None,
+        })
+        .expect("transactor call");
+    transactor_args[0] = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(Some(1)),
+    };
+    let errors = verify::verify_program(&bad_transactor_arg)
+        .expect_err("a numeric argument must not cross a String transactor parameter");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("transactor method `StringTransactor.echo` parameter 1 expects String")),
+        "unexpected verifier errors: {errors:?}"
+    );
+
+    let component_dest = prog
+        .functions
+        .iter()
+        .enumerate()
+        .find_map(|(function_index, function)| {
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .find_map(|stmt| match stmt {
+                    ir::Stmt::ComponentCall {
+                        method,
+                        dest: Some(dest),
+                        ..
+                    } if method == "choose" => Some((function_index, *dest)),
+                    _ => None,
+                })
+        })
+        .expect("component return destination");
+    let mut bad_component_return = prog.clone();
+    bad_component_return.functions[component_dest.0].locals[component_dest.1.index()].ty =
+        ir::IrType::UInt(Some(64));
+    let errors = verify::verify_program(&bad_component_return)
+        .expect_err("a String component return must require a String destination");
+    assert!(
+        errors.iter().any(|error| {
+            let message = error.to_string();
+            message.contains("component method `StringModel.choose` returns String")
+                && message.contains("destination is UInt")
+        }),
+        "unexpected verifier errors: {errors:?}"
+    );
+
+    let transactor_dest = prog
+        .functions
+        .iter()
+        .enumerate()
+        .find_map(|(function_index, function)| {
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .find_map(|stmt| match stmt {
+                    ir::Stmt::TransactorCall {
+                        dest: Some(dest),
+                        call: ir::Expr::Call(ir::CallTarget::TransactorMethod { method, .. }, _),
+                    } if method == "echo" => Some((function_index, *dest)),
+                    _ => None,
+                })
+        })
+        .expect("transactor return destination");
+    let mut bad_transactor_return = prog.clone();
+    bad_transactor_return.functions[transactor_dest.0].locals[transactor_dest.1.index()].ty =
+        ir::IrType::UInt(Some(64));
+    let errors = verify::verify_program(&bad_transactor_return)
+        .expect_err("a String transactor return must require a String destination");
+    assert!(
+        errors.iter().any(|error| {
+            let message = error.to_string();
+            message.contains("transactor method `StringTransactor.echo` returns String")
+                && message.contains("destination is UInt")
+        }),
+        "unexpected verifier errors: {errors:?}"
+    );
+
+    let mut unknown_transactor_return = prog.clone();
+    unknown_transactor_return.functions[transactor_dest.0].locals[transactor_dest.1.index()].ty =
+        ir::IrType::Unknown;
+    let errors = verify::verify_program(&unknown_transactor_return)
+        .expect_err("Unknown must not bypass a String transactor return destination");
+    assert!(
+        errors.iter().any(|error| {
+            let message = error.to_string();
+            message.contains("transactor method `StringTransactor.echo` returns String")
+                && message.contains("destination is Unknown")
+        }),
+        "unexpected verifier errors: {errors:?}"
+    );
+}
+
+#[test]
+fn unsupported_string_operations_and_numeric_contexts_are_rejected() {
+    let body = |statement: &str| {
+        format!(
+            "test T\n    let dut : Top\n    run\n        let s : String = \"text\"\n        {statement}\n    end run\nend test T"
+        )
+    };
+    for (statement, expected) in [
+        ("let n = s + 1", "binary operator"),
+        ("let same = s == \"text\"", "binary operator"),
+        ("let n = !s", "unary operators"),
+        (
+            "if s\n            let n = 1\n        end if",
+            "numeric or boolean",
+        ),
+        ("wait s cycles", "wait cycle count"),
+        (
+            "repeat s\n            let n = 1\n        end repeat",
+            "repeat count",
+        ),
+        ("let lane = dut.count_out[s]", "DUT lane index"),
+        ("let sliced = s[0:0]", "bit-slice target"),
+        ("let n = s as uint<8>", "cannot be cast"),
+        ("let selected : String = true ? s : 1", "ternary"),
+    ] {
+        let err = lower_src(&body(statement))
+            .expect_err("unsupported String operation unexpectedly lowered");
+        let message = assert_invalid(&err);
+        assert!(
+            message.contains(expected),
+            "`{statement}`: expected `{expected}`, got {message}"
+        );
+    }
+
+    let interpolation = lower_src(&body("log(info, \"value=${s}\")"))
+        .expect_err("String interpolation must stay outside the numeric formatting ABI");
+    let message = assert_not_implemented(&interpolation, lower::V1Status::EmitsUncompilable);
+    assert!(message.contains("interpolation capture"), "{message}");
+
+    let value_interpolation = lower_src(
+        r#"function take(value: String) -> uint<1>
+    return 1
+end function take
+test T
+    let dut : Top
+    run
+        let x : uint<8> = 7
+        let ok = take("${x}")
+    end run
+end test T"#,
+    )
+    .expect_err("interpolation must not become a first-class String value");
+    let message = assert_invalid(&value_interpolation);
+    assert!(
+        message.contains("String value literals do not support interpolation"),
+        "{message}"
+    );
+
+    let constrained = r#"struct Item
+    value : uint<8>
+end struct Item
+test T
+    let dut : Top
+    run
+        let item : Item
+        randomize(item) with
+            item.value == "text"
+        end randomize
+    end run
+end test T"#;
+    let err = lower_src(constrained).expect_err("String constraints must fail closed");
+    let message = assert_invalid(&err);
+    assert!(
+        message.contains("String values are not supported in randomize constraints"),
+        "{message}"
+    );
+
+    for declaration in ["tseq Bad() -> TSeq<uint<8>>", "tseq Bad()"] {
+        let source = format!(
+            "{declaration}\n    yield \"text\"\nend tseq Bad\n\ntest T\n    let dut : Top\n    run\n        wait 1 cycle\n    end run\nend test T\n"
+        );
+        let err = lower_src(&source).expect_err("String yield must fail closed");
+        let message = assert_invalid(&err);
+        assert!(
+            message.contains("`yield` does not support String values"),
+            "{declaration}: {message}"
+        );
+    }
+    for yielded in ["s", "identity(\"text\")"] {
+        let source = format!(
+            "function identity(value: String) -> String\n    return value\nend function identity\n\ntseq Bad() -> TSeq<uint<8>>\n    let s : String = \"text\"\n    yield {yielded}\nend tseq Bad\n\ntest T\n    let dut : Top\n    run\n        wait 1 cycle\n    end run\nend test T\n"
+        );
+        let err = lower_src(&source).expect_err("nonliteral String yield must fail closed");
+        let message = assert_invalid(&err);
+        assert!(
+            message.contains("`yield` does not support String values"),
+            "yield {yielded}: {message}"
+        );
+    }
+
+    let string_param = r#"tseq Bad(value: String) -> TSeq<uint<8>>
+    yield 1
+end tseq Bad
+
+test T
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test T"#;
+    let err = lower_src(string_param).expect_err("String tseq parameters must fail closed");
+    let message = assert_invalid(&err);
+    assert!(
+        message.contains("parameter `value` cannot use `String`"),
+        "{message}"
+    );
+
+    let string_sequence_param = string_param.replace("value: String", "value: TSeq<String>");
+    let err =
+        lower_src(&string_sequence_param).expect_err("TSeq<String> parameters must fail closed");
+    let message = assert_unsupported(&err);
+    assert!(message.contains("type contains `String`"), "{message}");
+
+    let mut mutated_yield =
+        lower_src(&fixture("tseq_scalar_test.harc")).expect("numeric tseq fixture lowers");
+    let value = mutated_yield
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::SeqPush { value, .. } => Some(value),
+            _ => None,
+        })
+        .expect("numeric fixture contains SeqPush");
+    *value = ir::Expr::StringLiteral("text".into());
+    let errors = verify::verify_program(&mutated_yield)
+        .expect_err("mutated String SeqPush must fail verification");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("SeqPush cannot use a String element")),
+        "unexpected verifier errors: {errors:?}"
+    );
+
+    let mut mutated_param =
+        lower_src(&fixture("tseq_scalar_test.harc")).expect("numeric tseq fixture lowers");
+    let function = mutated_param
+        .functions
+        .iter_mut()
+        .find(|function| matches!(function.kind, ir::FunctionKind::Tseq { .. }))
+        .expect("numeric fixture contains a tseq");
+    let string_sequence = ir::IrType::Seq(Box::new(ir::IrType::String));
+    function.params[0].ty = string_sequence.clone();
+    function.locals[0].ty = string_sequence;
+    let errors = verify::verify_program(&mutated_param)
+        .expect_err("mutated String tseq parameter must fail verification");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("tseq `Squares` param 0 cannot use String")),
+        "unexpected verifier errors: {errors:?}"
+    );
+
+    let mut temporal = lower_fixtures(&["counter_test.harc", "counter_test_props.harc"])
+        .expect("property fixture lowers");
+    temporal
+        .property_checks
+        .iter_mut()
+        .find_map(|check| check.temporals.first_mut())
+        .expect("property fixture has a temporal operand")
+        .inner = ir::Expr::StringLiteral("text".into());
+    let errors = verify::verify_program(&temporal)
+        .expect_err("mutated String temporal operand must fail verification");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("temporal operand is not a scalar value")),
+        "unexpected verifier errors: {errors:?}"
+    );
+}
+
+#[test]
+fn nested_string_declared_types_are_rejected_before_type_erasure() {
+    let test = r#"
+test T
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test T
+"#;
+    for ty in [
+        "queue<String>",
+        "event<String>",
+        "Vec<String, 2>",
+        "TSeq<String>",
+        "queue<Vec<String, 2>>",
+    ] {
+        let source = format!(
+            "function bad(values: {ty}) -> uint<1>\n    return 1\nend function bad\n{test}"
+        );
+        let err = lower_src(&source).expect_err("a String container parameter must fail closed");
+        let message = assert_unsupported(&err);
+        assert!(
+            message.contains("function `bad` parameter `values`")
+                && message.contains("type contains `String`"),
+            "{ty}: {message}"
+        );
+    }
+
+    let cases = [
+        (
+            "helper return",
+            format!("function bad() -> TSeq<String>\n    return 0\nend function bad\n{test}"),
+        ),
+        (
+            "extern parameter",
+            format!("extern function bad(values: queue<String>) -> uint<1>\n{test}"),
+        ),
+        (
+            "extern return",
+            format!("extern function bad() -> event<String>\n{test}"),
+        ),
+        (
+            "component method parameter",
+            r#"agent Bad
+    function f(values: Vec<String, 2>) -> uint<1>
+        return 1
+    end function f
+end agent Bad
+test T
+    let dut : Top
+    let bad : Bad
+    run
+        wait 1 cycle
+    end run
+end test T
+"#
+            .to_string(),
+        ),
+        (
+            "transactor method return",
+            r#"transactor Bad
+    dut : Top
+    when active
+        hookable f() -> queue<String>
+            return 0
+        end f
+    end when
+end transactor Bad
+test T
+    let dut : Top
+    let bad : Bad active
+    run
+        bad.dut = dut
+        wait 1 cycle
+    end run
+end test T
+"#
+            .to_string(),
+        ),
+        (
+            "testbench method return",
+            r#"testbench Tb
+    dut : Top
+    function f() -> TSeq<String>
+        return 0
+    end function f
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T
+"#
+            .to_string(),
+        ),
+        (
+            "local",
+            r#"test T
+    let dut : Top
+    run
+        let values : event<String>
+        wait 1 cycle
+    end run
+end test T
+"#
+            .to_string(),
+        ),
+        (
+            "record field",
+            format!("struct Bad\n    values : Vec<String, 2>\nend struct Bad\n{test}"),
+        ),
+        (
+            "component field",
+            format!("scoreboard Bad\n    values : queue<String>\nend scoreboard Bad\n{test}"),
+        ),
+    ];
+    for (case, source) in cases {
+        let err = lower_src(&source).expect_err("a nested String type must fail closed");
+        let message = assert_unsupported(&err);
+        assert!(
+            message.contains("type contains `String`")
+                || message.contains("type containing `String`"),
+            "{case}: {message}"
+        );
+    }
+}
+
+#[test]
+fn verifier_rejects_recursive_string_container_mutations() {
+    let source = r#"function identity(value: String) -> String
+    return value
+end function identity
+
+extern function ref_identity(value: String) -> String
+
+agent Model
+    function choose(value: String) -> String
+        return value
+    end function choose
+end agent Model
+
+test T
+    let dut : Top
+    let model : Model
+    run
+        let first : String = identity("first")
+        let second : String = ref_identity(first)
+        let third : String = model.choose(second)
+        wait 1 cycle
+    end run
+end test T
+"#;
+    let prog = lower_src(source).expect("exact String callable values lower");
+    let nested = ir::IrType::Seq(Box::new(ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::String),
+        len: 2,
+    }));
+
+    let mut bad_local = prog.clone();
+    let helper = bad_local
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "identity")
+        .expect("identity helper");
+    helper.params[0].ty = nested.clone();
+    helper.locals[0].ty = nested.clone();
+    let errors = verify::verify_program(&bad_local)
+        .expect_err("nested String helper parameter/local must fail verification");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.to_string().contains("type containing String")),
+        "unexpected verifier errors: {errors:?}"
+    );
+
+    let mut bad_component = prog.clone();
+    let method = bad_component
+        .components
+        .iter_mut()
+        .find(|component| component.name == "Model")
+        .and_then(|component| {
+            component
+                .methods
+                .iter_mut()
+                .find(|method| method.name == "choose")
+        })
+        .expect("component method schema");
+    method.param_tys[0] = nested.clone();
+    method.ret_ty = Some(nested.clone());
+    let errors = verify::verify_program(&bad_component)
+        .expect_err("nested String component metadata must fail verification");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("component c0 method `choose` param"))
+            && errors.iter().any(|error| error
+                .to_string()
+                .contains("component c0 method `choose` return")),
+        "unexpected verifier errors: {errors:?}"
+    );
+
+    let mut bad_extern = prog;
+    let target = bad_extern
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|statement| match statement {
+            ir::Stmt::Assign(
+                _,
+                ir::Expr::Call(ir::CallTarget::ExternFn { params, ret, .. }, _),
+            ) => Some((params, ret)),
+            _ => None,
+        })
+        .expect("extern call metadata");
+    target.0[0] = nested.clone();
+    *target.1 = nested;
+    let errors = verify::verify_program(&bad_extern)
+        .expect_err("nested String extern metadata must fail verification");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("extern function `ref_identity` parameter"))
+            && errors.iter().any(|error| error
+                .to_string()
+                .contains("extern function `ref_identity` return")),
+        "unexpected verifier errors: {errors:?}"
+    );
+}
+
+#[test]
+fn string_assignment_argument_and_return_mismatches_are_rejected() {
+    let sources = [
+        r#"test T
+    let dut : Top
+    run
+        let n : uint<8> = "text"
+    end run
+end test T"#,
+        r#"test T
+    let dut : Top
+    run
+        let s : String = 1
+    end run
+end test T"#,
+        r#"test T
+    let dut : Top
+    run
+        let s : String = "text"
+        dut.en = s
+    end run
+end test T"#,
+        r#"function bad() -> String
+    return 1
+end function bad
+test T
+    let dut : Top
+    run
+        let s : String = bad()
+    end run
+end test T"#,
+        r#"function take(value: String) -> uint<1>
+    return 1
+end function take
+test T
+    let dut : Top
+    run
+        let ok = take(1)
+    end run
+end test T"#,
+        r#"extern function take(value: uint<8>) -> uint<1>
+test T
+    let dut : Top
+    run
+        let ok = take("text")
+    end run
+end test T"#,
+        r#"agent BadModel
+    function bad() -> String
+        return 1
+    end function bad
+end agent BadModel
+testbench Tb
+    dut : Top
+    model : BadModel
+end testbench Tb
+impl T for Tb
+    run
+        let value : String = model.bad()
+    end run
+end impl T"#,
+    ];
+    for src in sources {
+        let err = lower_src(src).expect_err("String mismatch must fail during lowering");
+        assert_invalid(&err);
+    }
+}
+
+#[test]
+fn string_values_are_rejected_in_persistent_storage_schemas() {
+    let src = r#"struct Stored
+    value : uint<8>
+end struct Stored
+
+agent StorageAgent
+    count : uint<8> default 0
+end agent StorageAgent
+
+transactor StorageTx
+    dut : Top
+end transactor StorageTx
+
+testbench Tb
+    dut : Top
+    count : uint<8> default 0
+    model : StorageAgent
+    tx : StorageTx active
+end testbench Tb
+
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T
+"#;
+    let prog = lower_src(src).expect("storage control lowers");
+    verify::verify_program(&prog).expect("storage control verifies");
+
+    let mut record = prog.clone();
+    record.records[0].fields[0].ty = ir::IrType::String;
+    let errors = verify::verify_program(&record)
+        .expect_err("a mutated record String field must fail closed");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("record r0 `Stored` field `value`")
+            && error.to_string().contains("persistent String storage")),
+        "unexpected verifier errors: {errors:?}"
+    );
+
+    let mut nested_record = prog.clone();
+    nested_record.records[0].fields[0].ty = ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::Seq(Box::new(ir::IrType::String))),
+        len: 2,
+    };
+    let errors = verify::verify_program(&nested_record)
+        .expect_err("a recursively nested record String field must fail closed");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("record r0 `Stored` field `value`")
+            && error.to_string().contains("persistent String storage")),
+        "unexpected verifier errors: {errors:?}"
+    );
+
+    let mut component = prog.clone();
+    let field = component
+        .components
+        .iter_mut()
+        .find(|schema| schema.name == "StorageAgent")
+        .and_then(|schema| schema.fields.iter_mut().find(|field| field.name == "count"))
+        .expect("component scalar field");
+    let ir::ComponentFieldKind::Scalar { ty, .. } = &mut field.kind else {
+        panic!("component count field is scalar");
+    };
+    *ty = ir::IrType::String;
+    let errors = verify::verify_program(&component)
+        .expect_err("a mutated component String field must fail closed");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("component c0 field `count` has unsupported persistent String storage")),
+        "unexpected verifier errors: {errors:?}"
+    );
+
+    let mut testbench = prog.clone();
+    testbench.testbenches[0].scalar_fields[0].ty = ir::IrType::String;
+    let field = testbench.testbenches[0]
+        .state_fields
+        .iter_mut()
+        .find(
+            |field| matches!(field, ir::TbStateFieldSchema::Scalar(field) if field.name == "count"),
+        )
+        .expect("testbench scalar state field");
+    let ir::TbStateFieldSchema::Scalar(field) = field else {
+        unreachable!();
+    };
+    field.ty = ir::IrType::String;
+    let errors = verify::verify_program(&testbench)
+        .expect_err("a mutated testbench String field must fail closed");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("scalar field `count` has unsupported persistent String storage")),
+        "unexpected verifier errors: {errors:?}"
+    );
+
+    let mut transactor = prog.clone();
+    transactor.transactors[0]
+        .state_fields
+        .push(ir::StateFieldSchema {
+            name: "stored".into(),
+            kind: ir::StateFieldKind::Scalar {
+                ty: ir::IrType::String,
+                default: 0,
+            },
+        });
+    let errors = verify::verify_program(&transactor)
+        .expect_err("a mutated transactor String state field must fail closed");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("state field `stored` has unsupported persistent String storage")),
+        "unexpected verifier errors: {errors:?}"
+    );
 }

@@ -361,6 +361,51 @@ end transaction T"#,
 }
 
 #[test]
+fn elaborates_folded_typed_constants_for_constraint_lowering() {
+    let parsed = parse_source(
+        r#"const BASE : uint<8> = 2
+const LIMIT : uint<8> = BASE + 3
+const NEG : sint<8> = -1
+const ENABLE : bool = LIMIT == 5
+const TOO_WIDE : uint<8> = 256
+
+transaction T
+    u : uint<8>
+    s : sint<8>
+    keep u <= LIMIT
+    keep s >= NEG
+    keep ENABLE
+end transaction T"#,
+    )
+    .unwrap();
+
+    let elaborated = elaborate_constraints(&parsed);
+    let limit = &elaborated.consts["LIMIT"];
+    assert_eq!(limit.value, 5);
+    assert_eq!(limit.width, Some(8));
+    assert_eq!(limit.signedness, Signedness::Unsigned);
+
+    let neg = &elaborated.consts["NEG"];
+    assert_eq!(neg.value as i64, -1);
+    assert_eq!(neg.width, Some(8));
+    assert_eq!(neg.signedness, Signedness::Signed);
+
+    let enable = &elaborated.consts["ENABLE"];
+    assert_eq!(enable.value, 1);
+    assert!(enable.is_bool);
+    assert_eq!(enable.signedness, Signedness::NotNumeric);
+
+    assert!(
+        !elaborated.consts.contains_key("TOO_WIDE"),
+        "an invalid typed constant must not leak into constraint lowering"
+    );
+
+    let table = harc::solver::problem_table::build_typed_solver_problem_table(&parsed);
+    assert_eq!(table.z3_ready_count(), 1, "{:#?}", table.entries);
+    assert_eq!(table.lower_error_count(), 0);
+}
+
+#[test]
 fn lowers_relation_calls_to_typed_ir() {
     let parsed = parse_source(
         r#"transaction T

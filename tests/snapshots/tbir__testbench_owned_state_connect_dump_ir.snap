@@ -56,6 +56,7 @@ fn fn2 run_OwnedStateConnectFreshTest [kind=Run, owner=tb0]
 fn fn3 run_OwnedStateConnectTest [kind=Run, owner=tb1]
   locals:
     %0 item : record(r0)
+    %1 __t0 : record(r0)
   entry = b0
 
   b0:
@@ -71,6 +72,9 @@ fn fn3 run_OwnedStateConnectTest [kind=Run, owner=tb1]
     AssertCheck { cond: (nested.sink.sum == 8), on_fail: "assertion failed" }
     AssertCheck { cond: (_tb.pending.size() == 1), on_fail: "assertion failed" }
     AssertCheck { cond: (_tb.records.size() == 1), on_fail: "assertion failed" }
+    AssertCheck { cond: (_tb.pending.front() == 8), on_fail: "assertion failed" }
+    Assign(%__t0, _tb.records.front())
+    AssertCheck { cond: (%__t0.value == 9), on_fail: "assertion failed" }
     -> Return
 
 fn fn4 check_OwnedStateConnectTest [kind=Check, owner=tb1]

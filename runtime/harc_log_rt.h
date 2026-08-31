@@ -14,6 +14,15 @@
 namespace harc_rt {
 namespace log {
 
+template <typename DutT, typename ContextT>
+inline DutT* harc_make_dut(ContextT* context) {
+    if constexpr (requires { new DutT(context); }) {
+        return new DutT(context);
+    } else {
+        return new DutT;
+    }
+}
+
 inline std::string harc_resolve_log_path(const char* path) {
     if (path && path[0] == '/') return std::string(path);
     const char* base = std::getenv("HARC_LOG_DIR");
@@ -202,16 +211,11 @@ inline void harc_print_covergroup_more_missing(
     }
 }
 
-inline FILE* harc_coverage_json_file() {
-    static FILE* f = nullptr;
-    static bool initialized = false;
-    if (initialized) return f;
-    initialized = true;
+inline FILE* harc_open_coverage_json() {
     const char* path = std::getenv("HARC_COVERAGE_JSONL");
     if (!path || !*path) path = std::getenv("HARC_COVERAGE_JSON");
     if (!path || !*path) return nullptr;
-    f = std::fopen(path, "w");
-    return f;
+    return std::fopen(path, "w");
 }
 
 inline void harc_json_string(FILE* f, const char* value) {
@@ -239,8 +243,73 @@ inline void harc_json_string(FILE* f, const char* value) {
     std::fputc('"', f);
 }
 
-inline void harc_cov_json_summary(const char* group, uint64_t hit, uint64_t total) {
-    FILE* f = harc_coverage_json_file();
+inline void harc_cov_json_cover_summary(
+    FILE* f,
+    uint64_t hit,
+    uint64_t total) {
+    if (!f) return;
+    std::fprintf(
+        f,
+        "{\"type\":\"cover\",\"hit\":%llu,\"total\":%llu}\n",
+        static_cast<unsigned long long>(hit),
+        static_cast<unsigned long long>(total));
+    std::fflush(f);
+}
+
+inline void harc_cov_json_cover_point(FILE* f, const char* label, uint64_t hits) {
+    if (!f) return;
+    std::fputs("{\"type\":\"cover_point\",\"label\":", f);
+    harc_json_string(f, label);
+    std::fprintf(f, ",\"hits\":%llu}\n", static_cast<unsigned long long>(hits));
+    std::fflush(f);
+}
+
+inline void harc_cov_json_auto_summary(
+    FILE* f,
+    const char* type_name,
+    uint64_t span,
+    uint64_t hit,
+    uint64_t total,
+    uint64_t blocked) {
+    if (!f) return;
+    std::fputs("{\"type\":\"auto_cover\",\"record\":", f);
+    harc_json_string(f, type_name);
+    std::fprintf(
+        f,
+        ",\"span\":%llu,\"hit\":%llu,\"total\":%llu,\"blocked\":%llu}\n",
+        static_cast<unsigned long long>(span),
+        static_cast<unsigned long long>(hit),
+        static_cast<unsigned long long>(total),
+        static_cast<unsigned long long>(blocked));
+    std::fflush(f);
+}
+
+inline void harc_cov_json_auto_bin(
+    FILE* f,
+    const char* type_name,
+    uint64_t span,
+    const char* label,
+    bool hit,
+    bool blocked) {
+    if (!f) return;
+    std::fputs("{\"type\":\"auto_cover_bin\",\"record\":", f);
+    harc_json_string(f, type_name);
+    std::fprintf(
+        f, ",\"span\":%llu,\"label\":", static_cast<unsigned long long>(span));
+    harc_json_string(f, label);
+    std::fprintf(
+        f,
+        ",\"hit\":%s,\"blocked\":%s}\n",
+        hit ? "true" : "false",
+        blocked ? "true" : "false");
+    std::fflush(f);
+}
+
+inline void harc_cov_json_summary(
+    FILE* f,
+    const char* group,
+    uint64_t hit,
+    uint64_t total) {
     if (!f) return;
     std::fputs("{\"type\":\"covergroup\",\"group\":", f);
     harc_json_string(f, group);
@@ -253,11 +322,11 @@ inline void harc_cov_json_summary(const char* group, uint64_t hit, uint64_t tota
 }
 
 inline void harc_cov_json_bin(
+    FILE* f,
     const char* group,
     const char* point,
     const char* bin,
     uint64_t hits) {
-    FILE* f = harc_coverage_json_file();
     if (!f) return;
     std::fputs("{\"type\":\"coverpoint_bin\",\"group\":", f);
     harc_json_string(f, group);
@@ -270,12 +339,12 @@ inline void harc_cov_json_bin(
 }
 
 inline void harc_cov_json_cross_summary(
+    FILE* f,
     const char* group,
     const char* kind,
     const char* label,
     uint64_t hit,
     uint64_t total) {
-    FILE* f = harc_coverage_json_file();
     if (!f) return;
     std::fputs("{\"type\":\"cross\",\"group\":", f);
     harc_json_string(f, group);
@@ -292,12 +361,12 @@ inline void harc_cov_json_cross_summary(
 }
 
 inline void harc_cov_json_cross_bin(
+    FILE* f,
     const char* group,
     const char* kind,
     const char* label,
     const char* bin,
     uint64_t hits) {
-    FILE* f = harc_coverage_json_file();
     if (!f) return;
     std::fputs("{\"type\":\"cross_bin\",\"group\":", f);
     harc_json_string(f, group);
@@ -334,6 +403,7 @@ struct HarcLogFiles {
 
 struct HarcLogContext {
     FILE* sim_log = harc_open_sim_log();
+    FILE* coverage_json = harc_open_coverage_json();
     HarcLogFiles files;
 
     FILE* file(const char* path) {
@@ -342,6 +412,7 @@ struct HarcLogContext {
 
     void close_all() {
         harc_close_file(sim_log);
+        harc_close_file(coverage_json);
         files.close_all();
     }
 };

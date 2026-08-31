@@ -46,6 +46,11 @@ impl ScoreboardTypedQueueTest for Tb
         if checker.sb.errors.size() == 0
             fail("expected typed scoreboard error")
         else
+            let errors_before_front = checker.sb.errors.size()
+            assert checker.sb.errors.front().code == 0x1001
+                else fail("front did not preserve the typed queue record")
+            assert checker.sb.errors.size() == errors_before_front
+                else fail("front removed the typed queue record")
             let err : CheckerError = checker.sb.errors.pop()
             assert err.checker_id == 1 else fail("bad checker id")
             assert err.code == 0x1001 else fail("bad error code")

@@ -1,0 +1,64 @@
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent CopyCell
+    value : uint<8> default 7
+
+    hookable set(v: uint<8>)
+        value = v
+    end set
+end agent CopyCell
+
+agent CopyOwner
+    primary : CopyCell
+    snapshot : CopyCell
+
+    hookable load(input_state: CopyCell)
+        snapshot = input_state
+    end load
+
+    hookable clone()
+        snapshot = primary
+    end clone
+
+    hookable shadow(primary: CopyCell, input_state: CopyCell)
+        primary = input_state
+    end shadow
+
+    hookable capture_primary()
+        load(primary)
+    end capture_primary
+
+end agent CopyOwner
+
+test ComponentSubcopyValueTest
+    let dut : Top
+    let source : CopyCell
+    let owner : CopyOwner
+    clock clk = SysDomain
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 1 cycle
+
+        source.set(41)
+        owner.primary = source
+        source.set(99)
+        assert owner.primary.value == 41
+            else fail("test-scope copy aliased source: ${owner.primary.value}")
+
+        owner.capture_primary()
+        owner.primary.set(55)
+        assert owner.snapshot.value == 41
+            else fail("parameter copy aliased source: ${owner.snapshot.value}")
+
+        owner.clone()
+        owner.primary.set(12)
+        assert owner.snapshot.value == 55
+            else fail("self copy aliased source: ${owner.snapshot.value}")
+
+        log(info, "ALL TESTS PASSED - component subcopy values are independent")
+    end run
+end test ComponentSubcopyValueTest

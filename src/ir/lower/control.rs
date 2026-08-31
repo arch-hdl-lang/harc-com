@@ -85,9 +85,9 @@ impl FuncBuilder<'_> {
         // shape and the same single evaluation.
         if let ExprKind::Call { callee, args } = &*f.iter.kind {
             if let ExprKind::Ident(name) = &*callee.kind {
-                if let Some((elem, _, _)) = self.ctx.tseqs.get(&name.name).cloned() {
+                if let Some((_, elem, _, _)) = self.ctx.tseqs.get(&name.name).cloned() {
                     let seq_ty = elem.seq_type();
-                    let call = self.lower_tseq_call(&name.name, args)?;
+                    let call = self.lower_tseq_call(&name.name, args, f.iter.span)?;
                     let seq = self.fresh_temp();
                     self.set_local_type(seq, seq_ty);
                     self.push(Stmt::Assign(seq, call));
@@ -141,11 +141,13 @@ impl FuncBuilder<'_> {
         self.push_scope();
         // Loop counter init — evaluated once, outside the loop.
         let lo_ir = self.lower_expr_no_ports(lo)?;
+        self.validate_numeric_expr(&lo_ir, "range lower bound")?;
         let var = self.declare(&f.var.name);
         self.push(Stmt::Assign(var, lo_ir));
         // Upper bound — evaluated once; stash non-trivial expressions
         // in a synthesized local so the header re-reads a pure value.
         let hi_ir = self.lower_expr_no_ports(hi)?;
+        self.validate_numeric_expr(&hi_ir, "range upper bound")?;
         // The loop counter is a `uint64_t`, so a bound wider than 64
         // bits reaches the header through `HarcWide`'s implicit
         // conversion and the loop runs over its low 64 bits. That is a
@@ -333,6 +335,7 @@ impl FuncBuilder<'_> {
             },
         ));
         let count_ir = self.lower_expr_no_ports(&r.count)?;
+        self.validate_numeric_expr(&count_ir, "repeat count")?;
         // Same synthesized `uint64_t` counter as `for`, same silent
         // truncation, same v1 build failure.
         let count_operand = self.stash_if_impure(count_ir);
@@ -457,9 +460,7 @@ impl FuncBuilder<'_> {
                     Stmt::Assign(l, _)
                     | Stmt::DutRead(l, _)
                     | Stmt::RecordInit(l, _)
-                    | Stmt::AggregateInit(l) => {
-                        *l == bound
-                    }
+                    | Stmt::AggregateInit(l) => *l == bound,
                     Stmt::RecordFieldWrite { local, .. } | Stmt::RecordWriteCb { local, .. } => {
                         *local == bound
                     }
@@ -572,6 +573,13 @@ impl FuncBuilder<'_> {
         }
         let mut preds = Vec::with_capacity(conditions.len());
         for c in conditions {
+            let prelude = self.expr_value_prelude_summary(c);
+            if prelude.has_inline_statements() {
+                return Err(unsupported(
+                    "a value call requiring statement materialization inside a `wait until` predicate",
+                    "the predicate is re-evaluated every cycle; use an explicit polling loop if a component call, queue pop, or record-valued queue front must run on each attempt",
+                ));
+            }
             // Ports stay inline — the scheduler re-samples the DUT on
             // every cycle inside the predicate closure. The source
             // text rides along for the timeout breakdown, rendered by
@@ -582,11 +590,9 @@ impl FuncBuilder<'_> {
             self.in_reevaluated_predicate = previous;
             let expr = lowered?;
             self.validate_truth_expr(&expr, "wait-until predicate")?;
-            // A sibling or testbench-instance transactor method call is a
-            // synchronous C++ call and remains inline so the scheduler
-            // re-evaluates it on every predicate attempt, matching v1. Bus
-            // calls use the statement-level handshake seam and still cannot
-            // live in this closure (hoisting would evaluate only once).
+            // Synchronous sibling and testbench-instance methods remain inline
+            // and are re-evaluated on every predicate attempt, matching v1.
+            // Bus/TLM calls still require the statement-level handshake seam.
             if super::exprs::expr_has_bound_transactor_edge(&expr, &|field| {
                 self.ctx.bus_bindings.contains_key(field)
             }) {
@@ -617,6 +623,7 @@ impl FuncBuilder<'_> {
         // so the default timeout header reports the same value the
         // countdown used.
         let cycles_ir = self.lower_expr_no_ports(&to.cycles)?;
+        self.validate_numeric_expr(&cycles_ir, "wait-until timeout count")?;
         // `_wu_budget` is an `int64_t`; a wide budget reaches it
         // through `HarcWide`'s two implicit conversions, which tbir
         // resolved silently (keeping the low 64 bits) and g++ called
@@ -720,8 +727,15 @@ impl FuncBuilder<'_> {
     }
 
     pub(crate) fn lower_block_stmts(&mut self, b: &Block) -> Result<(), LowerError> {
-        for s in &b.stmts {
-            self.lower_stmt(s)?;
+        for (index, s) in b.stmts.iter().enumerate() {
+            let prior = self.current_source_id;
+            let source_id = b.stmt_source(index);
+            if source_id.is_known() {
+                self.current_source_id = source_id;
+            }
+            let result = self.lower_stmt(s);
+            self.current_source_id = prior;
+            result?;
         }
         Ok(())
     }

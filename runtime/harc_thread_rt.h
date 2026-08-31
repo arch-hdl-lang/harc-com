@@ -652,9 +652,32 @@ inline HarcWide<N> harc_wide_smod(HarcWide<N> lhs, HarcWide<N> rhs, unsigned wid
     return lhs_negative ? harc_wide_negate(remainder, width) : remainder;
 }
 
+template<typename T>
+struct HarcBusSignalRef {
+    std::function<T()> read_fn;
+    std::function<void(T)> write_fn;
+
+    T harc_read() const { return read_fn(); }
+
+    operator T() const { return harc_read(); }
+
+    template<typename Val>
+    void harc_write(Val val) const {
+        write_fn(T(val));
+    }
+
+    template<typename Val>
+    HarcBusSignalRef& operator=(Val val) {
+        harc_write(val);
+        return *this;
+    }
+};
+
 template<typename Sig, typename Val>
 inline void harc_assign(Sig& sig, Val val) {
-    if constexpr (std::is_assignable_v<Sig&, Val>) {
+    if constexpr (requires { sig.harc_write(val); }) {
+        sig.harc_write(val);
+    } else if constexpr (std::is_assignable_v<Sig&, Val>) {
         sig = val;
     } else if constexpr (std::is_arithmetic_v<Sig>) {
         if constexpr (is_harc_wide_v<Val>) {
@@ -679,7 +702,9 @@ inline void harc_assign(Sig& sig, Val val) {
 
 template<typename Sig>
 inline auto harc_read(const Sig& sig) {
-    if constexpr (std::is_arithmetic_v<Sig>) {
+    if constexpr (requires { sig.harc_read(); }) {
+        return sig.harc_read();
+    } else if constexpr (std::is_arithmetic_v<Sig>) {
         return static_cast<_harc_u128>(sig);
     } else if constexpr (harc_is_accessor_proxy_v<Sig>) {
         // Co-sim accessor proxy (harc_cosim_rt.h SigProxy): a <= 64-bit
@@ -877,6 +902,7 @@ struct harc_vec_lane_is_word_array<
 
 template<unsigned W, typename Sig>
 inline auto harc_vec_lane_read(const Sig& sig, std::size_t lane) {
+    static_assert(W <= 64, "HARC packed lane reads support at most 64-bit lanes");
     if constexpr (std::is_array_v<Sig>) {
         // Native-sim array port (and Verilator `unpacked Vec` ports):
         // lane is a real element.
@@ -907,6 +933,7 @@ inline auto harc_vec_lane_read(const Sig& sig, std::size_t lane) {
 
 template<unsigned W, typename Sig, typename Val>
 inline void harc_vec_lane_write(Sig& sig, std::size_t lane, Val val) {
+    static_assert(W <= 64, "HARC packed lane writes support at most 64-bit lanes");
     if constexpr (std::is_array_v<Sig>) {
         harc_assign(sig[lane], val);
     } else if constexpr (harc_vec_lane_is_word_array<Sig>::value) {
@@ -1120,7 +1147,21 @@ struct HarcThread {
         void return_void() noexcept {}
         void unhandled_exception() { std::terminate(); }
     };
-    std::coroutine_handle<promise_type> h;
+    std::coroutine_handle<promise_type> h = nullptr;
+    HarcThread() = default;
+    explicit HarcThread(std::coroutine_handle<promise_type> handle) : h(handle) {}
+    HarcThread(const HarcThread&) = delete;
+    HarcThread& operator=(const HarcThread&) = delete;
+    HarcThread(HarcThread&& other) noexcept : h(other.h) { other.h = nullptr; }
+    HarcThread& operator=(HarcThread&& other) noexcept {
+        if (this != &other) {
+            destroy();
+            h = other.h;
+            other.h = nullptr;
+        }
+        return *this;
+    }
+    ~HarcThread() { destroy(); }
     bool done() const { return !h || h.done(); }
     void resume() { if (h && !h.done()) h.resume(); }
     void destroy() { if (h) { h.destroy(); h = nullptr; } }
@@ -1241,7 +1282,12 @@ struct ThreadScheduler {
     // first posedge — so test setup statements (driving rst, default
     // signal values) run before the DUT samples anything.
     void bootstrap() {
-        for (auto* s : slots) {
+        // A capsule may construct actor coroutines while bootstrapping its
+        // run coroutine. Indexing re-reads `slots.size()` and remains valid
+        // if that setup appends actor slots; a range iterator would be
+        // invalidated by vector growth and could silently skip actors.
+        for (std::size_t i = 0; i < slots.size(); ++i) {
+            auto* s = slots[i];
             if (s->kind == WaitKind::Ready) {
                 s->thread.resume();
                 if (s->thread.done()) s->kind = WaitKind::Done;
@@ -1263,11 +1309,14 @@ struct ThreadScheduler {
     // The resumed[] guard prevents a freshly suspended slot from
     // re-firing in the same tick: `wait_cycles(N)` and `wait_until`
     // both promise at-least-one-cycle quantum from the suspend.
-    void tick() {
+    void tick() { tick_except(nullptr); }
+
+    void tick_except(ThreadSlot* excluded) {
         std::vector<bool> resumed(slots.size(), false);
 
         // Pass 1: advance counters / preds based on prior-tick state.
         for (auto* s : slots) {
+            if (s == excluded) continue;
             if (s->kind == WaitKind::WaitCycles) {
                 if (s->cycles_remaining > 0) --s->cycles_remaining;
                 if (s->cycles_remaining == 0) s->kind = WaitKind::Ready;
@@ -1304,6 +1353,7 @@ struct ThreadScheduler {
         while (changed) {
             changed = false;
             for (size_t i = 0; i < slots.size(); ++i) {
+                if (slots[i] == excluded) continue;
                 if (slots[i]->kind == WaitKind::Ready && !resumed[i]) {
                     resumed[i] = true;
                     slots[i]->thread.resume();
@@ -1312,6 +1362,7 @@ struct ThreadScheduler {
                 }
             }
             for (size_t i = 0; i < slots.size(); ++i) {
+                if (slots[i] == excluded) continue;
                 if (!resumed[i] && slots[i]->kind == WaitKind::WaitUntil) {
                     if (slots[i]->pred && slots[i]->pred()) {
                         slots[i]->kind = WaitKind::Ready;
@@ -1336,6 +1387,15 @@ struct ThreadScheduler {
         return true;
     }
 };
+
+inline void harc_destroy_scheduler_threads(ThreadScheduler& scheduler) {
+    for (auto* slot : scheduler.slots) {
+        if (!slot) continue;
+        slot->pred = {};
+        slot->thread.destroy();
+    }
+    scheduler.slots.clear();
+}
 
 // Convenience constructors. Pass the slot the caller is parked in so
 // the awaiter can write its suspend state.

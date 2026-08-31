@@ -1,8 +1,7 @@
 //! Runtime-facing typed problem descriptors.
 //!
-//! Phase 5A keeps generated C++ behavior on the existing `cpp_tb.rs` inline
-//! Z3 path. This module gives future codegen a stable descriptor shape and
-//! deterministic problem IDs to hand to `runtime/harc_random_rt.*`.
+//! Generated C++ uses these immutable descriptors together with explicit
+//! per-run state in `runtime/harc_random_rt.*`.
 
 use crate::constraints::typed::{CType, CTypedProblem, FieldPath, Sign};
 use crate::solver::problem_table::{TypedSolverProblemBuild, TypedSolverProblemTable};
@@ -14,7 +13,7 @@ pub struct RuntimeProblemTable {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeProblemDescriptor {
-    pub id: u32,
+    pub id: u64,
     pub origin: String,
     pub fields: Vec<RuntimeFieldDescriptor>,
     pub constraints: Vec<RuntimeConstraintDescriptor>,
@@ -88,71 +87,47 @@ impl RuntimeProblemTable {
         out
     }
 
-    pub fn render_cpp_table(&self, symbol: &str) -> String {
+    /// Render the immutable descriptor half of the runtime problem table.
+    /// Mutable call-site iterations belong to a concrete simulation run and
+    /// are deliberately omitted here.
+    pub fn render_cpp_inline_descriptors(&self, symbol: &str) -> String {
+        self.render_cpp_descriptors(symbol, "inline constexpr")
+    }
+
+    pub fn render_cpp_private_descriptors(&self, symbol: &str) -> String {
+        self.render_cpp_descriptors(symbol, "static constexpr")
+    }
+
+    fn render_cpp_descriptors(&self, symbol: &str, storage: &str) -> String {
         let mut out = String::new();
-        out.push_str("// HARC typed runtime randomization problem table (Phase 5B scaffold).\n");
-        out.push_str(
-            "// Current randomization behavior still uses cpp_tb.rs inline Z3 emission.\n",
-        );
-        out.push_str("namespace {\n");
-        out.push_str("static constexpr harc_rt::random::HarcRuntimeProblemDescriptor ");
+        out.push_str("// HARC typed runtime randomization problem descriptors.\n");
+        out.push_str(storage);
+        out.push_str(" harc_rt::random::HarcRuntimeProblemDescriptor ");
         out.push_str(symbol);
         out.push_str("_entries[] = {\n");
         for problem in &self.problems {
             out.push_str("    {");
             out.push_str(&problem.id.to_string());
-            out.push_str(", \"");
+            out.push_str("ULL, \"");
             out.push_str(&escape_cpp_string(&problem.origin));
             out.push_str("\", \"");
             out.push_str(&escape_cpp_string(&problem.manifest()));
             out.push_str("\"},\n");
         }
         out.push_str("};\n");
-        out.push_str("static constexpr harc_rt::random::HarcRuntimeProblemTable ");
+        out.push_str(storage);
+        out.push_str(" harc_rt::random::HarcRuntimeProblemTable ");
         out.push_str(symbol);
         out.push_str(" = {");
         out.push_str(symbol);
         out.push_str("_entries, ");
         out.push_str(&self.problems.len().to_string());
-        out.push_str("};\n");
-        out.push_str("static harc_rt::random::HarcRuntimeCallSite ");
-        out.push_str(symbol);
-        out.push_str("_call_sites[] = {\n");
-        for problem in &self.problems {
-            out.push_str("    {");
-            out.push_str(&problem.id.to_string());
-            out.push_str(", ");
-            out.push_str(&problem.id.to_string());
-            out.push_str(", 0},\n");
-        }
-        out.push_str("};\n");
-        out.push_str("static constexpr uint32_t ");
-        out.push_str(symbol);
-        out.push_str("_call_site_count = ");
-        out.push_str(&self.problems.len().to_string());
-        out.push_str(";\n");
-        out.push_str("static inline harc_rt::random::HarcRandomizeCall ");
-        out.push_str(symbol);
-        out.push_str("_prepare_call(\n");
-        out.push_str("    harc_rt::random::harc_problem_id problem_id,\n");
-        out.push_str("    harc_rt::random::harc_seed global_seed,\n");
-        out.push_str("    harc_rt::random::harc_seed fallback_seed) {\n");
-        out.push_str("    return harc_rt::random::harc_prepare_randomize_call(\n");
-        out.push_str("        ");
-        out.push_str(symbol);
-        out.push_str(",\n");
-        out.push_str("        ");
-        out.push_str(symbol);
-        out.push_str("_call_sites,\n");
-        out.push_str("        ");
-        out.push_str(symbol);
-        out.push_str("_call_site_count,\n");
-        out.push_str("        problem_id,\n");
-        out.push_str("        global_seed,\n");
-        out.push_str("        fallback_seed);\n");
-        out.push_str("}\n");
-        out.push_str("} // namespace\n\n");
+        out.push_str("};\n\n");
         out
+    }
+
+    pub fn problem_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.problems.iter().map(|problem| problem.id)
     }
 }
 
@@ -341,18 +316,19 @@ end test Smoke
 
         assert_eq!(runtime_table.problems.len(), 2);
         assert_eq!(runtime_table.problems[0].id, 1);
-        assert_eq!(runtime_table.problems[1].id, 2);
+        let site_id = runtime_table.problems[1].id;
+        assert_ne!(site_id, 1);
 
         let manifest = runtime_table.manifest();
         assert!(manifest.contains("problem 1 randomize(Packet)"));
-        assert!(manifest.contains("problem 2 randomize(Packet) with"));
+        assert!(manifest.contains(&format!("problem {site_id} randomize(Packet) with")));
         assert!(manifest.contains("field addr u8 random=true default=false attrs=[range]"));
         assert!(manifest.contains("field op enum Op {READ,WRITE}"));
         assert!(manifest.contains("field tag u4 random=false"));
     }
 
     #[test]
-    fn renders_cpp_problem_table_metadata() {
+    fn renders_immutable_cpp_problem_table_metadata() {
         let src = r#"
 transaction Packet
     addr : uint<8>
@@ -371,17 +347,53 @@ end test Smoke
         let parsed = parse_source(src).expect("parse");
         let typed_table = build_typed_solver_problem_table(&parsed);
         let runtime_table = RuntimeProblemTable::from_typed_solver_table(&typed_table);
-        let cpp = runtime_table.render_cpp_table("_harc_runtime_problem_table");
+        let site_id = runtime_table.problems[1].id;
+        let cpp = runtime_table.render_cpp_inline_descriptors("_harc_runtime_problem_table");
 
         assert!(cpp.contains("HarcRuntimeProblemDescriptor _harc_runtime_problem_table_entries[]"));
         assert!(cpp.contains("HarcRuntimeProblemTable _harc_runtime_problem_table"));
-        assert!(cpp.contains("HarcRuntimeCallSite _harc_runtime_problem_table_call_sites[]"));
-        assert!(cpp.contains("_harc_runtime_problem_table_call_site_count = 2"));
-        assert!(cpp.contains("{1, \"randomize(Packet)\""));
-        assert!(cpp.contains("{2, \"randomize(Packet) with\""));
-        assert!(cpp.contains("{1, 1, 0}"));
-        assert!(cpp.contains("{2, 2, 0}"));
+        assert!(cpp.contains("{1ULL, \"randomize(Packet)\""));
+        assert!(cpp.contains(&format!("{{{site_id}ULL, \"randomize(Packet) with\"")));
+        assert!(!cpp.contains("HarcRuntimeCallSite"));
         assert!(cpp.contains("problem 1 randomize(Packet)\\n"));
+
+        let cxx = std::env::var("HARC_CXX").unwrap_or_else(|_| "c++".to_string());
+        let tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("tmp");
+        std::fs::create_dir_all(&tmp).expect("create target/tmp");
+        let source = tmp.join("harc_random_rt_descriptor_test.cpp");
+        let object = tmp.join("harc_random_rt_descriptor_test.o");
+        std::fs::write(
+            &source,
+            format!("#include \"harc_random_rt.h\"\n{cpp}\nint main() {{ return 0; }}\n"),
+        )
+        .expect("write descriptor compile test");
+        let status = match Command::new(&cxx)
+            .args([
+                "-std=c++20",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-Iruntime",
+                "-c",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&object)
+            .status()
+        {
+            Ok(status) => status,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping C++ descriptor compile check: `{cxx}` not found");
+                return;
+            }
+            Err(err) => panic!("failed to launch `{cxx}`: {err}"),
+        };
+        assert!(
+            status.success(),
+            "`{cxx}` rejected generated descriptor literals"
+        );
     }
 
     #[test]
@@ -398,6 +410,9 @@ end test Smoke
         let status = match Command::new(&cxx)
             .args([
                 "-std=c++20",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
                 "-Iruntime",
                 "-c",
                 "runtime/harc_random_rt.cpp",
@@ -542,5 +557,59 @@ int main() {
             status.success(),
             "`{cxx}` failed to compile runtime lookup/callsite helper test"
         );
+    }
+
+    #[test]
+    fn random_callsite_iterations_cover_zero_one_and_wrap() {
+        let cxx = std::env::var("HARC_CXX").unwrap_or_else(|_| "c++".to_string());
+        let tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("tmp");
+        std::fs::create_dir_all(&tmp).expect("create target/tmp");
+        let src = tmp.join("harc_random_rt_iteration_test.cpp");
+        let out = tmp.join("harc_random_rt_iteration_test");
+        std::fs::write(
+            &src,
+            r#"#include "harc_random_rt.h"
+
+using namespace harc_rt::random;
+
+int main() {
+    HarcRuntimeCallSite site{9, 1, 0};
+    harc_seed zero = harc_call_site_next_seed(site, 23);
+    harc_seed one = harc_call_site_next_seed(site, 23);
+    site.iteration = ~uint64_t{0};
+    harc_seed maximum = harc_call_site_next_seed(site, 23);
+    harc_seed wrapped = harc_call_site_next_seed(site, 23);
+    return zero == harc_seed_from(23, 9, 0) &&
+            one == harc_seed_from(23, 9, 1) &&
+            maximum == harc_seed_from(23, 9, ~uint64_t{0}) &&
+            wrapped == zero && site.iteration == 1
+        ? 0
+        : 1;
+}
+"#,
+        )
+        .expect("write iteration test");
+
+        let status = match Command::new(&cxx)
+            .args(["-std=c++20", "-Iruntime"])
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .status()
+        {
+            Ok(status) => status,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping C++ runtime iteration check: `{cxx}` not found");
+                return;
+            }
+            Err(err) => panic!("failed to launch `{cxx}`: {err}"),
+        };
+        assert!(status.success(), "`{cxx}` failed to compile iteration test");
+        let status = Command::new(&out)
+            .status()
+            .expect("run runtime iteration test");
+        assert!(status.success(), "runtime iteration test failed");
     }
 }

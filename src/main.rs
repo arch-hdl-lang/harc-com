@@ -87,6 +87,19 @@ enum Cmd {
         #[arg(short, long)]
         write: bool,
     },
+    /// Print the exact native C++ source list owned by a trusted
+    /// common-object manifest, one path per line.
+    ManifestSources {
+        /// Generated `*artifacts.json` manifest.
+        manifest: PathBuf,
+        /// Print the manifest-owned SystemVerilog probe stub instead.
+        #[arg(long)]
+        probe_stub: bool,
+        /// Print every manifest-owned build input, including generated
+        /// headers and the probe stub, instead of only native C++ sources.
+        #[arg(long, conflicts_with = "probe_stub")]
+        all_artifacts: bool,
+    },
     /// Compile a HARC test against a DUT and run it.
     ///
     /// Counterpart to `arch sim`. Two DUT paths are supported (spec §10.5):
@@ -157,8 +170,8 @@ enum Cmd {
         /// stable capsule per test.
         #[arg(long, default_value_t = 4)]
         cpp_split_group_size: usize,
-        /// Generated C++ split layout for `--cpp-split tests` with
-        /// `--codegen v1`. `self-contained` keeps the historical
+        /// Generated C++ split layout for `--cpp-split tests`.
+        /// `self-contained` keeps the historical
         /// per-shard self-contained translation units; `common` compiles
         /// the shared runtime/testbench/component infrastructure once
         /// and emits one small stable capsule per test plus an explicit
@@ -221,6 +234,11 @@ enum Cmd {
         /// the scoreboard calls to compute expected outputs.
         #[arg(long)]
         ref_src: Vec<PathBuf>,
+        /// Additional native-build identity entry supplied by an external
+        /// build driver. Repeatable; values are fingerprinted but do not
+        /// otherwise affect code generation or runtime selection.
+        #[arg(long)]
+        build_profile_input: Vec<String>,
         /// Z3 installation prefix. Looks for include/z3++.h and lib*/libz3.
         #[arg(long)]
         z3_root: Option<PathBuf>,
@@ -234,10 +252,11 @@ enum Cmd {
         /// invoking Verilator. Default (off) reuses the existing
         /// Verilator output when the emitted `.cpp` is byte-identical
         /// — `harc sim --test foo` then `harc sim --test bar` against
-        /// the same source skips Verilator entirely. Pass `--rebuild`
-        /// when Verilator's version changed, when SV flags changed
-        /// in a way the `.cpp` doesn't capture, or when investigating
-        /// a suspected stale-`.o` problem. See
+        /// the same source skips Verilator entirely. Native-build
+        /// identity changes (including Verilator, flags, backend, and
+        /// layout) invalidate the object directory automatically; use
+        /// `--rebuild` to force the same cleanup while investigating a
+        /// suspected stale-`.o` problem. See
         /// docs/separate-compilation-plan.md §1c.
         #[arg(long)]
         rebuild: bool,
@@ -257,9 +276,8 @@ enum Cmd {
         /// `--trace-fst` on the Verilator command. Default format is
         /// FST (smaller + faster for large regressions); override
         /// with `--wave-format vcd`. Wave file lands in `<outdir>`
-        /// unless `--wave-file` is given. When flipping waveforms on
-        /// after a non-waves build (or changing format), pass
-        /// `--rebuild` because Verilator reuses cached objects.
+        /// unless `--wave-file` is given. Trace configuration changes
+        /// invalidate incompatible cached native objects automatically.
         #[arg(long)]
         waves: bool,
         /// Waveform format. `vcd` is verbose but universally
@@ -537,6 +555,11 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Check { files, ast } => learn_wrap(&files, || cmd_check(files.clone(), ast)),
         Cmd::Fmt { file, write } => cmd_fmt(file, write),
+        Cmd::ManifestSources {
+            manifest,
+            probe_stub,
+            all_artifacts,
+        } => cmd_manifest_sources(&manifest, probe_stub, all_artifacts),
         Cmd::Sim {
             files,
             dut,
@@ -558,6 +581,7 @@ fn main() -> Result<()> {
             mt,
             coverage,
             ref_src,
+            build_profile_input,
             z3_root,
             z3_include_dir,
             z3_lib_dir,
@@ -622,6 +646,7 @@ fn main() -> Result<()> {
                         mt,
                         coverage,
                         ref_src.clone(),
+                        build_profile_input.clone(),
                         z3_opts,
                         rebuild,
                         wave_opts,
@@ -651,6 +676,7 @@ fn main() -> Result<()> {
                         mt,
                         coverage,
                         ref_src.clone(),
+                        build_profile_input.clone(),
                         z3_opts,
                         rebuild,
                         record_trace.clone(),
@@ -719,6 +745,42 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn cmd_manifest_sources(manifest_path: &Path, probe_stub: bool, all_artifacts: bool) -> Result<()> {
+    let manifest = harc::codegen::common_artifacts::read_manifest(manifest_path)
+        .map_err(|error| miette::miette!(error.to_string()))?;
+    let outdir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let sources = if probe_stub {
+        manifest.probe_stub().into_iter().collect::<Vec<_>>()
+    } else if all_artifacts {
+        manifest.build_inputs().collect::<Vec<_>>()
+    } else {
+        manifest.native_sources().collect::<Vec<_>>()
+    };
+    if sources.is_empty() {
+        return Err(miette::miette!(
+            "common-object manifest contains no {} source",
+            if probe_stub {
+                "probe-stub"
+            } else if all_artifacts {
+                "build-input"
+            } else {
+                "native"
+            }
+        ));
+    }
+    for source in sources {
+        let path = outdir.join(source);
+        if !path.is_file() {
+            return Err(miette::miette!(
+                "common-object manifest references missing native source {}",
+                path.display()
+            ));
+        }
+        println!("{}", path.display());
+    }
+    Ok(())
 }
 
 fn cmd_graph(cmd: GraphCmd) -> Result<()> {
@@ -846,24 +908,6 @@ struct Z3PathOpts {
 struct Z3Paths {
     include_dir: Option<PathBuf>,
     lib_dir: Option<PathBuf>,
-}
-
-/// Extract the `artifacts` filename list from a schema-1 common-split
-/// manifest. Returns `None` when the manifest is absent or malformed so
-/// callers can skip cleanup instead of guessing.
-fn parse_manifest_artifacts(manifest: &str) -> Option<Vec<String>> {
-    const KEY: &str = "\"artifacts\":[";
-    let start = manifest.find(KEY)? + KEY.len();
-    let end = manifest[start..].find(']')? + start;
-    let body = &manifest[start..end];
-    let mut names = Vec::new();
-    for part in body.split(',') {
-        let trimmed = part.trim().trim_matches('"');
-        if !trimmed.is_empty() {
-            names.push(trimmed.to_string());
-        }
-    }
-    Some(names)
 }
 
 fn validate_param_overrides(params: &[String]) -> Result<()> {
@@ -1325,15 +1369,25 @@ fn resolve_use_imports(
             Ok(s) => s,
             Err(_) => continue,
         };
-        let parsed = match harc::parser::parse_source(&src) {
+        let parsed = match harc::parser::parse_source_named(path.display().to_string(), &src) {
             Ok(p) => p,
             Err(_) => continue, // skip files we can't parse
         };
-        let bus_only: Vec<Item> = parsed
-            .items
-            .into_iter()
-            .filter(|it| matches!(it, Item::Bus(_)))
-            .collect();
+        let harc::ast::SourceFile {
+            items: parsed_items,
+            item_sources: parsed_item_sources,
+            sources: parsed_sources,
+            ..
+        } = parsed;
+        let mut bus_only = Vec::new();
+        let mut item_sources = Vec::new();
+        assert_eq!(parsed_items.len(), parsed_item_sources.len());
+        for (item, source_id) in parsed_items.into_iter().zip(parsed_item_sources) {
+            if matches!(item, Item::Bus(_)) {
+                bus_only.push(item);
+                item_sources.push(source_id);
+            }
+        }
         if !bus_only.is_empty() {
             for it in &bus_only {
                 if let Item::Bus(b) = it {
@@ -1342,6 +1396,8 @@ fn resolve_use_imports(
             }
             imported.push(harc::ast::SourceFile {
                 items: bus_only,
+                item_sources,
+                sources: parsed_sources,
                 inner_doc: None,
                 frontmatter: None,
             });
@@ -1352,17 +1408,31 @@ fn resolve_use_imports(
 
 fn parse_file(path: &PathBuf) -> Result<harc::ast::SourceFile> {
     let src = fs::read_to_string(path).into_diagnostic()?;
-    harc::parser::parse_source(&src).map_err(|e| {
+    harc::parser::parse_source_named(path.display().to_string(), &src).map_err(|e| {
         Report::new(e).with_source_code(NamedSource::new(path.display().to_string(), src))
     })
 }
 
 fn parse_file_source(path: &PathBuf, src: &str) -> Result<harc::ast::SourceFile> {
-    harc::parser::parse_source(src).map_err(|e| {
+    harc::parser::parse_source_named(path.display().to_string(), src).map_err(|e| {
         Report::new(e).with_source_code(NamedSource::new(
             path.display().to_string(),
             src.to_string(),
         ))
+    })
+}
+
+fn lower_tbir(file: &harc::ast::SourceFile) -> Result<harc::ir::TbProgram> {
+    harc::ir::lower::lower_program_diagnostic(file).map_err(|error| {
+        let source_id = error.source_id();
+        let report = Report::new(error);
+        match file.source_for_id(source_id) {
+            Some(source) => report.with_source_code(NamedSource::new(
+                source.name.to_string(),
+                source.text.to_string(),
+            )),
+            None => report,
+        }
     })
 }
 
@@ -1524,7 +1594,7 @@ fn cmd_dump_ir(files: Vec<PathBuf>, pass: Option<String>, profile: Option<String
     all_files.extend(extra_files);
     let merged = harc::codegen::merge::merge_for_sim(all_files, None)
         .map_err(|e| miette::miette!("{}", e))?;
-    let prog = harc::ir::lower::lower_program(&merged).map_err(|e| miette::miette!("{}", e))?;
+    let prog = lower_tbir(&merged)?;
     harc::ir::verify::verify_program(&prog).map_err(|errs| {
         let lines: Vec<String> = errs.iter().map(|e| format!("  - {e}")).collect();
         miette::miette!(
@@ -1597,13 +1667,9 @@ fn cmd_fmt(file: PathBuf, write: bool) -> Result<()> {
 /// Returns `Ok(true)` when a write happened, `Ok(false)` when the
 /// file already matched.
 fn write_if_changed(path: &Path, contents: &[u8]) -> Result<bool> {
-    if let Ok(existing) = fs::read(path) {
-        if existing == contents {
-            return Ok(false);
-        }
-    }
-    fs::write(path, contents).into_diagnostic()?;
-    Ok(true)
+    harc::codegen::common_artifacts::atomic_write_if_changed(path, contents)
+        .map(|status| status == harc::codegen::common_artifacts::WriteStatus::Written)
+        .map_err(|error| miette::miette!(error.to_string()))
 }
 
 /// Wall-clock for a build phase, in the one-decimal seconds the rest of
@@ -1740,7 +1806,10 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
     let _ = writeln!(s, "    endcase");
     let _ = writeln!(s, "  endfunction");
     let _ = writeln!(s);
-    let _ = writeln!(s, "  function void harc_sv_set(input int _harc_sig_id, input longint _harc_value);");
+    let _ = writeln!(
+        s,
+        "  function void harc_sv_set(input int _harc_sig_id, input longint _harc_value);"
+    );
     let _ = writeln!(s, "    case (_harc_sig_id)");
     for (id, p) in co.ports.iter().enumerate() {
         // Outputs are read-only from the TB; the shim's proxy write would
@@ -1751,7 +1820,12 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
         if p.width_bits == 1 {
             let _ = writeln!(s, "      {id}: {} = _harc_value[0];", p.name);
         } else {
-            let _ = writeln!(s, "      {id}: {} = _harc_value[{}:0];", p.name, p.width_bits - 1);
+            let _ = writeln!(
+                s,
+                "      {id}: {} = _harc_value[{}:0];",
+                p.name,
+                p.width_bits - 1
+            );
         }
     }
     // Force-probe drive/enable writes into the bound stub; its
@@ -1761,7 +1835,11 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
             continue;
         };
         if probe.width_bits == 1 {
-            let _ = writeln!(s, "      {drv_id}: dut.harc_probes.{}_drv = _harc_value[0];", probe.name);
+            let _ = writeln!(
+                s,
+                "      {drv_id}: dut.harc_probes.{}_drv = _harc_value[0];",
+                probe.name
+            );
         } else {
             let _ = writeln!(
                 s,
@@ -1770,7 +1848,11 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
                 probe.width_bits - 1
             );
         }
-        let _ = writeln!(s, "      {en_id}: dut.harc_probes.{}_en = _harc_value[0];", probe.name);
+        let _ = writeln!(
+            s,
+            "      {en_id}: dut.harc_probes.{}_en = _harc_value[0];",
+            probe.name
+        );
     }
     let _ = writeln!(s, "      default: ;");
     let _ = writeln!(s, "    endcase");
@@ -1822,7 +1904,11 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
         if p.width_bits <= 64 || !p.is_input || p.unpacked_elems.is_some() {
             continue;
         }
-        let _ = writeln!(s, "      {id}: {}[_harc_word * 32 +: 32] = _harc_value[31:0];", p.name);
+        let _ = writeln!(
+            s,
+            "      {id}: {}[_harc_word * 32 +: 32] = _harc_value[31:0];",
+            p.name
+        );
     }
     let _ = writeln!(s, "      default: ;");
     let _ = writeln!(s, "    endcase");
@@ -1856,7 +1942,12 @@ fn emit_cosim_harness(top: &str, co: &harc::codegen::cpp_tb::CosimOpts) -> Strin
         if p.width_bits == 1 {
             let _ = writeln!(s, "      {id}: {}[_harc_idx] = _harc_value[0];", p.name);
         } else {
-            let _ = writeln!(s, "      {id}: {}[_harc_idx] = _harc_value[{}:0];", p.name, p.width_bits - 1);
+            let _ = writeln!(
+                s,
+                "      {id}: {}[_harc_idx] = _harc_value[{}:0];",
+                p.name,
+                p.width_bits - 1
+            );
         }
     }
     let _ = writeln!(s, "      default: ;");
@@ -1916,7 +2007,9 @@ fn emit_probe_stub_if_needed(
     outdir: &Path,
     file: &harc::ast::SourceFile,
 ) -> Result<Option<PathBuf>> {
-    let Some((dut_ty, probes)) = harc::codegen::cpp_tb::dut_probes(file) else {
+    let Some((dut_ty, probes)) = harc::codegen::cpp_tb::dut_probes(file)
+        .map_err(|e| miette::miette!("probe catalog validation failed: {e}"))?
+    else {
         return Ok(None);
     };
     let stub_src = harc::codegen::sv_stub::emit_stub(&dut_ty, &probes)
@@ -1930,11 +2023,168 @@ fn emit_probe_stub_if_needed(
     Ok(Some(stub_path))
 }
 
+struct CommonManifestInputs {
+    cpp: Vec<PathBuf>,
+    probe_stub: Option<PathBuf>,
+}
+
+fn push_build_input_file(
+    profile: &mut Vec<String>,
+    kind: &str,
+    index: usize,
+    path: &Path,
+) -> Result<()> {
+    let canonical = fs::canonicalize(path).into_diagnostic()?;
+    let contents = fs::read(&canonical).into_diagnostic()?;
+    profile.push(format!(
+        "{kind}:{index:08}:{}:{}",
+        canonical.display(),
+        harc::codegen::common_artifacts::stable_hash_hex(&contents)
+    ));
+    Ok(())
+}
+
+fn embedded_runtime_abi_fingerprint(include_cosim: bool) -> String {
+    let mut canonical = String::new();
+    for (name, contents) in [
+        ("thread", harc::codegen::cpp_tb::THREAD_RT_HEADER),
+        ("random", harc::codegen::cpp_tb::RANDOM_RT_HEADER),
+        ("queue", harc::codegen::cpp_tb::QUEUE_RT_HEADER),
+        ("trace", harc::codegen::cpp_tb::TRACE_RT_HEADER),
+        ("log", harc::codegen::cpp_tb::LOG_RT_HEADER),
+        ("z3", harc::codegen::cpp_tb::Z3_RT_HEADER),
+    ] {
+        canonical.push_str(name);
+        canonical.push('=');
+        canonical.push_str(&harc::codegen::common_artifacts::stable_hash_hex(
+            contents.as_bytes(),
+        ));
+        canonical.push('\n');
+    }
+    if include_cosim {
+        canonical.push_str("cosim=");
+        canonical.push_str(&harc::codegen::common_artifacts::stable_hash_hex(
+            harc::codegen::cpp_tb::COSIM_RT_HEADER.as_bytes(),
+        ));
+        canonical.push('\n');
+    }
+    harc::codegen::common_artifacts::stable_hash_hex(canonical.as_bytes())
+}
+
+fn common_abi_identity_inputs(waves: &WaveOpts, runtime_abi: &str) -> Vec<String> {
+    vec![
+        format!("runtime_abi={runtime_abi}"),
+        format!(
+            "trace_mode={}",
+            if waves.waves {
+                waves.format.as_str()
+            } else {
+                "disabled"
+            }
+        ),
+    ]
+}
+
+fn tool_version_identity(program: &str) -> String {
+    match Command::new(program).arg("--version").output() {
+        Ok(output) => {
+            let version = if output.stdout.is_empty() {
+                output.stderr.as_slice()
+            } else {
+                output.stdout.as_slice()
+            };
+            let digest = harc::codegen::common_artifacts::stable_hash_hex(version);
+            if output.status.success() {
+                digest
+            } else {
+                format!("status={};{digest}", output.status)
+            }
+        }
+        Err(error) => format!("unavailable:{:?}", error.kind()),
+    }
+}
+
+fn verilator_version_identity() -> String {
+    tool_version_identity("verilator")
+}
+
+fn common_manifest_inputs(
+    manifest_path: &Path,
+    expected_plan: &harc::codegen::common_artifacts::CommonArtifactPlan,
+    expected_backend: harc::codegen::common_artifacts::CodegenBackend,
+    expected_interface_abi: &str,
+    expected_build_profile: &str,
+    expected_placement: &harc::codegen::common_artifacts::PlacementMetrics,
+) -> Result<CommonManifestInputs> {
+    let manifest = harc::codegen::common_artifacts::read_manifest(manifest_path)
+        .map_err(|error| miette::miette!(error.to_string()))?;
+    if manifest.schema_version() != harc::codegen::common_artifacts::MANIFEST_SCHEMA_V2
+        || manifest.backend() != Some(expected_backend)
+        || manifest.layout() != Some(harc::codegen::common_artifacts::CppLayout::Common)
+        || manifest.interface_abi() != expected_interface_abi
+        || manifest.build_profile() != expected_build_profile
+        || manifest
+            .tests()
+            .iter()
+            .map(String::as_str)
+            .ne(expected_plan.tests().iter().map(|test| test.name()))
+        || manifest.placement() != Some(expected_placement)
+        || manifest.artifacts()
+            != expected_plan
+                .artifacts()
+                .iter()
+                .map(|artifact| artifact.filename().to_string())
+                .collect::<Vec<_>>()
+    {
+        return Err(miette::miette!(
+            "common-object manifest identity does not match the generated suite: {}",
+            manifest_path.display()
+        ));
+    }
+    let outdir = manifest_path.parent().ok_or_else(|| {
+        miette::miette!(
+            "common-object manifest has no output directory: {}",
+            manifest_path.display()
+        )
+    })?;
+    let cpp = manifest
+        .native_sources()
+        .map(|filename| outdir.join(filename))
+        .collect::<Vec<_>>();
+    if cpp.is_empty() || cpp.iter().any(|path| !path.is_file()) {
+        return Err(miette::miette!(
+            "common-object manifest references a missing native source: {}",
+            manifest_path.display()
+        ));
+    }
+    let probe_stub = manifest.probe_stub().map(|filename| outdir.join(filename));
+    if probe_stub.as_ref().is_some_and(|path| !path.is_file()) {
+        return Err(miette::miette!(
+            "common-object manifest references a missing probe stub: {}",
+            manifest_path.display()
+        ));
+    }
+    Ok(CommonManifestInputs { cpp, probe_stub })
+}
+
 fn absolutize_trace_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
     }
     Ok(std::env::current_dir().into_diagnostic()?.join(path))
+}
+
+fn prepare_native_build_directory(mdir: &Path, rebuild: bool, build_identity: &str) -> Result<()> {
+    let identity_path = mdir.join(".harc_build_identity");
+    let expected = format!("{build_identity}\n");
+    let identity_matches = fs::read_to_string(&identity_path).is_ok_and(|value| value == expected);
+    if mdir.exists() && (rebuild || !identity_matches) {
+        fs::remove_dir_all(mdir).into_diagnostic()?;
+    }
+    fs::create_dir_all(mdir).into_diagnostic()?;
+    harc::codegen::common_artifacts::atomic_write_if_changed(&identity_path, expected.as_bytes())
+        .map_err(|error| miette::miette!(error.to_string()))?;
+    Ok(())
 }
 
 fn run_verilator(
@@ -1955,6 +2205,7 @@ fn run_verilator(
     waves: &WaveOpts,
     params: &[String],
     cosim: bool,
+    build_identity: &str,
 ) -> Result<()> {
     let mdir = outdir_abs.join("obj_dir");
     // Build-reuse path (Phase 1c). When `--rebuild` is unset and the
@@ -1964,10 +2215,7 @@ fn run_verilator(
     // a fresh build — useful when Verilator was upgraded or when
     // verilator flags changed in a way the emitted .cpp doesn't
     // capture.
-    if rebuild {
-        let _ = fs::remove_dir_all(&mdir);
-    }
-    fs::create_dir_all(&mdir).into_diagnostic()?;
+    prepare_native_build_directory(&mdir, rebuild, build_identity)?;
 
     let mut args: Vec<String> = if cosim {
         // `--cosim dpi`: the simulator owns time. `--binary` =
@@ -1998,13 +2246,13 @@ fn run_verilator(
     ]);
     if !cosim {
         args.extend([
-        // Cycle-based TBs don't need delay semantics; tell Verilator
-        // to elide `#N` delay statements rather than refusing to
-        // elaborate. HARC's `wait N cycles` is always cycle-based
-        // (handled by the runtime scheduler) — delays inside a DUT
-        // are a property of the DUT author, not the TB, and CVDP
-        // coverage scoring ignores delay semantics too.
-        "--no-timing".into(),
+            // Cycle-based TBs don't need delay semantics; tell Verilator
+            // to elide `#N` delay statements rather than refusing to
+            // elaborate. HARC's `wait N cycles` is always cycle-based
+            // (handled by the runtime scheduler) — delays inside a DUT
+            // are a property of the DUT author, not the TB, and CVDP
+            // coverage scoring ignores delay semantics too.
+            "--no-timing".into(),
         ]);
     }
     args.extend([
@@ -2042,9 +2290,9 @@ fn run_verilator(
     // trace/no-trace builds (the scaffolding is always there, gated
     // by `#if defined(HARC_TRACE_*)`), so the rebuild-skip heuristic
     // in cmd_sim still works for the no-trace → no-trace case. When
-    // *flipping* trace on/off, users should pass `--rebuild` because
-    // Verilator's cached object files were compiled without the
-    // trace defines and would silently link against the new .cpp.
+    // *flipping* trace on/off changes the native build identity below,
+    // so cached objects compiled with the other trace configuration are
+    // discarded before Verilator runs.
     if waves.waves {
         let trace_flag = match waves.format.as_str() {
             // `--trace` (not `--trace-vcd`) is the portable spelling for
@@ -2282,6 +2530,7 @@ fn cmd_sim(
     mt: bool,
     coverage: bool,
     ref_src: Vec<PathBuf>,
+    external_build_profile_inputs: Vec<String>,
     z3_opts: Z3PathOpts,
     rebuild: bool,
     record_trace: Option<PathBuf>,
@@ -2367,18 +2616,9 @@ fn cmd_sim(
                 "--cpp-split-layout common requires --cpp-split tests"
             ));
         }
-        // M1: TB-IR now supports common-object layout via SeparateCppPlan;
-        // v1 remains supported. Other codegens (none today) are rejected.
-        if codegen != CodegenKind::V1 && codegen != CodegenKind::Tbir {
+        if split.group_size != 4 {
             return Err(miette::miette!(
-                "--cpp-split-layout common is currently supported for --codegen v1 and --codegen tbir"
-            ));
-        }
-        // v1 common always emits one capsule per test; group_size is
-        // meaningless there. TB-IR common still groups tests into shards.
-        if codegen == CodegenKind::V1 && split.group_size != 4 {
-            return Err(miette::miette!(
-                "--cpp-split-group-size does not apply to --cpp-split-layout common with --codegen v1 \
+                "--cpp-split-group-size does not apply to --cpp-split-layout common \
                  (it always emits one stable capsule per test); drop the flag"
             ));
         }
@@ -2386,6 +2626,19 @@ fn cmd_sim(
             return Err(miette::miette!(
                 "--cpp-split-layout common does not support split DPI co-simulation yet"
             ));
+        }
+        if codegen == CodegenKind::Tbir {
+            if compile_scope != CompileScope::Suite {
+                return Err(miette::miette!(
+                    "TB-IR common layout currently requires --compile-scope suite"
+                ));
+            }
+            if !vlt.is_empty() || !waves.verilator_args.is_empty() {
+                return Err(miette::miette!(
+                    "TB-IR common layout does not yet support custom Verilator inputs/arguments; use \
+                     --cpp-split-layout self-contained (ticket 09)"
+                ));
+            }
         }
     }
 
@@ -2501,8 +2754,8 @@ fn cmd_sim(
             .ok_or_else(|| {
                 miette::miette!("--cosim dpi: cannot determine the DUT top module (pass --top)")
             })?;
-        let ports = harc::codegen::cpp_tb::cosim_ports_from_sv(&sv, &top_for_scan)
-            .ok_or_else(|| {
+        let ports =
+            harc::codegen::cpp_tb::cosim_ports_from_sv(&sv, &top_for_scan).ok_or_else(|| {
                 miette::miette!(
                     "--cosim dpi: could not scan the port list of module `{}` from the \
                      --sv sources (ANSI-style port declarations required)",
@@ -2513,7 +2766,9 @@ fn cmd_sim(
         // backend; the harness reaches its signals hierarchically. Only
         // the accessor width is constrained (<= 64 bits, like ports).
         let mut probes = Vec::new();
-        if let Some((_, probe_decls)) = harc::codegen::cpp_tb::dut_probes(&codegen_source) {
+        if let Some((_, probe_decls)) = harc::codegen::cpp_tb::dut_probes(&codegen_source)
+            .map_err(|e| miette::miette!("probe catalog validation failed: {e}"))?
+        {
             for pr in &probe_decls {
                 let width = harc::codegen::sv_stub::probe_width_bits(&pr.ty).unwrap_or(1);
                 if width > 64 {
@@ -2541,14 +2796,136 @@ fn cmd_sim(
     } else {
         None
     };
+    let top_for_interface = top
+        .clone()
+        .or_else(|| harc::codegen::cpp_tb::dut_type_name(&codegen_source));
+    let dut_interface = top_for_interface
+        .as_deref()
+        .map(|top_name| {
+            harc::codegen::cpp_tb::dut_interface_catalog_with_parameter_overrides(
+                &sv,
+                &dut_iface,
+                top_name,
+                &vec_lane_widths,
+                &params,
+            )
+        })
+        .transpose()
+        .map_err(|error| miette::miette!(error))?
+        .flatten();
+    if let Some(interface) = &dut_interface {
+        for port in interface.ports() {
+            if let Some(width) = port.resolved_width() {
+                dut_port_widths.insert(port.name().to_string(), width);
+            }
+            if let Some(width) = port.packed_lane_width() {
+                vec_lane_widths.insert(port.name().to_string(), width);
+            }
+        }
+    }
+    let codegen_identity = match codegen {
+        CodegenKind::V1 => "v1",
+        CodegenKind::Tbir => "tbir",
+    };
+    let layout_identity = match (split.mode, split.layout) {
+        (CppSplit::Off, _) => "single",
+        (CppSplit::Tests, CppSplitLayout::SelfContained) => "self-contained",
+        (CppSplit::Tests, CppSplitLayout::Common) => "common",
+    };
+    let mut build_profile_inputs = params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| format!("param:{index:08}:{param}"))
+        .collect::<Vec<_>>();
+    build_profile_inputs.push(format!("harc_version={}", env!("CARGO_PKG_VERSION")));
+    build_profile_inputs.push(format!("backend={codegen_identity}"));
+    build_profile_inputs.push(format!("layout={layout_identity}"));
+    build_profile_inputs.push(format!(
+        "top={}",
+        top_for_interface.as_deref().unwrap_or_default()
+    ));
+    if let Some((dut_type, probes)) = harc::codegen::cpp_tb::dut_probes(&codegen_source)
+        .map_err(|error| miette::miette!("probe catalog validation failed: {error}"))?
+    {
+        let probe_stub = harc::codegen::sv_stub::emit_stub(&dut_type, &probes)
+            .map_err(|error| miette::miette!("probe stub emit failed: {error}"))?;
+        build_profile_inputs.push(format!(
+            "probes={}",
+            harc::codegen::common_artifacts::stable_hash_hex(probe_stub.as_bytes())
+        ));
+    }
+    build_profile_inputs.push(format!("cosim={}", cosim_opts.is_some()));
+    build_profile_inputs.push(format!("coverage={coverage}"));
+    build_profile_inputs.push(format!(
+        "waves={}",
+        waves
+            .waves
+            .then(|| waves.format.clone())
+            .unwrap_or_default()
+    ));
+    build_profile_inputs.push(format!("trace_structs={}", waves.trace_structs));
+    build_profile_inputs.push(format!("trace_max_width={}", waves.trace_max_width));
+    build_profile_inputs.push(format!(
+        "trace_max_array={}",
+        waves
+            .trace_max_array
+            .map_or_else(String::new, |value| value.to_string())
+    ));
+    for (index, argument) in waves.verilator_args.iter().enumerate() {
+        build_profile_inputs.push(format!("verilator_arg:{index:08}:{argument}"));
+    }
+    build_profile_inputs.push(
+        "native_flags=gnu++20;-Wno-fatal;-Wno-WIDTH;-Wno-BLKANDNBLK;-Wno-UNOPTFLAT".to_string(),
+    );
+    let runtime_abi = embedded_runtime_abi_fingerprint(cosim_opts.is_some());
+    build_profile_inputs.push(format!("runtime_abi={runtime_abi}"));
+    let cxx = std::env::var("HARC_CXX").unwrap_or_else(|_| "c++".to_string());
+    build_profile_inputs.push(format!("cxx={cxx}"));
+    build_profile_inputs.push(format!("cxx_version={}", tool_version_identity(&cxx)));
+    if !sv.is_empty() {
+        build_profile_inputs.push(format!("verilator={}", verilator_version_identity()));
+    }
+    build_profile_inputs.push(format!(
+        "z3_inc={}",
+        z3_paths
+            .include_dir
+            .as_deref()
+            .map_or_else(String::new, |path| path.display().to_string())
+    ));
+    build_profile_inputs.push(format!(
+        "z3_lib={}",
+        z3_paths
+            .lib_dir
+            .as_deref()
+            .map_or_else(String::new, |path| path.display().to_string())
+    ));
+    for (index, path) in ref_src.iter().enumerate() {
+        push_build_input_file(&mut build_profile_inputs, "ref_src", index, path)?;
+    }
+    for (index, path) in vlt.iter().enumerate() {
+        push_build_input_file(&mut build_profile_inputs, "vlt", index, path)?;
+    }
+    for (index, path) in sv.iter().enumerate() {
+        push_build_input_file(&mut build_profile_inputs, "sv", index, path)?;
+    }
+    for (index, value) in external_build_profile_inputs.iter().enumerate() {
+        build_profile_inputs.push(format!("external:{index:08}:{value}"));
+    }
+    let mut native_build_identity =
+        harc::codegen::common_artifacts::build_profile_fingerprint(mt, &build_profile_inputs);
     let emit_opts = harc::codegen::cpp_tb::EmitOpts {
         mt,
         vec_lane_widths,
         dut_port_widths,
+        dut_interface,
+        build_profile_inputs,
+        common_abi_inputs: common_abi_identity_inputs(&waves, &runtime_abi),
         dut_bus_port_overrides,
         cosim: cosim_opts.clone(),
     };
     let mut cpp_paths = Vec::new();
+    let mut probe_stub_path = None;
+    let mut runtime_headers_published = false;
     match split.mode {
         CppSplit::Off => {
             let cpp = match codegen {
@@ -2557,8 +2934,7 @@ fn cmd_sim(
                         .map_err(|e| miette::miette!("{}", e))?
                 }
                 CodegenKind::Tbir => {
-                    let prog = harc::ir::lower::lower_program(&codegen_source)
-                        .map_err(|e| miette::miette!("{}", e))?;
+                    let prog = lower_tbir(&codegen_source)?;
                     uses_solver |= !prog.constraint_sites.is_empty();
                     harc::ir::verify::verify_program(&prog).map_err(|errs| {
                         let lines: Vec<String> = errs.iter().map(|e| format!("  - {e}")).collect();
@@ -2598,29 +2974,7 @@ fn cmd_sim(
                 // are written via write_if_changed in deterministic
                 // order so Verilator's incremental Make path stays
                 // exact.
-                let mut profile_extra: Vec<String> = Vec::new();
-                profile_extra.push(format!("top={}", top.clone().unwrap_or_default()));
-                profile_extra.push(format!("mt={}", mt));
-                profile_extra.push(format!("coverage={}", coverage));
-                profile_extra.push(format!(
-                    "waves={}",
-                    waves.waves.then(|| waves.format.clone()).unwrap_or_default()
-                ));
-                for p in &params {
-                    profile_extra.push(format!("param:{p}"));
-                }
-                // Toolchain-visible knobs that reach the compiler/linker.
-                // Z3 paths matter because they become -I/-L/-rpath flags;
-                // HARC_CXX selects the compiler binary itself.
-                if let Ok(cxx) = std::env::var("HARC_CXX") {
-                    profile_extra.push(format!("cxx={cxx}"));
-                }
-                if let Ok(inc) = std::env::var("HARC_Z3_INCLUDE_DIR") {
-                    profile_extra.push(format!("z3_inc={inc}"));
-                }
-                if let Ok(lib) = std::env::var("HARC_Z3_LIB_DIR") {
-                    profile_extra.push(format!("z3_lib={lib}"));
-                }
+                let profile_extra: Vec<String> = Vec::new();
                 let started = Instant::now();
                 let prefix = format!("{stem}__");
                 let suite = harc::codegen::cpp_tb::emit_common_split(
@@ -2630,79 +2984,60 @@ fn cmd_sim(
                     &profile_extra,
                 )
                 .map_err(|e| miette::miette!("{}", e))?;
-
-                // Manifest-owned stale cleanup (issue #643): read the
-                // previous manifest, and remove ONLY files it owned that
-                // the new plan no longer contains — e.g. a deleted
-                // test's capsule. Never clean by glob. Deletion happens
-                // before the new writes: an interrupted run may briefly
-                // leave no manifest covering the on-disk set, but the
-                // next regeneration self-heals (the stale file is then
-                // still absent from the plan and removed here again).
-                let manifest_path = outdir.join(format!("{prefix}artifacts.json"));
-                if let Ok(prev) = fs::read_to_string(&manifest_path) {
-                    if let Some(items) = parse_manifest_artifacts(&prev) {
-                        for name in items {
-                            if !suite.files.iter().any(|f| &f.filename == &name) {
-                                let stale = outdir.join(&name);
-                                match fs::remove_file(&stale) {
-                                    Ok(()) => eprintln!("removed stale {}", stale.display()),
-                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                    Err(e) => {
-                                        return Err(miette::miette!(
-                                            "failed to remove stale artifact {}: {e}",
-                                            stale.display()
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let mut emitted_count = 0usize;
+                let manifest_identity = harc::codegen::common_artifacts::ManifestIdentity::new(
+                    harc::codegen::common_artifacts::CodegenBackend::V1,
+                    harc::codegen::common_artifacts::CppLayout::Common,
+                    &suite.interface_abi,
+                    &suite.build_profile,
+                    suite.placement.clone(),
+                );
+                let publication = suite
+                    .artifact_plan
+                    .begin_publication_v2(&outdir, &manifest_identity)
+                    .map_err(|error| miette::miette!(error.to_string()))?;
                 for generated in &suite.files {
                     let cpp_path = outdir.join(&generated.filename);
-                    let changed = write_if_changed(&cpp_path, generated.contents.as_bytes())?;
-                    if changed {
-                        emitted_count += 1;
+                    let status = publication
+                        .write(&generated.filename, generated.contents.as_bytes())
+                        .map_err(|error| miette::miette!(error.to_string()))?;
+                    if status == harc::codegen::common_artifacts::WriteStatus::Written {
                         eprintln!("emitted {}", cpp_path.display());
                     } else {
                         eprintln!("reused {} (unchanged)", cpp_path.display());
                     }
-                    if cpp_path.extension().is_some_and(|ext| ext == "cpp") {
-                        cpp_paths.push(cpp_path);
-                    }
                 }
-                // Manifest: schema version + fingerprints + exact
-                // artifact list, written last so an interrupted run
-                // never leaves a manifest claiming incomplete artifacts.
-                let manifest = format!(
-                    "{{\"schema_version\":1,\"interface_abi\":\"{}\",\"build_profile\":\"{}\",\"tests\":[{}],\"artifacts\":[{}]}}\n",
-                    suite.interface_abi,
-                    suite.build_profile,
-                    suite
-                        .test_names
-                        .iter()
-                        .map(|t| format!("\"{t}\""))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    suite
-                        .files
-                        .iter()
-                        .map(|f| format!("\"{}\"", f.filename))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
-                write_if_changed(&manifest_path, manifest.as_bytes())?;
+                for (filename, contents) in harc::codegen::cpp_tb::RUNTIME_HEADERS {
+                    publication
+                        .write(filename, contents.as_bytes())
+                        .map_err(|error| miette::miette!(error.to_string()))?;
+                }
+                let publication = publication
+                    .commit()
+                    .map_err(|error| miette::miette!(error.to_string()))?;
+                for stale in publication.removed() {
+                    eprintln!("removed stale {}", stale.display());
+                }
                 eprintln!(
                     "HARC common split: {} artifacts ({} rewritten), interface abi {}, profile {}, in {:?}",
                     suite.files.len(),
-                    emitted_count,
+                    publication.rewritten_artifacts(),
                     suite.interface_abi,
                     suite.build_profile,
                     started.elapsed()
                 );
+                let inputs = common_manifest_inputs(
+                    &outdir.join(suite.artifact_plan.manifest_filename()),
+                    &suite.artifact_plan,
+                    harc::codegen::common_artifacts::CodegenBackend::V1,
+                    &suite.interface_abi,
+                    &suite.build_profile,
+                    &suite.placement,
+                )?;
+                cpp_paths = inputs.cpp;
+                probe_stub_path = inputs.probe_stub;
+                native_build_identity =
+                    format!("common:v1:{}:{}", suite.interface_abi, suite.build_profile);
+                runtime_headers_published = true;
             }
             CodegenKind::V1 => {
                 let batch = harc::codegen::cpp_tb::emit_split_tests_with_file_prefix(
@@ -2725,9 +3060,6 @@ fn cmd_sim(
                     }
                 }
             }
-            // M1: TB-IR separate-compilation path (issue #619) — interface +
-            // common are emitted once, shards contain only test-owned
-            // `run_<Test>` wrappers.
             CodegenKind::Tbir if split.layout == CppSplitLayout::Common => {
                 eprintln!(
                     "TBIR parse: {} | merge: {}",
@@ -2735,8 +3067,7 @@ fn cmd_sim(
                     fmt_secs(merge_elapsed),
                 );
                 let lower_started = Instant::now();
-                let prog = harc::ir::lower::lower_program(&codegen_source)
-                    .map_err(|e| miette::miette!("{}", e))?;
+                let prog = lower_tbir(&codegen_source)?;
                 let lower_elapsed = lower_started.elapsed();
                 uses_solver |= !prog.constraint_sites.is_empty();
                 let verify_started = Instant::now();
@@ -2747,235 +3078,230 @@ fn cmd_sim(
                         lines.join("\n")
                     )
                 })?;
+                let verify_elapsed = verify_started.elapsed();
                 eprintln!(
                     "TBIR lower: {} | verify: {}",
                     fmt_secs(lower_elapsed),
-                    fmt_secs(verify_started.elapsed()),
+                    fmt_secs(verify_elapsed),
                 );
 
                 let plan_started = Instant::now();
-                let plan = harc::codegen::tbir::plan_separate_tests(
+                let prefix = format!("{stem}__");
+                harc::codegen::tbir::check_gated_bus_access(&prog, &codegen_source, &emit_opts)
+                    .map_err(|error| miette::miette!(error.to_string()))?;
+                let plan = harc::codegen::tbir::common::plan_common_tests_with_source(
                     &prog,
                     &codegen_source,
                     &emit_opts,
-                    &format!("{stem}__"),
-                    split.group_size,
+                    &prefix,
                 )
-                .map_err(|e| miette::miette!("{}", e))?;
-                let shard_count = plan.shards.len();
-                let jobs = harc::codegen::tbir::resolve_emit_jobs(split.emit_jobs, shard_count);
+                .map_err(|error| miette::miette!(error.to_string()))?;
+                if top.as_deref().is_some_and(|top| top != plan.dut_type()) {
+                    return Err(miette::miette!(
+                        "TB-IR common layout requires --top to match the verified DUT type `{}`",
+                        plan.dut_type()
+                    ));
+                }
+                let jobs =
+                    harc::codegen::tbir::resolve_emit_jobs(split.emit_jobs, plan.capsules().len());
+                let common_callables = plan
+                    .callables()
+                    .iter()
+                    .filter(|callable| {
+                        matches!(
+                            callable.placement(),
+                            harc::codegen::tbir::common::CallablePlacement::Common
+                        )
+                    })
+                    .count();
+                let mut capsule_reasons = std::collections::BTreeMap::<String, usize>::new();
+                for callable in plan.callables() {
+                    match callable.placement() {
+                        harc::codegen::tbir::common::CallablePlacement::CapsuleLocal {
+                            reason,
+                            ..
+                        }
+                        | harc::codegen::tbir::common::CallablePlacement::CapsuleScoped {
+                            reason,
+                        } => {
+                            *capsule_reasons.entry(format!("{reason:?}")).or_default() += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                let capsule_callables = capsule_reasons.values().sum::<usize>();
+                let capsule_summary = capsule_reasons
+                    .iter()
+                    .map(|(reason, count)| format!("{reason}={count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 eprintln!(
-                    "TBIR separate plan: {} tests, {shard_count} shards, group size {}, \
-                     emit jobs {jobs}, planned in {}",
-                    plan.test_names.len(),
-                    split.group_size,
+                    "TBIR common plan: {} tests, {} common unit(s), {} capsule-local test-body unit(s), {common_callables} common callable(s), {capsule_callables} capsule-owned callable(s) [{}], emit jobs {jobs}, planned in {}",
+                    plan.artifact_plan().tests().len(),
+                    plan.artifact_plan().common_units().len(),
+                    plan.capsules().len(),
+                    capsule_summary,
                     fmt_secs(plan_started.elapsed()),
                 );
 
-                // M0: Category accounting — report shared vs per-shard bytes.
-                let cat_started = Instant::now();
-                let cat = harc::codegen::tbir::separate_category_bytes(
-                    &prog,
-                    &codegen_source,
-                    &emit_opts,
-                    &format!("{stem}__"),
-                    split.group_size,
-                )
-                .map_err(|e| miette::miette!("{}", e))?;
-                eprintln!(
-                    "TBIR category bytes: preamble {} | records {} | scoreboards {} | components {} | helpers {} | tb+ctx {} | covergroups {} | problem_table {}",
-                    fmt_bytes(cat.preamble),
-                    fmt_bytes(cat.records),
-                    fmt_bytes(cat.scoreboards),
-                    fmt_bytes(cat.components),
-                    fmt_bytes(cat.helpers),
-                    fmt_bytes(cat.tb_and_context),
-                    fmt_bytes(cat.covergroups),
-                    fmt_bytes(cat.problem_table),
-                );
-                eprintln!(
-                    "TBIR layout bytes: interface {} | common {} | dispatcher {} | shards {} (avg {}), total separate {} vs self-contained {} (saved {}), in {}",
-                    fmt_bytes(cat.interface_total),
-                    fmt_bytes(cat.common_total),
-                    fmt_bytes(cat.dispatcher),
-                    fmt_bytes(cat.shards_total),
-                    fmt_bytes(cat.shards_avg),
-                    fmt_bytes(cat.total_separate),
-                    fmt_bytes(cat.total_self_contained),
-                    fmt_bytes(cat.total_self_contained.saturating_sub(cat.total_separate)),
-                    fmt_secs(cat_started.elapsed()),
-                );
+                let rendered = plan
+                    .publication()
+                    .map_err(|error| miette::miette!(error.to_string()))?;
+                let interface_cpp = rendered.interface();
+                let runtime_cpp = rendered
+                    .runtime()
+                    .map_err(|error| miette::miette!(error.to_string()))?;
+                let registry_cpp = rendered.registry();
+                let probe_stub = plan
+                    .artifact_plan()
+                    .probe_stub()
+                    .map(|artifact| {
+                        harc::codegen::sv_stub::emit_stub_from_plan(plan.dut_access())
+                            .map(|contents| (artifact.filename().to_string(), contents))
+                    })
+                    .transpose()
+                    .map_err(|error| miette::miette!("probe stub emit failed: {error}"))?;
 
-                // Emit interface and common first — shards include the header.
-                let file_prefix = format!("{stem}__");
-                let mut profile_extra: Vec<String> = Vec::new();
-                profile_extra.push(format!("top={}", top.clone().unwrap_or_default()));
-                profile_extra.push(format!("mt={}", mt));
-                profile_extra.push(format!("coverage={}", coverage));
-                profile_extra.push(format!(
-                    "waves={}",
-                    waves.waves.then(|| waves.format.clone()).unwrap_or_default()
-                ));
-                for p in &params {
-                    profile_extra.push(format!("param:{p}"));
-                }
-                if let Ok(cxx) = std::env::var("HARC_CXX") {
-                    profile_extra.push(format!("cxx={cxx}"));
-                }
-                if let Ok(inc) = std::env::var("HARC_Z3_INCLUDE_DIR") {
-                    profile_extra.push(format!("z3_inc={inc}"));
-                }
-                if let Ok(lib) = std::env::var("HARC_Z3_LIB_DIR") {
-                    profile_extra.push(format!("z3_lib={lib}"));
-                }
-                let interface_started = Instant::now();
-                let interface_cpp = harc::codegen::tbir::emit_separate_interface_with_prefix(
-                    &prog,
-                    &codegen_source,
-                    &emit_opts,
-                    &plan.scaffold,
-                    &file_prefix,
-                )
-                .map_err(|e| miette::miette!("{}", e))?;
-                let interface_path = outdir.join(&plan.interface.filename);
-                let interface_changed = write_if_changed(&interface_path, interface_cpp.as_bytes())?;
+                let publication = rendered
+                    .begin_publication(&outdir)
+                    .map_err(|error| miette::miette!(error.to_string()))?;
+                let interface_artifact = plan.artifact_plan().interface();
+                let interface_path = outdir.join(interface_artifact.filename());
+                let interface_status = publication
+                    .write(interface_artifact.filename(), interface_cpp.as_bytes())
+                    .map_err(|error| miette::miette!(error.to_string()))?;
                 eprintln!(
-                    "{} {} (interface) in {}",
-                    if interface_changed { "emitted" } else { "reused" },
+                    "{} {} (interface)",
+                    if interface_status == harc::codegen::common_artifacts::WriteStatus::Written {
+                        "emitted"
+                    } else {
+                        "reused"
+                    },
                     interface_path.display(),
-                    fmt_secs(interface_started.elapsed())
                 );
-                // Common is .cpp, not header — tracked for Verilator.
-                let common_started = Instant::now();
-                let common_cpp = harc::codegen::tbir::emit_separate_common_with_prefix(
-                    &prog,
-                    &codegen_source,
-                    &emit_opts,
-                    &plan.scaffold,
-                    &file_prefix,
-                )
-                .map_err(|e| miette::miette!("{}", e))?;
-                let common_path = outdir.join(&plan.common.filename);
-                let common_changed = write_if_changed(&common_path, common_cpp.as_bytes())?;
-                eprintln!(
-                    "{} {} (common) in {}",
-                    if common_changed { "emitted" } else { "reused" },
-                    common_path.display(),
-                    fmt_secs(common_started.elapsed())
-                );
-                cpp_paths.push(common_path.clone());
 
-                let dispatcher_path = outdir.join(&plan.dispatcher.filename);
-                if write_if_changed(&dispatcher_path, plan.dispatcher.contents.as_bytes())? {
-                    eprintln!("emitted {}", dispatcher_path.display());
-                } else {
-                    eprintln!("reused {} (unchanged)", dispatcher_path.display());
-                }
-                cpp_paths.push(dispatcher_path);
+                let runtime_unit = &plan.artifact_plan().common_units()[0];
+                let runtime_artifact = plan.artifact_plan().artifact(runtime_unit.artifact_index());
+                let runtime_path = outdir.join(runtime_artifact.filename());
+                let runtime_status = publication
+                    .write(runtime_artifact.filename(), runtime_cpp.as_bytes())
+                    .map_err(|error| miette::miette!(error.to_string()))?;
+                eprintln!(
+                    "{} {} (common runtime)",
+                    if runtime_status == harc::codegen::common_artifacts::WriteStatus::Written {
+                        "emitted"
+                    } else {
+                        "reused"
+                    },
+                    runtime_path.display(),
+                );
 
                 let emit_started = Instant::now();
-                let total_bytes = AtomicUsize::new(0);
-                let delivered = harc::codegen::tbir::emit_separate_shards(
-                    &prog,
-                    &codegen_source,
-                    &emit_opts,
-                    &plan,
+                let total_bytes = AtomicUsize::new(interface_cpp.len() + runtime_cpp.len());
+                let delivered = harc::codegen::tbir::common::emit_common_publication_capsules(
+                    &rendered,
                     jobs,
-                    &file_prefix,
-                    |shard, cpp, elapsed| {
-                        let path = outdir.join(&shard.filename);
+                    |capsule, cpp, elapsed| {
+                        let artifact = plan.artifact_plan().artifact(capsule.artifact_index());
+                        let path = outdir.join(artifact.filename());
                         let bytes = cpp.len();
-                        match write_if_changed(&path, cpp.as_bytes()) {
-                            Ok(changed) => {
-                                total_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
-                                eprintln!(
-                                    "TBIR separate shard {}/{shard_count}: {} tests, {}, {}, {}",
-                                    shard.index + 1,
-                                    shard.test_indices.len(),
-                                    fmt_bytes(bytes),
-                                    fmt_secs(elapsed),
-                                    if changed { "emitted" } else { "reused" },
-                                );
-                                Ok(())
-                            }
-                            Err(e) => Err(harc::codegen::cpp_tb::EmitError(format!(
-                                "write {}: {e}",
-                                path.display()
-                            ))),
-                        }
+                        let status = publication
+                            .write(artifact.filename(), cpp.as_bytes())
+                            .map_err(|error| harc::codegen::cpp_tb::EmitError(error.to_string()))?;
+                        total_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
+                        eprintln!(
+                            "TBIR common capsule {}/{}: {}, {} test(s), {}, {}, {}",
+                            capsule.index() + 1,
+                            plan.capsules().len(),
+                            path.display(),
+                            capsule.test_bodies().len(),
+                            fmt_bytes(bytes),
+                            fmt_secs(elapsed),
+                            if status == harc::codegen::common_artifacts::WriteStatus::Written {
+                                "emitted"
+                            } else {
+                                "reused"
+                            },
+                        );
+                        Ok(())
                     },
                 )
-                .map_err(|e| miette::miette!("{}", e))?;
+                .map_err(|error| miette::miette!(error.to_string()))?;
 
+                let registry_artifact = plan.artifact_plan().registry();
+                let registry_path = outdir.join(registry_artifact.filename());
+                let registry_status = publication
+                    .write(registry_artifact.filename(), registry_cpp.as_bytes())
+                    .map_err(|error| miette::miette!(error.to_string()))?;
+                total_bytes.fetch_add(registry_cpp.len(), AtomicOrdering::Relaxed);
                 eprintln!(
-                    "TBIR separate emit: {}/{shard_count} shards, {}, {}",
+                    "{} {} (registry)",
+                    if registry_status == harc::codegen::common_artifacts::WriteStatus::Written {
+                        "emitted"
+                    } else {
+                        "reused"
+                    },
+                    registry_path.display(),
+                );
+
+                if let Some((filename, contents)) = probe_stub {
+                    let path = outdir.join(&filename);
+                    let status = publication
+                        .write(&filename, contents.as_bytes())
+                        .map_err(|error| miette::miette!(error.to_string()))?;
+                    total_bytes.fetch_add(contents.len(), AtomicOrdering::Relaxed);
+                    eprintln!(
+                        "{} {} (probe stub)",
+                        if status == harc::codegen::common_artifacts::WriteStatus::Written {
+                            "emitted"
+                        } else {
+                            "reused"
+                        },
+                        path.display(),
+                    );
+                }
+
+                for (filename, contents) in harc::codegen::cpp_tb::RUNTIME_HEADERS {
+                    publication
+                        .write(filename, contents.as_bytes())
+                        .map_err(|error| miette::miette!(error.to_string()))?;
+                    total_bytes.fetch_add(contents.len(), AtomicOrdering::Relaxed);
+                }
+
+                let publication = publication
+                    .commit()
+                    .map_err(|error| miette::miette!(error.to_string()))?;
+                for stale in publication.removed() {
+                    eprintln!("removed stale {}", stale.display());
+                }
+                eprintln!(
+                    "TBIR common emit: {}/{} capsules, {}, {} rewritten, interface abi {}, profile {}, {}",
                     delivered.len(),
+                    plan.capsules().len(),
                     fmt_bytes(total_bytes.load(AtomicOrdering::Relaxed)),
+                    publication.rewritten_artifacts(),
+                    rendered.interface_abi(),
+                    plan.build_profile(),
                     fmt_secs(emit_started.elapsed()),
                 );
-                cpp_paths.extend(
-                    delivered
-                        .into_iter()
-                        .map(|i| outdir.join(&plan.shards[i].filename)),
-                );
 
-                // Manifest for incremental builds — records interface,
-                // common, dispatcher, and shards.
-                let manifest_path = outdir.join(format!("{file_prefix}manifest.json"));
-                // Stale cleanup: remove files owned by previous manifest
-                // but absent now.
-                if let Ok(prev) = fs::read_to_string(&manifest_path) {
-                    if let Some(items) = parse_manifest_artifacts(&prev) {
-                        let mut current = vec![
-                            plan.interface.filename.clone(),
-                            plan.common.filename.clone(),
-                            plan.dispatcher.filename.clone(),
-                        ];
-                        current.extend(plan.shards.iter().map(|s| s.filename.clone()));
-                        for name in items {
-                            if !current.contains(&name) {
-                                let stale = outdir.join(&name);
-                                match fs::remove_file(&stale) {
-                                    Ok(()) => eprintln!("removed stale {}", stale.display()),
-                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                    Err(e) => {
-                                        return Err(miette::miette!(
-                                            "failed to remove stale artifact {}: {e}",
-                                            stale.display()
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                let build_profile = harc::codegen::cpp_tb::build_profile_fingerprint(
-                    &emit_opts,
-                    &profile_extra,
+                let _ = delivered;
+                let inputs = common_manifest_inputs(
+                    &outdir.join(plan.artifact_plan().manifest_filename()),
+                    plan.artifact_plan(),
+                    harc::codegen::common_artifacts::CodegenBackend::Tbir,
+                    rendered.interface_abi(),
+                    plan.build_profile(),
+                    plan.placement(),
+                )?;
+                cpp_paths = inputs.cpp;
+                probe_stub_path = inputs.probe_stub;
+                native_build_identity = format!(
+                    "common:tbir:{}:{}",
+                    rendered.interface_abi(),
+                    plan.build_profile()
                 );
-                let manifest = format!(
-                    "{{\"schema_version\":1,\"interface_abi\":\"{}\",\"build_profile\":\"{}\",\"tests\":[{}],\"artifacts\":[{}]}}\n",
-                    harc::codegen::cpp_tb::stable_hash_hex(interface_cpp.as_bytes()),
-                    build_profile,
-                    plan.test_names
-                        .iter()
-                        .map(|t| format!("\"{t}\""))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    {
-                        let mut arts = vec![
-                            plan.interface.filename.clone(),
-                            plan.common.filename.clone(),
-                            plan.dispatcher.filename.clone(),
-                        ];
-                        arts.extend(plan.shards.iter().map(|s| s.filename.clone()));
-                        arts.iter()
-                            .map(|f| format!("\"{f}\""))
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    }
-                );
-                write_if_changed(&manifest_path, manifest.as_bytes())?;
+                runtime_headers_published = true;
             }
             // TB-IR streams: the suite is lowered and verified once, the
             // dispatcher lands before any shard work starts, and each
@@ -2993,8 +3319,7 @@ fn cmd_sim(
                     fmt_secs(merge_elapsed),
                 );
                 let lower_started = Instant::now();
-                let prog = harc::ir::lower::lower_program(&codegen_source)
-                    .map_err(|e| miette::miette!("{}", e))?;
+                let prog = lower_tbir(&codegen_source)?;
                 let lower_elapsed = lower_started.elapsed();
                 uses_solver |= !prog.constraint_sites.is_empty();
                 let verify_started = Instant::now();
@@ -3115,36 +3440,11 @@ fn cmd_sim(
     // them by basename. Bundled as baked-in strings via
     // `include_str!` so a binary install of `harc` ships the runtime
     // without a separate file dependency.
-    let rt_header_path = outdir.join("harc_thread_rt.h");
-    write_if_changed(
-        &rt_header_path,
-        harc::codegen::cpp_tb::THREAD_RT_HEADER.as_bytes(),
-    )?;
-    let random_rt_header_path = outdir.join("harc_random_rt.h");
-    write_if_changed(
-        &random_rt_header_path,
-        harc::codegen::cpp_tb::RANDOM_RT_HEADER.as_bytes(),
-    )?;
-    let queue_rt_header_path = outdir.join("harc_queue_rt.h");
-    write_if_changed(
-        &queue_rt_header_path,
-        harc::codegen::cpp_tb::QUEUE_RT_HEADER.as_bytes(),
-    )?;
-    let trace_rt_header_path = outdir.join("harc_trace_rt.h");
-    write_if_changed(
-        &trace_rt_header_path,
-        harc::codegen::cpp_tb::TRACE_RT_HEADER.as_bytes(),
-    )?;
-    let log_rt_header_path = outdir.join("harc_log_rt.h");
-    write_if_changed(
-        &log_rt_header_path,
-        harc::codegen::cpp_tb::LOG_RT_HEADER.as_bytes(),
-    )?;
-    let z3_rt_header_path = outdir.join("harc_z3_rt.h");
-    write_if_changed(
-        &z3_rt_header_path,
-        harc::codegen::cpp_tb::Z3_RT_HEADER.as_bytes(),
-    )?;
+    if !runtime_headers_published {
+        for (filename, contents) in harc::codegen::cpp_tb::RUNTIME_HEADERS {
+            write_if_changed(&outdir.join(filename), contents.as_bytes())?;
+        }
+    }
     // `--cosim dpi`: the co-sim runtime header + the generated SV harness
     // (DUT instantiation, DPI accessor exports, timed master process).
     let cosim_harness_path = if let Some(co) = &cosim_opts {
@@ -3158,10 +3458,7 @@ fn cmd_sim(
             .or_else(|| harc::codegen::cpp_tb::dut_type_name(&codegen_source))
             .expect("cosim: top resolved during port discovery");
         let harness_path = outdir.join("HarcCosimTop.sv");
-        write_if_changed(
-            &harness_path,
-            emit_cosim_harness(&top_name, co).as_bytes(),
-        )?;
+        write_if_changed(&harness_path, emit_cosim_harness(&top_name, co).as_bytes())?;
         Some(harness_path)
     } else {
         None
@@ -3169,7 +3466,9 @@ fn cmd_sim(
 
     // `--emit-only` must still emit every generated source artifact a
     // downstream Verilator build needs, including probe bind stubs.
-    let probe_stub_path = emit_probe_stub_if_needed(&outdir, &codegen_source)?;
+    if probe_stub_path.is_none() {
+        probe_stub_path = emit_probe_stub_if_needed(&outdir, &codegen_source)?;
+    }
 
     if emit_only {
         return Ok(());
@@ -3260,6 +3559,7 @@ fn cmd_sim(
             &waves,
             &params,
             cosim_harness_path.is_some(),
+            &native_build_identity,
         );
     }
 
@@ -3413,6 +3713,7 @@ fn cmd_sim_check_backends(
     mt: bool,
     coverage: bool,
     ref_src: Vec<PathBuf>,
+    external_build_profile_inputs: Vec<String>,
     z3_opts: Z3PathOpts,
     rebuild: bool,
     waves: WaveOpts,
@@ -3469,6 +3770,7 @@ fn cmd_sim_check_backends(
         mt,
         coverage,
         ref_src.clone(),
+        external_build_profile_inputs.clone(),
         z3_opts.clone(),
         rebuild,
         Some(arch_trace.clone()),
@@ -3497,6 +3799,7 @@ fn cmd_sim_check_backends(
         mt,
         coverage,
         ref_src.clone(),
+        external_build_profile_inputs,
         z3_opts.clone(),
         rebuild,
         Some(sv_trace.clone()),
@@ -3585,6 +3888,62 @@ mod tests {
         // backend's shadowing headers.
         assert_ne!(arch_dir, parent);
         assert_ne!(sv_dir, parent);
+    }
+
+    #[test]
+    fn native_build_directory_reuses_only_an_exact_identity() {
+        let base = temp_dir("native-build-identity");
+        let obj_dir = base.join("obj_dir");
+        prepare_native_build_directory(&obj_dir, false, "v1:common:abi-a:profile-a").unwrap();
+        let retained = obj_dir.join("retained.o");
+        fs::write(&retained, "object").unwrap();
+
+        prepare_native_build_directory(&obj_dir, false, "v1:common:abi-a:profile-a").unwrap();
+        assert!(
+            retained.is_file(),
+            "exact build identity should reuse objects"
+        );
+
+        prepare_native_build_directory(&obj_dir, false, "tbir:common:abi-b:profile-a").unwrap();
+        assert!(
+            !retained.exists(),
+            "backend/layout/ABI identity changes must isolate stale objects"
+        );
+        assert_eq!(
+            fs::read_to_string(obj_dir.join(".harc_build_identity")).unwrap(),
+            "tbir:common:abi-b:profile-a\n"
+        );
+
+        let forced = obj_dir.join("forced.o");
+        fs::write(&forced, "object").unwrap();
+        prepare_native_build_directory(&obj_dir, true, "tbir:common:abi-b:profile-a").unwrap();
+        assert!(!forced.exists(), "--rebuild must discard matching objects");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn common_abi_identity_includes_runtime_layout_and_trace_mode() {
+        let disabled = WaveOpts::default();
+        assert_eq!(
+            common_abi_identity_inputs(&disabled, "runtime-a"),
+            vec![
+                "runtime_abi=runtime-a".to_string(),
+                "trace_mode=disabled".to_string(),
+            ]
+        );
+
+        let vcd = WaveOpts {
+            waves: true,
+            format: "vcd".to_string(),
+            ..WaveOpts::default()
+        };
+        assert_eq!(
+            common_abi_identity_inputs(&vcd, "runtime-b"),
+            vec![
+                "runtime_abi=runtime-b".to_string(),
+                "trace_mode=vcd".to_string(),
+            ]
+        );
     }
 
     fn temp_dir(name: &str) -> PathBuf {

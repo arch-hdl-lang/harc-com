@@ -1,0 +1,133 @@
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+struct LazySnapshot
+    value : uint<32> default 0
+end struct LazySnapshot
+
+function tick_once(dut: Top) -> bool
+    dut.en = 1
+    wait 1 cycle
+    dut.en = 0
+    return true
+end function tick_once
+
+function nested_tick(dut: Top) -> bool
+    return tick_once(dut)
+end function nested_tick
+
+function wait_once() -> bool
+    wait 1 cycle
+    return true
+end function wait_once
+
+function nested_wait() -> bool
+    return wait_once()
+end function nested_wait
+
+function pure_true() -> bool
+    return true
+end function pure_true
+
+function preserve_before(before: uint<8>, observed: bool) -> uint<8>
+    return before
+end function preserve_before
+
+function combine_snapshot(before: LazySnapshot, observed: uint<32>) -> uint<32>
+    return before.value * 1000 + observed
+end function combine_snapshot
+
+function combine_scalar(before: uint<32>, observed: uint<32>) -> uint<32>
+    return before * 1000 + observed
+end function combine_scalar
+
+testbench LazyImpureHelperTb
+    dut : Top
+    calls : uint<8> default 0
+    shared_record : LazySnapshot
+    shared_scalar : uint<32> default 0
+
+    function bump() -> bool
+        calls = calls + 1
+        return true
+    end function bump
+
+    function nested_bump() -> bool
+        return bump()
+    end function nested_bump
+
+    function mutate_shared_record() -> uint<32>
+        shared_record.value = 2
+        return 3
+    end function mutate_shared_record
+
+    function mutate_shared_scalar() -> uint<32>
+        shared_scalar = 2
+        return 3
+    end function mutate_shared_scalar
+end testbench LazyImpureHelperTb
+
+impl LazyImpureHelperTest for LazyImpureHelperTb
+    clock clk = SysDomain
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        let free_and = false && nested_tick(dut)
+        let free_or = true || tick_once(dut)
+        assert !free_and && free_or else fail("free helper short-circuit result mismatch")
+        assert dut.count_out == 0
+            else fail("untaken free helper executed: count=${dut.count_out}")
+
+        let free_then = true ? nested_tick(dut) : tick_once(dut)
+        let free_else = false ? tick_once(dut) : nested_tick(dut)
+        assert free_then && free_else else fail("free helper ternary result mismatch")
+        assert dut.count_out == 2
+            else fail("selected free helpers did not execute exactly once: count=${dut.count_out}")
+        let free_before = preserve_before(dut.count_out, nested_tick(dut))
+        assert free_before == 2 && dut.count_out == 3
+            else fail("free helper argument order mismatch: before=${free_before} count=${dut.count_out}")
+        dut.en = 1
+        let transitive_skip = false && nested_wait()
+        dut.en = 0
+        assert !transitive_skip && dut.count_out == 3
+            else fail("transitively impure helper ran in an untaken branch")
+        dut.en = 1
+        let transitive_take = true && nested_wait()
+        dut.en = 0
+        assert transitive_take && dut.count_out == 4
+            else fail("transitively impure helper did not run exactly once")
+
+        let tb_and = false && nested_bump()
+        let tb_or = true || bump()
+        assert !tb_and && tb_or else fail("testbench helper short-circuit result mismatch")
+        assert calls == 0
+            else fail("untaken testbench helper executed: calls=${calls}")
+
+        let tb_then = true ? nested_bump() : bump()
+        let tb_else = false ? bump() : nested_bump()
+        assert tb_then && tb_else else fail("testbench helper ternary result mismatch")
+        assert calls == 2
+            else fail("selected testbench helpers did not execute exactly once: calls=${calls}")
+        let tb_before = preserve_before(calls, nested_bump())
+        assert tb_before == 2 && calls == 3
+            else fail("testbench helper argument order mismatch: before=${tb_before} calls=${calls}")
+
+        shared_record.value = 1
+        let ordered_record = combine_snapshot(shared_record, mutate_shared_record())
+        assert ordered_record == 1003
+            else fail("shared record was read after mutation: got=${ordered_record} expected=1003")
+        shared_scalar = 1
+        let ordered_scalar = combine_scalar(shared_scalar, mutate_shared_scalar())
+        assert ordered_scalar == 1003
+            else fail("shared scalar was read after mutation: got=${ordered_scalar} expected=1003")
+
+        let pure_lazy = false && pure_true()
+        assert !pure_lazy else fail("pure helper short-circuit result mismatch")
+        log(info, "PASS: lazy impure helpers")
+    end run
+end impl LazyImpureHelperTest

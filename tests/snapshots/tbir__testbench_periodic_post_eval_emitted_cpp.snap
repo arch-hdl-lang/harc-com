@@ -55,11 +55,6 @@ static void _harc_eval_posedge(DUT* dut) {
     dut->eval();
 }
 
-static harc_rt::random::HarcRng harc_rng;
-static inline uint64_t harc_rng_next() {
-    return harc_rng.next();
-}
-
 struct Sample {
     uint64_t got = 0;
     uint64_t exp = 0;
@@ -100,6 +95,17 @@ struct Collector {
     harc_rt::HarcQueue<Sample> samples;
     uint64_t _last_in_cycle = 0;
     uint64_t _last_out_cycle = 0;
+    void _harc_copy_user_state_from(const Collector& source) {
+        this->samples = source.samples;
+    }
+    Collector() = default;
+    Collector(const Collector& source) {
+        _harc_copy_user_state_from(source);
+    }
+    Collector& operator=(const Collector& source) {
+        if (this != &source) _harc_copy_user_state_from(source);
+        return *this;
+    }
 };
 
 struct Auditor {
@@ -107,6 +113,18 @@ struct Auditor {
     uint64_t last_got = 0;
     uint64_t _last_in_cycle = 0;
     uint64_t _last_out_cycle = 0;
+    void _harc_copy_user_state_from(const Auditor& source) {
+        this->mismatches = source.mismatches;
+        this->last_got = source.last_got;
+    }
+    Auditor() = default;
+    Auditor(const Auditor& source) {
+        _harc_copy_user_state_from(source);
+    }
+    Auditor& operator=(const Auditor& source) {
+        if (this != &source) _harc_copy_user_state_from(source);
+        return *this;
+    }
 };
 
 struct TbReactive {
@@ -116,6 +134,7 @@ struct TbReactive {
 };
 
 struct HarcTestContext {
+    VerilatedContext verilated;
     VScoreboardTypedQueue* dut = nullptr;
 #if HARC_TRACE_ENABLED
     HarcTraceC* tfp = nullptr;
@@ -127,15 +146,21 @@ struct HarcTestContext {
     int cycle_count = 0;
     harc_rt::trace::HarcTraceWriter trace;
     harc_rt::log::HarcLogContext log_ctx;
+    harc_rt::random::HarcRng rng;
     std::vector<std::function<void()>> _checkers;
     std::vector<std::function<void()>> _post_eval_services;
     std::vector<std::function<void()>> _auto_cov_reports;
 };
 
+struct HarcRuntimeCells_t0 {
+    int64_t tb_periodic_0_last = 0;
+    std::function<void()> test_hook_tb_periodic_0;
+};
+
 int run_TbReactivePostEval(int argc, char** argv) {
-    Verilated::commandArgs(argc, argv);
     HarcTestContext ctx;
-    ctx.dut = new VScoreboardTypedQueue;
+    ctx.verilated.commandArgs(argc, argv);
+    ctx.dut = harc_rt::log::harc_make_dut<VScoreboardTypedQueue>(&ctx.verilated);
     auto* dut = ctx.dut;
 #if HARC_TRACE_ENABLED
     auto* tfp = ctx.tfp;
@@ -147,6 +172,8 @@ int run_TbReactivePostEval(int argc, char** argv) {
     auto& cycle_count = ctx.cycle_count;
     auto& trace = ctx.trace;
     auto& log_ctx = ctx.log_ctx;
+    auto& harc_rng = ctx.rng;
+    auto harc_rng_next = [&]() { return harc_rng.next(); };
     auto& _checkers = ctx._checkers;
     auto& _post_eval_services = ctx._post_eval_services;
     auto& _auto_cov_reports = ctx._auto_cov_reports;
@@ -209,7 +236,7 @@ int run_TbReactivePostEval(int argc, char** argv) {
     // scheduler tick — same semantics as `log(fatal, ...)`. Emitted
     // verbatim by both codegens so the two traces stay diffable.
     harc_rt::HarcQueueFatalScope _queue_fatal_scope([&]() {
-        sim_log_line("FATAL", "pop() on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed");
+        sim_log_line("FATAL", "queue front/pop on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed");
         ctx.errors++;
         _fatal = true;
     });
@@ -217,6 +244,7 @@ int run_TbReactivePostEval(int argc, char** argv) {
     sim_log_line("INFO", "seed=%llu", (long long)harc_rng.state);
 
     harc_rt::ThreadScheduler sched;
+    HarcRuntimeCells_t0 _harc_runtime_cells{};
     TbReactive _tb;
     Collector collector;
     Auditor auditor;
@@ -263,12 +291,36 @@ int run_TbReactivePostEval(int argc, char** argv) {
             }
         }
     };
-    std::function<void()> TbReactivePostEval_tb_periodic_3;
-    TbReactivePostEval_tb_periodic_3 = [&]() -> void {
+    auto TbReactive_drain_samples = [&](TbReactive& _tb) -> void {
+        Sample s{}; (void)s;
+        int __bb = 0;
+        while (true) {
+            switch (__bb) {
+            case 0: {
+                __bb = 1;
+                break;
+            }
+            case 1: {
+                if ((((uint64_t)collector.samples.size()) != 0)) { __bb = 2; } else { __bb = 3; }
+                break;
+            }
+            case 2: {
+                s = collector.samples.pop();
+                Auditor_audit(auditor, s.got, s.exp);
+                __bb = 1;
+                break;
+            }
+            case 3: {
+                return;
+                break;
+            }
+            default: return;
+            }
+        }
+    };
+    _harc_runtime_cells.test_hook_tb_periodic_0 = [&]() -> void {
         uint64_t __t0 = 0; (void)__t0;
         uint64_t __t1 = 0; (void)__t1;
-        uint64_t __t2 = 0; (void)__t2;
-        Sample s{}; (void)s;
         int __bb = 0;
         while (true) {
             switch (__bb) {
@@ -276,26 +328,8 @@ int run_TbReactivePostEval(int argc, char** argv) {
                 __t0 = harc_rt::harc_read(dut->dut_value);
                 __t1 = harc_rt::harc_read(dut->expected_value);
                 Collector_push_sample(collector, __t0, __t1);
-                __t2 = 0;
-                __bb = 2;
-                break;
-            }
-            case 1: {
+                TbReactive_drain_samples(_tb);
                 return;
-                break;
-            }
-            case 2: {
-                if ((((uint64_t)collector.samples.size()) != 0)) { __bb = 3; } else { __bb = 4; }
-                break;
-            }
-            case 3: {
-                s = collector.samples.pop();
-                Auditor_audit(auditor, s.got, s.exp);
-                __bb = 2;
-                break;
-            }
-            case 4: {
-                __bb = 1;
                 break;
             }
             default: return;
@@ -303,10 +337,9 @@ int run_TbReactivePostEval(int argc, char** argv) {
         }
     };
     _post_eval_services.push_back([&]() {
-        static int64_t _tbper_3_last = 0;
-        if ((int64_t)cycle_count - _tbper_3_last >= 1) {
-            _tbper_3_last = (int64_t)cycle_count;
-            TbReactivePostEval_tb_periodic_3();
+        if ((int64_t)cycle_count - _harc_runtime_cells.tb_periodic_0_last >= 1) {
+            _harc_runtime_cells.tb_periodic_0_last = (int64_t)cycle_count;
+            _harc_runtime_cells.test_hook_tb_periodic_0();
         }
     });
     harc_rt::ThreadSlot _run_slot;
@@ -391,8 +424,12 @@ int run_TbReactivePostEval(int argc, char** argv) {
 
 
     for (auto& _r : _auto_cov_reports) _r();
+    _auto_cov_reports.clear();
+    _post_eval_services.clear();
+    _checkers.clear();
+    harc_rt::harc_destroy_scheduler_threads(sched);
     dut->final();
-    HARC_RT_WRITE_COVERAGE(Verilated::threadContextp()->coveragep());
+    HARC_RT_WRITE_COVERAGE(ctx.verilated.coveragep());
     HARC_RT_CLOSE_WAVE_TRACE(tfp);
     delete dut;
 

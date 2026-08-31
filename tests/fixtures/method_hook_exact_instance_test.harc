@@ -1,0 +1,113 @@
+// Exact-instance method-hook ownership for TB-IR self-contained emission.
+// Common-layout transactor fields are outside this fixture's qualified slice.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+agent MethodHookWatcher
+    calls : uint<32> default 0
+
+    hookable note(v: sint<8>)
+        calls = calls + 1
+    end note
+end agent MethodHookWatcher
+
+scoreboard MethodHookSink
+    total : sint<32> default 0
+
+    hookable add(v: sint<8>)
+        total = total + v
+    end add
+end scoreboard MethodHookSink
+
+transactor MethodHookDriver
+    hookable ping(v: uint<8>)
+        if v == 0
+            return
+        end if
+    end ping
+end transactor MethodHookDriver
+
+env MethodHookEnv
+    watcher : MethodHookWatcher
+    sibling : MethodHookWatcher
+    sink    : MethodHookSink
+end env MethodHookEnv
+
+testbench MethodHookFamilyTb
+    dut          : Top
+    env          : MethodHookEnv
+    drv          : MethodHookDriver passive
+    drv_sibling  : MethodHookDriver passive
+    static_sum   : sint<32> default 0
+    dynamic_sum  : sint<32> default 0
+    drv_post_hits : uint<32> default 0
+    registration_order : uint<64> default 0
+end testbench MethodHookFamilyTb
+
+impl MethodHookFamilyTest for MethodHookFamilyTb
+    clock clk = SysDomain
+
+    on env.watcher.note pre
+        static_sum = static_sum + v
+    end on
+
+    on env.watcher.note pre
+        registration_order = registration_order * 10 + 1
+    end on
+
+    on env.watcher.note pre
+        registration_order = registration_order * 10 + 2
+    end on
+
+    on drv.ping post
+        drv_post_hits = drv_post_hits + 1
+    end on
+
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+
+        env.watcher.note(-2)
+
+        let local_bias : sint<32> = 4
+        on env.watcher.note post
+            dynamic_sum = dynamic_sum + v + local_bias
+            local_bias = local_bias + 1
+            env.sink.add(v)
+        end on
+        on env.watcher.note pre
+            registration_order = registration_order * 10 + 3
+        end on
+        env.watcher.note(5)
+        env.sibling.note(7)
+
+        drv.ping(0)
+        drv.ping(1)
+        drv_sibling.ping(1)
+
+        assert static_sum == 3 else fail("static hook sum ${static_sum}, expected 3")
+        assert dynamic_sum == 9 else fail("dynamic hook sum ${dynamic_sum}, expected 9")
+        assert local_bias == 5 else fail("captured local ${local_bias}, expected 5")
+        assert env.watcher.calls == 2 else fail("method body count ${env.watcher.calls}, expected 2")
+        assert env.sibling.calls == 1 else fail("sibling body count ${env.sibling.calls}, expected 1")
+        assert env.sink.total == 5 else fail("hook-called method sum ${env.sink.total}, expected 5")
+        assert drv_post_hits == 1 else fail("driver post hook count ${drv_post_hits}, expected 1")
+        assert registration_order == 12123
+            else fail("method hook registration order ${registration_order}, expected 12123")
+        log(info, "PASS: nested and statement-position method hooks")
+    end run
+
+    check
+        env.watcher.note(3)
+        assert static_sum == 6 else fail("cross-phase static sum ${static_sum}, expected 6")
+        assert dynamic_sum == 17 else fail("cross-phase dynamic sum ${dynamic_sum}, expected 17")
+        assert env.watcher.calls == 3 else fail("cross-phase method count ${env.watcher.calls}, expected 3")
+        assert env.sink.total == 8 else fail("cross-phase hook-called sum ${env.sink.total}, expected 8")
+        assert registration_order == 12123123
+            else fail("cross-phase registration order ${registration_order}, expected 12123123")
+    end check
+end impl MethodHookFamilyTest

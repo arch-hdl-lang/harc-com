@@ -11,11 +11,11 @@
 
 namespace harc_rt {
 
-// Reporter for a pop off an empty queue, installed for the duration of a
+// Reporter for a value read from an empty queue, installed for the duration of a
 // test run by the generated `run_<Test>()` prologue — see
 // `HarcQueueFatalScope` below.
 //
-// `pop()` lives in a standalone header and has no way to reach the test
+// The queue methods live in a standalone header and have no way to reach the test
 // context (`ctx.errors`, `_fatal`, `sim_log_line`), and threading one
 // through every queue would change how every scoreboard and component
 // struct is built. An installed reporter keeps the queue helper free of
@@ -28,7 +28,7 @@ namespace harc_rt {
 // other FATAL raised from an actor body — no better, no worse.
 inline std::function<void()> harc_queue_empty_pop_reporter;
 
-// Backstop for an empty pop with NO reporter installed — a unit test, or
+// Backstop for an empty value read with NO reporter installed — a unit test, or
 // any future caller outside a generated `run_<Test>()`. There is no test
 // context to fail cleanly through, so this is the one place that keeps
 // the hard abort: silently returning a default would turn a real bug
@@ -36,7 +36,7 @@ inline std::function<void()> harc_queue_empty_pop_reporter;
 //
 // Kept out of the template so the diagnostic string exists once per
 // program rather than once per queue element type.
-[[noreturn]] inline void harc_queue_empty_pop_abort() {
+[[noreturn]] inline void harc_queue_empty_access_abort(const char* operation) {
     // stdout is block-buffered when redirected to a file or a pipe, and
     // abort() does not flush it, so without this the lines before the
     // failure — the ones that say what the caller was doing — are lost
@@ -44,9 +44,10 @@ inline std::function<void()> harc_queue_empty_pop_reporter;
     std::fflush(stdout);
     std::fprintf(
         stderr,
-        "HARC-ERROR: pop() on an empty queue\n"
-        "  guard the pop with `.empty()`/`.size()`, or wait until the "
-        "producer has pushed\n");
+        "HARC-ERROR: %s() on an empty queue\n"
+        "  guard the queue read with `.empty()`/`.size()`, or wait until the "
+        "producer has pushed\n",
+        operation);
     std::fflush(stderr);
     std::abort();
 }
@@ -56,17 +57,30 @@ inline void harc_queue_empty_pop() {
         harc_queue_empty_pop_reporter();
         return;
     }
-    harc_queue_empty_pop_abort();
+    harc_queue_empty_access_abort("pop");
 }
 
-// Installs `report` as the empty-pop reporter for its own lifetime.
+inline void harc_queue_empty_front() {
+    if (harc_queue_empty_pop_reporter) {
+        harc_queue_empty_pop_reporter();
+        return;
+    }
+    harc_queue_empty_access_abort("front");
+}
+
+// Installs `report` as the empty-read reporter for its own lifetime.
 // Scoped rather than assigned once so a process that runs more than one
 // test cannot leave a dangling reference to a dead test context behind.
 struct HarcQueueFatalScope {
-    explicit HarcQueueFatalScope(std::function<void()> report) {
+    std::function<void()> previous;
+
+    explicit HarcQueueFatalScope(std::function<void()> report)
+        : previous(std::move(harc_queue_empty_pop_reporter)) {
         harc_queue_empty_pop_reporter = std::move(report);
     }
-    ~HarcQueueFatalScope() { harc_queue_empty_pop_reporter = nullptr; }
+    ~HarcQueueFatalScope() {
+        harc_queue_empty_pop_reporter = std::move(previous);
+    }
     HarcQueueFatalScope(const HarcQueueFatalScope&) = delete;
     HarcQueueFatalScope& operator=(const HarcQueueFatalScope&) = delete;
 };
@@ -77,12 +91,9 @@ struct HarcQueue {
 
     void push(T v) { _d.push_back(v); }
 
-    // `std::deque::front()` on an empty deque is undefined behaviour, so
-    // an unguarded pop used to read garbage — or die somewhere unrelated
-    // to the mistake that caused it. Report through the installed
-    // reporter and hand back a value-initialised `T`: the run is already
-    // marked fatal and stops at the next scheduler tick, and a zero is
-    // deterministic where the old read was not.
+    // `std::deque::front()` on an empty deque is undefined behaviour.
+    // Report through the installed fatal path and return a value-initialised
+    // `T` so execution remains deterministic until the scheduler stops.
     T pop() {
         if (_d.empty()) {
             harc_queue_empty_pop();
@@ -91,6 +102,14 @@ struct HarcQueue {
         T v = _d.front();
         _d.pop_front();
         return v;
+    }
+
+    T front() const {
+        if (_d.empty()) {
+            harc_queue_empty_front();
+            return T{};
+        }
+        return _d.front();
     }
 
     bool empty() const { return _d.empty(); }

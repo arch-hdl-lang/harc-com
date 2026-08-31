@@ -19,6 +19,7 @@ template <int W> struct VlWide {
 struct VerilatedCovContext { void write(const char*) {} };
 struct VerilatedContext {
     VerilatedCovContext* coveragep() { static VerilatedCovContext c; return &c; }
+    void commandArgs(int, char**) {}
     void timeInc(uint64_t) {}
     uint64_t time() const { return 0; }
 };

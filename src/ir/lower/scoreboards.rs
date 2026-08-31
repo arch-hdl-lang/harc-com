@@ -42,6 +42,8 @@ pub(crate) fn lower_scoreboard(
     // `v1_leaves_the_type_name_undeclared` rule at the queue-element seam.
     enum_names: &std::collections::HashSet<String>,
     consts: &HashMap<String, super::ConstVal>,
+    diagnostics: &super::LowerDiagnosticRecorder,
+    source_id: crate::ast::SourceId,
 ) -> Result<ScoreboardSchema, LowerError> {
     let sb = &c.name.name;
     if !c.params.is_empty() {
@@ -104,6 +106,9 @@ pub(crate) fn lower_scoreboard(
         match item {
             ComponentItem::Field(f) => {
                 let fname = &f.name.name;
+                if let Some(span) = super::helpers::nested_string_type_span(Some(&f.ty)) {
+                    diagnostics.record(source_id, span);
+                }
                 if matches!(fname.as_str(), "_last_in_cycle" | "_last_out_cycle") {
                     return Err(not_implemented(
                         &format!("scoreboard field `{sb}.{fname}`"),
@@ -334,6 +339,12 @@ fn scoreboard_field_kind(
     declared_records: &std::collections::HashSet<String>,
     enum_names: &std::collections::HashSet<String>,
 ) -> Result<ScoreboardFieldKind, LowerError> {
+    if super::helpers::is_nested_string_type(Some(t)) {
+        return Err(unsupported(
+            &format!("scoreboard field `{sb}.{fname}` whose type contains `String`"),
+            "String containers and aggregates are not supported in persistent fields",
+        ));
+    }
     if let TypeExpr::Named { name, generics, .. } = t {
         if matches!(
             name.segments.last().map(|s| s.name.as_str()),

@@ -1,0 +1,57 @@
+// Exact-instance transactor-hook ownership for TB-IR self-contained emission.
+// Common-layout transactor fields are outside this fixture's qualified slice.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor HookedDriver
+    dut : Top
+    calls : uint<32> default 0
+    _last_in_cycle : uint<32> default 10
+    _last_out_cycle : uint<32> default 20
+
+    when active
+        hookable go()
+            calls = calls + 1
+            _last_in_cycle = _last_in_cycle + 1
+            _last_out_cycle = _last_out_cycle + 2
+            dut.en = 1
+        end go
+    end when
+end transactor HookedDriver
+
+testbench TransactorHookTb
+    dut : Top
+    left : HookedDriver active
+    right : HookedDriver active
+    left_hooks : uint<32> default 0
+end testbench TransactorHookTb
+
+impl TransactorHookExactInstanceTest for TransactorHookTb
+    clock clk = SysDomain
+
+    on left.go post
+        left_hooks = left_hooks + 1
+    end on
+
+    run
+        left.dut = dut
+        right.dut = dut
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        assert left.idle(1) else fail("left heartbeat idle predicate")
+        left.go()
+        right.go()
+        assert left_hooks == 1 else fail("left hook count ${left_hooks}, expected 1")
+        assert left.calls == 1 else fail("left calls ${left.calls}, expected 1")
+        assert right.calls == 1 else fail("right calls ${right.calls}, expected 1")
+        assert left._last_in_cycle == 11 else fail("left input heartbeat field collision")
+        assert left._last_out_cycle == 22 else fail("left output heartbeat field collision")
+        assert right._last_in_cycle == 11 else fail("right input heartbeat field collision")
+        assert right._last_out_cycle == 22 else fail("right output heartbeat field collision")
+        log(info, "PASS: transactor hooks are exact-instance owned")
+    end run
+end impl TransactorHookExactInstanceTest

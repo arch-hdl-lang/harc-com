@@ -55,11 +55,6 @@ static void _harc_eval_posedge(DUT* dut) {
     dut->eval();
 }
 
-static harc_rt::random::HarcRng harc_rng;
-static inline uint64_t harc_rng_next() {
-    return harc_rng.next();
-}
-
 struct CountSb {
     harc_rt::HarcQueue<uint64_t> expected;
     uint64_t writes = 0;
@@ -69,6 +64,22 @@ struct CountSb {
     _harc_u128 sized = (((_harc_u128)0x1ULL << 64) | (_harc_u128)0x0ULL);
     uint64_t _last_in_cycle = 0;
     uint64_t _last_out_cycle = 0;
+    CountSb() = default;
+    CountSb(const CountSb& source) {
+        _harc_copy_user_state_from(source);
+    }
+    CountSb& operator=(const CountSb& source) {
+        if (this != &source) _harc_copy_user_state_from(source);
+        return *this;
+    }
+    void _harc_copy_user_state_from(const CountSb& source) {
+        this->expected = source.expected;
+        this->writes = source.writes;
+        this->reads = source.reads;
+        this->wide = source.wide;
+        this->seeded = source.seeded;
+        this->sized = source.sized;
+    }
 };
 
 struct ScoreboardBasicTb {
@@ -79,6 +90,7 @@ struct ScoreboardBasicTb {
 };
 
 struct HarcTestContext {
+    VerilatedContext verilated;
     VTop* dut = nullptr;
 #if HARC_TRACE_ENABLED
     HarcTraceC* tfp = nullptr;
@@ -90,15 +102,16 @@ struct HarcTestContext {
     int cycle_count = 0;
     harc_rt::trace::HarcTraceWriter trace;
     harc_rt::log::HarcLogContext log_ctx;
+    harc_rt::random::HarcRng rng;
     std::vector<std::function<void()>> _checkers;
     std::vector<std::function<void()>> _post_eval_services;
     std::vector<std::function<void()>> _auto_cov_reports;
 };
 
 int run_ScoreboardBasicTest(int argc, char** argv) {
-    Verilated::commandArgs(argc, argv);
     HarcTestContext ctx;
-    ctx.dut = new VTop;
+    ctx.verilated.commandArgs(argc, argv);
+    ctx.dut = harc_rt::log::harc_make_dut<VTop>(&ctx.verilated);
     auto* dut = ctx.dut;
 #if HARC_TRACE_ENABLED
     auto* tfp = ctx.tfp;
@@ -110,6 +123,8 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
     auto& cycle_count = ctx.cycle_count;
     auto& trace = ctx.trace;
     auto& log_ctx = ctx.log_ctx;
+    auto& harc_rng = ctx.rng;
+    auto harc_rng_next = [&]() { return harc_rng.next(); };
     auto& _checkers = ctx._checkers;
     auto& _post_eval_services = ctx._post_eval_services;
     auto& _auto_cov_reports = ctx._auto_cov_reports;
@@ -194,7 +209,7 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
     // scheduler tick — same semantics as `log(fatal, ...)`. Emitted
     // verbatim by both codegens so the two traces stay diffable.
     harc_rt::HarcQueueFatalScope _queue_fatal_scope([&]() {
-        sim_log_line("FATAL", "pop() on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed");
+        sim_log_line("FATAL", "queue front/pop on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed");
         ctx.errors++;
         _fatal = true;
     });
@@ -212,6 +227,7 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
             uint64_t total = 0; (void)total;
             uint64_t i = 0; (void)i;
             uint64_t bump = 0; (void)bump;
+            uint64_t queued = 0; (void)queued;
             uint64_t _anon = 0; (void)_anon;
             uint64_t want = 0; (void)want;
             uint64_t got = 0; (void)got;
@@ -260,6 +276,11 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                     bump = (i + 1);
                     total = (total + bump);
                     _tb.sb.expected.push(total);
+                    queued = _tb.sb.expected.front();
+                    if (!((queued == total))) {
+                        sim_log_line("FAIL", "front changed or removed the queued expectation");
+                        ctx.errors++;
+                    }
                     _tb.sb.writes = (_tb.sb.writes + 1);
                     harc_rt::harc_assign(dut->en, 1);
                     _anon = 1;
@@ -394,8 +415,12 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
 
 
     for (auto& _r : _auto_cov_reports) _r();
+    _auto_cov_reports.clear();
+    _post_eval_services.clear();
+    _checkers.clear();
+    harc_rt::harc_destroy_scheduler_threads(sched);
     dut->final();
-    HARC_RT_WRITE_COVERAGE(Verilated::threadContextp()->coveragep());
+    HARC_RT_WRITE_COVERAGE(ctx.verilated.coveragep());
     HARC_RT_CLOSE_WAVE_TRACE(tfp);
     delete dut;
 

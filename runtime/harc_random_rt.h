@@ -1,26 +1,28 @@
 // harc_random_rt.h — Runtime randomization scaffold for HARC.
 //
-// Phase 5A only defines the ABI-shaped boundary that generated C++ will
-// eventually call. Current codegen still emits inline Z3 solving in
-// cpp_tb.rs; these entrypoints are intentionally inert until the typed
-// runtime backend takes ownership of solving.
+// Generated code keeps immutable problem descriptors separate from the
+// per-run RNG, call-site iteration, uniqueness, retry, and coverage state
+// passed through these helpers.
 
 #pragma once
 
+#include <any>
 #include <cstdio>
 #include <functional>
 #include <initializer_list>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <unordered_map>
 #include <vector>
+#include "harc_log_rt.h"
 #include "harc_thread_rt.h"
 
 namespace harc_rt {
 namespace random {
 
-using harc_problem_id = uint32_t;
-using harc_call_site_id = uint32_t;
+using harc_problem_id = uint64_t;
+using harc_call_site_id = uint64_t;
 using harc_call_iteration = uint64_t;
 using harc_seed = uint64_t;
 
@@ -80,7 +82,7 @@ struct HarcAutoCovCrossMeta {
 
 struct HarcAutoCovPlan {
     const char* type_name = nullptr;
-    uint32_t span = 0;
+    uint64_t span = 0;
     const HarcAutoCovPointMeta* points = nullptr;
     size_t point_count = 0;
     const HarcAutoCovCrossMeta* crosses = nullptr;
@@ -102,6 +104,19 @@ struct HarcSolverRetryPolicy {
 
 template <typename T>
 using HarcUniqueHistory = std::vector<T>;
+
+struct HarcUniqueRegistry {
+    std::unordered_map<uint64_t, std::any> histories;
+
+    template <typename T>
+    HarcUniqueHistory<T>& get(uint64_t key) {
+        auto [it, inserted] = histories.try_emplace(key);
+        if (inserted) it->second = HarcUniqueHistory<T>{};
+        auto* history = std::any_cast<HarcUniqueHistory<T>>(&it->second);
+        if (!history) std::abort();
+        return *history;
+    }
+};
 
 enum class HarcSolveMode : uint8_t {
     Inline,
@@ -150,9 +165,12 @@ inline void harc_rng_seed_from_env(uint64_t& state, const char* env_name = "HARC
 
 struct HarcRng {
     uint64_t state = 0;
+    uint64_t initial_seed = 0;
+    HarcUniqueRegistry unique;
 
     void seed_from_env(const char* env_name = "HARC_SEED") {
         harc_rng_seed_from_env(state, env_name);
+        initial_seed = state;
     }
 
     uint64_t next() {
@@ -525,14 +543,14 @@ inline constexpr const char* harc_auto_cov_state(
 
 inline void harc_auto_cov_report_summary(
     const char* type_name,
-    uint32_t span,
+    uint64_t span,
     uint64_t hit,
     uint64_t total,
     uint64_t blocked) {
     std::printf(
-        "[auto_cov %s@%u] %llu/%llu hit (%.1f%%), blocked=%llu\n",
+        "[auto_cov %s@%llu] %llu/%llu hit (%.1f%%), blocked=%llu\n",
         type_name ? type_name : "",
-        span,
+        static_cast<unsigned long long>(span),
         static_cast<unsigned long long>(hit),
         static_cast<unsigned long long>(total),
         total ? (100.0 * hit / total) : 0.0,
@@ -551,7 +569,8 @@ inline void harc_auto_cov_report_bin(
 
 inline void harc_auto_cov_report(
     const HarcAutoCovPlan& plan,
-    HarcAutoCovState& state) {
+    HarcAutoCovState& state,
+    FILE* coverage_json = nullptr) {
     harc_auto_cov_init(plan, state);
     uint64_t hit = 0;
     uint64_t blocked = 0;
@@ -561,11 +580,20 @@ inline void harc_auto_cov_report(
     for (uint8_t v : state.cross_blocked) if (v) ++blocked;
     uint64_t total = state.point_hit.size() + state.cross_hit.size();
     harc_auto_cov_report_summary(plan.type_name, plan.span, hit, total, blocked);
+    harc_rt::log::harc_cov_json_auto_summary(
+        coverage_json, plan.type_name, plan.span, hit, total, blocked);
 
     for (size_t point = 0; point < plan.point_count; ++point) {
         size_t base = harc_auto_cov_point_offset(plan, point);
         for (size_t i = 0; i < plan.points[point].len; ++i) {
             harc_auto_cov_report_bin(
+                plan.points[point].labels[i],
+                state.point_hit[base + i],
+                state.point_blocked[base + i]);
+            harc_rt::log::harc_cov_json_auto_bin(
+                coverage_json,
+                plan.type_name,
+                plan.span,
                 plan.points[point].labels[i],
                 state.point_hit[base + i],
                 state.point_blocked[base + i]);
@@ -576,6 +604,13 @@ inline void harc_auto_cov_report(
         size_t len = plan.crosses[cross].rows * plan.crosses[cross].cols;
         for (size_t i = 0; i < len; ++i) {
             harc_auto_cov_report_bin(
+                plan.crosses[cross].labels[i],
+                state.cross_hit[base + i],
+                state.cross_blocked[base + i]);
+            harc_rt::log::harc_cov_json_auto_bin(
+                coverage_json,
+                plan.type_name,
+                plan.span,
                 plan.crosses[cross].labels[i],
                 state.cross_hit[base + i],
                 state.cross_blocked[base + i]);
