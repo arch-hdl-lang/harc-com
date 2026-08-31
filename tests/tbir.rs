@@ -52036,3 +52036,83 @@ end impl T
         "unexpected verifier errors: {errors:?}"
     );
 }
+
+#[test]
+fn transactor_tseq_unsupported_element_is_rejected() {
+    let src = r#"
+transactor SeqSink
+    dut : Top
+
+    when active
+        hookable consume(txns: TSeq<Missing>)
+            wait 1 cycle
+        end consume
+    end when
+end transactor SeqSink
+
+testbench SeqTb
+    dut : Top
+    sink : SeqSink active
+end testbench SeqTb
+
+impl SeqTest for SeqTb
+    run
+        wait 1 cycle
+    end run
+end impl SeqTest
+"#;
+    let err = lower_src(src).expect_err("unsupported transactor TSeq element must be rejected");
+    let msg = assert_unsupported(&err);
+    assert!(
+        msg.contains("unsupported TSeq element type"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn transactor_widthless_result_rejects_narrowing_and_sign_change() {
+    let src = r#"
+transactor ResultSource
+    dut : Top
+
+    when active
+        hookable wide() -> uint<128>
+            return 42
+        end wide
+        hookable signed() -> sint<8>
+            return -1
+        end signed
+        hookable small() -> uint<8>
+            return 7
+        end small
+    end when
+end transactor ResultSource
+
+testbench ResultTb
+    dut : Top
+    src : ResultSource active
+end testbench ResultTb
+
+impl ResultTest for ResultTb
+    run
+        let v : uint = src.CALL
+        wait 1 cycle
+    end run
+end impl ResultTest
+"#;
+    for (call, reject) in [("wide()", true), ("signed()", true), ("small()", false)] {
+        let s = src.replace("CALL", call);
+        match lower_src(&s) {
+            Err(err) if reject => {
+                let msg = assert_invalid(&err);
+                assert!(
+                    msg.contains("incompatible with transactor method return"),
+                    "{call}: {msg}"
+                );
+            }
+            Ok(_) if !reject => {}
+            Err(err) => panic!("{call}: expected acceptance, got {err:?}"),
+            Ok(_) => panic!("{call}: expected rejection"),
+        }
+    }
+}
