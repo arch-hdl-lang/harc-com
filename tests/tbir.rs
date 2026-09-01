@@ -28199,8 +28199,11 @@ end test T"#,
 fn constraint_forms_in_value_position_do_not_suggest_v1() {
     // `soft` / `dist` / `solve_order` only PARSE inside a constraint
     // body, so their value-position arms are unreachable from source;
-    // `inside` parses as an ordinary binary operator anywhere.
-    for (expr, want) in [("dut.a inside {1, 2}", "membership test in value position")] {
+    // `in` and `inside` both parse to `ExprKind::Membership` anywhere.
+    for (expr, want) in [
+        ("dut.a in {1, 2}", "membership test in value position"),
+        ("dut.a inside {1, 2}", "membership test in value position"),
+    ] {
         let src = format!(
             r#"test T
     let dut : Top

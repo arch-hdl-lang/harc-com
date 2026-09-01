@@ -9961,6 +9961,16 @@ former `transaction` group lives in
      fallback remains for other spellings; raw inventory stays at 97 textual
      matches (96 constructors plus the helper definition).
 
+195. **Membership operator fallback classification (2026-09-01).**
+
+     The parser canonicalizes both `in` and `inside` to
+     `ExprKind::Membership`, whose value-position diagnostic already records
+     that v1 rejects the form. The defensive `BinaryOp::{In, Inside}` arm now
+     calls that same diagnostic helper instead of retaining an unreachable
+     `Unsupported` suggestion. Source regressions cover both spellings. This
+     reduces the raw inventory to 96 textual matches (95 constructors plus the
+     helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
