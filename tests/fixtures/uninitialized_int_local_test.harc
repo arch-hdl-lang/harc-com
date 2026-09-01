@@ -1,0 +1,11 @@
+test UninitializedIntLocalTest
+    let dut : Top
+
+    run
+        let value : int
+        assert value == 0 else fail("int local was not zero initialized")
+        value = 37
+        assert value == 37 else fail("int local assignment was lost")
+        wait 1 cycle
+    end run
+end test UninitializedIntLocalTest

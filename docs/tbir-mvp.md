@@ -9819,6 +9819,18 @@ former `transaction` group lives in
      residual note: passive env-held BFMs are no longer rejected merely for
      being passive; only their `when active` method surface is unavailable.
 
+184. **Uninitialized builtin-`int` locals (2026-08-31).**
+
+     A declaration such as `let count : int` now follows the existing
+     zero-initialized scalar-local path instead of falling through the generic
+     typed-declaration unsupported boundary. TBIR retains `int`'s 32-bit
+     language width in `IrType` and uses the same narrow unsigned carrier as
+     v1, so later assignments and reads verify and emit normally. The
+     self-checking fixture confirms both initial zero and a subsequent write
+     under v1/TBIR trace parity. This routes around a shared constructor, so
+     the raw unsupported inventory remains 104 textual matches (103
+     constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

@@ -30293,11 +30293,24 @@ end impl T"#,
     let dut : Top
     run
         let x : int
+        x = 7
+        assert x == 7
     end run
 end test T"#,
     )
-    .expect_err("an unsupported typed declaration must not be erased");
-    assert_unsupported(&typed);
+    .expect("an uninitialized builtin-int local uses typed scalar storage");
+    verify::verify_program(&typed).expect("the builtin-int local verifies");
+    let run = typed
+        .functions
+        .iter()
+        .find(|f| matches!(f.kind, ir::FunctionKind::Run { .. }))
+        .expect("run function");
+    let x = run
+        .locals
+        .iter()
+        .find(|local| local.name == "x")
+        .expect("x local");
+    assert_eq!(x.ty, ir::IrType::UInt(Some(32)));
 
     let err = lower_src(
         r#"test T
