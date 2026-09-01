@@ -8264,11 +8264,20 @@ impl Emitter {
             })
             .unwrap_or_else(|| "assertion failed".to_string());
         let (fmt, caps) = process_interp(&msg);
+        // C++ does not guarantee a source-order evaluation for variadic
+        // function arguments. Snapshot captures before the log call so
+        // interpolation side effects happen left-to-right.
+        self.pad(depth + 1);
+        writeln!(self.out, "{{").ok();
+        self.emit_interp_capture_temps(&caps, depth + 2);
+        self.pad(depth + 2);
         write!(self.out, "sim_log_line(\"FAIL\", \"{}\"", escape_c(&fmt)).ok();
-        for c in &caps {
-            self.emit_interp_arg(c);
+        for (index, c) in caps.iter().enumerate() {
+            self.emit_interp_temp_arg(c, index);
         }
         writeln!(self.out, ");").ok();
+        self.pad(depth + 1);
+        writeln!(self.out, "}}").ok();
         self.pad(depth + 1);
         let runtime_context = self.randomize_context_ref().to_string();
         writeln!(self.out, "{runtime_context}.errors++;").ok();
@@ -8558,11 +8567,16 @@ impl Emitter {
                 self.pad(depth + 2);
                 if let Some(raw) = header {
                     let (fmt, caps) = process_interp(&raw);
+                    writeln!(self.out, "{{").ok();
+                    self.emit_interp_capture_temps(&caps, depth + 3);
+                    self.pad(depth + 3);
                     write!(self.out, "sim_log_line(\"FAIL\", \"{}\"", escape_c(&fmt)).ok();
-                    for c in &caps {
-                        self.emit_interp_arg(c);
+                    for (index, c) in caps.iter().enumerate() {
+                        self.emit_interp_temp_arg(c, index);
                     }
                     writeln!(self.out, ");").ok();
+                    self.pad(depth + 2);
+                    writeln!(self.out, "}}").ok();
                 } else {
                     let label = match mode {
                         WaitUntilMode::Single => "wait until",
@@ -19747,7 +19761,12 @@ impl Emitter {
             })
             .unwrap_or_else(|| "".to_string());
         let (fmt, caps) = process_interp(&msg);
+        // Make interpolation sequencing explicit instead of relying on the
+        // unspecified evaluation order of C++ function arguments.
         self.pad(depth);
+        writeln!(self.out, "{{").ok();
+        self.emit_interp_capture_temps(&caps, depth + 1);
+        self.pad(depth + 1);
         match file_path {
             Some(p) => {
                 write!(
@@ -19763,8 +19782,8 @@ impl Emitter {
                 write!(self.out, "sim_log_line(\"{}\", \"{}\"", sev, escape_c(&fmt)).ok();
             }
         }
-        for c in &caps {
-            self.emit_interp_arg(c);
+        for (index, c) in caps.iter().enumerate() {
+            self.emit_interp_temp_arg(c, index);
         }
         writeln!(self.out, ");").ok();
 
@@ -19778,26 +19797,38 @@ impl Emitter {
         // `warn` / `info` / `debug` have no test-result effect.
         match sev.as_str() {
             "ERROR" => {
-                self.pad(depth);
+                self.pad(depth + 1);
                 let runtime_context = self.randomize_context_ref().to_string();
                 writeln!(self.out, "{runtime_context}.errors++;").ok();
             }
             "FATAL" => {
-                self.pad(depth);
+                self.pad(depth + 1);
                 let runtime_context = self.randomize_context_ref().to_string();
                 writeln!(self.out, "{runtime_context}.errors++; _fatal = true;").ok();
             }
             _ => {}
         }
+        self.pad(depth);
+        writeln!(self.out, "}}").ok();
     }
 
-    /// Emit one captured `${expr}` value as a printf argument. Routes the
-    /// captured source text through the parser so `dut.x` (a member access
-    /// on a pointer) gets emitted as `dut->x` via the normal field-rewrite
-    /// machinery, rather than the literal source text. Falls back to raw
-    /// text if the fragment doesn't parse — preserves whatever the user
-    /// wrote so they get a meaningful C++ error rather than a hidden one.
-    fn emit_interp_arg(&mut self, cap: &InterpCap) {
+    /// Evaluate each interpolation capture in source order before passing
+    /// it to a variadic C++ logging function.
+    fn emit_interp_capture_temps(&mut self, caps: &[InterpCap], depth: usize) {
+        for (index, cap) in caps.iter().enumerate() {
+            self.pad(depth);
+            write!(self.out, "auto _harc_interp_{index} = ").ok();
+            match crate::parser::parse_expr_fragment(&cap.expr) {
+                Ok(e) => self.emit_expr(&e),
+                Err(_) => self.reject_unparseable_capture(&cap.expr),
+            }
+            writeln!(self.out, ";").ok();
+        }
+    }
+
+    /// Emit one previously snapshotted interpolation value with the printf
+    /// carrier selected for its format specifier.
+    fn emit_interp_temp_arg(&mut self, cap: &InterpCap, index: usize) {
         write!(self.out, ", ").ok();
         match cap.wide_hex {
             Some((width, upper)) => {
@@ -19807,24 +19838,10 @@ impl Emitter {
                 } else {
                     write!(self.out, "(const char*)harc_rt::HarcHexBuf128(").ok();
                 }
-                match crate::parser::parse_expr_fragment(&cap.expr) {
-                    Ok(e) => self.emit_expr(&e),
-                    Err(_) => self.reject_unparseable_capture(&cap.expr),
-                }
-                write!(self.out, ", {width}, {upper_str})").ok();
+                write!(self.out, "_harc_interp_{index}, {width}, {upper_str})").ok();
             }
             None => {
-                // Narrow / decimal path: preserve the legacy long-long
-                // printf ABI. HarcWide<N> has both uint64_t and _harc_u128
-                // conversions, so route through a helper to avoid ambiguous
-                // C-style casts when a wide DUT signal is printed with a
-                // narrow format such as `${sig:08x}`.
-                write!(self.out, "harc_rt::harc_printf_ll(").ok();
-                match crate::parser::parse_expr_fragment(&cap.expr) {
-                    Ok(e) => self.emit_expr(&e),
-                    Err(_) => self.reject_unparseable_capture(&cap.expr),
-                }
-                write!(self.out, ")").ok();
+                write!(self.out, "harc_rt::harc_printf_ll(_harc_interp_{index})").ok();
             }
         }
     }
@@ -22537,14 +22554,19 @@ impl Emitter {
                 };
                 let (fmt, caps) = process_interp(&raw);
                 self.pad(depth);
+                writeln!(self.out, "{{").ok();
+                self.emit_interp_capture_temps(&caps, depth + 1);
+                self.pad(depth + 1);
                 write!(self.out, "sim_log_line(\"FAIL\", \"{}\"", escape_c(&fmt)).ok();
-                for c in &caps {
-                    self.emit_interp_arg(c);
+                for (index, c) in caps.iter().enumerate() {
+                    self.emit_interp_temp_arg(c, index);
                 }
                 writeln!(self.out, ");").ok();
-                self.pad(depth);
+                self.pad(depth + 1);
                 let runtime_context = self.randomize_context_ref().to_string();
                 writeln!(self.out, "{runtime_context}.errors++;").ok();
+                self.pad(depth);
+                writeln!(self.out, "}}").ok();
             }
             StmtKind::Assume(v) => {
                 if let Some(expr) = &v.expr {

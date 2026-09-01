@@ -1703,18 +1703,15 @@ end test T"#,
         cpp
     );
     assert!(
-        cpp.contains(
-            "(const char*)harc_rt::HarcHexBuf128(harc_rt::harc_read(dut->text_out), 32, false)"
-        ),
+        cpp.contains("auto _harc_interp_0 = harc_rt::harc_read(dut->text_out);")
+            && cpp.contains("(const char*)harc_rt::HarcHexBuf128(_harc_interp_0, 32, false)"),
         "expected HarcHexBuf128 lowering for `:032x`:\n{}",
         cpp
     );
 
     // Wide-hex uppercase — same shape, upper=true.
     assert!(
-        cpp.contains(
-            "(const char*)harc_rt::HarcHexBuf128(harc_rt::harc_read(dut->text_out), 32, true)"
-        ),
+        cpp.contains("(const char*)harc_rt::HarcHexBuf128(_harc_interp_0, 32, true)"),
         "expected HarcHexBuf128 lowering for `:032X`:\n{}",
         cpp
     );
@@ -1726,7 +1723,7 @@ end test T"#,
         cpp
     );
     assert!(
-        cpp.contains("harc_rt::harc_printf_ll(harc_rt::harc_read(dut->x))"),
+        cpp.contains("\"narrow=0x%08llx\", harc_rt::harc_printf_ll(_harc_interp_0)"),
         "expected narrow interpolation args to use harc_printf_ll:\n{}",
         cpp
     );
@@ -12974,11 +12971,11 @@ end test StableB"#,
         ),
         (
             "stable__test_StableA.cpp".to_string(),
-            "1e5512ab9ed7e74d".to_string(),
+            "a907b3b09e3ee62b".to_string(),
         ),
         (
             "stable__test_StableB.cpp".to_string(),
-            "c171dba204a5b8af".to_string(),
+            "8894ec6118367e01".to_string(),
         ),
         (
             "stable__registry.cpp".to_string(),

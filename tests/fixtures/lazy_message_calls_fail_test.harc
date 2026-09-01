@@ -16,7 +16,8 @@ function pick(dut: Top) -> uint<8>
 end function pick
 
 function set_en(dut: Top, value: uint<8>) -> uint<8>
-    dut.en = value
+    // `en` is a one-bit DUT port; retain only the intentional low bit.
+    dut.en = value.trunc<1>()
     return value
 end function set_en
 
