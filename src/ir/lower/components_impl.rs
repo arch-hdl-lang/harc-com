@@ -1605,11 +1605,10 @@ fn lower_field(
                 },
                 _ => None,
             }
-            .filter(|n| *n != 0)
             .ok_or_else(|| {
                 unsupported(
                     &format!("fixed-vector field `{comp}.{fname}` with an invalid length"),
-                    "the length must be a nonzero decimal compile-time literal",
+                    "the length must be a decimal compile-time literal",
                 )
             })?;
             Ok(ComponentFieldKind::FixedVec(FixedVecSchema { elem, len }))
@@ -3398,9 +3397,9 @@ fn vec_elem_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
 /// `FixedVec { elem: FixedVec { elem: UInt(8), len: 2 }, len: 2 }` and
 /// the emitter renders `std::array<std::array<uint64_t, 2>, 2>`,
 /// matching v1. `None` for any element outside the subset — a record,
-/// a dynamic list, a zero width, or a bad inner length — which the
-/// caller turns into the honest refusal. The inner length is parsed
-/// exactly as the outer one (nonzero decimal literal).
+/// a dynamic list, a zero-width scalar, or a non-literal inner length —
+/// which the caller turns into the honest refusal. A zero-length vector is
+/// an ordinary empty value aggregate (`std::array<T, 0>`).
 pub(crate) fn fixed_vec_elem_ir_type(t: &TypeExpr) -> Option<IrType> {
     fixed_vec_elem_ir_type_with_records(t, &HashMap::new())
 }
@@ -3452,9 +3451,6 @@ fn fixed_vec_elem_ir_type_with_records(
             },
             _ => return None,
         };
-        if len == 0 {
-            return None;
-        }
         return Some(IrType::FixedVec {
             elem: Box::new(elem),
             len,

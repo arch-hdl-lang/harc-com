@@ -149,6 +149,9 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Explicitly passive unbound transactors retain always-on state at
   testbench-field and test-scope declaration surfaces while active-only
   methods remain unavailable.
+- [x] Zero-length fixed vectors as typed empty value aggregates across record
+  fields, component/transactor state, queues, events, helper and component
+  method ABIs, with exact `std::array<T, 0>` storage and verifier metadata.
 
 This list intentionally excludes v1 failures such as a blocking bus call
 nested in an expression. Those may still be useful TB-IR enhancements, but

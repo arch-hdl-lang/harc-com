@@ -14209,16 +14209,9 @@ end impl T"#;
         );
     }
 
-    for corrupt in ["inner length", "outer length", "missing outer length"] {
+    for corrupt in ["missing outer length"] {
         let mut broken = nested_prog.clone();
         match corrupt {
-            "inner length" => {
-                broken.records[0].fields[0].ty = ir::IrType::FixedVec {
-                    elem: Box::new(ir::IrType::UInt(Some(8))),
-                    len: 0,
-                }
-            }
-            "outer length" => broken.records[0].fields[0].vec_len = Some(0),
             "missing outer length" => broken.records[0].fields[0].vec_len = None,
             _ => unreachable!(),
         }
@@ -14592,7 +14585,11 @@ end test T"#
     // The length, not the width — `std::array<uint64_t, 0>`, in either
     // profile.
     let src = field("Vec<uint<8>, 0>");
-    assert_unsupported(&lower_src(&src).unwrap_err());
+    let prog = lower_src(&src).expect("a zero-length record vector lowers");
+    verify::verify_program(&prog).expect("a zero-length record vector verifies");
+    let tbir = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+        .expect("TBIR emits a zero-length record vector");
+    assert!(tbir.contains("std::array<uint64_t, 0> data"), "{tbir}");
     let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
     assert!(v1.contains("std::array<uint64_t, 0> data"), "{v1}");
 
@@ -15085,19 +15082,19 @@ end impl T"#
     );
 
     // The verifier owns the list element/layout contract rather than
-    // trusting lowering forever. Corrupt both independent pieces of metadata.
+    // trusting lowering forever. Zero is a valid fixed-vector cardinality,
+    // so corrupt the independent element-type metadata instead.
     let list_src = prog("scoreboard Sb\n    l : list<Vec<uint<8>, 2>>\nend scoreboard Sb");
     let list_prog = lower_src(&list_src).expect("list control lowers");
-    for corrupt in ["element", "length"] {
+    for corrupt in ["element"] {
         let mut broken = list_prog.clone();
-        let ir::ScoreboardFieldKind::List { elem, vec_len } =
+        let ir::ScoreboardFieldKind::List { elem, .. } =
             &mut broken.scoreboards[0].fields[0].kind
         else {
             panic!("control field is a list")
         };
         match corrupt {
             "element" => *elem = ir::IrType::Record(ir::RecordId(u32::MAX)),
-            "length" => *vec_len = Some(0),
             _ => unreachable!(),
         }
         assert!(
@@ -22461,8 +22458,8 @@ end impl FixedVectorTseqSignatureTest"#;
         .expect("echo_rows helper");
     let mut malformed = prog.clone();
     let bad = ir::IrType::Seq(Box::new(ir::IrType::FixedVec {
-        elem: Box::new(ir::IrType::UInt(Some(8))),
-        len: 0,
+        elem: Box::new(ir::IrType::Unknown),
+        len: 2,
     }));
     malformed.functions[helper_id].params[0].ty = bad.clone();
     malformed.functions[helper_id].locals[0].ty = bad;
@@ -22487,8 +22484,8 @@ end impl FixedVectorTseqSignatureTest"#;
 
     let mut bad_component_param = prog.clone();
     let bad = ir::IrType::Seq(Box::new(ir::IrType::FixedVec {
-        elem: Box::new(ir::IrType::UInt(Some(8))),
-        len: 0,
+        elem: Box::new(ir::IrType::Unknown),
+        len: 2,
     }));
     let relay_schema = bad_component_param
         .components
@@ -22875,13 +22872,6 @@ fn fixed_vector_testbench_method_signatures_are_typed_end_to_end() {
     for (bad_ty, label) in [
         (
             ir::IrType::FixedVec {
-                elem: Box::new(ir::IrType::UInt(Some(8))),
-                len: 0,
-            },
-            "zero length",
-        ),
-        (
-            ir::IrType::FixedVec {
                 elem: Box::new(ir::IrType::Record(ir::RecordId(999))),
                 len: 2,
             },
@@ -22890,12 +22880,12 @@ fn fixed_vector_testbench_method_signatures_are_typed_end_to_end() {
         (
             ir::IrType::FixedVec {
                 elem: Box::new(ir::IrType::FixedVec {
-                    elem: Box::new(ir::IrType::UInt(Some(8))),
-                    len: 0,
+                    elem: Box::new(ir::IrType::Unknown),
+                    len: 2,
                 }),
                 len: 2,
             },
-            "nested zero length",
+            "nested unknown element",
         ),
         (
             ir::IrType::FixedVec {
@@ -45710,6 +45700,135 @@ end test T"#
                 } else {
                     msg.contains("active-only")
                 },
+            "{what}: {msg}"
+        );
+    }
+}
+
+/// A fixed vector's length is a cardinality, not a scalar width. Length zero
+/// therefore denotes the ordinary empty value aggregate `std::array<T, 0>`;
+/// rejecting it made every typed aggregate seam narrower than v1 even though
+/// the existing IR and C++ emitter already represent it exactly.
+#[test]
+fn zero_length_fixed_vectors_flow_through_typed_value_seams() {
+    let src = r#"struct EmptyRecord
+    data : Vec<uint<8>, 0>
+    nested : Vec<Vec<uint<8>, 2>, 0>
+end struct EmptyRecord
+
+function keep_empty(v: Vec<uint<8>, 0>) -> Vec<uint<8>, 0>
+    return v
+end function keep_empty
+
+transactor EmptyRelay
+    state : Vec<uint<8>, 0>
+    pending : queue<Vec<uint<8>, 0>>
+    seen : out event<Vec<uint<8>, 0>>
+
+    hookable pass(v: Vec<uint<8>, 0>) -> Vec<uint<8>, 0>
+        return keep_empty(v)
+    end pass
+
+    hookable get() -> Vec<uint<8>, 0>
+        return state
+    end get
+end transactor EmptyRelay
+
+testbench EmptyTb
+    dut : Top
+    relay : EmptyRelay passive
+end testbench EmptyTb
+
+impl EmptyTest for EmptyTb
+    run
+        let initial = relay.get()
+        relay.pending.push(initial)
+        let popped = relay.pending.pop()
+        let returned = relay.pass(popped)
+        emit relay.seen(returned)
+        let rec : EmptyRecord
+        assert rec.data == relay.state else fail("empty values differ")
+        assert rec.nested == rec.nested else fail("nested empty values differ")
+        wait 1 cycle
+    end run
+end impl EmptyTest
+"#;
+
+    let prog = lower_src(src).expect("zero-length fixed vectors lower");
+    verify::verify_program(&prog).expect("zero-length fixed vectors verify");
+    let cpp = tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
+        .expect("zero-length fixed vectors emit");
+    assert!(
+        cpp.matches("std::array<uint64_t, 0>").count() >= 6,
+        "every typed seam must retain the empty array carrier:\n{cpp}"
+    );
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the empty fixed-vector program");
+    assert!(v1.contains("std::array<uint64_t, 0>"), "{v1}");
+}
+
+/// Empty vectors are values but have no elements. In particular, a dynamic
+/// index cannot evade the literal bounds check and reach unchecked C++
+/// `std::array<T, 0>::operator[]` UB.
+#[test]
+fn zero_length_fixed_vectors_reject_every_index() {
+    let record = r#"struct EmptyRecord
+    data : Vec<uint<8>, 0>
+end struct EmptyRecord
+testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let r : EmptyRecord
+        let i = 0
+        let x = r.data[i]
+        wait 1 cycle
+    end run
+end impl T"#;
+
+    let testbench = r#"transactor Empty
+    dut : Top
+    data : Vec<uint<8>, 0>
+end transactor Empty
+testbench Tb
+    dut : Top
+    empty : Empty passive
+end testbench Tb
+impl T for Tb
+    run
+        empty.dut = dut
+        let i = 0
+        let x = empty.data[i]
+        wait 1 cycle
+    end run
+end impl T"#;
+
+    let component = r#"scoreboard Empty
+    data : Vec<uint<8>, 0>
+    hookable put(x: uint<8>)
+        let i = 0
+        let y = data[i]
+    end put
+end scoreboard Empty
+testbench Tb
+    dut : Top
+    empty : Empty
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#;
+
+    for (what, src) in [
+        ("record", record),
+        ("testbench/transactor", testbench),
+        ("component", component),
+    ] {
+        let err = lower_src(src).expect_err("an empty vector has no valid index");
+        let msg = assert_invalid(&err);
+        assert!(
+            msg.contains("length 0") && msg.contains("no valid indices"),
             "{what}: {msg}"
         );
     }

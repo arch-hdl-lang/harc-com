@@ -1,0 +1,40 @@
+struct EmptyRecord
+    data : Vec<uint<8>, 0>
+end struct EmptyRecord
+
+function keep_empty(v: Vec<uint<8>, 0>) -> Vec<uint<8>, 0>
+    return v
+end function keep_empty
+
+agent ZeroVecSink
+    incoming : in event<Vec<uint<8>, 0>>
+    values : Vec<uint<8>, 0>
+    pending : queue<Vec<uint<8>, 0>>
+    seen : uint<32> default 0
+
+    hookable get() -> Vec<uint<8>, 0>
+        return values
+    end get
+
+    hookable publish()
+        let value = get()
+        emit incoming(keep_empty(value))
+    end publish
+
+    on incoming(payload)
+        seen = seen + 1
+    end on
+end agent ZeroVecSink
+
+testbench ZeroVecTb
+    dut : Top
+    sink : ZeroVecSink
+end testbench ZeroVecTb
+
+impl ZeroFixedVecTest for ZeroVecTb
+    run
+        sink.publish()
+        assert sink.seen == 1 else fail("empty fixed-vector event was not delivered")
+        wait 1 cycle
+    end run
+end impl ZeroFixedVecTest
