@@ -5725,6 +5725,7 @@ mod lifecycle_classifier_tests {
             testbench_field: "dut".to_string(),
             port_path: vec!["vec".to_string()],
             aggregate_path: false,
+            deferred_bus_binding: None,
             direction: None,
             width: None,
             access: PortAccess::Port,

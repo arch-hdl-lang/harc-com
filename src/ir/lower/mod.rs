@@ -4811,6 +4811,26 @@ fn lower_test(
             )));
         };
         let cschema = &prog.components[cid.index()];
+        for field in &cschema.fields {
+            let ir::ComponentFieldKind::Dut {
+                dut_type: handle_type,
+            } = &field.kind
+            else {
+                continue;
+            };
+            if handle_type != &dut_type {
+                return Err(not_implemented(
+                    &format!(
+                        "bound transactor instance `{instance} : {}` whose `{}` DUT handle \
+                         type `{handle_type}` differs from the test DUT type `{dut_type}`",
+                        cschema.name, field.name
+                    ),
+                    "v1 emits a `V<Name>*` member for the mismatched type while including \
+                     only the test DUT's Verilated header, so the emitted C++ does not compile",
+                    V1Status::EmitsUncompilable,
+                ));
+            }
+        }
         if cschema.bound_bus.as_deref() != Some(binding.bus.as_str()) {
             return Err(LowerError::Invalid(format!(
                 "bound-to event-driven transactor `{instance} : {}` is bound to bus binding \
@@ -8842,35 +8862,42 @@ fn fill_visit_port(
     rewrite: bool,
     conflict: &mut Option<String>,
 ) {
-    match p.port_path.first() {
-        Some(seg) if seg == placeholder => {
-            if rewrite {
-                // A 3-segment `[placeholder, channel, signal]` handshake
-                // path collapses to the `bind ... with { ch.sig: "port" }`
-                // override — a single-segment full flat port name — when
-                // `(channel, signal)` is mapped; otherwise the placeholder
-                // is rewritten to the binding name (the canonical
-                // `<bind>_<ch>_<sig>` convention). Mirrors v1's
-                // `bus_signal_name`, which remaps the channel form only.
-                if p.port_path.len() == 3 {
-                    if let Some((_, port)) = remap
-                        .iter()
-                        .find(|((rch, rsig), _)| rch == &p.port_path[1] && rsig == &p.port_path[2])
-                    {
-                        p.port_path = vec![port.clone()];
-                        return;
-                    }
-                }
-                p.port_path[0] = binding.to_string();
-            }
+    let Some(selected) = p.deferred_bus_binding.clone() else {
+        return;
+    };
+    if let crate::ir::DeferredBusBinding::Selected(selected) = selected {
+        if selected != binding && conflict.is_none() {
+            // The physical path may have collapsed through a remap, so compare
+            // the retained logical binding rather than path segment zero.
+            *conflict = Some(selected);
         }
-        // A non-placeholder, non-`binding` prefix means a prior bind
-        // already rewrote this shared body to a different name.
-        Some(seg) if seg != binding && conflict.is_none() => {
-            *conflict = Some(seg.clone());
-        }
-        _ => {}
+        return;
     }
+    if !rewrite {
+        return;
+    }
+
+    // A 3-segment `[placeholder, channel, signal]` handshake path collapses
+    // to the `bind ... with { ch.sig: "port" }` override when mapped;
+    // otherwise rewrite the placeholder to the logical binding name.
+    if p.port_path.len() == 3 {
+        if let Some((_, port)) = remap
+            .iter()
+            .find(|((rch, rsig), _)| rch == &p.port_path[1] && rsig == &p.port_path[2])
+        {
+            p.port_path = vec![port.clone()];
+            p.deferred_bus_binding = Some(crate::ir::DeferredBusBinding::Selected(
+                binding.to_string(),
+            ));
+            return;
+        }
+    }
+    if p.port_path.first().is_some_and(|seg| seg == placeholder) {
+        p.port_path[0] = binding.to_string();
+    }
+    p.deferred_bus_binding = Some(crate::ir::DeferredBusBinding::Selected(
+        binding.to_string(),
+    ));
 }
 
 /// Recursively fill/check the placeholder bus prefix of every `PortRef`

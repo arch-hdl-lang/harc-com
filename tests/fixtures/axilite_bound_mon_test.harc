@@ -31,6 +31,9 @@ scoreboard AxilSb
 end scoreboard AxilSb
 
 transactor AxilXactor bound to BusAxiLite
+    // A bound BFM may still use the conventional DUT handle alongside bus
+    // channels; DUT pokes resolve to this test's DUT in both backends.
+    dut       : AxiLiteRegs
     sb        : AxilSb
     last_read : uint<32> default 0
 
@@ -49,6 +52,7 @@ transactor AxilXactor bound to BusAxiLite
         req : in event<RegOp>
 
         on req(t)
+            dut.rst = 0
             bus.aw.addr = t.addr
             bus.aw.valid = 1
             bus.w.send(t.value, 15)
@@ -127,4 +131,3 @@ impl AxiLiteBoundMonTest for AxiLiteBoundMonTb
         log(info, "PASS: passive transactor observed 5 writes + 5 reads")
     end run
 end impl AxiLiteBoundMonTest
-

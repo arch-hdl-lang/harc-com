@@ -4040,6 +4040,7 @@ impl FuncBuilder<'_> {
                             testbench_field: self.ctx.dut_field.clone(),
                             port_path: segments,
                             aggregate_path: true,
+                            deferred_bus_binding: None,
                             direction: None,
                             width,
                             access,

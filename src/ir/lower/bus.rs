@@ -1021,6 +1021,8 @@ fn bus_port(bind: &str, tail: &[&str]) -> PortRef {
         testbench_field: "dut".to_string(),
         port_path,
         aggregate_path: false,
+        deferred_bus_binding: (bind == super::transactors::INITIATOR_BUS_PLACEHOLDER)
+            .then_some(crate::ir::DeferredBusBinding::Unresolved),
         direction: None,
         width: None,
         access: PortAccess::Port,
@@ -1036,6 +1038,7 @@ pub(crate) fn bus_port_flat(flat: &str) -> PortRef {
         testbench_field: "dut".to_string(),
         port_path: vec![flat.to_string()],
         aggregate_path: false,
+        deferred_bus_binding: None,
         direction: None,
         width: None,
         access: PortAccess::Port,

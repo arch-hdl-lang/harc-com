@@ -3266,6 +3266,11 @@ pub struct PortRef {
     /// (`dut->exc_cause.irq_int`) rather than flattened bus-style
     /// signal names (`dut->axi_aw_valid`).
     pub aggregate_path: bool,
+    /// Logical binding state for a port lowered through deferred `bus` in a
+    /// bound transactor body. Starts unresolved, then retains the concrete
+    /// binding even when a remap collapses the physical path; ordinary DUT
+    /// ports carry `None` and are never rewrite candidates.
+    pub deferred_bus_binding: Option<DeferredBusBinding>,
     pub direction: Option<PortDirection>,
     pub width: Option<u32>,
     pub access: PortAccess,
@@ -3277,6 +3282,12 @@ pub struct PortRef {
     /// ports through a raw C++ subscript — the same split as v1's
     /// `dut_packed_lane` (which also accepts an arbitrary index expr).
     pub lane: Option<LaneIndex>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DeferredBusBinding {
+    Unresolved,
+    Selected(String),
 }
 
 /// Lane index on a `dut.<port>[i]` access. v1 carries the raw `&Expr`

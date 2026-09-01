@@ -8850,22 +8850,22 @@ end impl T"#
         );
     }
 
-    // The bound-to transactor WITH a module-typed field keeps its
-    // `Unsupported`, and that promise is honest for the same reason the
-    // arms above are dishonest: v1's member is inert and the poke
-    // retargets to the test DUT. Stated directly, because reading
-    // `VAxiLiteRegs* dut = nullptr;` and `dut->rst` in one file and
-    // calling it a null dereference is the mistake this row corrects.
-    let bound_dut = bound_src.replace(
-        "transactor AxilXactor bound to BusAxiLite\n    sb        : AxilSb",
-        "transactor AxilXactor bound to BusAxiLite\n    dut       : AxiLiteRegs\n    sb        : AxilSb",
+    // A bound-to transactor may retain its conventional module-typed field.
+    // The member is inert storage in v1; DUT pokes in the handler resolve to
+    // the test DUT in both backends.
+    let bound_dut = bound_src;
+    let prog = lower_with_stdlib_bus_src(&bound_dut).expect("bound DUT handle lowers");
+    verify::verify_program(&prog).expect("bound DUT handle verifies");
+    let tbir = tbir::emit(
+        &prog,
+        &merged_with_stdlib_bus(&bound_dut, "BusAxiLite.arch"),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("TBIR emits");
+    assert!(
+        tbir.contains("harc_rt::harc_assign(dut->rst, 0);"),
+        "TBIR poke targets the test DUT: {tbir}"
     );
-    let bound_dut = bound_dut.replace(
-        "        on req(t)\n            bus.aw.addr = t.addr",
-        "        on req(t)\n            dut.rst = 0\n            bus.aw.addr = t.addr",
-    );
-    let msg = assert_unsupported(&lower_with_stdlib_bus_src(&bound_dut).unwrap_err());
-    assert!(msg.contains("module-typed (DUT handle) field"), "{msg}");
     let v1 =
         cpp_tb::emit(&merged_with_stdlib_bus(&bound_dut, "BusAxiLite.arch")).expect("v1 emits");
     assert!(
@@ -8880,6 +8880,52 @@ end impl T"#
         !v1.contains("drv.dut") && !v1.contains("xactor.dut"),
         "nothing ever reads the member — it is inert, which is what makes \
          `--codegen v1` an honest suggestion here"
+    );
+
+    // Both active and passive instances select the same remapped logical
+    // binding. A physical-port collapse must remain idempotent on the second
+    // fill rather than looking like a different binding.
+    let remapped = bound_dut.replace(
+        "let axil : BusAxiLite = bind dut",
+        "let axil : BusAxiLite = bind dut with { aw.valid: \"axil_aw_valid\" }",
+    );
+    let remapped_prog =
+        lower_with_stdlib_bus_src(&remapped).expect("same remapped binding fills twice");
+    verify::verify_program(&remapped_prog).expect("remapped binding verifies");
+
+    // `bus` is also a legal concrete binding name; it must not alias the
+    // explicit unresolved provenance state. A later instance selecting a
+    // genuinely different binding still trips the shared-body conflict gate.
+    let split_bindings = bound_dut
+        .replace(
+            "let axil : BusAxiLite = bind dut",
+            "let bus   : BusAxiLite = bind dut\n    let other : BusAxiLite = bind dut",
+        )
+        .replace("let drv  : AxilXactor active  = bind axil", "let drv  : AxilXactor active  = bind bus")
+        .replace("let mon  : AxilXactor passive = bind axil", "let mon  : AxilXactor passive = bind other");
+    let msg = assert_unsupported(&lower_with_stdlib_bus_src(&split_bindings).unwrap_err());
+    assert!(
+        msg.contains("more than one bus binding")
+            && msg.contains("`bus`")
+            && msg.contains("`other`"),
+        "{msg}"
+    );
+
+    // The inert member still has to name the test's DUT type: otherwise v1
+    // emits an undeclared VTop pointer and TBIR must not emit the same broken
+    // C++.
+    let mismatched = bound_dut.replace(
+        "transactor AxilXactor bound to BusAxiLite\n    // A bound BFM may still use the conventional DUT handle alongside bus\n    // channels; DUT pokes resolve to this test's DUT in both backends.\n    dut       : AxiLiteRegs",
+        "transactor AxilXactor bound to BusAxiLite\n    // A bound BFM may still use the conventional DUT handle alongside bus\n    // channels; DUT pokes resolve to this test's DUT in both backends.\n    dut       : Top",
+    );
+    assert_ne!(mismatched, bound_dut, "mismatch replacement anchor");
+    let msg = assert_not_implemented(
+        &lower_with_stdlib_bus_src(&mismatched).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(
+        msg.contains("DUT handle type `Top`") && msg.contains("test DUT type `AxiLiteRegs`"),
+        "{msg}"
     );
 
     // The fifth arm reported a "malformed" handshake handler when the
@@ -19270,6 +19316,7 @@ fn verifier_catches_bad_successor_and_use_before_def() {
                 testbench_field: "dut".to_string(),
                 port_path: vec!["en".to_string()],
                 aggregate_path: false,
+                deferred_bus_binding: None,
                 direction: None,
                 width: None,
                 access: ir::PortAccess::Port,
@@ -19300,6 +19347,7 @@ fn verifier_rejects_port_in_assign_value() {
             testbench_field: "dut".to_string(),
             port_path: vec!["count_out".to_string()],
             aggregate_path: false,
+            deferred_bus_binding: None,
             direction: None,
             width: None,
             access: ir::PortAccess::Port,
@@ -23458,6 +23506,7 @@ end impl GatedSeqIdxTest
                 testbench_field: "dut".to_string(),
                 port_path: vec!["b".to_string(), "idx".to_string()],
                 aggregate_path: false,
+                deferred_bus_binding: None,
                 direction: None,
                 width: None,
                 access: ir::PortAccess::Port,

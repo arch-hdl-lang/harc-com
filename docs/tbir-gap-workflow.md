@@ -507,6 +507,11 @@ not applicable before requesting review:
    method into an active-only sibling. These remove two constructors, leaving
    100 textual `unsupported(` matches (99 constructors plus the helper
    definition).
+   Bound event-driven transactors may now retain a conventional module-typed
+   `dut` field and mix direct DUT pokes with bound-bus traffic. Deferred bus
+   prefix provenance keeps native DUT ports out of instance specialization.
+   This removes one constructor, leaving 99 textual `unsupported(` matches
+   (98 constructors plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

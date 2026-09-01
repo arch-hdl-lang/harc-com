@@ -545,6 +545,7 @@ fn lower_point_target(
                         testbench_field: "dut".to_string(),
                         port_path: segments,
                         aggregate_path: true,
+                        deferred_bus_binding: None,
                         direction: None,
                         width: None,
                         access: PortAccess::Port,
