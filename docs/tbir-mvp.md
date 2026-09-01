@@ -9917,6 +9917,19 @@ former `transaction` group lives in
      integer-literal fallback, the raw inventory remains 99 textual
      `unsupported(` matches (98 constructors plus the helper definition).
 
+191. **Wide binary sized literals in general expressions (2026-09-01).**
+
+     Valid binary sized values above `u64` now lower into the existing
+     LSB-first `WideLiteral` carrier, matching the hexadecimal TBIR path.
+     Values that fit `u64` remain ordinary host scalars, and the same
+     explicit-wide-destination parity guard applies
+     to untyped lets. Unit coverage proves bit 64 survives; v1 normalizes this
+     spelling to an oversized native binary literal that clang rejects, so the
+     regression is intentionally TBIR-only. Decimal sized values above
+     `u64` remain outside this slice, so the shared fallback stays and the raw
+     inventory remains 99 textual matches (98 constructors plus the helper
+     definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
