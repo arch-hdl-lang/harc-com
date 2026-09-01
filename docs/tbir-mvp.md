@@ -9877,6 +9877,16 @@ former `transaction` group lives in
      so the raw unsupported inventory remains 102 textual matches (101
      constructors plus the helper definition).
 
+188. **Source-invalid shapes stop advertising v1 (2026-08-31).**
+
+     A clock-qualified wall-time wait now reports that the qualifier requires
+     a cycle count. An always-on transactor method calling a sibling declared
+     under `when active` now reports the mode-boundary violation as a source
+     error, matching the other active/passive access checks. Parentheses around
+     the wall-time expression do not change its classification. These remove
+     two constructors and leave 100 textual `unsupported(` matches (99
+     constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

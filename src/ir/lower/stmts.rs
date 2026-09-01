@@ -174,11 +174,12 @@ impl FuncBuilder<'_> {
                 // `eval_clocks_until(now_ps + N)` form. Only
                 // test-scoped bodies may use it because emitted helpers
                 // must capture the surrounding scheduler runtime.
-                if let ExprKind::Time(s) = &*duration.kind {
+                let bare_duration = super::exprs::unparen_expr(duration);
+                if let ExprKind::Time(s) = &*bare_duration.kind {
                     if clock.is_some() {
-                        return Err(unsupported(
-                            "`wait <time> on <clock>`",
-                            "clock-qualified waits take a cycle count",
+                        return Err(LowerError::Invalid(
+                            "`wait <time> on <clock>` is invalid: clock-qualified waits take a cycle count"
+                                .to_string(),
                         ));
                     }
                     if !self.ctx.allow_scheduler_time_waits {
@@ -4745,16 +4746,11 @@ impl FuncBuilder<'_> {
                 .current_body_name
                 .as_deref()
                 .unwrap_or("<current method>");
-            return Err(unsupported(
-                &format!(
-                    "transactor sibling method call `{name}(...)` from always-on method \
-                     `{caller}`",
-                ),
-                &format!(
-                    "`{name}` is declared inside `when active`; move `{caller}` into `when active`, \
-                     or call `{name}` only from active-only code",
-                ),
-            ));
+            return Err(LowerError::Invalid(format!(
+                "transactor sibling method call `{name}(...)` from always-on method `{caller}` \
+                 is invalid: `{name}` is declared inside `when active`; move `{caller}` into \
+                 `when active`, or call `{name}` only from active-only code",
+            )));
         }
         // Same as the bound-instance arm above.
         super::reject_misplaced_named_args(
