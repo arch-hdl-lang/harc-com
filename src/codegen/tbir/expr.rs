@@ -1722,13 +1722,16 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                     let symbol = cx
                         .prog
                         .and_then(|prog| match cx.func.kind {
-                            crate::ir::FunctionKind::TransactorBody { transactor } => {
+                            crate::ir::FunctionKind::TransactorBody { transactor, .. } => {
                                 prog.transactors.get(transactor.index())
                             }
                             _ => None,
                         })
                         .map(crate::ir::TransactorSchema::emission_name)
-                        .unwrap_or(transactor);
+                        .unwrap_or(transactor_name);
+                    for arg in args {
+                        rendered.push(expr_cpp(cx, arg)?);
+                    }
                     return Ok(format!("{symbol}_{method}({})", rendered.join(", ")));
                 }
             };
@@ -3223,6 +3226,7 @@ mod render_binding_tests {
             origin: PortOrigin::Dut,
             port_path: vec!["status".to_string()],
             aggregate_path: true,
+            deferred_bus_binding: None,
             direction: None,
             width: None,
             value_type: None,

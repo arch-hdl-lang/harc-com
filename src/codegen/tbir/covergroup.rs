@@ -1301,55 +1301,6 @@ fn sample_body(
     Ok(())
 }
 
-/// Emit the `<Type>_<method>_pre` and `<Type>_<method>_post` hook-vector
-/// declarations for one transactor method that has covergroup
-/// subscribers. Mirrors v1's `emit_hook_vectors`: a
-/// `std::vector<std::function<void(args)>>` per side, holding the sample
-/// closures. The method body fans these out at its pre/post boundary
-/// (`emit_method`). Param C-types match the method-lambda param shape.
-pub(super) fn hook_vector_decls(
-    out: &mut String,
-    prog: &TbProgram,
-    owner_name: &str,
-    method_name: &str,
-    function: FunctionId,
-    n_params: usize,
-    pad: &str,
-) -> Result<(), EmitError> {
-    let arg_csv = method_param_ctypes(prog, function, n_params).join(", ");
-    writeln!(
-        out,
-        "{pad}std::vector<std::function<void({arg_csv})>> {}_{}_pre;",
-        owner_name, method_name
-    )
-    .ok();
-    writeln!(
-        out,
-        "{pad}std::vector<std::function<void({arg_csv})>> {}_{}_post;",
-        owner_name, method_name
-    )
-    .ok();
-    Ok(())
-}
-
-pub(super) fn transactor_hook_vector_decls(
-    out: &mut String,
-    prog: &TbProgram,
-    schema: &TransactorSchema,
-    m: &TransactorMethodSchema,
-    pad: &str,
-) -> Result<(), EmitError> {
-    hook_vector_decls(
-        out,
-        prog,
-        schema.emission_name(),
-        &m.name,
-        m.function,
-        m.param_names.len(),
-        pad,
-    )
-}
-
 /// Push one hook-triggered covergroup's sample closure onto the resolved
 /// method's `<Type>_<method>_<side>` hook vector — the trigger-specific
 /// analogue of `sampler_registration`. The closure takes the method's

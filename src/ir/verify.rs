@@ -1999,7 +1999,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 continue;
             };
             if function.id != method.function
-                || function.name != format!("{}_{}", x.name, method.name)
+                || function.name != format!("{}_{}", x.emission_name(), method.name)
                 || function.kind
                     != (FunctionKind::TransactorBody {
                         transactor: TransactorId(xi as u32),
@@ -2082,7 +2082,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             };
             let member = x.methods.len() + target_member;
             if function.id != method.function
-                || function.name != format!("{}_target_{}", x.name, method.name)
+                || function.name != format!("{}_target_{}", x.emission_name(), method.name)
                 || function.kind
                     != (FunctionKind::TransactorBody {
                         transactor: TransactorId(xi as u32),

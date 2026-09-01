@@ -3205,10 +3205,10 @@ fn lower_program_impl(
     // when HARC_TBIR_NATIVE_LIFECYCLE is enabled.
     let mut shared_lifecycle_fns: HashMap<String, HashMap<crate::ast::LifecyclePhase, FunctionId>> =
         HashMap::new();
-    // Preserve pristine bound-initiator schemas/functions across every test
-    // in the file. The first instance can retain the source IDs (keeping the
-    // established single-instance IR stable); later instances clone from
-    // this cache rather than from a body another test already specialized.
+    // Clone a bound initiator only when one test owns multiple *different*
+    // bindings for that source type. The pristine template makes every clone
+    // independent, while normal one-binding-per-test use retains the shared
+    // source callable required by common-object planning.
     let mut bound_initiator_templates = HashMap::new();
     for (index, schema) in prog.transactors.iter().enumerate() {
         if schema.bound_bus.is_none()
@@ -3227,7 +3227,6 @@ fn lower_program_impl(
             BoundInitiatorTemplate {
                 schema: schema.clone(),
                 functions,
-                claimed: false,
             },
         );
     }
@@ -3265,7 +3264,7 @@ fn lower_program_impl(
             &always_on_dut_event_host_names,
             &shared_lifecycle_bodies,
             &mut shared_lifecycle_fns,
-            &mut bound_initiator_templates,
+            &bound_initiator_templates,
             &all_probe_meta,
             &mut prog,
         )?;
@@ -4103,7 +4102,7 @@ fn lower_test(
     // Both empty when `HARC_TBIR_NATIVE_LIFECYCLE` is off.
     shared_lifecycle_bodies: &crate::codegen::cpp_tb::SharedLifecycleBodies,
     shared_lifecycle_fns: &mut HashMap<String, HashMap<crate::ast::LifecyclePhase, FunctionId>>,
-    bound_initiator_templates: &mut HashMap<TransactorId, BoundInitiatorTemplate>,
+    bound_initiator_templates: &HashMap<TransactorId, BoundInitiatorTemplate>,
     suite_probe_meta: &HashMap<String, ProbeMeta>,
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
@@ -5239,9 +5238,10 @@ fn lower_test(
         .map(|method| (method.name.clone(), method.function))
         .collect::<HashMap<_, _>>();
     // Bound-to initiator-side BFM instances (`let helper : H active =
-    // bind axil`). Validate the bound bus binding, specialize each instance
-    // to keep its concrete ports and state storage independent, and retain
-    // its typed per-test bus association for code generation.
+    // bind axil`). Retain their typed per-test bus associations for codegen.
+    // A test that binds one source type to more than one bus receives one
+    // adapter-specialized callable per distinct binding.
+    let mut bound_initiator_specializations = HashMap::new();
     for (instance, xid, bus_field) in &initiator_bfm_binds {
         if transactor_fields.iter().any(|(f, _)| f == instance) {
             return Err(LowerError::Invalid(format!(
@@ -5268,31 +5268,27 @@ fn lower_test(
                 xschema.bound_bus.as_deref().unwrap_or("<none>"),
             )));
         }
-        let template = bound_initiator_templates.get_mut(xid).ok_or_else(|| {
-            LowerError::Invalid(format!(
-                "internal bound-initiator template for `{}` is missing",
-                xschema.name
-            ))
-        })?;
-        let specialized = if template.claimed {
-            specialize_bound_initiator(prog, template, instance, bus_field, &binding.remap)?
-        } else {
-            template.claimed = true;
-            for method in &template.schema.methods {
-                if let Err(previous) = fill_initiator_bus_prefix(
-                    &mut prog.functions[method.function.index()],
-                    bus_field,
-                    &binding.remap,
-                ) {
-                    return Err(LowerError::Invalid(format!(
-                        "pristine bound initiator `{}` unexpectedly retained bus binding \
-                         `{previous}` while selecting `{bus_field}`",
-                        template.schema.name
-                    )));
-                }
-            }
-            *xid
-        };
+        let source_owner = ir::BoundBusOwner::Transactor(*xid);
+        let specialized =
+            if let Some(existing) = bound_initiator_specializations.get(&(*xid, binding.id)) {
+                *existing
+            } else if !bound_bus_instances
+                .iter()
+                .any(|instance| instance.owner == source_owner)
+            {
+                *xid
+            } else {
+                let template = bound_initiator_templates.get(xid).ok_or_else(|| {
+                    LowerError::Invalid(format!(
+                        "internal bound-initiator template for `{}` is missing",
+                        xschema.name
+                    ))
+                })?;
+                let specialized = specialize_bound_initiator(prog, template, instance)?;
+                bound_initiator_specializations.insert((*xid, binding.id), specialized);
+                specialized
+            };
+        bound_initiator_specializations.insert((*xid, binding.id), specialized);
         bound_bus_instances.push(ir::BoundBusInstanceSchema {
             field: instance.clone(),
             owner: ir::BoundBusOwner::Transactor(specialized),
@@ -5815,24 +5811,10 @@ fn lower_test(
                 .map(|f| (f.name.clone(), f.kind.clone()))
                 .collect(),
         );
-        // Bound-to INITIATOR BFMs bake their instance-specific storage into
-        // their cloned method bodies. Unbound methods keep an empty receiver
-        // placeholder so the shared lambda receives state explicitly.
-        if is_bound && !is_passive {
-            let method_fns: Vec<usize> =
-                xschema.methods.iter().map(|m| m.function.index()).collect();
-            let storage = &transactor_storage_names[field];
-            for fidx in method_fns {
-                if let Err(prev) =
-                    fill_transactor_state_instance(&mut prog.functions[fidx], storage)
-                {
-                    return Err(LowerError::Invalid(format!(
-                        "internal bound-initiator specialization for `{xname}` mixed state \
-                         storage `{prev}` and `{field}`"
-                    )));
-                }
-            }
-        }
+        // Bound-initiator methods retain their receiver-relative state and
+        // logical BoundBus ports. Codegen supplies the per-instance state and
+        // bus adapter, which keeps the callable eligible for common layout.
+        let _ = is_passive;
         unbound_state_actors.push(ir::UnboundStateActorSchema {
             field: field.clone(),
             transactor: *xid,
@@ -9098,6 +9080,7 @@ fn remap_terminator(t: &mut Terminator, remap: &[BlockId]) {
 /// emission supplies the receiver. Initiator bodies still share one function
 /// per type, so this is idempotent for the same instance but `Err(prev)` for a
 /// different one. The scan-then-fill split keeps the body un-mutated on error.
+#[allow(dead_code)]
 fn fill_transactor_state_instance(func: &mut TbFunction, instance: &str) -> Result<(), String> {
     if let Some(prev) = existing_state_instance(func) {
         if prev != instance {
@@ -9214,6 +9197,7 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 }
                 ir::Stmt::TransactorCall { call, .. }
                 | ir::Stmt::TransactorSelfCall { call, .. } => in_expr(call),
+                ir::Stmt::TestbenchCall { args, .. } => args.iter().find_map(in_expr),
                 ir::Stmt::ScoreboardOp { op, .. } => match op {
                     ir::ScoreboardOp::QueuePush { value, .. }
                     | ir::ScoreboardOp::ScalarWrite { value, .. } => in_expr(value),
@@ -9251,7 +9235,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                     in_expr(value)
                 }
                 ir::Stmt::ComponentQueuePop { .. }
+                | ir::Stmt::ComponentInit { .. }
                 | ir::Stmt::ComponentSubAssign { .. }
+                | ir::Stmt::ComponentAssign { .. }
                 | ir::Stmt::TbQueuePop { .. } => None,
                 // Fork/join descriptors carry their request payload exprs;
                 // a responder body never forks, but scan for completeness.
@@ -9365,6 +9351,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 }
             }
             ir::Expr::Literal { .. }
+            | ir::Expr::StringLiteral(_)
             | ir::Expr::WideLiteral(_)
             | ir::Expr::Local(_)
             | ir::Expr::CycleCount
@@ -9484,6 +9471,11 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 }
                 ir::Stmt::TransactorCall { call, .. }
                 | ir::Stmt::TransactorSelfCall { call, .. } => fill_expr(call, instance),
+                ir::Stmt::TestbenchCall { args, .. } => {
+                    for arg in args {
+                        fill_expr(arg, instance);
+                    }
+                }
                 ir::Stmt::ScoreboardOp { op, .. } => match op {
                     ir::ScoreboardOp::QueuePush { value, .. }
                     | ir::ScoreboardOp::ScalarWrite { value, .. } => fill_expr(value, instance),
@@ -9521,7 +9513,9 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 ir::Stmt::SeqPush { value, .. } => fill_expr(value, instance),
                 ir::Stmt::ComponentQueuePush { value, .. } => fill_expr(value, instance),
                 ir::Stmt::ComponentQueuePop { .. }
+                | ir::Stmt::ComponentInit { .. }
                 | ir::Stmt::ComponentSubAssign { .. }
+                | ir::Stmt::ComponentAssign { .. }
                 | ir::Stmt::TbQueuePop { .. } => {}
                 ir::Stmt::TlmFork(desc) => {
                     for a in &mut desc.args {
@@ -9697,6 +9691,7 @@ fn fill_visit_expr(
             }
         }
         Expr::Literal { .. }
+        | Expr::StringLiteral(_)
         | Expr::WideLiteral(_)
         | Expr::Local(_)
         | Expr::CycleCount
@@ -9718,49 +9713,71 @@ fn fill_visit_expr(
     }
 }
 
-/// Fill the placeholder bus prefix in a single schema-resident expression
-/// (a monitor cycle-handler's synthesized `valid && ready` trigger, which
-/// lives on the schema rather than in a function body, so the body-walking
-/// `fill_initiator_bus_prefix` does not reach it). Same one-instance-per-
-/// type conflict gate.
-fn fill_initiator_bus_prefix_expr(
-    e: &mut crate::ir::Expr,
-    binding: &str,
-    remap: &[((String, String), String)],
-) -> Result<(), String> {
-    let placeholder = transactors::INITIATOR_BUS_PLACEHOLDER;
-    let mut conflict = None;
-    fill_visit_expr(e, placeholder, binding, remap, false, &mut conflict);
-    if let Some(prev) = conflict {
-        return Err(prev);
+#[allow(dead_code)]
+fn retarget_transactor_self_calls(
+    func: &mut TbFunction,
+    source: TransactorId,
+    target: TransactorId,
+    functions: &HashMap<FunctionId, FunctionId>,
+) {
+    let mut rewrite_call = |nested: &mut ir::Expr| {
+        if let ir::Expr::Call(
+            ir::CallTarget::TransactorSelfMethod {
+                transactor,
+                function,
+                ..
+            },
+            _,
+        ) = nested
+        {
+            if *transactor == source {
+                *transactor = target;
+                if let Some(mapped) = functions.get(function) {
+                    *function = *mapped;
+                }
+            }
+        }
+    };
+    let mut rewrite_expr = |expr: &mut ir::Expr| {
+        // `walk_expr_mut` visits descendants only, so rewrite the root call
+        // first. A `TransactorSelfCall` stores this root expression directly.
+        rewrite_call(expr);
+        ir::visit::walk_expr_mut(expr, &mut rewrite_call);
+    };
+    for block in &mut func.blocks {
+        for stmt in &mut block.stmts {
+            ir::visit::visit_stmt_exprs_mut(stmt, &mut rewrite_expr);
+        }
+        ir::visit::visit_terminator_exprs_mut(&mut block.terminator, &mut rewrite_expr);
     }
-    fill_visit_expr(e, placeholder, binding, remap, true, &mut conflict);
-    Ok(())
 }
 
 #[derive(Clone)]
 struct BoundInitiatorTemplate {
     schema: ir::TransactorSchema,
     functions: Vec<TbFunction>,
-    claimed: bool,
 }
 
-/// Clone one bound initiator schema and its method functions for a concrete
-/// test-scope instance. Bus ports are physical C++ identifiers, so leaving
-/// them on the source-type schema would make a second binding overwrite the
-/// first. The clone receives an instance-qualified internal name; source type
-/// lookup continues to resolve the untouched template schema.
+/// Clone one bound initiator schema and its method functions for an additional
+/// concrete binding in the same test. Bodies retain logical bus ports and a
+/// receiver-relative state placeholder; the emitted call site supplies both
+/// instance-specific resources.
 fn specialize_bound_initiator(
     prog: &mut TbProgram,
     template: &BoundInitiatorTemplate,
     instance: &str,
-    binding: &str,
-    remap: &[((String, String), String)],
 ) -> Result<TransactorId, LowerError> {
     let specialized_id = TransactorId(prog.transactors.len() as u32);
     let mut schema = template.schema.clone();
     schema.emission_name = Some(format!("{}__{instance}", schema.name));
     let emission_name = schema.emission_name().to_string();
+    let function_base = prog.functions.len() as u32;
+    let function_ids = schema
+        .methods
+        .iter()
+        .enumerate()
+        .map(|(index, method)| (method.function, FunctionId(function_base + index as u32)))
+        .collect::<HashMap<_, _>>();
 
     for method in &mut schema.methods {
         let mut func = template
@@ -9774,19 +9791,27 @@ fn specialize_bound_initiator(
                     template.schema.name, method.function.0
                 ))
             })?;
-        let function_id = FunctionId(prog.functions.len() as u32);
+        let function_id = function_ids[&method.function];
         func.id = function_id;
         func.name = format!("{emission_name}_{}", method.name);
+        let FunctionKind::TransactorBody {
+            transactor: source,
+            member,
+            name,
+        } = &func.kind
+        else {
+            return Err(LowerError::Invalid(format!(
+                "internal bound-initiator template `{}` has non-transactor fn{}",
+                template.schema.name, func.id.0
+            )));
+        };
+        let source = *source;
         func.kind = FunctionKind::TransactorBody {
             transactor: specialized_id,
+            member: *member,
+            name: name.clone(),
         };
-        if let Err(previous) = fill_initiator_bus_prefix(&mut func, binding, remap) {
-            return Err(LowerError::Invalid(format!(
-                "internal bound-initiator specialization for `{}` found an already-filled \
-                 bus binding `{previous}` while selecting `{binding}`",
-                schema.name
-            )));
-        }
+        retarget_transactor_self_calls(&mut func, source, specialized_id, &function_ids);
         prog.functions.push(func);
         method.function = function_id;
     }
@@ -9796,6 +9821,7 @@ fn specialize_bound_initiator(
     Ok(specialized_id)
 }
 
+#[allow(dead_code)]
 fn fill_initiator_bus_prefix(
     func: &mut TbFunction,
     binding: &str,
@@ -9906,6 +9932,11 @@ fn fill_initiator_bus_prefix(
                     Stmt::TransactorCall { call, .. } | Stmt::TransactorSelfCall { call, .. } => {
                         visit_expr(call, placeholder, binding, remap, rewrite, &mut conflict)
                     }
+                    Stmt::TestbenchCall { args, .. } => {
+                        for arg in args {
+                            visit_expr(arg, placeholder, binding, remap, rewrite, &mut conflict);
+                        }
+                    }
                     Stmt::ScoreboardOp { op, .. } => match op {
                         ir::ScoreboardOp::QueuePush { value, .. }
                         | ir::ScoreboardOp::ScalarWrite { value, .. } => {
@@ -9924,7 +9955,9 @@ fn fill_initiator_bus_prefix(
                         visit_expr(value, placeholder, binding, remap, rewrite, &mut conflict)
                     }
                     Stmt::ComponentQueuePop { .. }
+                    | Stmt::ComponentInit { .. }
                     | Stmt::ComponentSubAssign { .. }
+                    | Stmt::ComponentAssign { .. }
                     | Stmt::TransactorStateQueuePop { .. }
                     | Stmt::TbQueuePop { .. } => {}
                     Stmt::TlmFork(desc) => {

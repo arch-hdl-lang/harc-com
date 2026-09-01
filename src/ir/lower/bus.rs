@@ -1296,22 +1296,3 @@ pub(super) fn bus_port(
         lane: None,
     }
 }
-
-/// PortRef whose flat name is `flat` verbatim (single-segment path) —
-/// for a `bind ... with { ch.sig: "port" }` remapped handshake signal,
-/// where the override already names the full DUT port.
-pub(crate) fn bus_port_flat(flat: &str) -> PortRef {
-    PortRef {
-        testbench_field: "dut".to_string(),
-        origin: crate::ir::PortOrigin::Dut,
-        port_path: vec![flat.to_string()],
-        aggregate_path: false,
-        deferred_bus_binding: None,
-        direction: None,
-        width: None,
-        value_type: None,
-        access: PortAccess::Port,
-        probe: None,
-        lane: None,
-    }
-}

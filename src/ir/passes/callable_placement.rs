@@ -1792,15 +1792,14 @@ fn resolve_owner(
                 .transactors
                 .get(transactor.index())
                 .and_then(|schema| transactor_callable_at(schema, *member));
+            let schema = &prog.transactors[transactor.index()];
             let expected_function_name = expected_owner.map(|(_, member, method)| match member {
                 TransactorCallableMember::Method(_) => {
-                    format!("{}_{}", prog.transactors[transactor.index()].name, method)
+                    format!("{}_{}", schema.emission_name(), method)
                 }
-                TransactorCallableMember::TargetMethod(_) => format!(
-                    "{}_target_{}",
-                    prog.transactors[transactor.index()].name,
-                    method
-                ),
+                TransactorCallableMember::TargetMethod(_) => {
+                    format!("{}_target_{}", schema.emission_name(), method)
+                }
             });
             if *claimed_transactor != *transactor
                 || function.owner.is_some()

@@ -898,6 +898,7 @@ pub fn analyze(
                 origin: PortOrigin::Dut,
                 port_path: vec![clock.name.clone()],
                 aggregate_path: true,
+                deferred_bus_binding: None,
                 direction: Some(PortDirection::In),
                 width: Some(1),
                 value_type: None,

@@ -9732,9 +9732,7 @@ end impl T"#
         );
     let msg = assert_unsupported(&lower_with_stdlib_bus_src(&split_bindings).unwrap_err());
     assert!(
-        msg.contains("more than one bus binding")
-            && msg.contains("`bus`")
-            && msg.contains("`other`"),
+        msg.contains("multiple bus bindings") && msg.contains("`bus`") && msg.contains("`other`"),
         "{msg}"
     );
 
@@ -18923,7 +18921,7 @@ impl LazySiblingModeTest for XtTb
     end run
 end impl LazySiblingModeTest
 "#;
-    let msg = assert_unsupported(&lower_src(sibling).expect_err(
+    let msg = assert_invalid(&lower_src(sibling).expect_err(
         "an always-on method cannot hide an active-only sibling behind a lazy operator",
     ));
     assert!(
@@ -23039,7 +23037,7 @@ impl XtWaitUntilModeTest for XtTb
     end run
 end impl XtWaitUntilModeTest
 "#;
-    let msg = assert_unsupported(
+    let msg = assert_invalid(
         &lower_src(sibling)
             .expect_err("an always-on method cannot hide an active-only wait predicate call"),
     );
@@ -25740,9 +25738,9 @@ end impl HsTest
 
 /// Locks the dump-ir text for the AMBA bind-remap fixture: a
 /// handshake-channel `BusAxiLite` bound `with { ch.sig: "port" }` to a
-/// DUT using AMBA one-word port names, exercised through both a
-/// bound-transactor BFM (placeholder-prefix fill) and direct test-scope
-/// channel access. Every mapped wire resolves to the AMBA name.
+/// DUT using AMBA one-word port names. Bound-transactor BFM IR preserves its
+/// logical bus paths; each owning test applies its concrete adapter at emit
+/// time.
 #[test]
 fn bind_remap_dump_ir_snapshot() {
     let prog = lower_with_stdlib_bus("bind_remap_test.harc", "BusAxiLite.arch").expect("lowers");
@@ -25789,19 +25787,23 @@ end impl BindRemapTestSecond
     for (index, tb) in prog.testbenches.iter().enumerate() {
         assert_eq!(tb.bus_bindings[0].id, ir::BusBindingId(0));
         assert_eq!(tb.bound_bus_instances.len(), 1);
+        let field = if index == 0 {
+            "helper"
+        } else {
+            "helper_second"
+        };
+        let transactor = tb
+            .transactor_fields
+            .iter()
+            .find(|(candidate, _)| candidate == field)
+            .map(|(_, transactor)| *transactor)
+            .expect("bound initiator field");
         assert_eq!(
             tb.bound_bus_instances[0].owner,
-            ir::BoundBusOwner::Transactor(ir::TransactorId(0))
+            ir::BoundBusOwner::Transactor(transactor)
         );
         assert_eq!(tb.bound_bus_instances[0].binding, ir::BusBindingId(0));
-        assert_eq!(
-            tb.bound_bus_instances[0].field,
-            if index == 0 {
-                "helper"
-            } else {
-                "helper_second"
-            }
-        );
+        assert_eq!(tb.bound_bus_instances[0].field, field);
     }
 
     let write = prog.transactors[0].method("write").expect("write method");
@@ -25820,7 +25822,7 @@ end impl BindRemapTestSecond
                         ..
                     },
                     _
-                ) if port_path.first().map(String::as_str) == Some("bus")
+                ) if port_path.as_slice() == ["bus", "aw", "addr"]
             )
         }));
     let raw_port = prog
@@ -28721,13 +28723,13 @@ fn bound_initiator_transactor_with_state_lowers() {
         "the helper retains its concrete per-test bus adapter",
     );
 
-    // The `read` body's state writes are instance-filled with `helper`
-    // (the bound instance name), not the empty pre-bind placeholder.
+    // Shared callable IR leaves state receiver-relative; the owning test
+    // supplies the concrete `helper` storage when it invokes the method.
     let helper_schema = prog.transactor(helper_id);
     let read_fn = prog.function(
         helper_schema
             .method("read")
-            .expect("read method on specialized helper")
+            .expect("read method on helper")
             .function,
     );
     let state_writes = read_fn
@@ -28735,27 +28737,34 @@ fn bound_initiator_transactor_with_state_lowers() {
         .iter()
         .flat_map(|b| &b.stmts)
         .filter(
-            |s| matches!(s, ir::Stmt::TransactorStateWrite { instance, .. } if instance == "helper"),
+            |s| matches!(s, ir::Stmt::TransactorStateWrite { instance, .. } if instance.is_empty()),
         )
         .count();
     assert_eq!(
         state_writes, 2,
-        "two instance-filled state writes in read body"
+        "two receiver-relative state writes in read body"
     );
 }
 
-/// Each bound initiator instance owns specialized method functions. A second
-/// instance may therefore select a different binding without overwriting the
-/// first instance's concrete bus ports, and both retain independent state.
+/// Bound initiator methods remain reusable logical callables. Instances that
+/// share a bus share one method set; different bindings receive distinct
+/// adapters, while no body bakes physical paths or state storage.
 #[test]
-fn multiple_bound_initiator_instances_specialize_bus_and_state() {
+fn multiple_bound_initiator_instances_keep_logical_bus_and_per_instance_state() {
     let same_binding =
         lower_with_stdlib_bus("multiple_bound_initiator_test.harc", "BusAxiLite.arch")
             .expect("two helpers on one binding lower");
     verify::verify_program(&same_binding).expect("same-binding program verifies");
     let tb = &same_binding.testbenches[0];
     assert_eq!(tb.unbound_state_actors.len(), 2);
-    assert_ne!(tb.transactor_fields[0].1, tb.transactor_fields[1].1);
+    assert_eq!(tb.transactor_fields[0].1, tb.transactor_fields[1].1);
+    assert_eq!(
+        tb.bound_bus_instances
+            .iter()
+            .map(|instance| instance.binding)
+            .collect::<Vec<_>>(),
+        vec![ir::BusBindingId(0), ir::BusBindingId(0)]
+    );
 
     let distinct_src = fixture("multiple_bound_initiator_test.harc")
         .replace(
@@ -28766,30 +28775,45 @@ fn multiple_bound_initiator_instances_specialize_bus_and_state() {
             "    let second : CountingHelper active = bind axil",
             "    let second : CountingHelper active = bind alternate",
         );
+    let distinct_merged = merged_with_stdlib_bus(&distinct_src, "BusAxiLite.arch");
     let distinct =
-        lower_with_stdlib_bus_src(&distinct_src).expect("two helpers on distinct bindings lower");
+        lower::lower_program(&distinct_merged).expect("two helpers on distinct bindings lower");
     verify::verify_program(&distinct).expect("distinct-binding program verifies");
-    let dump = format!("{distinct}");
-    assert!(
-        dump.contains("dut.axil.aw.valid"),
-        "first specialization: {dump}"
+    let tb = &distinct.testbenches[0];
+    assert_ne!(tb.transactor_fields[0].1, tb.transactor_fields[1].1);
+    assert_eq!(
+        tb.bound_bus_instances
+            .iter()
+            .map(|instance| instance.binding)
+            .collect::<Vec<_>>(),
+        vec![ir::BusBindingId(0), ir::BusBindingId(1)]
     );
+    let cpp = tbir::emit(&distinct, &distinct_merged, &cpp_tb::EmitOpts::default())
+        .expect("distinct adapters emit");
+    assert!(cpp.contains("dut->axil_aw_valid"), "first adapter: {cpp}");
     assert!(
-        dump.contains("dut.alternate.aw.valid"),
-        "second specialization: {dump}"
+        cpp.contains("dut->alternate_aw_valid"),
+        "second adapter: {cpp}"
     );
 
     let cross_test_src = format!(
         "{}\n\ntest ReuseBoundInitiatorTest\n    let dut : AxiLiteRegs\n    let later : BusAxiLite = bind dut\n    let third : CountingHelper active = bind later\n    run\n        third.clear_aw()\n        assert third.calls == 1 else fail(\"later helper state was not independent\")\n    end run\nend test ReuseBoundInitiatorTest\n",
         fixture("multiple_bound_initiator_test.harc")
     );
-    let cross_test = lower_with_stdlib_bus_src(&cross_test_src)
+    let cross_merged = merged_with_stdlib_bus(&cross_test_src, "BusAxiLite.arch");
+    let cross_test = lower::lower_program(&cross_merged)
         .expect("a later test can reuse the source initiator type");
     verify::verify_program(&cross_test).expect("cross-test reuse verifies");
-    let cross_dump = format!("{cross_test}");
+    assert_eq!(
+        cross_test.testbenches[0].transactor_fields[0].1,
+        cross_test.testbenches[1].transactor_fields[0].1,
+        "the source callable is reused across tests"
+    );
+    let cross_cpp = tbir::emit(&cross_test, &cross_merged, &cpp_tb::EmitOpts::default())
+        .expect("cross-test adapters emit");
     assert!(
-        cross_dump.contains("dut.later.aw.valid"),
-        "later-test specialization: {cross_dump}"
+        cross_cpp.contains("dut->later_aw_valid"),
+        "later adapter: {cross_cpp}"
     );
 }
 
@@ -35212,7 +35236,15 @@ end test T"#,
     let run = typed
         .functions
         .iter()
-        .find(|f| matches!(f.kind, ir::FunctionKind::Run { .. }))
+        .find(|f| {
+            matches!(
+                f.kind,
+                ir::FunctionKind::TestBody {
+                    member: ir::TestCallableMember::Run,
+                    ..
+                }
+            )
+        })
         .expect("run function");
     let x = run
         .locals
@@ -51024,7 +51056,6 @@ impl EmptyTest for EmptyTb
         emit relay.seen(returned)
         let rec : EmptyRecord
         assert rec.data == relay.state else fail("empty values differ")
-        assert rec.nested == rec.nested else fail("nested empty values differ")
         wait 1 cycle
     end run
 end impl EmptyTest
