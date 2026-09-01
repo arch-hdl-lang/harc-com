@@ -392,7 +392,6 @@ fn scoreboard_field_kind(
                         },
                         _ => None,
                     }
-                    .filter(|n| *n != 0)
                     .ok_or_else(|| {
                         let what = format!(
                             "scoreboard list field `{sb}.{fname}` with an invalid fixed-vector length"
@@ -400,7 +399,7 @@ fn scoreboard_field_kind(
                         if scoreboard_list_value_type_is_preserved(elem_ty) {
                             scoreboard_subset_gap(
                                 &what,
-                                "use a nonzero decimal compile-time literal for the fixed-vector length",
+                                "use a decimal compile-time literal for the fixed-vector length",
                             )
                         } else {
                             not_implemented(

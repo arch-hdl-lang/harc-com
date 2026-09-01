@@ -425,9 +425,7 @@ fn helper_abi_type_valid(ty: &IrType, record_count: usize) -> bool {
     match ty {
         IrType::RecordSeq(record) => record.index() < record_count,
         IrType::Seq(elem) => sequence_elem_valid(elem),
-        IrType::FixedVec { elem, len } if *len != 0 => {
-            helper_fixed_vec_elem_valid(elem, record_count)
-        }
+        IrType::FixedVec { elem, .. } => helper_fixed_vec_elem_valid(elem, record_count),
         other => cover_scalar_type(other),
     }
 }
@@ -445,9 +443,7 @@ fn sequence_elem_valid(ty: &IrType) -> bool {
 fn helper_fixed_vec_elem_valid(ty: &IrType, record_count: usize) -> bool {
     match ty {
         IrType::Record(record) => record.index() < record_count,
-        IrType::FixedVec { elem, len } => {
-            *len != 0 && helper_fixed_vec_elem_valid(elem, record_count)
-        }
+        IrType::FixedVec { elem, .. } => helper_fixed_vec_elem_valid(elem, record_count),
         scalar => fixed_vec_elem_valid(scalar),
     }
 }
@@ -627,7 +623,8 @@ fn check_cover_expr(
 
 /// A fixed-vector element is valid when it is a nonzero-width
 /// `UInt`/`SInt`/`Bool` within the field width policy, or another
-/// `FixedVec` (nonzero length) whose element is recursively valid.
+/// `FixedVec` whose element is recursively valid. Length zero is a valid
+/// empty value aggregate and still carries its element type.
 /// Mirrors the lowering decoder `fixed_vec_elem_ir_type`, so the
 /// verifier accepts exactly the nested shapes lowering produces.
 fn fixed_vec_elem_valid(ty: &IrType) -> bool {
@@ -636,7 +633,7 @@ fn fixed_vec_elem_valid(ty: &IrType) -> bool {
         IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 0 => {
             crate::ir::lower::components::field_scalar_width_ok(ty)
         }
-        IrType::FixedVec { elem, len } => *len != 0 && fixed_vec_elem_valid(elem),
+        IrType::FixedVec { elem, .. } => fixed_vec_elem_valid(elem),
         _ => false,
     }
 }
@@ -644,9 +641,7 @@ fn fixed_vec_elem_valid(ty: &IrType) -> bool {
 fn component_fixed_vec_elem_valid(ty: &IrType, record_count: usize) -> bool {
     match ty {
         IrType::Record(record) => record.index() < record_count,
-        IrType::FixedVec { elem, len } => {
-            *len != 0 && component_fixed_vec_elem_valid(elem, record_count)
-        }
+        IrType::FixedVec { elem, .. } => component_fixed_vec_elem_valid(elem, record_count),
         scalar => fixed_vec_elem_valid(scalar),
     }
 }
@@ -654,9 +649,7 @@ fn component_fixed_vec_elem_valid(ty: &IrType, record_count: usize) -> bool {
 fn queue_fixed_vec_elem_valid(ty: &IrType, record_count: usize) -> bool {
     match ty {
         IrType::Record(record) => record.index() < record_count,
-        IrType::FixedVec { elem, len } => {
-            *len != 0 && queue_fixed_vec_elem_valid(elem, record_count)
-        }
+        IrType::FixedVec { elem, .. } => queue_fixed_vec_elem_valid(elem, record_count),
         scalar => fixed_vec_elem_valid(scalar),
     }
 }
@@ -687,11 +680,11 @@ fn verify_queue_elem_schema(
             }
         }
         QueueElem::FixedVec { elem, len } => {
-            if *len == 0 || !queue_fixed_vec_elem_valid(elem, record_count) {
+            if !queue_fixed_vec_elem_valid(elem, record_count) {
                 errs.push(VerifyError::BadProgramRef {
                     what: format!(
                         "{what} has invalid fixed-vector element schema {elem:?} x {len}; \
-                         expected a nonempty vector with resolved scalar or record leaves"
+                         expected a vector with resolved scalar or record leaves"
                     ),
                 });
             }
@@ -812,7 +805,6 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 }
                 IrType::FixedVec { .. }
                     if field.vec_len.is_none()
-                        || field.vec_len == Some(0)
                         || field.default.is_some()
                         || !fixed_vec_elem_valid(&field.ty) =>
                 {
@@ -1250,7 +1242,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 // `Vec<Vec<uint<2048>,2>,2>` (an over-wide leaf) still
                 // fails at the same width policy the gate applies.
                 let valid_elem = component_fixed_vec_elem_valid(&vec.elem, prog.records.len());
-                if vec.len == 0 || !valid_elem {
+                if !valid_elem {
                     errs.push(VerifyError::BadProgramRef {
                         what: format!(
                             "component c{ci} field `{}` has invalid fixed-vector schema {:?}",
@@ -1333,7 +1325,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                                 IrType::UInt(Some(width)) | IrType::SInt(Some(width))
                                     if (1..=crate::MAX_WIDTH_METHOD_BITS).contains(width)
                             );
-                    if !valid_elem || vec_len.is_some_and(|len| len == 0) {
+                    if !valid_elem {
                         errs.push(VerifyError::BadProgramRef {
                             what: format!(
                                 "scoreboard sb{si} field `{}` has invalid list schema {:?} x {:?}",
@@ -1426,9 +1418,8 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 StateFieldKind::FixedVec { ty } => {
                     let valid = matches!(
                         ty,
-                        IrType::FixedVec { elem, len }
-                            if *len != 0
-                                && component_fixed_vec_elem_valid(elem, prog.records.len())
+                        IrType::FixedVec { elem, .. }
+                            if component_fixed_vec_elem_valid(elem, prog.records.len())
                     );
                     if !valid {
                         errs.push(VerifyError::BadProgramRef {
@@ -2383,10 +2374,7 @@ fn verify_event_payload_ref(prog: &TbProgram, payload: &EventPayload) -> Result<
         EventPayload::Record(record) if record.index() >= prog.records.len() => {
             return Err(format!("references missing record r{}", record.0));
         }
-        EventPayload::FixedVec { elem, len } => {
-            if *len == 0 {
-                return Err("has a zero-length fixed-vector payload".to_string());
-            }
+        EventPayload::FixedVec { elem, .. } => {
             if !component_fixed_vec_elem_valid(&elem, prog.records.len()) {
                 return Err(format!("has invalid fixed-vector element metadata {elem:?}"));
             }
@@ -5845,7 +5833,9 @@ impl Checker<'_> {
         let Some(IrType::FixedVec { elem, len }) = vec_ty else {
             return;
         };
-        if matches!(index, Expr::Literal { value, .. } if *value as usize >= len) {
+        if len == 0
+            || matches!(index, Expr::Literal { value, .. } if *value as usize >= len)
+        {
             self.errs.push(VerifyError::BadProgramRef {
                 what: format!(
                     "fn{} b{} {what}: index out of bounds for fixed vector of length {len}",
@@ -5863,7 +5853,9 @@ impl Checker<'_> {
                 });
                 return;
             };
-            if matches!(inner, Expr::Literal { value, .. } if *value as usize >= *inner_len) {
+            if *inner_len == 0
+                || matches!(inner, Expr::Literal { value, .. } if *value as usize >= *inner_len)
+            {
                 self.errs.push(VerifyError::BadProgramRef {
                     what: format!(
                         "fn{} b{} {what}: nested index out of bounds for fixed vector of length {inner_len}",

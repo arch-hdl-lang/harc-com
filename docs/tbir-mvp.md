@@ -9864,6 +9864,19 @@ former `transaction` group lives in
      prefixes. This removes two shared-body `Unsupported` gates, reducing the
      inventory to 102 textual matches (101 constructors plus the helper definition).
 
+187. **Zero-length fixed vectors are typed empty values (2026-08-31).**
+
+     `Vec<T, 0>` now follows its value semantics instead of being confused
+     with an invalid zero-width scalar. Record fields, persistent component
+     and transactor state, queue elements, event payloads, pure helpers, and
+     component method ABIs retain the exact `std::array<T, 0>` carrier.
+     Recursive verifier checks validate the element type while accepting the
+     empty cardinality, and all indexing into an empty vector is rejected.
+     A self-checking fixture delivers an empty-vector event and trace-diffs
+     cleanly against v1. The change routes around shared aggregate diagnostics,
+     so the raw unsupported inventory remains 102 textual matches (101
+     constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

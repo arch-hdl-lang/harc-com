@@ -5802,6 +5802,11 @@ pub(crate) fn check_literal_vec_index_bounds(
     idx: &Expr,
     len: usize,
 ) -> Result<(), LowerError> {
+    if len == 0 {
+        return Err(LowerError::Invalid(format!(
+            "cannot index `Vec` record field `{dotted}` of length 0 (an empty vector has no valid indices)"
+        )));
+    }
     let Expr::Literal { value, .. } = idx else {
         return Ok(());
     };
@@ -5820,6 +5825,11 @@ pub(crate) fn check_literal_tb_vec_index_bounds(
     idx: &Expr,
     len: usize,
 ) -> Result<(), LowerError> {
+    if len == 0 {
+        return Err(LowerError::Invalid(format!(
+            "cannot index testbench `Vec` field `{field}` of length 0 (an empty vector has no valid indices)"
+        )));
+    }
     let Expr::Literal { value, .. } = idx else {
         return Ok(());
     };
@@ -5839,12 +5849,6 @@ pub(crate) fn check_literal_component_vec_index_bounds(
     idx: &Expr,
     len: usize,
 ) -> Result<(), LowerError> {
-    let Expr::Literal { value, .. } = idx else {
-        return Ok(());
-    };
-    if (*value as u128) < len as u128 {
-        return Ok(());
-    }
     let access = match base {
         crate::ir::ComponentBase::SelfField => field.to_string(),
         crate::ir::ComponentBase::Path(path) => {
@@ -5852,6 +5856,17 @@ pub(crate) fn check_literal_component_vec_index_bounds(
         }
         crate::ir::ComponentBase::Local(_) => field.to_string(),
     };
+    if len == 0 {
+        return Err(LowerError::Invalid(format!(
+            "cannot index component `Vec` field `{access}` of length 0 (an empty vector has no valid indices)"
+        )));
+    }
+    let Expr::Literal { value, .. } = idx else {
+        return Ok(());
+    };
+    if (*value as u128) < len as u128 {
+        return Ok(());
+    }
     Err(LowerError::Invalid(format!(
         "element index {value} is out of range for component `Vec` field \
          `{access}` of length {len} (valid indices are 0..={})",

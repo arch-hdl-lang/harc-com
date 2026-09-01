@@ -653,9 +653,6 @@ fn fixed_vec_field(
         },
         _ => return None,
     };
-    if len == 0 {
-        return None;
-    }
     // `Vec<Record, N>`: a fixed array of a nested transaction/struct.
     // The element record's own lowering already validated every leaf
     // (an unsupported leaf failed THERE, naming its `Inner.field` path),
