@@ -3296,7 +3296,11 @@ fn emit_stmt(
                     .callbacks
                     .iter()
                     .find(|(field, _)| field == &reg.name)
-                    .map(|(_, fid)| format!(" {}(_rec_data);", prog.function(*fid).name))
+                    .map(|(_, fid)| {
+                        test_hook_cpp_name(cx, *fid)
+                            .map(|callback| format!(" {callback}(_rec_data);"))
+                    })
+                    .transpose()?
                     .unwrap_or_default();
                 writeln!(
                     out,

@@ -28931,6 +28931,30 @@ fn regblock_record_corpus_lowers_with_callback() {
 }
 
 #[test]
+fn regblock_runtime_write_dispatches_through_the_test_hook_cell() {
+    let source = fixture("regblock_record_test.harc");
+    let merged = merged_with_stdlib_bus(&source, "BusAxiLite.arch");
+    let prog = lower::lower_program(&merged).expect("regblock callback lowers");
+    verify::verify_program(&prog).expect("regblock callback verifies");
+    let cpp =
+        tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("regblock callback emits");
+
+    // Test hooks are stored in typed, run-owned `std::function` cells. A
+    // runtime-address record_write must dispatch through that cell, rather
+    // than attempting to call the TestHook's non-existent free-function name.
+    const CALLBACK: &str = "RegblockRecordTest_regblock_b4_regs_r7_MM2S_SA_cb";
+    const CELL: &str = "_harc_runtime_cells.test_hook_regblock_b4_regs_r7_MM2S_SA";
+    assert!(
+        cpp.contains(&format!("{CELL}(_rec_data);")),
+        "expected runtime record_write callback dispatch through its runtime cell:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains(&format!("{CALLBACK}(_rec_data);")),
+        "runtime record_write must not call the TestHook source name directly:\n{cpp}"
+    );
+}
+
+#[test]
 fn regblock_callback_identity_rejects_same_abi_body_swaps() {
     let source = fixture("regblock_record_test.harc");
     let first = "    on regs.MM2S_SA\n        regs.record_write(0x28, data)\n    end on\n";
