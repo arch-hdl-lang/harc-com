@@ -9950,6 +9950,17 @@ former `transaction` group lives in
      test's `dut` binding. This reduces the raw inventory to 97 textual matches
      (96 constructors plus the helper definition).
 
+194. **Wide decimal sized literals in general expressions (2026-09-01).**
+
+     Valid decimal sized values above `u64` now lower into the shared
+     LSB-first `WideLiteral` carrier using exact per-digit multiply-add over
+     32-bit words. Typed TBIR code therefore preserves values such as decimal
+     2^64 without a bigint dependency. v1 pastes the normalized decimal into
+     C++ as an oversized native token, so untyped forms receive the same
+     `EmitsUncompilable` verdict as wide binary forms. The generic integer
+     fallback remains for other spellings; raw inventory stays at 97 textual
+     matches (96 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

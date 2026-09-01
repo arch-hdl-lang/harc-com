@@ -1786,13 +1786,13 @@ impl FuncBuilder<'_> {
                         && super::exprs::ast_expr_contains_sized_literal(value)
                 })
         {
-            let v1_binary_overflow = l.value.as_ref().is_some_and(|value| {
-                super::exprs::ast_expr_contains_wide_sized_binary_literal(value)
+            let v1_native_literal_overflow = l.value.as_ref().is_some_and(|value| {
+                super::exprs::ast_expr_contains_wide_sized_native_literal(value)
             });
-            let (detail, v1_status) = if v1_binary_overflow {
+            let (detail, v1_status) = if v1_native_literal_overflow {
                 (
                     format!(
-                        "give `{}` an explicit wide type for TBIR; v1 emits the binary value as an oversized native C++ literal",
+                        "give `{}` an explicit wide type for TBIR; v1 emits the binary or decimal value as an oversized native C++ literal",
                         l.name.name
                     ),
                     V1Status::EmitsUncompilable,

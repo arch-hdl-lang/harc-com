@@ -534,6 +534,10 @@ not applicable before requesting review:
    probe family: v1 creates no accessor and a probe read cannot compile.
    Replacing the generic fallback reduces the raw inventory to 97 textual
    matches (96 constructors plus the helper definition).
+   Wide sized decimal values now use exact multiply-add conversion into the
+   shared LSB-first word carrier. The generic fallback still covers other
+   integer spellings, so the raw inventory remains 97 textual matches (96
+   constructors plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
