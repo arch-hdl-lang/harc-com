@@ -152,6 +152,13 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Zero-length fixed vectors as typed empty value aggregates across record
   fields, component/transactor state, queues, events, helper and component
   method ABIs, with exact `std::array<T, 0>` storage and verifier metadata.
+- [x] By-value recursive records (`struct Node { next: Node }`) are rejected
+  in `harc check` and `tbir::lower` with a diagnostic pointing to a scalar
+  index/handle field (the only cycle break a record field currently supports —
+  `ref`/`list`/`queue` are not valid record-field types); `v1`'s direct
+  `emit_record_struct` path would stack-overflow on the same input but is
+  intentionally not fixed — `v1` is phasing out and `harc check` is the single
+  source of truth (see #483).
 
 This list intentionally excludes v1 failures such as a blocking bus call
 nested in an expression. Those may still be useful TB-IR enhancements, but
