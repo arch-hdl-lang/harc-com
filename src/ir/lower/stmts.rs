@@ -1782,13 +1782,30 @@ impl FuncBuilder<'_> {
                         && super::exprs::ast_expr_contains_sized_literal(value)
                 })
         {
+            let v1_binary_overflow = l.value.as_ref().is_some_and(|value| {
+                super::exprs::ast_expr_contains_wide_sized_binary_literal(value)
+            });
+            let (detail, v1_status) = if v1_binary_overflow {
+                (
+                    format!(
+                        "give `{}` an explicit wide type for TBIR; v1 emits the binary value as an oversized native C++ literal",
+                        l.name.name
+                    ),
+                    V1Status::EmitsUncompilable,
+                )
+            } else {
+                (
+                    format!(
+                        "give `{}` an explicit wide type, such as `let {} : uint<128> = ...`",
+                        l.name.name, l.name.name
+                    ),
+                    V1Status::SilentlyMisLowers,
+                )
+            };
             return Err(not_implemented(
                 "an untyped local initialized from a wide expression containing a sized literal",
-                &format!(
-                    "give `{}` an explicit wide type, such as `let {} : uint<128> = ...`",
-                    l.name.name, l.name.name
-                ),
-                V1Status::SilentlyMisLowers,
+                detail,
+                v1_status,
             ));
         }
         // Untyped signed-scalar RHS (`let d = NEG` where NEG is a `sint`

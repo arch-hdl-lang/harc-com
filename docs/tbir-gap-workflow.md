@@ -521,6 +521,11 @@ not applicable before requesting review:
    literal fallback, so this routes around that constructor and leaves the raw
    inventory at 99 textual matches (98 constructors plus the helper
    definition).
+   Wide binary sized literals now reuse the same value-based scalar/wide
+   split and LSB-first word carrier as hexadecimal sized literals. Decimal
+   values above `u64` still share the generic integer-literal fallback, so
+   this route leaves the raw inventory at 99 textual matches (98 constructors
+   plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

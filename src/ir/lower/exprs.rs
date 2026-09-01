@@ -1030,6 +1030,9 @@ impl FuncBuilder<'_> {
                 if let Some(words) = parse_wide_hex_literal(s) {
                     return Ok(Expr::WideLiteral(words));
                 }
+                if let Some(words) = parse_wide_sized_binary_literal(s) {
+                    return Ok(Expr::WideLiteral(words));
+                }
                 if let Some(words) = parse_wide_sized_hex_literal(s) {
                     return Ok(Expr::WideLiteral(words));
                 }
@@ -5768,6 +5771,33 @@ fn parse_wide_sized_hex_literal(s: &str) -> Option<Vec<u32>> {
     Some(words)
 }
 
+/// Binary counterpart of [`parse_wide_sized_hex_literal`]. Binary chunks map
+/// directly to the wide carrier's 32-bit words, so no bigint dependency or
+/// host-width truncation is involved.
+fn parse_wide_sized_binary_literal(s: &str) -> Option<Vec<u32>> {
+    let t = s.replace('_', "");
+    let tick = t.find('\'')?;
+    let width = t[..tick].parse::<u32>().ok()?;
+    let rest = &t[tick + 1..];
+    let digits = rest.strip_prefix('b').or_else(|| rest.strip_prefix('B'))?;
+    if width == 0 || digits.is_empty() || digits.chars().any(|c| !matches!(c, '0' | '1')) {
+        return None;
+    }
+
+    let significant = digits.trim_start_matches('0');
+    if significant.len() <= 64 || significant.len() as u64 > u64::from(width) {
+        return None;
+    }
+    let mut words = Vec::with_capacity(significant.len().div_ceil(32));
+    let mut remaining = significant.len();
+    while remaining > 0 {
+        let start = remaining.saturating_sub(32);
+        words.push(u32::from_str_radix(&significant[start..remaining], 2).ok()?);
+        remaining = start;
+    }
+    Some(words)
+}
+
 /// Fold an AST expression to a `u64` when it is an integer literal
 /// (optionally parenthesized). Used by the target-side `out_of_order
 /// tags N` responder lowering to range-check the literal tag count;
@@ -5988,47 +6018,61 @@ pub(crate) fn parse_sized_int_literal(s: &str) -> Option<u64> {
 /// The value IR deliberately erases this source provenance when matching v1's
 /// host-scalar semantics; host-width unary bit-not still needs the distinction.
 pub(crate) fn ast_expr_contains_sized_literal(e: &AstExpr) -> bool {
+    ast_expr_any_int(e, &|text| text.contains('\''))
+}
+
+/// Whether `e` contains a sized binary value that needs the wide carrier.
+/// v1 pastes these values into C++ as oversized native `0b...` tokens, so
+/// untyped-local diagnostics must distinguish them from wide sized hex values,
+/// which v1 instead narrows silently.
+pub(crate) fn ast_expr_contains_wide_sized_binary_literal(e: &AstExpr) -> bool {
+    ast_expr_any_int(e, &|text| {
+        parse_wide_sized_binary_literal(text).is_some()
+    })
+}
+
+fn ast_expr_any_int(e: &AstExpr, predicate: &impl Fn(&str) -> bool) -> bool {
     match &*e.kind {
-        ExprKind::Int(text) => text.contains('\''),
+        ExprKind::Int(text) => predicate(text),
         ExprKind::Paren(inner) | ExprKind::Unary { expr: inner, .. } => {
-            ast_expr_contains_sized_literal(inner)
+            ast_expr_any_int(inner, predicate)
         }
-        ExprKind::Cast { expr, .. } => ast_expr_contains_sized_literal(expr),
-        ExprKind::Field { target, .. } => ast_expr_contains_sized_literal(target),
+        ExprKind::Cast { expr, .. } => ast_expr_any_int(expr, predicate),
+        ExprKind::Field { target, .. } => ast_expr_any_int(target, predicate),
         ExprKind::Index { target, index } => {
-            ast_expr_contains_sized_literal(target) || ast_expr_contains_sized_literal(index)
+            ast_expr_any_int(target, predicate) || ast_expr_any_int(index, predicate)
         }
         ExprKind::BitSlice { target, hi, lo } => {
-            ast_expr_contains_sized_literal(target)
-                || ast_expr_contains_sized_literal(hi)
-                || ast_expr_contains_sized_literal(lo)
+            ast_expr_any_int(target, predicate)
+                || ast_expr_any_int(hi, predicate)
+                || ast_expr_any_int(lo, predicate)
         }
         ExprKind::Call { callee, args } => {
-            ast_expr_contains_sized_literal(callee)
+            ast_expr_any_int(callee, predicate)
                 || args.iter().any(|arg| match arg {
                     CallArg::Expr(value) | CallArg::Named { value, .. } => {
-                        ast_expr_contains_sized_literal(value)
+                        ast_expr_any_int(value, predicate)
                     }
                 })
         }
         ExprKind::Binary { lhs, rhs, .. } => {
-            ast_expr_contains_sized_literal(lhs) || ast_expr_contains_sized_literal(rhs)
+            ast_expr_any_int(lhs, predicate) || ast_expr_any_int(rhs, predicate)
         }
         ExprKind::Ternary {
             cond,
             then_branch,
             else_branch,
         } => {
-            ast_expr_contains_sized_literal(cond)
-                || ast_expr_contains_sized_literal(then_branch)
-                || ast_expr_contains_sized_literal(else_branch)
+            ast_expr_any_int(cond, predicate)
+                || ast_expr_any_int(then_branch, predicate)
+                || ast_expr_any_int(else_branch, predicate)
         }
         ExprKind::SystemCall { args, .. } | ExprKind::SolveOrder { args } => {
-            args.iter().any(ast_expr_contains_sized_literal)
+            args.iter().any(|arg| ast_expr_any_int(arg, predicate))
         }
-        ExprKind::NamedArg { value, .. } => ast_expr_contains_sized_literal(value),
+        ExprKind::NamedArg { value, .. } => ast_expr_any_int(value, predicate),
         ExprKind::Membership { expr, set } => {
-            ast_expr_contains_sized_literal(expr) || ast_expr_contains_sized_literal(set)
+            ast_expr_any_int(expr, predicate) || ast_expr_any_int(set, predicate)
         }
         _ => false,
     }

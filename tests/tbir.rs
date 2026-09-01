@@ -32893,6 +32893,49 @@ end impl T
     );
 }
 
+#[test]
+fn wide_sized_binary_literals_lower_in_general_value_positions() {
+    let src = r#"
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    run
+        let wide : uint<128> = 128'b1_00000000000000000000000000000000_00000000000000000000000000000000
+        assert wide == 0x1_0000_0000_0000_0000
+    end run
+end impl T
+"#;
+    let prog = lower_src(src).expect("wide sized binary values lower");
+    verify::verify_program(&prog).expect("wide sized binary values verify");
+    assert!(
+        prog.function(prog.tests[0].run)
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .any(|stmt| matches!(
+                stmt,
+                ir::Stmt::Assign(_, ir::Expr::WideLiteral(words)) if words == &[0, 0, 1]
+            )),
+        "the 65-bit binary value lowers to three LSB-first words"
+    );
+    assert!(emit_cpp_src(src).contains("_harc_u128"));
+    // v1 normalizes this to an oversized native C++ binary literal, which
+    // clang rejects. TBIR deliberately routes it through the wide carrier.
+    assert!(
+        cpp_tb::emit(&merged_src(src))
+            .expect("v1 emits wide sized binary values")
+            .contains("0b10000000000000000000000000000000000000000000000000000000000000000")
+    );
+
+    let untyped = src.replace("let wide : uint<128>", "let wide");
+    let err = lower_src(&untyped).expect_err("an untyped wide binary local is diagnosed");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("explicit wide type for TBIR"), "{msg}");
+    assert!(msg.contains("oversized native C++ literal"), "{msg}");
+}
+
 /// A regblock register `@ <addr>` offset and `reset` value now FOLD,
 /// through the same helper as the addrmap base and size. Like those,
 /// this puts TB-IR ahead of v1 rather than level with it: v1 folds both
