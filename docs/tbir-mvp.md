@@ -9844,6 +9844,20 @@ former `transaction` group lives in
      fallback, so the raw inventory remains 104 textual `unsupported(`
      matches (103 constructors plus the helper definition).
 
+186. **Multiple bound initiator-BFM instances (2026-08-31).**
+
+     A bus-bound initiator transactor type may now be instantiated more than
+     once in one test, including against different bindings of the same bus.
+     Test binding clones the source schema and its method functions per
+     instance, then fills each clone's physical bus prefix and persistent
+     state storage independently. Instance-qualified internal names keep the
+     generated method lambdas and state structs distinct while an immutable
+     lowering-side template remains available across tests. A self-checking
+     fixture proves two helpers sharing one bus retain independent counters,
+     and a lowering regression proves two helpers can select different bus
+     prefixes. This removes two shared-body `Unsupported` gates, reducing the
+     inventory to 102 textual matches (101 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

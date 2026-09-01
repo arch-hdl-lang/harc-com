@@ -26051,11 +26051,17 @@ fn bound_initiator_transactor_with_state_lowers() {
 
     // The stateful bound-initiator instance is recorded for per-instance
     // state materialization (the same table the unbound form uses).
+    let helper_id = prog.testbenches[0]
+        .transactor_fields
+        .iter()
+        .find(|(field, _)| field == "helper")
+        .map(|(_, xid)| *xid)
+        .expect("helper binding");
     assert_eq!(
         prog.testbenches[0].unbound_state_actors,
         vec![ir::UnboundStateActorSchema {
             field: "helper".to_string(),
-            transactor: ir::TransactorId(0),
+            transactor: helper_id,
             storage: "helper".to_string(),
         }],
         "stateful bound-initiator instance recorded for materialization",
@@ -26063,11 +26069,13 @@ fn bound_initiator_transactor_with_state_lowers() {
 
     // The `read` body's state writes are instance-filled with `helper`
     // (the bound instance name), not the empty pre-bind placeholder.
-    let read_fn = prog
-        .functions
-        .iter()
-        .find(|f| f.name == "AxilHelper_read")
-        .expect("read method function");
+    let helper_schema = prog.transactor(helper_id);
+    let read_fn = prog.function(
+        helper_schema
+            .method("read")
+            .expect("read method on specialized helper")
+            .function,
+    );
     let state_writes = read_fn
         .blocks
         .iter()
@@ -26077,6 +26085,57 @@ fn bound_initiator_transactor_with_state_lowers() {
     assert_eq!(
         state_writes, 2,
         "two instance-filled state writes in read body"
+    );
+}
+
+/// Each bound initiator instance owns specialized method functions. A second
+/// instance may therefore select a different binding without overwriting the
+/// first instance's concrete bus ports, and both retain independent state.
+#[test]
+fn multiple_bound_initiator_instances_specialize_bus_and_state() {
+    let same_binding = lower_with_stdlib_bus(
+        "multiple_bound_initiator_test.harc",
+        "BusAxiLite.arch",
+    )
+    .expect("two helpers on one binding lower");
+    verify::verify_program(&same_binding).expect("same-binding program verifies");
+    let tb = &same_binding.testbenches[0];
+    assert_eq!(tb.unbound_state_actors.len(), 2);
+    assert_ne!(tb.transactor_fields[0].1, tb.transactor_fields[1].1);
+
+    let distinct_src = fixture("multiple_bound_initiator_test.harc")
+        .replace(
+            "    let axil : BusAxiLite = bind dut",
+            "    let axil : BusAxiLite = bind dut\n    let alternate : BusAxiLite = bind dut",
+        )
+        .replace(
+            "    let second : CountingHelper active = bind axil",
+            "    let second : CountingHelper active = bind alternate",
+        );
+    let distinct = lower_with_stdlib_bus_src(&distinct_src)
+        .expect("two helpers on distinct bindings lower");
+    verify::verify_program(&distinct).expect("distinct-binding program verifies");
+    let dump = format!("{distinct}");
+    assert!(
+        dump.contains("dut.axil.aw.valid"),
+        "first specialization: {dump}"
+    );
+    assert!(
+        dump.contains("dut.alternate.aw.valid"),
+        "second specialization: {dump}"
+    );
+
+    let cross_test_src = format!(
+        "{}\n\ntest ReuseBoundInitiatorTest\n    let dut : AxiLiteRegs\n    let later : BusAxiLite = bind dut\n    let third : CountingHelper active = bind later\n    run\n        third.clear_aw()\n        assert third.calls == 1 else fail(\"later helper state was not independent\")\n    end run\nend test ReuseBoundInitiatorTest\n",
+        fixture("multiple_bound_initiator_test.harc")
+    );
+    let cross_test = lower_with_stdlib_bus_src(&cross_test_src)
+        .expect("a later test can reuse the source initiator type");
+    verify::verify_program(&cross_test).expect("cross-test reuse verifies");
+    let cross_dump = format!("{cross_test}");
+    assert!(
+        cross_dump.contains("dut.later.aw.valid"),
+        "later-test specialization: {cross_dump}"
     );
 }
 

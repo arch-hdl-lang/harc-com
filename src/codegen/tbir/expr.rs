@@ -877,7 +877,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                     }
                     return Ok(format!(
                         "{}_{method}({})",
-                        schema.name,
+                        schema.emission_name(),
                         rendered.join(", ")
                     ));
                 }
@@ -889,7 +889,17 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                     for arg in args {
                         rendered.push(expr_cpp(cx, arg)?);
                     }
-                    return Ok(format!("{transactor}_{method}({})", rendered.join(", ")));
+                    let symbol = cx
+                        .prog
+                        .and_then(|prog| match cx.func.kind {
+                            crate::ir::FunctionKind::TransactorBody { transactor } => {
+                                prog.transactors.get(transactor.index())
+                            }
+                            _ => None,
+                        })
+                        .map(crate::ir::TransactorSchema::emission_name)
+                        .unwrap_or(transactor);
+                    return Ok(format!("{symbol}_{method}({})", rendered.join(", ")));
                 }
             };
             let mut rendered = Vec::with_capacity(args.len());

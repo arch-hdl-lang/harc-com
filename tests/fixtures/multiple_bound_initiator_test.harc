@@ -1,0 +1,32 @@
+use BusAxiLite
+
+transactor CountingHelper bound to BusAxiLite
+    calls : uint<32> default 0
+
+    when active
+        hookable clear_aw()
+            bus.aw.valid = 0
+            calls = calls + 1
+        end clear_aw
+
+        hookable clear_aw_twice()
+            clear_aw()
+            clear_aw()
+        end clear_aw_twice
+    end when
+end transactor CountingHelper
+
+test MultipleBoundInitiatorTest
+    let dut : AxiLiteRegs
+    let axil : BusAxiLite = bind dut
+    let first : CountingHelper active = bind axil
+    let second : CountingHelper active = bind axil
+
+    run
+        first.clear_aw_twice()
+        second.clear_aw()
+
+        assert first.calls == 2 else fail("first helper state was not independent")
+        assert second.calls == 1 else fail("second helper state was not independent")
+    end run
+end test MultipleBoundInitiatorTest

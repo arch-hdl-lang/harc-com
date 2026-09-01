@@ -3510,7 +3510,7 @@ fn emit_test(
                         let xs = prog.transactor(*xid);
                         xs.method(method).map(|m| {
                             (
-                                format!("{}_{}", xs.name, m.name),
+                                format!("{}_{}", xs.emission_name(), m.name),
                                 m.function,
                                 m.param_names.len(),
                             )

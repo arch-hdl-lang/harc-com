@@ -271,7 +271,7 @@ pub(super) fn target_state_struct_inst(
 /// lambda takes it by reference as `self_state` so one body drives any
 /// number of instances (#494 P1b).
 pub(super) fn unbound_state_struct_ty(schema: &crate::ir::TransactorSchema) -> String {
-    format!("_{}_state", schema.name)
+    format!("_{}_state", schema.emission_name())
 }
 
 /// Emit the shared per-TYPE state struct declaration for the state-receiver

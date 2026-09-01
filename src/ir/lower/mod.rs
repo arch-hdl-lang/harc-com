@@ -2758,6 +2758,30 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // populated on first bind, reused after. Empty when the switch is off.
     let mut shared_lifecycle_fns: HashMap<String, HashMap<crate::ast::LifecyclePhase, FunctionId>> =
         HashMap::new();
+    // Preserve pristine bound-initiator schemas/functions across every test
+    // in the file. The first instance can retain the source IDs (keeping the
+    // established single-instance IR stable); later instances clone from
+    // this cache rather than from a body another test already specialized.
+    let mut bound_initiator_templates = HashMap::new();
+    for (index, schema) in prog.transactors.iter().enumerate() {
+        if schema.bound_bus.is_none() || schema.methods.is_empty() || !schema.target_methods.is_empty()
+        {
+            continue;
+        }
+        let functions = schema
+            .methods
+            .iter()
+            .map(|method| prog.function(method.function).clone())
+            .collect();
+        bound_initiator_templates.insert(
+            TransactorId(index as u32),
+            BoundInitiatorTemplate {
+                schema: schema.clone(),
+                functions,
+                claimed: false,
+            },
+        );
+    }
     for it in &file.items {
         let Item::Test(t) = it else { continue };
         lower_test(
@@ -2787,6 +2811,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &always_on_dut_event_host_names,
             &shared_lifecycle_bodies,
             &mut shared_lifecycle_fns,
+            &mut bound_initiator_templates,
             &mut prog,
         )?;
     }
@@ -3562,6 +3587,7 @@ fn lower_test(
     // Both empty when `HARC_TBIR_NATIVE_LIFECYCLE` is off.
     shared_lifecycle_bodies: &crate::codegen::cpp_tb::SharedLifecycleBodies,
     shared_lifecycle_fns: &mut HashMap<String, HashMap<crate::ast::LifecyclePhase, FunctionId>>,
+    bound_initiator_templates: &mut HashMap<TransactorId, BoundInitiatorTemplate>,
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
     if !t.params.is_empty() {
@@ -4701,13 +4727,13 @@ fn lower_test(
     }
     // Bound-to initiator-side BFM instances (`let helper : H active =
     // bind axil`). Validate the bound bus binding matches the
-    // transactor's `bound to` bus, fill the placeholder bus prefix in
-    // the (TYPE-shared) method bodies with the real binding name, and
+    // transactor's `bound to` bus, specialize its method bodies with the
+    // real binding name, and
     // register the helper as a bare-name active transactor field so the
     // regblock `via` frontdoor and direct method calls resolve. The
-    // method bodies are shared per transactor TYPE, so the subset is one
-    // bound instance per type per file — a second bind to a different
-    // bus binding would clobber the first's filled prefix, so reject it.
+    // Additional bound instances get internal schema/function clones. That
+    // keeps concrete bus ports and state storage instance-local; an immutable
+    // lowering-side template prevents an earlier test from poisoning a clone.
     for (instance, xid, bus_field) in &initiator_bfm_binds {
         if transactor_fields.iter().any(|(f, _)| f == instance) {
             return Err(LowerError::Invalid(format!(
@@ -4734,28 +4760,32 @@ fn lower_test(
                 xschema.bound_bus.as_deref().unwrap_or("<none>"),
             )));
         }
-        // Fill the placeholder bus prefix in the method bodies with the
-        // real binding name. The bodies are shared per type; a second
-        // bind to a different binding name is rejected (one instance per
-        // type per file).
-        let method_fns: Vec<usize> = xschema.methods.iter().map(|m| m.function.index()).collect();
-        let xname = xschema.name.clone();
-        let remap = binding.remap.clone();
-        for fidx in method_fns {
-            if let Err(prev) =
-                fill_initiator_bus_prefix(&mut prog.functions[fidx], bus_field, &remap)
-            {
-                return Err(unsupported(
-                    &format!(
-                        "initiator-BFM transactor `{xname}` bound to more than one bus \
-                         binding (`{prev}`, `{bus_field}`)"
-                    ),
-                    "the initiator-BFM subset shares one method body per transactor type; \
-                     multiple instances need per-instance bodies",
-                ));
+        let template = bound_initiator_templates.get_mut(xid).ok_or_else(|| {
+            LowerError::Invalid(format!(
+                "internal bound-initiator template for `{}` is missing",
+                xschema.name
+            ))
+        })?;
+        let specialized = if template.claimed {
+            specialize_bound_initiator(prog, template, instance, bus_field, &binding.remap)?
+        } else {
+            template.claimed = true;
+            for method in &template.schema.methods {
+                if let Err(previous) = fill_initiator_bus_prefix(
+                    &mut prog.functions[method.function.index()],
+                    bus_field,
+                    &binding.remap,
+                ) {
+                    return Err(LowerError::Invalid(format!(
+                        "pristine bound initiator `{}` unexpectedly retained bus binding \
+                         `{previous}` while selecting `{bus_field}`",
+                        template.schema.name
+                    )));
+                }
             }
-        }
-        transactor_fields.push((instance.clone(), *xid));
+            *xid
+        };
+        transactor_fields.push((instance.clone(), specialized));
         bare_transactor_fields.insert(instance.clone());
     }
     // Bound-to event-driven component instances (`let xact : X active =
@@ -5284,12 +5314,11 @@ fn lower_test(
                 .collect(),
         );
         // Bound-to INITIATOR BFMs still bake the instance name into their
-        // (type-shared) method bodies — those bodies are not invoked
-        // through the state-receiver method lambdas, and a bound bus pins
-        // one instance per type. The unbound DUT-poking form leaves the
-        // placeholders EMPTY so codegen renders them against the per-call
-        // `self_state` receiver, letting multiple active instances of one
-        // type coexist (#494 P1b). A PASSIVE instance's `when active`
+        // instance-specialized method bodies — those bodies are not invoked
+        // through the state-receiver method lambdas. The unbound DUT-poking
+        // form leaves the placeholders EMPTY so codegen renders them against
+        // the per-call `self_state` receiver, letting multiple active instances
+        // of one type coexist (#494 P1b). A PASSIVE instance's `when active`
         // methods are never callable, so its bodies are never filled and
         // never receive a receiver either.
         if is_bound && !is_passive {
@@ -5297,16 +5326,14 @@ fn lower_test(
                 xschema.methods.iter().map(|m| m.function.index()).collect();
             let storage = &transactor_storage_names[field];
             for fidx in method_fns {
-                if let Err(prev) =
-                    fill_transactor_state_instance(&mut prog.functions[fidx], storage)
-                {
-                    return Err(unsupported(
-                        &format!(
-                            "bound-to initiator transactor `{xname}` instantiated more than \
-                             once (`{prev}`, `{field}`)"
-                        ),
-                        "a bound-to initiator BFM pins one instance per transactor type",
-                    ));
+                if let Err(prev) = fill_transactor_state_instance(
+                    &mut prog.functions[fidx],
+                    storage,
+                ) {
+                    return Err(LowerError::Invalid(format!(
+                        "internal bound-initiator specialization for `{xname}` mixed state \
+                         storage `{prev}` and `{field}`"
+                    )));
                 }
             }
         }
@@ -8967,6 +8994,64 @@ fn fill_initiator_bus_prefix_expr(
     }
     fill_visit_expr(e, placeholder, binding, remap, true, &mut conflict);
     Ok(())
+}
+
+#[derive(Clone)]
+struct BoundInitiatorTemplate {
+    schema: ir::TransactorSchema,
+    functions: Vec<TbFunction>,
+    claimed: bool,
+}
+
+/// Clone one bound initiator schema and its method functions for a concrete
+/// test-scope instance. Bus ports are physical C++ identifiers, so leaving
+/// them on the source-type schema would make a second binding overwrite the
+/// first. The clone receives an instance-qualified internal name; source type
+/// lookup continues to resolve the untouched template schema.
+fn specialize_bound_initiator(
+    prog: &mut TbProgram,
+    template: &BoundInitiatorTemplate,
+    instance: &str,
+    binding: &str,
+    remap: &[((String, String), String)],
+) -> Result<TransactorId, LowerError> {
+    let specialized_id = TransactorId(prog.transactors.len() as u32);
+    let mut schema = template.schema.clone();
+    schema.emission_name = Some(format!("{}__{instance}", schema.name));
+    let emission_name = schema.emission_name().to_string();
+
+    for method in &mut schema.methods {
+        let mut func = template
+            .functions
+            .iter()
+            .find(|func| func.id == method.function)
+            .cloned()
+            .ok_or_else(|| {
+                LowerError::Invalid(format!(
+                    "internal bound-initiator template `{}` is missing fn{}",
+                    template.schema.name, method.function.0
+                ))
+            })?;
+        let function_id = FunctionId(prog.functions.len() as u32);
+        func.id = function_id;
+        func.name = format!("{emission_name}_{}", method.name);
+        func.kind = FunctionKind::TransactorBody {
+            transactor: specialized_id,
+        };
+        if let Err(previous) = fill_initiator_bus_prefix(&mut func, binding, remap) {
+            return Err(LowerError::Invalid(format!(
+                "internal bound-initiator specialization for `{}` found an already-filled \
+                 bus binding `{previous}` while selecting `{binding}`",
+                schema.name
+            )));
+        }
+        prog.functions.push(func);
+        method.function = function_id;
+    }
+
+    debug_assert!(schema.target_methods.is_empty());
+    prog.transactors.push(schema);
+    Ok(specialized_id)
 }
 
 fn fill_initiator_bus_prefix(
