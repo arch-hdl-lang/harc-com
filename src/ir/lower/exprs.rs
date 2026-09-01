@@ -2253,11 +2253,7 @@ impl FuncBuilder<'_> {
                 "ranges are a `for`/`inside` form, not a value",
                 V1Status::SilentlyMisLowers,
             )),
-            ExprKind::Membership { .. } => Err(not_implemented(
-                "an `in` membership test in value position",
-                "membership is a constraint form — it lowers inside `randomize ... with`",
-                V1Status::Rejects,
-            )),
+            ExprKind::Membership { .. } => Err(membership_value_error()),
             // v1 emits the shorthand verbatim (`int64_t x = .a;`),
             // which is not valid C++.
             ExprKind::ImplicitSelf => Err(not_implemented(
@@ -5712,9 +5708,20 @@ pub(crate) fn lower_bin_op(op: BinaryOp) -> Result<BinOp, LowerError> {
             ));
         }
         BinaryOp::In | BinaryOp::Inside => {
-            return Err(unsupported("`in`/`inside` membership operators", ""));
+            // Source parsing canonicalizes both spellings to
+            // `ExprKind::Membership`; keep the defensive operator fallback on
+            // the same measured verdict instead of advertising v1.
+            return Err(membership_value_error());
         }
     })
+}
+
+fn membership_value_error() -> LowerError {
+    not_implemented(
+        "an `in`/`inside` membership test in value position",
+        "membership is a constraint form — it lowers inside `randomize ... with`",
+        V1Status::Rejects,
+    )
 }
 
 /// Parse a hex literal wider than 64 bits (> 16 hex digits) into

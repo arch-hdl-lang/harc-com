@@ -538,6 +538,11 @@ not applicable before requesting review:
    shared LSB-first word carrier. The generic fallback still covers other
    integer spellings, so the raw inventory remains 97 textual matches (96
    constructors plus the helper definition).
+   The defensive `BinaryOp::{In, Inside}` fallback now shares the reachable
+   membership diagnostic: both spellings are constraint-only and v1 rejects
+   them in value position. Removing the stale constructor reduces the raw
+   inventory to 96 textual matches (95 constructors plus the helper
+   definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
