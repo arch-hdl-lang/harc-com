@@ -9887,6 +9887,19 @@ former `transaction` group lives in
      two constructors and leave 100 textual `unsupported(` matches (99
      constructors plus the helper definition).
 
+189. **Bound transactors may retain a DUT handle (2026-09-01).**
+
+     An event-driven transactor `bound to` a bus may now also declare the
+     conventional module-typed `dut` field and use both `dut.<port>` pokes and
+     `bus.<channel>` traffic in one handler. `PortRef` retains the selected
+     logical bus binding even when remapping collapses its physical path, so
+     test-instance specialization rewrites only bus ports, remains idempotent,
+     and leaves native DUT paths untouched. The
+     existing active/passive AxiLite fixture now exercises the combined
+     surface under v1/TBIR parity. This removes one constructor and leaves 99
+     textual `unsupported(` matches (98 constructors plus the helper
+     definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

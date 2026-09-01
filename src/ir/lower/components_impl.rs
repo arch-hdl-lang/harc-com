@@ -940,19 +940,9 @@ pub(crate) fn lower_component_schema(
         .filter(|f| matches!(f.kind, ComponentFieldKind::Dut { .. }))
         .map(|f| f.name.as_str())
         .collect();
-    // A bound-bus event-driven transactor drives the bound bus's wires, not
-    // a private DUT handle — a module-typed field on it is ambiguous.
-    if bound_bus.is_some() && !dut_fields.is_empty() {
-        return Err(unsupported(
-            &format!(
-                "bound-to event-driven transactor `{name}` with a module-typed (DUT handle) \
-                 field ({})",
-                dut_fields.join(", ")
-            ),
-            "a bound-to transactor drives the bound bus's wires on the test DUT; it has no \
-             private DUT handle",
-        ));
-    }
+    // A bound-bus event-driven transactor may also retain the conventional
+    // `dut` handle. Both backends resolve DUT pokes in its handlers to the
+    // test's DUT; the by-value pointer field itself is inert, matching v1.
     if dut_fields.len() > 1 {
         // v1's poke lowering hardwires the name `dut` and resolves it
         // to the TEST's DUT pointer, so the transactor's own module
@@ -2031,6 +2021,7 @@ fn monitor_bus_port(channel: &str, signal: &str) -> crate::ir::PortRef {
             signal.to_string(),
         ],
         aggregate_path: false,
+        deferred_bus_binding: Some(crate::ir::DeferredBusBinding::Unresolved),
         direction: None,
         width: None,
         access: crate::ir::PortAccess::Port,
