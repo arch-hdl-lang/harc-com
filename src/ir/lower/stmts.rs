@@ -343,6 +343,12 @@ impl FuncBuilder<'_> {
                 if self.try_lower_bitbash(e)? {
                     return Ok(());
                 }
+                // TBIR-native regblock mirror reset. This must precede
+                // generic method-call dispatch, which otherwise treats
+                // `regs.reset_all()` as an unknown component method.
+                if self.try_lower_regblock_reset_all(e)? {
+                    return Ok(());
+                }
                 // `regs.record_write(addr, data)` — passive mirror update
                 // of an observed bus write (no bus, no callback).
                 if self.try_lower_record_write(e)? {
