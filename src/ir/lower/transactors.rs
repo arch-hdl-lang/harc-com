@@ -411,6 +411,7 @@ pub(crate) fn lower_transactor(
 
     let mut schema = TransactorSchema {
         name: tname.clone(),
+        emission_name: None,
         dut_field: dut_field.clone(),
         dut_type,
         methods: Vec::new(),
@@ -858,6 +859,7 @@ fn lower_bound_target_transactor(
 
     let mut schema = TransactorSchema {
         name: tname.clone(),
+        emission_name: None,
         // A bound target transactor has no private DUT handle; the
         // responder drives the bound bus's wires on the test DUT.
         dut_field: String::new(),
@@ -1467,6 +1469,7 @@ fn lower_bound_initiator_transactor(
 
     let mut schema = TransactorSchema {
         name: tname.clone(),
+        emission_name: None,
         // An initiator BFM drives the bound bus's wires on the test DUT;
         // it has no private DUT handle field.
         dut_field: String::new(),

@@ -123,6 +123,8 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Untyped promoted lets initialized from composed DUT-port expressions,
   using the established widthless host-scalar ABI while preserving the
   source-ordered runtime read and write.
+- [x] Multiple bound initiator-BFM instances of one source type, with
+  per-instance method specialization for independent bus bindings and state.
 - [x] Passive event-driven transactor fields, retaining always-on state while
   activation-aware lowering blocks `when active` member access and omits its
   handlers, lifecycle services, and connect endpoints from registration.

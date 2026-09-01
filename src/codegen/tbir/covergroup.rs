@@ -1228,7 +1228,7 @@ pub(super) fn transactor_hook_vector_decls(
     hook_vector_decls(
         out,
         prog,
-        &schema.name,
+        schema.emission_name(),
         &m.name,
         m.function,
         m.param_names.len(),

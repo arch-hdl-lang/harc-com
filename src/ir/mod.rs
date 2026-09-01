@@ -460,6 +460,10 @@ impl RegAccess {
 #[derive(Debug, Clone)]
 pub struct TransactorSchema {
     pub name: String,
+    /// Optional instance-qualified C++ symbol stem. Bound initiator BFMs
+    /// receive one on their per-instance schema clones; source lookup and
+    /// diagnostics continue to use `name`.
+    pub emission_name: Option<String>,
     /// Name of the module-typed field the method bodies drive
     /// (`dut` by convention).
     pub dut_field: String,
@@ -585,6 +589,10 @@ pub struct TransactorMethodSchema {
 }
 
 impl TransactorSchema {
+    pub fn emission_name(&self) -> &str {
+        self.emission_name.as_deref().unwrap_or(&self.name)
+    }
+
     pub fn method(&self, name: &str) -> Option<&TransactorMethodSchema> {
         self.methods.iter().find(|m| m.name == name)
     }

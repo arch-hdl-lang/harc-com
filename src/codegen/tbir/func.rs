@@ -1849,7 +1849,7 @@ fn emit_stmt(
                         func.name
                     ))
                 })?;
-            let xname = xschema.name.as_str();
+            let xname = xschema.emission_name();
             let mut rendered = Vec::with_capacity(args.len() + 1);
             // State-receiver ABI (#494 P1b): an unbound stateful
             // transactor's method takes the calling instance's per-instance
@@ -2368,7 +2368,7 @@ fn emit_stmt(
                             transactor.0
                         ))
                     })?;
-                    format!("{}_{}_{side}", schema.name, method)
+                    format!("{}_{}_{side}", schema.emission_name(), method)
                 }
                 crate::ir::MethodHookTarget::Component {
                     component, method, ..
@@ -3512,7 +3512,7 @@ pub(super) fn declare_method_slot(
     writeln!(
         out,
         "{pad}std::function<{ret_ty}({params})> {}_{};",
-        schema.name, m.name
+        schema.emission_name(), m.name
     )
     .ok();
     Ok(())
@@ -3619,7 +3619,7 @@ pub(super) fn emit_method(
     writeln!(
         out,
         "{pad}{}_{} = [&]({params}) -> {ret_ty} {{",
-        schema.name, m.name
+        schema.emission_name(), m.name
     )
     .ok();
     declare_locals(out, prog, func, &names, nparams, depth + 1)?;
@@ -3636,7 +3636,7 @@ pub(super) fn emit_method(
         writeln!(
             out,
             "{pad1}for (auto& _h : {}_{}_pre) _h({hook_args});",
-            schema.name, m.name
+            schema.emission_name(), m.name
         )
         .ok();
     }
@@ -3696,7 +3696,7 @@ pub(super) fn emit_method(
                     writeln!(
                         out,
                         "{pad3}for (auto& _h : {}_{}_post) _h({hook_args});",
-                        schema.name, m.name
+                        schema.emission_name(), m.name
                     )
                     .ok();
                 }

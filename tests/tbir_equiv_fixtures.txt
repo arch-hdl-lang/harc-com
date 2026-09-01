@@ -273,6 +273,7 @@ analysis_source_mode_test | Top | top_counter.sv | top_counter.arch | pass | - |
 analysis_source_mode_test | Top | top_counter.sv | top_counter.arch | pass | - | - | AnalysisSourceModeFreshTest
 uninitialized_int_local_test | Top | top_counter.sv | top_counter.arch | pass
 promoted_compound_dut_let_test | Top | top_counter.sv | top_counter.arch | pass
+multiple_bound_initiator_test | AxiLiteRegs | AxiLiteRegs.sv | BusAxiLite.arch | pass
 keep_constraints_test | Top | top_counter.sv | top_counter.arch | pass
 wrapping_keep_constraint_test | Top | top_counter.sv | - | pass
 axilite_constraint_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass | axilite_regs_test.harc | - | AxiLiteConstraintTest
