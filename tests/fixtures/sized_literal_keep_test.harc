@@ -3,10 +3,10 @@
 // any `.harc` file in the repo, which is why `4'hFF` could lower to
 // `0xFF` (255 out of a token declaring four bits) for as long as it did.
 //
-// Sized literals in STATEMENT position are still a declared TB-IR subset
-// gap (`let a : uint<8> = 8'hFF` names `--codegen v1`), so this fixture
-// puts them where both backends lower them: inside `keep` constraints.
-// That also makes the value checkable rather than just the emitted text
+// The constraint rows cover declared-width solver semantics. The run body
+// also covers general value positions, including a declaration wider than
+// 64 bits whose value remains scalar and one whose value needs wide words.
+// That makes the values checkable rather than just the emitted text
 // — each constraint pins a field to exactly one legal value, so a
 // literal that lowers to the wrong number fails an assert here instead
 // of passing silently.
@@ -19,6 +19,10 @@
 domain SysDomain
   freq_mhz: 100
 end domain SysDomain
+
+function wide_id(x: uint<128>) -> uint<128>
+    return x
+end function wide_id
 
 transaction Lits
     hex8  : uint<8>
@@ -72,6 +76,16 @@ impl SizedLiteralKeepTest for SizedLiteralKeepTb
             assert t.wrap8 == 16
                 else fail("iter ${i}: (wrap8 +% 8'hFF) == 8'h0F gave ${t.wrap8}, want 16")
         end for
+
+        let padded = 128'h1
+        let wide : uint<128> = 128'h1_0000_0000_0000_0000
+        let returned = wide_id(128'h1_0000_0000_0000_0000)
+        assert padded == 1
+            else fail("128'h1 did not retain the scalar value 1")
+        assert wide == 0x1_0000_0000_0000_0000
+            else fail("wide sized hexadecimal literal lost high bits")
+        assert returned == 0x1_0000_0000_0000_0000
+            else fail("wide sized hexadecimal call argument lost high bits")
 
         log(info, "PASS: sized literals lower to the values they declare")
     end run

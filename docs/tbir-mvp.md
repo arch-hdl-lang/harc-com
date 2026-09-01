@@ -9900,6 +9900,23 @@ former `transaction` group lives in
      textual `unsupported(` matches (98 constructors plus the helper
      definition).
 
+190. **Wide hexadecimal sized literals in general expressions (2026-09-01).**
+
+     A hexadecimal sized literal in a statement or assertion now chooses its
+     TBIR carrier from the value, matching v1's normalized general-expression
+     behavior. A spelling such as `128'h1` remains the ordinary host scalar
+     value one even though its declaration is wide, while
+     `128'h1_0000_0000_0000_0000` lowers to the existing LSB-first
+     `WideLiteral` word representation without losing its high bit when the
+     destination has an explicit wide type. An untyped wide-sized initializer
+     is classified as a v1 silent mis-lowering because v1 stores it in
+     `int64_t` and truncates its high bits. The
+     registered sized-literal fixture exercises both forms under the shared
+     simulation and emit-parity gates. Binary and decimal values above `u64`
+     remain outside this slice. Because those radices still use the shared
+     integer-literal fallback, the raw inventory remains 99 textual
+     `unsupported(` matches (98 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

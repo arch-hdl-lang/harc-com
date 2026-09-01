@@ -69,6 +69,23 @@ fn resolve_statement_method_hook_target(
     resolve_component_hook_target(b, receiver, method)
 }
 
+/// Mirror v1's declaration choice for `let x = RHS`: top-level calls and
+/// wrapping expressions use `auto`, including through parentheses. Every
+/// other untyped integer-shaped RHS is stored in `int64_t`.
+fn v1_untyped_let_uses_auto(e: &AstExpr) -> bool {
+    match &*e.kind {
+        ExprKind::Call { .. } => true,
+        ExprKind::Binary { op, .. } => matches!(
+            op,
+            crate::ast::BinaryOp::AddWrap
+                | crate::ast::BinaryOp::SubWrap
+                | crate::ast::BinaryOp::MulWrap
+        ),
+        ExprKind::Paren(inner) => v1_untyped_let_uses_auto(inner),
+        _ => false,
+    }
+}
+
 fn resolve_component_hook_target(
     b: &super::FuncBuilder<'_>,
     receiver: &[String],
@@ -1751,6 +1768,29 @@ impl FuncBuilder<'_> {
         let wide_scalar_ty = self
             .host_state_scalar_type(&e)
             .filter(|t| matches!(t, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 64));
+        // v1 declares a non-call untyped let as `int64_t`, even when a
+        // newly admitted sized literal makes the RHS wider than 64 bits.
+        // TBIR would otherwise infer the wide carrier and preserve bits that
+        // v1 truncates. Keep the explicitly typed parity-safe spelling and
+        // diagnose the untyped one rather than silently changing behavior.
+        if l.ty.is_none()
+            && wide_scalar_ty.is_some()
+            && l.value
+                .as_ref()
+                .is_some_and(|value| {
+                    !v1_untyped_let_uses_auto(value)
+                        && super::exprs::ast_expr_contains_sized_literal(value)
+                })
+        {
+            return Err(not_implemented(
+                "an untyped local initialized from a wide expression containing a sized literal",
+                &format!(
+                    "give `{}` an explicit wide type, such as `let {} : uint<128> = ...`",
+                    l.name.name, l.name.name
+                ),
+                V1Status::SilentlyMisLowers,
+            ));
+        }
         // Untyped signed-scalar RHS (`let d = NEG` where NEG is a `sint`
         // const): v1's `auto` deduces `int64_t` from the signed
         // expression, so the local must carry signedness or `d >> 1` /

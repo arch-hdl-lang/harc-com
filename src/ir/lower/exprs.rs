@@ -1011,8 +1011,11 @@ impl FuncBuilder<'_> {
                 // with declared-width semantics. General value positions can
                 // share its numeric decoding when the value fits the native
                 // scalar carrier, while matching v1's host-scalar behavior.
-                // Wider sized values remain a separate wide-word slice.
-                if let Some((_width @ 1..=64, value)) = parse_sized_int_literal_with_width(s) {
+                // The declared width does not change v1's general-position
+                // host-scalar value: `128'h1` is still the ordinary integer
+                // one. Only the value overflowing this carrier needs the
+                // wide-word path below.
+                if let Some((1.., value)) = parse_sized_int_literal_with_width(s) {
                     return Ok(Expr::Literal {
                         value,
                         // v1 emits a general sized literal as an ordinary
@@ -1025,6 +1028,9 @@ impl FuncBuilder<'_> {
                 // Hex literals wider than 64 bits lower to LSB-first
                 // 32-bit word lists (v1's `c_wide_lit_words` shape).
                 if let Some(words) = parse_wide_hex_literal(s) {
+                    return Ok(Expr::WideLiteral(words));
+                }
+                if let Some(words) = parse_wide_sized_hex_literal(s) {
                     return Ok(Expr::WideLiteral(words));
                 }
                 Err(unsupported(
@@ -5722,6 +5728,41 @@ pub(crate) fn parse_wide_hex_literal(s: &str) -> Option<Vec<u32>> {
     while remaining > 0 {
         let start = remaining.saturating_sub(8);
         words.push(u32::from_str_radix(&hex[start..remaining], 16).ok()?);
+        remaining = start;
+    }
+    Some(words)
+}
+
+/// Parse the VALUE of a validated hexadecimal sized literal when it needs
+/// more than the native 64-bit scalar carrier. The declared width is a
+/// representability bound, not zero-padding for general expressions: this
+/// mirrors v1's normalized literal value and keeps `128'h1` on the scalar
+/// path while `128'h1_0000_0000_0000_0000` becomes three LSB-first words.
+fn parse_wide_sized_hex_literal(s: &str) -> Option<Vec<u32>> {
+    let t = s.replace('_', "");
+    let tick = t.find('\'')?;
+    let width = t[..tick].parse::<u32>().ok()?;
+    let rest = &t[tick + 1..];
+    let digits = rest.strip_prefix('h').or_else(|| rest.strip_prefix('H'))?;
+    if width == 0 || digits.is_empty() || digits.chars().any(|c| !c.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let significant = digits.trim_start_matches('0');
+    if significant.len() <= 16 {
+        return None;
+    }
+    let first_bits = 32 - significant.chars().next()?.to_digit(16)?.leading_zeros();
+    let value_bits = (significant.len() as u64 - 1) * 4 + u64::from(first_bits);
+    if value_bits > u64::from(width) {
+        return None;
+    }
+
+    let mut words = Vec::with_capacity(significant.len().div_ceil(8));
+    let mut remaining = significant.len();
+    while remaining > 0 {
+        let start = remaining.saturating_sub(8);
+        words.push(u32::from_str_radix(&significant[start..remaining], 16).ok()?);
         remaining = start;
     }
     Some(words)

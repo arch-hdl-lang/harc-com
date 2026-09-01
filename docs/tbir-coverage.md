@@ -1042,16 +1042,21 @@ run/check-shared `_tb`-struct members
 (`TestbenchSchema::scalar_fields`, `Expr::TbField` /
 `Stmt::TbFieldWrite`). Both structs registered.
 
-### Wide (>64-bit) integer literals — 2 fixtures — **RESOLVED 2026-06-12**
+### Wide (>64-bit) integer literals — 3 fixtures — **RESOLVED 2026-06-12**
 
 > ~~TB-IR lowering does not support integer literal yet (`0x...` is not
 > a plain literal)~~
 
-`wide_reg_test` (256-bit), `sha256_test` (512-bit message block) —
-hex literals wider than 64 bits lower to `Expr::WideLiteral` word
+`wide_reg_test` (256-bit), `sha256_test` (512-bit message block), plus
+general-expression coverage in `sized_literal_keep_test` — unsized and
+Verilog-style sized hex values wider than 64 bits lower to `Expr::WideLiteral` word
 lists; emission mirrors v1 (`_harc_u128` composite ≤ 128 bits,
 `HarcWide<N>` above, `harc_assign_words_checked` /
-`harc_eq_words` at the assign / `==` / `!=` sites). Both registered.
+`harc_eq_words` at the assign / `==` / `!=` sites). A wide declaration whose
+value still fits `u64`, such as `128'h1`, remains an ordinary scalar just as it
+does in v1. Sized values above `u64` require an explicitly wide destination;
+the untyped spelling is diagnosed because v1 silently truncates it to
+`int64_t`. All three fixtures are registered.
 
 ### Singleton blockers — 1 fixture each (10 total)
 
