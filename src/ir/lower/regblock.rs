@@ -649,6 +649,73 @@ impl super::FuncBuilder<'_> {
         Ok(true)
     }
 
+    /// `regs.reset_all()` — reset every host-mirror register to its
+    /// declared reset value (or zero). This is intentionally mirror-only:
+    /// unlike a frontdoor register assignment it emits no bus traffic.
+    ///
+    /// v1 prints an undeclared C++ method call for this spelling. TBIR owns
+    /// the typed regblock schema, so it can provide the useful operation
+    /// directly while v1 is retired.
+    pub(crate) fn try_lower_regblock_reset_all(
+        &mut self,
+        e: &crate::ast::Expr,
+    ) -> Result<bool, LowerError> {
+        let ExprKind::Call { callee, args } = &*e.kind else {
+            return Ok(false);
+        };
+        let ExprKind::Field { target, name } = &*callee.kind else {
+            return Ok(false);
+        };
+        if name.name != "reset_all" {
+            return Ok(false);
+        }
+        let mut receiver = target;
+        while let ExprKind::Paren(inner) = &*receiver.kind {
+            receiver = inner;
+        }
+        let ExprKind::Ident(binding_id) = &*receiver.kind else {
+            return Ok(false);
+        };
+        let Some(bctx) = self.ctx.regblock_bindings.get(&binding_id.name).cloned() else {
+            return Ok(false);
+        };
+        let mirror = self.lookup(&binding_id.name).ok_or_else(|| {
+            LowerError::Invalid(format!(
+                "regblock binding `{}` is not in scope at its reset_all site",
+                binding_id.name
+            ))
+        })?;
+        // Name lookup is lexical while `regblock_bindings` describes the
+        // outer test binding. An inner `let regs = ...` must win and must
+        // not receive record-field writes intended for the shadowed mirror.
+        if self.local_type(mirror) != &IrType::Record(bctx.record) {
+            return Ok(false);
+        }
+        if !args.is_empty() {
+            return Err(LowerError::Invalid(format!(
+                "`{}.reset_all()` takes no arguments",
+                binding_id.name
+            )));
+        }
+        let record = &self.ctx.records[bctx.record.index()];
+        let resets: Vec<(String, u64)> = record
+            .fields
+            .iter()
+            .map(|field| (field.name.clone(), field.default.unwrap_or(0)))
+            .collect();
+        for (field, value) in resets {
+            self.push(Stmt::RecordFieldWrite {
+                local: mirror,
+                field,
+                path: Vec::new(),
+                mid_indices: Vec::new(),
+                index: None,
+                value: lit(value),
+            });
+        }
+        Ok(true)
+    }
+
     /// `let x = regs.NAME` register-level frontdoor read, declaring a
     /// fresh local `dest_name`. Returns `Ok(true)` when `value` is a
     /// register read on a regblock binding (and lowers it).
@@ -1201,13 +1268,9 @@ impl super::FuncBuilder<'_> {
         // the C++, so `regs.NOPE = v` becomes `NOPE = v` — not a member
         // of the mirror struct — and does not compile.
         //
-        // A METHOD CALL does not reach this arm: `regs.reset_all()` is
-        // intercepted by generic statement lowering (`stmts.rs`) well
-        // before regblock access resolution, and is still `Unsupported`
-        // there. Pinned by
-        // `out_of_subset_regblock_and_addrmap_access_does_not_point_at_v1`,
-        // which asserts on the MESSAGE precisely because both spellings
-        // are rejected and the exit status cannot tell them apart.
+        // A METHOD CALL does not reach this arm. `regs.reset_all()` is a
+        // typed TBIR built-in intercepted by statement lowering; other
+        // method names are intercepted by generic method-call lowering.
         Err(not_implemented(
             &format!("{detail} (regblock `{binding}`)"),
             "register-level `regs.NAME = v` writes/`regs.NAME` reads, field-level \

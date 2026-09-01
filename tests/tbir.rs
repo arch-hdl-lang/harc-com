@@ -34622,11 +34622,7 @@ fn out_of_subset_regblock_and_addrmap_access_does_not_point_at_v1() {
     let fixture = fixture("regblock_subset_test.harc");
     emit_cpp_src(&fixture);
 
-    // An unknown REGISTER is what reaches the catch-all. A method call
-    // (`regs.reset_all()`) does NOT: generic statement lowering
-    // intercepts it first, so it is still `Unsupported` and belongs to
-    // whatever sweep covers `stmts.rs`. Asserted here so the boundary is
-    // recorded rather than rediscovered.
+    // An unknown REGISTER is what reaches the catch-all.
     let src = fixture.replace("regs.SRC = 305419896", "regs.NOPE = 305419896");
     let msg = assert_not_implemented(
         &lower_src(&src).unwrap_err(),
@@ -34638,13 +34634,6 @@ fn out_of_subset_regblock_and_addrmap_access_does_not_point_at_v1() {
             .expect("v1 accepts the bad access")
             .contains("NOPE"),
         "v1 emits the path verbatim"
-    );
-
-    let method = fixture.replace("regs.SRC = 305419896", "regs.reset_all()");
-    let msg = assert_unsupported(&lower_src(&method).unwrap_err());
-    assert!(
-        msg.contains("method call `.reset_all(...)`"),
-        "a method call is intercepted before the regblock catch-all: {msg}"
     );
 
     // The addrmap twin, on the self-contained `ADDRMAP_TB` (the
@@ -34664,6 +34653,63 @@ fn out_of_subset_regblock_and_addrmap_access_does_not_point_at_v1() {
             .contains("nope.SA"),
         "v1 emits the addrmap path verbatim"
     );
+}
+
+/// `reset_all` is a TBIR-native mirror operation. v1 emits an undeclared
+/// method call, but the retiring backend is no longer a reason to withhold
+/// an operation the typed regblock schema can model.
+#[test]
+fn regblock_reset_all_is_a_tbir_native_mirror_operation() {
+    let fixture = fixture("regblock_subset_test.harc");
+    let baseline = lower_src(&fixture).expect("baseline regblock fixture lowers");
+    let src = fixture.replace("regs.SRC = 305419896", "regs.reset_all()");
+    let prog = lower_src(&src).expect("TBIR lowers regblock reset_all");
+    verify::verify_program(&prog).expect("reset_all IR verifies");
+    let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+        .expect("reset_all emits");
+    assert!(
+        cpp.contains("regs.CTRL = 7;")
+            && cpp.contains("regs.SRC = 0;")
+            && cpp.contains("regs.STATUS = 0;")
+            && cpp.contains("regs.CMD = 0;"),
+        "reset_all must restore every mirror field: {cpp}"
+    );
+    let call_count = |program: &ir::TbProgram| {
+        program
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.stmts)
+            .filter(|stmt| matches!(stmt, ir::Stmt::TransactorCall { .. }))
+            .count()
+    };
+    assert_eq!(
+        call_count(&prog) + 1,
+        call_count(&baseline),
+        "replacing one frontdoor write with reset_all must add no helper/bus calls"
+    );
+
+    let parenthesized = fixture.replace("regs.SRC = 305419896", "(regs).reset_all()");
+    lower_src(&parenthesized).expect("a parenthesized regblock receiver still resets");
+
+    for args in ["", "1"] {
+        let shadowed = fixture.replace(
+            "regs.SRC = 305419896",
+            &format!(
+                "if 1\n            let regs = 0\n            regs.reset_all({args})\n        end if"
+            ),
+        );
+        let err = lower_src(&shadowed).expect_err("a scalar shadow must not reset as a record");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reset_all") && !msg.contains("takes no arguments"),
+            "ordinary scalar-method resolution should survive shadowing: {msg}"
+        );
+    }
+
+    let bad_arity = fixture.replace("regs.SRC = 305419896", "regs.reset_all(1)");
+    let msg = assert_invalid(&lower_src(&bad_arity).unwrap_err());
+    assert!(msg.contains("takes no arguments"), "{msg}");
 }
 
 /// Two `control.rs` sites, classified opposite ways.

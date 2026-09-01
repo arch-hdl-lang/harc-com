@@ -132,6 +132,11 @@ compile-time-unrolled walk-all over the RW registers (write/read both
 patterns + compare; RO/WO skipped), unrolled into the existing
 `TransactorCall`/`AssertCheck` statements, plus a new `Expr::ErrorCount`
 framework value for the trailing `assert errors == 0`. The
+**TBIR-native mirror reset slice** adds `regs.reset_all()`: it expands
+to one `RecordFieldWrite` per declared register, restoring each declared
+reset value (or zero) without frontdoor bus traffic. This is intentionally
+TBIR-first while v1 is retired; v1 emitted an undeclared C++ method call
+for the same spelling. The
 **field-level + addrmap slice** (2026-06-13, divergence 12) adds the
 remaining regblock residuals: (a) **field-level decomposition**
 (`regs.REG.FIELD`) — a register split into named bit-fields lowers to a
@@ -2991,9 +2996,10 @@ case and only locally-determinable `Assign` types are compared).
     register and a method call, and both were rejected — so both looked
     like they reached it. They did not: `regs.reset_all()` is
     intercepted by generic statement lowering (`stmts.rs`) well before
-    regblock access resolution, and is still `Unsupported` because that
-    is a different site in a file this batch never touched. The probe's
-    exit status could not tell them apart; the test asserting the
+    regblock access resolution. At the time it was still `Unsupported`
+    because that was a different site in a file that batch never touched;
+    it has since become the TBIR-native mirror reset described above. The
+    probe's exit status could not tell them apart; the test asserting the
     message did. **A rejection is evidence that SOMETHING rejected, not
     that the thing under edit did** — and the cheapest way to hold
     yourself to that is to assert on the message text, not on the error
