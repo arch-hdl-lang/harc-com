@@ -11862,6 +11862,32 @@ end impl T
     }
 }
 
+/// Test-scope `apply` reaches a separate lowering arm from component and
+/// transactor items, but v1 gives every reachable spelling the same semantics:
+/// it drops the item without even resolving the aspect name.
+#[test]
+fn a_test_scope_apply_is_dropped_by_v1_without_a_false_escape_hatch() {
+    let control = r#"test T
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test T
+"#;
+    let with_apply = control.replace("    run\n", "    apply Missing.Policy\n    run\n");
+
+    lower_src(control).expect("control lowers");
+    let err = lower_src(&with_apply).expect_err("test-scope apply is not implemented");
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(msg.contains("test-scope `apply` item"), "{msg}");
+    assert!(msg.contains("drops the aspect activation"), "{msg}");
+
+    let control_cpp = cpp_tb::emit(&merged_src(control)).expect("v1 emits control");
+    let apply_cpp = cpp_tb::emit(&merged_src(&with_apply)).expect("v1 emits apply");
+    assert_eq!(apply_cpp, control_cpp, "v1 drops test-scope apply entirely");
+    assert!(!apply_cpp.contains("Missing"));
+}
+
 /// The transactor state-field arms, one row per LANDING the guard
 /// admits — not one probe per arm.
 ///

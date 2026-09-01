@@ -9930,6 +9930,16 @@ former `transaction` group lives in
      inventory remains 99 textual matches (98 constructors plus the helper
      definition).
 
+192. **Test-scope `apply` classification (2026-09-01).**
+
+     The remaining `TestItem::Apply` fallback no longer reports an
+     `Unsupported` error that recommends v1. Direct comparison with an
+     otherwise identical test proves v1 drops the item byte-for-byte, without
+     resolving the aspect name, so TBIR now reports `SilentlyMisLowers`.
+     Component and transactor `apply` sites already carried that verdict.
+     Replacing this constructor reduces the raw inventory to 98 textual
+     matches (97 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
