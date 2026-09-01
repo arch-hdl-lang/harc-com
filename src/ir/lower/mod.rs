@@ -4413,7 +4413,13 @@ fn lower_test(
                     )));
                 }
             }
-            TestItem::Apply(_) => return Err(unsupported("apply", "")),
+            TestItem::Apply(_) => {
+                return Err(not_implemented(
+                    "a test-scope `apply` item",
+                    "v1 drops the aspect activation without resolving its name or changing the generated test",
+                    V1Status::SilentlyMisLowers,
+                ));
+            }
             TestItem::Use(_) => {}
         }
     }

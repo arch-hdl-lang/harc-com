@@ -526,6 +526,10 @@ not applicable before requesting review:
    values above `u64` still share the generic integer-literal fallback, so
    this route leaves the raw inventory at 99 textual matches (98 constructors
    plus the helper definition).
+   Test-scope `apply` is now classified by measured behavior instead of as a
+   TBIR-only gap: v1 drops it without resolving the aspect. Replacing that
+   stale constructor reduces the raw inventory to 98 textual matches (97
+   constructors plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
