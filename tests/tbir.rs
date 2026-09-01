@@ -20836,11 +20836,25 @@ impl XtPassiveBackdoorTest for XtTb
 end impl XtPassiveBackdoorTest
 "#;
     let err = lower_src(src).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let msg = assert_invalid(&err);
     assert!(
         msg.contains("active_only") && msg.contains("when active") && msg.contains("outer"),
         "{msg}"
     );
+}
+
+#[test]
+fn clock_qualified_wall_time_is_a_source_error() {
+    for duration in ["2ns", "(2ns)"] {
+        let src = WAIT_ON_CLOCK_SRC.replace("2 cycles", duration);
+        let err = lower_src(&src).expect_err("wall time cannot be qualified by a clock");
+        let msg = assert_invalid(&err);
+        assert!(
+            msg.contains("`wait <time> on <clock>`")
+                && msg.contains("clock-qualified waits take a cycle count"),
+            "{duration}: {msg}"
+        );
+    }
 }
 
 #[test]

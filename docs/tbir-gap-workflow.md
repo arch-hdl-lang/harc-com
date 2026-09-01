@@ -502,6 +502,11 @@ not applicable before requesting review:
    DUT. Accounting for the callable-signature fence above, the raw inventory
    is now 116 textual matches (115 constructors plus
    the helper definition).
+   Two source-invalid shapes no longer advertise v1 as a fallback:
+   clock-qualifying a wall-time wait and crossing from an always-on transactor
+   method into an active-only sibling. These remove two constructors, leaving
+   100 textual `unsupported(` matches (99 constructors plus the helper
+   definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
