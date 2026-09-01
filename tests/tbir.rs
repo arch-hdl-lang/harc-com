@@ -24928,10 +24928,29 @@ end test RuntimePromotedLetTest"#;
         "let observed : uint<32> = middle + 1",
         "let observed = dut.count_out + 1",
     );
-    let msg = assert_unsupported(&lower_src(&compound_port).unwrap_err());
+    let compound_prog = lower_src(&compound_port)
+        .expect("a compound untyped promoted DUT expression has a host-scalar type");
+    verify::verify_program(&compound_prog).expect("compound promoted DUT expression verifies");
+    let compound_tb =
+        &compound_prog.testbenches[compound_prog.tests[0].testbench.index()];
+    assert_eq!(
+        compound_tb
+            .scalar_fields
+            .iter()
+            .find(|field| field.name == "observed")
+            .map(|field| &field.ty),
+        Some(&ir::IrType::UInt(None))
+    );
+    let compound_cpp = emit_cpp_src(&compound_port);
+    let read = compound_cpp
+        .find("harc_rt::harc_read(dut->count_out)")
+        .expect("the compound initializer reads the DUT port");
+    let store = compound_cpp
+        .find("_tb.observed = (__t0 + 1)")
+        .expect("the compound initializer stores the computed value");
     assert!(
-        msg.contains("untyped promoted test-scope `let observed`"),
-        "a compound untyped DUT expression must retain the narrow boundary: {msg}"
+        read < store,
+        "the port snapshot must precede the promoted-field write:\n{compound_cpp}"
     );
 
     for initializer in ["-4'd1", "~4'd0", "~(middle + 4'd0)"] {

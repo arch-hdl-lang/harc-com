@@ -120,6 +120,9 @@ family of rejections over a one-site exception. Current implementation order:
   declaration semantics while keeping later reads/writes as use-site errors.
 - [x] Uninitialized builtin-`int` locals, using the same zero-initialized
   32-bit language value and narrow scalar carrier as v1.
+- [x] Untyped promoted lets initialized from composed DUT-port expressions,
+  using the established widthless host-scalar ABI while preserving the
+  source-ordered runtime read and write.
 - [x] Passive event-driven transactor fields, retaining always-on state while
   activation-aware lowering blocks `when active` member access and omits its
   handlers, lifecycle services, and connect endpoints from registration.
