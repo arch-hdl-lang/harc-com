@@ -512,6 +512,15 @@ not applicable before requesting review:
    prefix provenance keeps native DUT ports out of instance specialization.
    This removes one constructor, leaving 99 textual `unsupported(` matches
    (98 constructors plus the helper definition).
+   General-position hexadecimal sized literals now follow v1's value-based
+   carrier choice: declarations wider than 64 bits remain ordinary scalars
+   when their value fits `u64`, and larger values reuse `WideLiteral`'s
+   LSB-first word path at explicitly wide destinations. Untyped wide-sized
+   initializers are classified as v1 silent truncations. Other literal
+   radices still share the generic integer-
+   literal fallback, so this routes around that constructor and leaves the raw
+   inventory at 99 textual matches (98 constructors plus the helper
+   definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

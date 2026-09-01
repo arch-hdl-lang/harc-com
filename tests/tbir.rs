@@ -32823,6 +32823,76 @@ end impl T
     );
 }
 
+/// A sized literal whose declaration exceeds 64 bits is still an ordinary
+/// scalar when its value fits, while a hexadecimal value above `u64` takes
+/// the same LSB-first wide-word path as an unsized wide hex literal.
+#[test]
+fn wide_sized_hex_literals_lower_in_general_value_positions() {
+    let src = r#"
+function wide_id(x: uint<128>) -> uint<128>
+    return x
+end function wide_id
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    run
+        let padded = 128'h1
+        let wide : uint<128> = 128'h1_0000_0000_0000_0000
+        let returned = wide_id(128'h1_0000_0000_0000_0000)
+        assert padded == 1
+        assert wide == 0x1_0000_0000_0000_0000
+        assert returned == 0x1_0000_0000_0000_0000
+    end run
+end impl T
+"#;
+    let prog = lower_src(src).expect("wide sized hexadecimal values lower");
+    verify::verify_program(&prog).expect("wide sized hexadecimal values verify");
+    let run = prog.function(prog.tests[0].run);
+    assert_eq!(
+        run.locals
+            .iter()
+            .find(|local| local.name == "padded")
+            .expect("padded local")
+            .ty,
+        ir::IrType::SInt(None),
+        "v1 treats a sized literal whose value fits u64 as a host scalar"
+    );
+    assert!(
+        run.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+            matches!(
+                stmt,
+                ir::Stmt::Assign(_, ir::Expr::WideLiteral(words))
+                    if words == &[0, 0, 1]
+            )
+        }),
+        "the 65-bit value lowers to three LSB-first words"
+    );
+
+    let tbir = emit_cpp_src(src);
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits wide sized hex values");
+    assert!(tbir.contains("_harc_u128"), "{tbir}");
+    assert!(v1.contains("_harc_u128"), "{v1}");
+
+    let untyped = src.replace(
+        "let wide : uint<128> = 128'h1_0000_0000_0000_0000",
+        "let wide = 128'h1_0000_0000_0000_0000",
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&untyped).expect_err("v1 truncates an untyped wide-sized initializer"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("explicit wide type"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&untyped)).expect("v1 emits its truncating int64_t local");
+    assert!(v1.contains("int64_t wide ="), "{v1}");
+    assert!(
+        tbir.contains("_harc_u128 returned") && v1.contains("auto returned ="),
+        "top-level call results preserve the wide value in both backends\nTBIR:\n{tbir}\nV1:\n{v1}"
+    );
+}
+
 /// A regblock register `@ <addr>` offset and `reset` value now FOLD,
 /// through the same helper as the addrmap base and size. Like those,
 /// this puts TB-IR ahead of v1 rather than level with it: v1 folds both
