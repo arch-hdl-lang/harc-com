@@ -359,6 +359,7 @@ bus_bind_generic_test | BusRwBind | BusRwBind.sv | - | pass
 wide1024_tlm_test | wide1024_tlm | wide1024_tlm.sv | - | pass
 lz4_decomp_test | Lz4Decomp | Lz4Decomp.sv | Lz4Decomp.arch | pass
 passive_multi_instance_test | Top | top_counter.sv | top_counter.arch | pass
+passive_transactor_state_update_test | Top | top_counter.sv | top_counter.arch | pass
 component_fixed_vec_test | Top | top_counter.sv | top_counter.arch | pass
 fixed_vec_event_payload_test | Top | top_counter.sv | top_counter.arch | pass
 nested_fixed_vec_event_payload_test | Top | top_counter.sv | top_counter.arch | pass

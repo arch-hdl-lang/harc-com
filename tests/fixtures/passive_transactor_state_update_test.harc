@@ -1,0 +1,77 @@
+// #763 / harc#769 — runtime coverage for an ALWAYS-ON `hookable` method
+// called on a `passive` DUT-poking transactor instance.
+//
+// #763 ("Support passive unbound transactor state") keeps a passive
+// instance's always-on state AND its always-on handlers, hiding only the
+// `when active` method surface. Its unit test only inspects the emitted
+// C++ text, so the runtime path was never exercised — and it hid a
+// miscompile (harc#769): the TB-IR emitter skipped ALL method lambdas for
+// a passive-only transactor type (a pre-#763 "passive ⇒ no callable
+// methods" assumption), emitting the call `CountPoker_bump(p)` with no
+// definition. v1 emitted the definition and ran. This fixture drives the
+// path so the two backends are trace-diffed.
+//
+// Coverage delta vs `passive_multi_instance_test` (which proves only that a
+// passive instance's `default` state INITIALIZES and STAYS put, nothing
+// poking it): here an always-on `hookable bump()` — declared OUTSIDE
+// `when active`, so it survives on a passive instance — is CALLED on the
+// passive instance and must UPDATE the always-on state at runtime. The
+// `when active` `poke()` stays structurally unavailable and is never called.
+//
+// Self-check: state starts at its nonzero `default` (7), each always-on
+// `bump()` increments it. v1 and TB-IR must agree (equivalence-gated).
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor CountPoker
+    dut : Top
+    count : uint<32> default 7
+
+    // Always-on handler (outside `when active`): kept on a passive instance.
+    // Per spec §8.1 an always-on hookable body must NOT drive a DUT signal
+    // (it would still execute on a passive instance), so it only mutates the
+    // transactor's own always-on state.
+    hookable bump()
+        count = count + 1
+    end bump
+
+    when active
+        // Active-only surface: absent on a passive instance. May drive the
+        // DUT because it never runs on a passive instance.
+        hookable poke()
+            count = count + 100
+            dut.en = 1
+        end poke
+    end when
+end transactor CountPoker
+
+testbench PassiveStateUpdateTb
+    dut : Top
+    p : CountPoker passive
+end testbench PassiveStateUpdateTb
+
+impl PassiveStateUpdateTest for PassiveStateUpdateTb
+    clock clk = SysDomain
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+
+        // Always-on initial state is observable at runtime.
+        assert p.count == 7 else fail("passive always-on state default lost: ${p.count}")
+
+        // Always-on handler fires on a passive instance and updates state.
+        p.bump()
+        wait 1 cycle
+        assert p.count == 8 else fail("always-on bump did not update passive state: ${p.count}")
+
+        p.bump()
+        wait 1 cycle
+        assert p.count == 9 else fail("second always-on bump lost: ${p.count}")
+
+        wait 3 cycles
+        log(info, "ALL TESTS PASSED - passive transactor always-on state update")
+    end run
+end impl PassiveStateUpdateTest
