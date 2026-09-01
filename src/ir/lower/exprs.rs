@@ -1033,6 +1033,9 @@ impl FuncBuilder<'_> {
                 if let Some(words) = parse_wide_sized_binary_literal(s) {
                     return Ok(Expr::WideLiteral(words));
                 }
+                if let Some(words) = parse_wide_sized_decimal_literal(s) {
+                    return Ok(Expr::WideLiteral(words));
+                }
                 if let Some(words) = parse_wide_sized_hex_literal(s) {
                     return Ok(Expr::WideLiteral(words));
                 }
@@ -5798,6 +5801,43 @@ fn parse_wide_sized_binary_literal(s: &str) -> Option<Vec<u32>> {
     Some(words)
 }
 
+/// Convert a sized decimal value above `u64` into the same LSB-first word
+/// carrier as wide hexadecimal and binary literals. Repeated multiply-add is
+/// bounded by the parser's exact-decimal digit limit and avoids a bigint
+/// dependency or any host-width truncation.
+fn parse_wide_sized_decimal_literal(s: &str) -> Option<Vec<u32>> {
+    let t = s.replace('_', "");
+    let tick = t.find('\'')?;
+    let width = t[..tick].parse::<u32>().ok()?;
+    let rest = &t[tick + 1..];
+    let digits = rest.strip_prefix('d').or_else(|| rest.strip_prefix('D'))?;
+    if width == 0 || digits.is_empty() || digits.chars().any(|c| !c.is_ascii_digit()) {
+        return None;
+    }
+
+    let mut words = vec![0u32];
+    for digit in digits.bytes().map(|byte| u64::from(byte - b'0')) {
+        let mut carry = digit;
+        for word in &mut words {
+            let value = u64::from(*word) * 10 + carry;
+            *word = value as u32;
+            carry = value >> 32;
+        }
+        if carry != 0 {
+            words.push(carry as u32);
+        }
+    }
+    while words.last() == Some(&0) {
+        words.pop();
+    }
+    if words.len() <= 2 {
+        return None;
+    }
+    let value_bits = (words.len() as u64 - 1) * 32
+        + u64::from(32 - words.last().copied()?.leading_zeros());
+    (value_bits <= u64::from(width)).then_some(words)
+}
+
 /// Fold an AST expression to a `u64` when it is an integer literal
 /// (optionally parenthesized). Used by the target-side `out_of_order
 /// tags N` responder lowering to range-check the literal tag count;
@@ -6021,13 +6061,14 @@ pub(crate) fn ast_expr_contains_sized_literal(e: &AstExpr) -> bool {
     ast_expr_any_int(e, &|text| text.contains('\''))
 }
 
-/// Whether `e` contains a sized binary value that needs the wide carrier.
-/// v1 pastes these values into C++ as oversized native `0b...` tokens, so
-/// untyped-local diagnostics must distinguish them from wide sized hex values,
-/// which v1 instead narrows silently.
-pub(crate) fn ast_expr_contains_wide_sized_binary_literal(e: &AstExpr) -> bool {
+/// Whether `e` contains a sized binary or decimal value that needs the wide
+/// carrier. v1 pastes these into C++ as oversized native tokens, so untyped
+/// local diagnostics must distinguish them from wide sized hex values, which
+/// v1 instead narrows silently.
+pub(crate) fn ast_expr_contains_wide_sized_native_literal(e: &AstExpr) -> bool {
     ast_expr_any_int(e, &|text| {
         parse_wide_sized_binary_literal(text).is_some()
+            || parse_wide_sized_decimal_literal(text).is_some()
     })
 }
 

@@ -32991,6 +32991,44 @@ end impl T
     assert!(msg.contains("oversized native C++ literal"), "{msg}");
 }
 
+#[test]
+fn wide_sized_decimal_literals_lower_in_general_value_positions() {
+    let src = r#"
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    run
+        let wide : uint<128> = 128'd18446744073709551616
+        assert wide == 0x1_0000_0000_0000_0000
+    end run
+end impl T
+"#;
+    let prog = lower_src(src).expect("wide sized decimal values lower");
+    verify::verify_program(&prog).expect("wide sized decimal values verify");
+    assert!(
+        prog.function(prog.tests[0].run)
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .any(|stmt| matches!(
+                stmt,
+                ir::Stmt::Assign(_, ir::Expr::WideLiteral(words)) if words == &[0, 0, 1]
+            )),
+        "decimal 2^64 lowers to three LSB-first words"
+    );
+    assert!(emit_cpp_src(src).contains("_harc_u128"));
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits wide sized decimal");
+    assert!(v1.contains("18446744073709551616"));
+
+    let untyped = src.replace("let wide : uint<128>", "let wide");
+    let err = lower_src(&untyped).expect_err("untyped wide decimal is diagnosed");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("explicit wide type for TBIR"), "{msg}");
+    assert!(msg.contains("oversized native C++ literal"), "{msg}");
+}
+
 /// A regblock register `@ <addr>` offset and `reset` value now FOLD,
 /// through the same helper as the addrmap base and size. Like those,
 /// this puts TB-IR ahead of v1 rather than level with it: v1 folds both
