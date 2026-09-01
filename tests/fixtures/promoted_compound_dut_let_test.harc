@@ -1,0 +1,12 @@
+test PromotedCompoundDutLetTest
+    let dut : Top
+    let observed = dut.count_out + 1
+
+    run
+        wait 1 cycle
+    end run
+
+    check
+        assert observed == 1 else fail("compound DUT initializer was not preserved")
+    end check
+end test PromotedCompoundDutLetTest

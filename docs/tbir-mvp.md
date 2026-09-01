@@ -9831,6 +9831,19 @@ former `transaction` group lives in
      the raw unsupported inventory remains 104 textual matches (103
      constructors plus the helper definition).
 
+185. **Composed DUT expressions in promoted untyped lets (2026-08-31).**
+
+     A test-scope declaration captured by `check`, such as `let observed =
+     dut.count_out + 1`, now infers its persistent `_tb` field through the
+     DUT port's established widthless unsigned host-scalar ABI. Operator
+     inference composes that leaf with literals and other scalar operands;
+     ordinary expression lowering still hoists the `DutRead` and writes the
+     computed value at the declaration's original source position. A
+     self-checking fixture proves the value persists into `check` under
+     v1/TBIR trace parity. This routes around the shared untyped promoted-let
+     fallback, so the raw inventory remains 104 textual `unsupported(`
+     matches (103 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

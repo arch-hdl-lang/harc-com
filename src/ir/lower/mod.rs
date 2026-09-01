@@ -6677,6 +6677,17 @@ fn infer_promoted_scalar_type(
 ) -> Option<IrType> {
     use crate::ast::{BinaryOp, UnaryOp};
 
+    // A DUT port has no source-level width metadata in this lowering pass,
+    // but it does have the established widthless host-scalar ABI. Recognize
+    // the port leaf here so a composed expression (`dut.count + 1`, a
+    // comparison, a shift, or a ternary arm) can be typed by the same
+    // operator rules as declared locals. The ordinary expression lowering
+    // still performs the actual `DutRead` hoist at the declaration's source
+    // position; this is type inference only.
+    if is_direct_dut_port_initializer(expr) {
+        return Some(IrType::UInt(None));
+    }
+
     let inferred = match &*expr.kind {
         ExprKind::Bool(_) => Some(IrType::Bool),
         // General value lowering deliberately erases literal widths to the
