@@ -1429,10 +1429,7 @@ pub(super) fn aggregate_value_cty(ty: &ir::IrType, records: &[ir::RecordSchema])
 /// `std::vector<std::array<…>>` exactly like a standalone `Vec<T, N>`, and
 /// every callable surface agrees on the spelling. Scalar leaves use the scalar
 /// ABI carrier (`local_scalar_cty`).
-pub(super) fn callable_value_cty(
-    prog: &TbProgram,
-    ty: &ir::IrType,
-) -> Result<String, EmitError> {
+pub(super) fn callable_value_cty(prog: &TbProgram, ty: &ir::IrType) -> Result<String, EmitError> {
     Ok(match ty {
         ir::IrType::Record(record) => prog
             .records

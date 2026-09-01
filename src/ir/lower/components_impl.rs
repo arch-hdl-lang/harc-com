@@ -2525,9 +2525,11 @@ pub(crate) fn method_schema_ir_type(
     allow_fixed_vec: bool,
 ) -> Result<IrType, LowerError> {
     callable_method_schema_ir_type(
-        || format!(
+        || {
+            format!(
             "{what} of component method `{component}.{method}` has an unsupported TSeq element type"
-        ),
+        )
+        },
         ty,
         ids,
         record_ids,

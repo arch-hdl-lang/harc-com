@@ -906,8 +906,10 @@ fn wire_type_compatible(prog: &TbProgram, expected: &IrType, actual: &IrType) ->
         // A widthless bus schema signal is a signedness-family constraint that
         // the DUT interface catalog resolves, not an exact width. It matches a
         // concrete unsigned/signed port of the same family at any width.
-        (IrType::UInt(None), IrType::UInt(_)) | (IrType::UInt(_), IrType::UInt(None))
-        | (IrType::SInt(None), IrType::SInt(_)) | (IrType::SInt(_), IrType::SInt(None)) => true,
+        (IrType::UInt(None), IrType::UInt(_))
+        | (IrType::UInt(_), IrType::UInt(None))
+        | (IrType::SInt(None), IrType::SInt(_))
+        | (IrType::SInt(_), IrType::SInt(None)) => true,
         (IrType::UInt(Some(lhs)), IrType::UInt(Some(rhs)))
         | (IrType::SInt(Some(lhs)), IrType::SInt(Some(rhs))) => lhs == rhs,
         (IrType::Record(_), IrType::UInt(Some(width)))

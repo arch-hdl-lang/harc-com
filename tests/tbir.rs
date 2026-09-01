@@ -52063,10 +52063,7 @@ end impl SeqTest
 "#;
     let err = lower_src(src).expect_err("unsupported transactor TSeq element must be rejected");
     let msg = assert_unsupported(&err);
-    assert!(
-        msg.contains("unsupported TSeq element type"),
-        "{msg}"
-    );
+    assert!(msg.contains("unsupported TSeq element type"), "{msg}");
 }
 
 #[test]

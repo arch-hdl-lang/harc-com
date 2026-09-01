@@ -2137,9 +2137,11 @@ fn method_return_ir_type(
         return Ok(None);
     };
     if let Some(seq) = super::helpers::callable_tseq_ir_type(
-        || format!(
-            "transactor `{tname}` method `{mname}` {what} has an unsupported TSeq element type"
-        ),
+        || {
+            format!(
+                "transactor `{tname}` method `{mname}` {what} has an unsupported TSeq element type"
+            )
+        },
         Some(ty),
         record_ids,
     )? {
@@ -2276,10 +2278,12 @@ fn method_param_ir_type(
     // rejects unsupported element spellings instead of leaking `Unknown`
     // into the emitted C++.
     if let Some(seq) = helpers::callable_tseq_ir_type(
-        || format!(
+        || {
+            format!(
             "transactor `{tname}` method `{mname}` parameter `{}` has an unsupported TSeq element type",
             p.name.name
-        ),
+        )
+        },
         p.ty.as_ref(),
         record_ids,
     )? {
