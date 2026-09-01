@@ -37826,11 +37826,9 @@ end impl T
     assert!(emit_cpp_src(src).contains("_harc_u128"));
     // v1 normalizes this to an oversized native C++ binary literal, which
     // clang rejects. TBIR deliberately routes it through the wide carrier.
-    assert!(
-        cpp_tb::emit(&merged_src(src))
-            .expect("v1 emits wide sized binary values")
-            .contains("0b10000000000000000000000000000000000000000000000000000000000000000")
-    );
+    assert!(cpp_tb::emit(&merged_src(src))
+        .expect("v1 emits wide sized binary values")
+        .contains("0b10000000000000000000000000000000000000000000000000000000000000000"));
 
     let untyped = src.replace("let wide : uint<128>", "let wide");
     let err = lower_src(&untyped).expect_err("an untyped wide binary local is diagnosed");
