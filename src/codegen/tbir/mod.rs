@@ -3594,27 +3594,40 @@ fn emit_test(
         if !emitted_xactors.insert(*xid) {
             continue;
         }
-        // A transactor type instantiated ONLY as `passive` never has its
-        // `when active` method bodies filled with an instance name (the
-        // methods are not callable on a passive instance), so emitting
-        // them would produce uncompilable code with unfilled
-        // `TransactorState` placeholders. Skip the method lambdas for such
-        // a type; its per-instance state structs (and any always-on `on`
-        // handlers) are emitted elsewhere. A type with at least one active
-        // instance still emits its (filled) methods as before. (#494
-        // P0a/P1b)
+        // For a transactor type instantiated ONLY as `passive`, its
+        // `when active` (`active_only`) methods are never callable, and
+        // `ir::verify` proves it: every call site (verify.rs, transactor
+        // method-call check) and cov-hook subscription to an active-only
+        // method on a passive instance is rejected. So a passive-only type
+        // has no reference to those method definitions — skipping them is
+        // safe (they would be dead code at best). Since #763, though, an
+        // always-on (`!active_only`) `hookable` method IS callable on a
+        // passive instance and its call site IS emitted; the pre-#763 gate
+        // here skipped the WHOLE type (assuming "passive ⇒ no callable
+        // methods"), which dropped those always-on definitions and left the
+        // calls dangling — `use of undeclared identifier` (harc#769). So: a
+        // type with an active instance emits all its methods as before; a
+        // passive-only type emits only its always-on methods (which use the
+        // per-schema state-receiver ABI — a `<State>&` receiver, no baked-in
+        // instance name) and still skips the `active_only` ones. Per-instance
+        // state structs and always-on `on` handlers are emitted elsewhere.
+        // (#494 P0a/P1b, #763, harc#769)
         let has_active_instance = tb
             .transactor_fields
             .iter()
             .any(|(f, x)| x == xid && !tb.passive_transactor_fields.contains(f));
-        if !has_active_instance {
-            continue;
-        }
         let schema = prog.transactor(*xid);
+        // On a passive-only type, emit only the always-on methods.
         for m in &schema.methods {
+            if !has_active_instance && m.active_only {
+                continue;
+            }
             func::declare_method_slot(out, prog, schema, m, 1)?;
         }
         for m in &schema.methods {
+            if !has_active_instance && m.active_only {
+                continue;
+            }
             func::emit_method(
                 out,
                 prog,
