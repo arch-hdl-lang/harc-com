@@ -9940,6 +9940,16 @@ former `transaction` group lives in
      Replacing this constructor reduces the raw inventory to 98 textual
      matches (97 constructors plus the helper definition).
 
+193. **Run-scope local probe classification (2026-09-01).**
+
+     A `probe` block attached to a `let` inside `run` reaches the statement
+     local path, not the supported test-level `dut` binding path. v1 emits the
+     ordinary local and drops the probe metadata byte-for-byte; because it
+     creates no accessor, using the declared probe produces uncompilable C++.
+     The fallback now reports `EmitsUncompilable` and directs probes to the
+     test's `dut` binding. This reduces the raw inventory to 97 textual matches
+     (96 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
