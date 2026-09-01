@@ -1236,7 +1236,7 @@ impl FuncBuilder<'_> {
             // Requires a declared scalar type to size it; an untyped
             // `let x;` with no initializer cannot be sized → rejected.
             // (Uninitialized records are handled by the record arm above.)
-            if let Some(ty) = l.ty.as_ref().and_then(typed_let_ir_type) {
+            if let Some(ty) = l.ty.as_ref().and_then(uninitialized_typed_let_ir_type) {
                 let id = self.declare(&l.name.name);
                 if let Some(w) = l.ty.as_ref().and_then(typed_let_width) {
                     self.let_widths.insert(id, w);
@@ -7053,6 +7053,21 @@ fn typed_let_ir_type(t: &TypeExpr) -> Option<IrType> {
         // so it is intentionally absent here.)
         BuiltinTy::Time => Some(IrType::UInt(Some(64))),
         _ => None,
+    }
+}
+
+/// Scalar type accepted specifically by an uninitialized declaration.
+///
+/// v1's `c_type_for` stores builtin `int` in the same unsigned 64-bit
+/// carrier as other narrow integral spellings while retaining a 32-bit
+/// language width. Keep this addition local to declare-then-assign lets:
+/// initialized values, queue pops, DUT reads, and component results have
+/// their own compatibility rules and are not widened by this batch.
+fn uninitialized_typed_let_ir_type(t: &TypeExpr) -> Option<IrType> {
+    if matches!(t, TypeExpr::Builtin { name: BuiltinTy::Int, .. }) {
+        Some(IrType::UInt(Some(32)))
+    } else {
+        typed_let_ir_type(t)
     }
 }
 
