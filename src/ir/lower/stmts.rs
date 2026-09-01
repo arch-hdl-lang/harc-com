@@ -936,7 +936,11 @@ impl FuncBuilder<'_> {
 
     fn lower_let(&mut self, l: &crate::ast::LetStmt) -> Result<(), LowerError> {
         if !l.probes.is_empty() {
-            return Err(unsupported("probe declarations", ""));
+            return Err(not_implemented(
+                "probe declarations on a run-scope local",
+                "declare probes on the test's `dut` binding; v1 emits no probe accessor for a run-scope local, so any probe read fails to compile",
+                V1Status::EmitsUncompilable,
+            ));
         }
         if l.bind {
             // Test-scope bindings (`let axil : BusAxiLite = bind ...`,

@@ -530,6 +530,10 @@ not applicable before requesting review:
    TBIR-only gap: v1 drops it without resolving the aspect. Replacing that
    stale constructor reduces the raw inventory to 98 textual matches (97
    constructors plus the helper definition).
+   Probe blocks on a run-scope local now join the already-measured non-DUT
+   probe family: v1 creates no accessor and a probe read cannot compile.
+   Replacing the generic fallback reduces the raw inventory to 97 textual
+   matches (96 constructors plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

@@ -29022,6 +29022,35 @@ end impl T"#,
     );
 }
 
+#[test]
+fn a_probe_on_a_run_scope_local_is_rejected_without_pointing_at_v1() {
+    let with_probe = r#"test T
+    let dut : Top
+    run
+        let local : uint<8>
+            probe hidden : uint<8> at internal.signal
+        end let local
+        wait 1 cycle
+    end run
+end test T
+"#;
+    let control = with_probe.replace(
+        "        let local : uint<8>\n            probe hidden : uint<8> at internal.signal\n        end let local\n",
+        "        let local : uint<8>\n",
+    );
+
+    let err = lower_src(with_probe).expect_err("run-scope local probes are not implemented");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("run-scope local"), "{msg}");
+    assert!(msg.contains("emits no probe accessor"), "{msg}");
+
+    let probed_cpp = cpp_tb::emit(&merged_src(with_probe)).expect("v1 emits probed local");
+    let control_cpp = cpp_tb::emit(&merged_src(&control)).expect("v1 emits control");
+    assert_eq!(probed_cpp, control_cpp, "v1 discards local probe metadata");
+    assert!(!probed_cpp.contains("hidden"));
+    assert!(!probed_cpp.contains("internal.signal"));
+}
+
 // ---------------------------------------------------------------------
 // Runtime-bounded bit slices, `else fail(...)` on a concurrent check,
 // and the diagnostics around them.
