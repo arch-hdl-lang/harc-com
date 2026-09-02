@@ -544,14 +544,19 @@ not applicable before requesting review:
    inventory to 96 textual matches (95 constructors plus the helper
    definition).
    Unsized binary values above `u64` now reuse the wide literal carrier while
-   native-width values retain their scalar representation. Wide decimal and
-   octal spellings still share the generic integer fallback, so the raw
+   native-width values retain their scalar representation. Wide decimal
+   spellings still use the generic integer fallback; the earlier octal
+   assumption was incorrect because the lexer has no octal token. The raw
    inventory remains 96 textual matches (95 constructors plus the helper
    definition).
    Unsized decimal values above `u64` now share the sized-decimal multiply-add
-   conversion and wide carrier. Wide octal still reaches the generic integer
-   fallback, so the raw inventory remains 96 textual matches (95 constructors
-   plus the helper definition).
+   conversion and wide carrier. The generic fallback is now only a defensive
+   malformed-AST path, so the raw inventory remains 96 textual matches (95
+   constructors plus the helper definition).
+   With scalar and wide paths for every lexer-valid integer family, the
+   generic literal catch-all is now an `Invalid` malformed-AST invariant.
+   Octal remains outside the source language. Removing that constructor leaves
+   95 textual matches (94 constructors plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

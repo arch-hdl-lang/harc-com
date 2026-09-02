@@ -9977,18 +9977,30 @@ former `transaction` group lives in
      `WideLiteral` carrier instead of falling through the generic integer
      diagnostic. Values through 64 bits retain the ordinary scalar path;
      wider values preserve every high bit in explicitly wide destinations.
-     The generic fallback remains for wide decimal and octal spellings, so
-     the raw inventory remains 96 textual matches (95 constructors plus the
-     helper definition).
+     The generic fallback remains for wide decimal spellings. An earlier
+     assumption that octal also reached it was incorrect because the lexer
+     has no octal token. The raw inventory remains 96 textual matches (95
+     constructors plus the helper definition).
 
 197. **Wide unsized decimal literals in general expressions (2026-09-01).**
 
      Plain decimal values above `u64` now reuse the exact multiply-add word
      conversion used by sized decimal literals and lower into `WideLiteral`.
      Native-width values stay scalars, and the conversion remains bounded by
-     the parser's decimal digit limit. Wide octal is the remaining valid
-     spelling behind the generic fallback, so the raw inventory remains 96
-     textual matches (95 constructors plus the helper definition).
+     the parser's decimal digit limit. The generic fallback is now only a
+     defensive malformed-AST path, so the raw inventory remains 96 textual
+     matches (95 constructors plus the helper definition).
+
+198. **Integer-literal fallback classification (2026-09-01).**
+
+     Every lexer-valid integer family now has either a scalar or wide TBIR
+     path: plain hexadecimal, binary, and decimal plus sized hexadecimal,
+     binary, and decimal. The remaining catch-all is therefore a malformed
+     AST invariant, not a v1-supported source construct; it reports `Invalid`
+     instead of advertising v1. Octal is deliberately not claimed here
+     because the lexer has no octal token. Removing the constructor reduces
+     the raw inventory to 95 textual matches (94 constructors plus the helper
+     definition).
 
 ## Next steps
 

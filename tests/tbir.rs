@@ -33080,6 +33080,27 @@ end test T"#
     assert!(cpp.contains("(((_harc_u128)0x1ULL << 64) | (_harc_u128)0x0ULL)"));
 }
 
+#[test]
+fn every_lexer_integer_family_has_a_scalar_or_wide_lowering_path() {
+    for literal in [
+        "0x10000000000000000",
+        "0b10000000000000000000000000000000000000000000000000000000000000000",
+        "18446744073709551616",
+        "128'h10000000000000000",
+        "128'b10000000000000000000000000000000000000000000000000000000000000000",
+        "128'd18446744073709551616",
+    ] {
+        let src = format!(
+            "test T\n    let dut : Top\n    run\n        let value : uint<128> = {literal}\n    end run\nend test T"
+        );
+        lower_src(&src).unwrap_or_else(|e| panic!("`{literal}` must lower: {e:?}"));
+    }
+
+    let octal = harc::lexer::tokenize("0o10").expect("the spelling tokenizes");
+    assert!(matches!(octal[0].kind, harc::lexer::TokenKind::DecLiteral(ref n) if n == "0"));
+    assert!(matches!(octal[1].kind, harc::lexer::TokenKind::Ident(ref n) if n == "o10"));
+}
+
 /// A regblock register `@ <addr>` offset and `reset` value now FOLD,
 /// through the same helper as the addrmap base and size. Like those,
 /// this puts TB-IR ahead of v1 rather than level with it: v1 folds both

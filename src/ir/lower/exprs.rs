@@ -1045,10 +1045,9 @@ impl FuncBuilder<'_> {
                 if let Some(words) = parse_wide_sized_hex_literal(s) {
                     return Ok(Expr::WideLiteral(words));
                 }
-                Err(unsupported(
-                    "integer literal",
-                    format!("`{s}` is not a plain literal"),
-                ))
+                Err(LowerError::Invalid(format!(
+                    "integer literal `{s}` reached lowering without a valid scalar or wide representation"
+                )))
             }
             ExprKind::Bool(b) => Ok(Expr::Literal {
                 value: *b as u64,
