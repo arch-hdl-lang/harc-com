@@ -548,6 +548,10 @@ not applicable before requesting review:
    octal spellings still share the generic integer fallback, so the raw
    inventory remains 96 textual matches (95 constructors plus the helper
    definition).
+   Unsized decimal values above `u64` now share the sized-decimal multiply-add
+   conversion and wide carrier. Wide octal still reaches the generic integer
+   fallback, so the raw inventory remains 96 textual matches (95 constructors
+   plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

@@ -1033,6 +1033,9 @@ impl FuncBuilder<'_> {
                 if let Some(words) = parse_wide_binary_literal(s) {
                     return Ok(Expr::WideLiteral(words));
                 }
+                if let Some(words) = parse_wide_decimal_literal(s) {
+                    return Ok(Expr::WideLiteral(words));
+                }
                 if let Some(words) = parse_wide_sized_binary_literal(s) {
                     return Ok(Expr::WideLiteral(words));
                 }
@@ -5769,6 +5772,18 @@ fn parse_wide_binary_literal(s: &str) -> Option<Vec<u32>> {
     Some(words)
 }
 
+/// Convert a plain decimal value above `u64` into the wide carrier without a
+/// bigint dependency. Sized decimal literals share the same multiply-add
+/// conversion below and add their declared-width representability check.
+fn parse_wide_decimal_literal(s: &str) -> Option<Vec<u32>> {
+    let t = s.replace('_', "");
+    if t.is_empty() || t.chars().any(|c| !c.is_ascii_digit()) {
+        return None;
+    }
+    let words = decimal_literal_words(&t)?;
+    (words.len() > 2).then_some(words)
+}
+
 /// Parse the VALUE of a validated hexadecimal sized literal when it needs
 /// more than the native 64-bit scalar carrier. The declared width is a
 /// representability bound, not zero-padding for general expressions: this
@@ -5845,6 +5860,16 @@ fn parse_wide_sized_decimal_literal(s: &str) -> Option<Vec<u32>> {
         return None;
     }
 
+    let words = decimal_literal_words(digits)?;
+    if words.len() <= 2 {
+        return None;
+    }
+    let value_bits = (words.len() as u64 - 1) * 32
+        + u64::from(32 - words.last().copied()?.leading_zeros());
+    (value_bits <= u64::from(width)).then_some(words)
+}
+
+fn decimal_literal_words(digits: &str) -> Option<Vec<u32>> {
     let mut words = vec![0u32];
     for digit in digits.bytes().map(|byte| u64::from(byte - b'0')) {
         let mut carry = digit;
@@ -5860,12 +5885,7 @@ fn parse_wide_sized_decimal_literal(s: &str) -> Option<Vec<u32>> {
     while words.last() == Some(&0) {
         words.pop();
     }
-    if words.len() <= 2 {
-        return None;
-    }
-    let value_bits = (words.len() as u64 - 1) * 32
-        + u64::from(32 - words.last().copied()?.leading_zeros());
-    (value_bits <= u64::from(width)).then_some(words)
+    (!words.is_empty()).then_some(words)
 }
 
 /// Fold an AST expression to a `u64` when it is an integer literal
