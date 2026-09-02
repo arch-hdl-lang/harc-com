@@ -28967,6 +28967,35 @@ end test T"#;
 }
 
 #[test]
+fn a_timed_sync_helper_wait_inside_an_on_handler_reports_v1_recursion() {
+    let src = r#"function settle_until_timeout()
+    wait until false timeout 1 cycles
+end function settle_until_timeout
+
+test T
+    let dut : Top
+    run
+        on true
+            settle_until_timeout()
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("a timed synchronous helper must be fenced"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("unbounded recursion"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the re-entrant helper");
+    assert!(
+        v1.contains("while (!(false) && ((int64_t)cycle_count - _wu_start) < _wu_budget)"),
+        "{v1}"
+    );
+    assert!(v1.contains("tick();"), "{v1}");
+}
+
+#[test]
 fn a_composite_suspending_on_trigger_reports_v1_recursion() {
     let src = r#"function settle() -> uint<8>
     wait 1 cycle

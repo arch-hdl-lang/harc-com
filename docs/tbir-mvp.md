@@ -10172,6 +10172,16 @@ former `transaction` group lives in
      other handler phases retain their separate paths. The inventory remains
      92 textual matches (91 constructors plus the helper definition).
 
+215. **Timed helper wait-until in boolean handler bodies (2026-09-02).**
+
+     The corresponding timed helper shape is now classified when its entry
+     predicate is literal false and its timeout budget is a positive literal.
+     v1 must synchronously tick at least once and recursively re-enters the
+     constant-true rising handler before updating edge state, so TBIR reports
+     `SilentlyMisLowers`. Zero/runtime budgets and conditional waits remain
+     conservative. The inventory remains 92 textual matches (91 constructors
+     plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

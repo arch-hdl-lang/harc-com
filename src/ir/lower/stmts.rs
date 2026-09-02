@@ -5860,6 +5860,23 @@ impl FuncBuilder<'_> {
                 super::V1Status::SilentlyMisLowers,
             ));
         }
+        let guaranteed_reentrant_helper_timed_wait = self.inline_frames.is_empty()
+            && !h.periodic
+            && matches!(h.phase, crate::ast::OnPhase::Checker)
+            && matches!(h.edge, crate::ast::EdgeMode::Rising)
+            && matches!(&*h.event.kind, ExprKind::Bool(true))
+            && !block_contains_wait_until(&h.body, true)
+            && entry_has_false_positive_timed_wait(&f);
+        if guaranteed_reentrant_helper_timed_wait {
+            return Err(super::not_implemented(
+                "a timed synchronous helper wait inside a statement-position `on` handler body",
+                "v1 polls the helper's always-false predicate with at least one synchronous \
+                 `tick()`; that tick re-enters the same constant-true rising handler before \
+                 its edge state is updated, causing unbounded recursion — move the helper \
+                 call into the run body",
+                super::V1Status::SilentlyMisLowers,
+            ));
+        }
         let guaranteed_reentrant_helper_wait = !h.periodic
             && matches!(h.phase, crate::ast::OnPhase::Checker)
             && matches!(h.edge, crate::ast::EdgeMode::Rising)
@@ -7147,6 +7164,25 @@ fn block_contains_wait_until(block: &crate::ast::Block, timed: bool) -> bool {
     }
 
     block.stmts.iter().any(|s| stmt_contains(s, timed))
+}
+
+fn entry_has_false_positive_timed_wait(f: &crate::ir::TbFunction) -> bool {
+    let entry = &f.blocks[f.entry.index()];
+    let Terminator::WaitUntilTimeout { preds, cycles, .. } = &entry.terminator else {
+        return false;
+    };
+    if preds.len() != 1 || !matches!(preds[0].expr, Expr::Literal { value: 0, .. }) {
+        return false;
+    }
+    let Expr::Local(budget) = cycles else {
+        return false;
+    };
+    entry.stmts.iter().any(|s| {
+        matches!(
+            s,
+            Stmt::Assign(id, Expr::Literal { value, .. }) if id == budget && *value > 0
+        )
+    })
 }
 
 /// Children of an AST expression to visit when hoisting message calls,
