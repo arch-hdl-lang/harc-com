@@ -5520,12 +5520,10 @@ impl FuncBuilder<'_> {
         // helper, or a helper-mediated wait in the handler body, is emitted
         // through an ordinary synchronous lambda instead.
         let direct_coroutine_untimed_wait_until = self.inline_frames.is_empty()
-            && h.body.stmts.iter().any(|s| {
-                matches!(
-                    &s.kind,
-                    StmtKind::WaitUntil { timeout: None, .. }
-                )
-            });
+            && h.body
+                .stmts
+                .iter()
+                .any(|s| matches!(&s.kind, StmtKind::WaitUntil { timeout: None, .. }));
         let direct_coroutine_timed_wait_until = self.inline_frames.is_empty()
             && h.body.stmts.iter().any(|s| {
                 matches!(
@@ -5784,12 +5782,10 @@ impl FuncBuilder<'_> {
         // compile. A named-clock wait takes a different broken path: v1 emits
         // an explicit checker pass after the wait, recursively invoking this
         // same handler while it is already running.
-        if f.blocks.iter().any(|b| {
-            matches!(
-                b.terminator,
-                Terminator::WaitCycles(_, None, _)
-            )
-        }) {
+        if f.blocks
+            .iter()
+            .any(|b| matches!(b.terminator, Terminator::WaitCycles(_, None, _)))
+        {
             return Err(super::not_implemented(
                 "an unqualified cycle `wait` inside a statement-position `on` handler body",
                 "the body runs from a void per-cycle checker callback; v1 emits `co_await` \
