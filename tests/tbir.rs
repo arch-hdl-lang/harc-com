@@ -28731,6 +28731,42 @@ end test T"#;
 }
 
 #[test]
+fn a_literal_false_else_named_clock_handler_wait_reports_v1_recursion() {
+    let src = r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on true
+            if false
+                log(info, "unreachable")
+            else
+                wait 1 cycle on aux
+            end if
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("the literal-false else wait must be fenced"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively firing"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive else arm");
+    assert!(v1.contains("if (false)"), "{v1}");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target)"), "{v1}");
+
+    let reachable_elsif = src.replace(
+        "            else\n",
+        "            elsif true\n                log(info, \"taken\")\n            else\n",
+    );
+    assert_unsupported(
+        &lower_src(&reachable_elsif).expect_err("a reachable elsif keeps the fallback"),
+    );
+}
+
+#[test]
 fn an_untimed_wait_until_inside_an_on_handler_is_uncompilable_in_v1() {
     let src = r#"test T
     let dut : Top

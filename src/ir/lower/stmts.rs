@@ -7236,6 +7236,11 @@ fn block_entry_guarantees_named_wait(block: &crate::ast::Block) -> bool {
         StmtKind::If(s) if matches!(&*s.cond.kind, ExprKind::Bool(true)) => {
             block_entry_guarantees_named_wait(&s.then_block)
         }
+        StmtKind::If(s)
+            if matches!(&*s.cond.kind, ExprKind::Bool(false)) && s.elsifs.is_empty() => s
+            .else_block
+            .as_ref()
+            .is_some_and(block_entry_guarantees_named_wait),
         _ => false,
     }
 }

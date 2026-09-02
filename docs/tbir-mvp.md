@@ -10211,6 +10211,16 @@ former `transaction` group lives in
      branches remain conservative. The inventory remains 92 textual matches
      (91 constructors plus the helper definition).
 
+219. **Literal-false else-path named-clock waits (2026-09-02).**
+
+     The guaranteed named-wait proof now follows the `else` entry of a
+     literal-false `if` with no `elsif` arms. In a constant-true rising checker
+     handler this path necessarily reaches v1's nested checker pass before edge
+     state changes,
+     so TBIR reports `SilentlyMisLowers`. Missing else blocks and intervening
+     `elsif` arms remain conservative. The inventory remains 92 textual matches
+     (91 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
