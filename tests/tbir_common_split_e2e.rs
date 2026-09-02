@@ -3611,6 +3611,17 @@ fn tbir_common_extern_string_and_ref_source_profile_match_self_contained() {
         &std::fs::read_to_string(&manifest_path).expect("read first manifest"),
     )
     .expect("parse first manifest");
+    // A reference-source edit is Verilator's makefile's business: the
+    // build profile keys on the source *path*, so the common objects and
+    // the published artifacts stay valid, while the native build still
+    // recompiles the edited translation unit and relinks the binary.
+    let identity_path = common_out.join("obj_dir/.harc_build_identity");
+    let first_identity =
+        std::fs::read_to_string(&identity_path).expect("read first build identity");
+    let binary_path = common_out.join("obj_dir/VTop");
+    let first_binary_mtime = std::fs::metadata(&binary_path)
+        .and_then(|meta| meta.modified())
+        .expect("first binary mtime");
     let mut changed = std::fs::read_to_string(&ref_src).expect("read reference source copy");
     changed.push_str("\n// profile invalidation probe\n");
     std::fs::write(&ref_src, changed).expect("update reference source copy");
@@ -3619,13 +3630,32 @@ fn tbir_common_extern_string_and_ref_source_profile_match_self_contained() {
         &std::fs::read_to_string(&manifest_path).expect("read rebuilt manifest"),
     )
     .expect("parse rebuilt manifest");
-    assert_ne!(
+    assert_eq!(
         first_manifest["build_profile"], second_manifest["build_profile"],
-        "reference-source content did not invalidate the common build profile"
+        "reference-source content must not invalidate the common build profile"
     );
     assert!(
-        !rebuild_log.contains(", 0 rewritten,"),
-        "reference-source edit did not republish common artifacts:\n{rebuild_log}"
+        rebuild_log.contains(", 0 rewritten,"),
+        "reference-source edit must not republish common artifacts:\n{rebuild_log}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&identity_path).expect("read rebuilt build identity"),
+        first_identity,
+        "reference-source content must not evict the native build directory"
+    );
+    let second_binary_mtime = std::fs::metadata(&binary_path)
+        .and_then(|meta| meta.modified())
+        .expect("rebuilt binary mtime");
+    assert!(
+        second_binary_mtime > first_binary_mtime,
+        "the native build must relink after a reference-source edit:\n{rebuild_log}"
+    );
+    let rerun = run(&common_out, "common_rebuilt");
+    assert!(
+        rerun.status.success(),
+        "rebuilt common binary run failed:\n{}{}",
+        String::from_utf8_lossy(&rerun.stdout),
+        String::from_utf8_lossy(&rerun.stderr)
     );
 
     let _ = std::fs::remove_dir_all(inputs);
