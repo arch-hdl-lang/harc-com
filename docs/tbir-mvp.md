@@ -10120,6 +10120,16 @@ former `transaction` group lives in
      shared fallback, so the inventory remains 92 textual matches (91
      constructors plus the helper definition).
 
+210. **Timed wait-until in statement-position handlers (2026-09-02).**
+
+     A top-level `wait until ... timeout` written directly in a run-body
+     statement-position `on` handler no longer advertises v1. The legacy
+     emitter places `co_await wait_until_timeout` inside the void handler
+     callback, so the generated C++ cannot compile. TBIR reports
+     `EmitsUncompilable`; nested-control, helper-defined, and helper-mediated
+     timed waits retain the shared fallback. The inventory remains 92 textual
+     matches (91 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

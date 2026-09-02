@@ -28652,6 +28652,32 @@ test T
         wait 2 cycles
     end run
 end test T"#,
+        r#"function settle_until_timeout()
+    wait until false timeout 1 cycles
+end function settle_until_timeout
+
+test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            settle_until_timeout()
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+        r#"function install_timeout()
+    on true
+        wait until false timeout 1 cycles
+    end on
+end function install_timeout
+
+test T
+    let dut : Top
+    run
+        install_timeout()
+        wait 2 cycles
+    end run
+end test T"#,
     ];
     for src in cases {
         let err = lower_src(src).expect_err("a suspending handler body must not lower");
@@ -28718,6 +28744,34 @@ end test T"#;
     let checker_window = &v1[checker_start..v1.len().min(checker_start + 1400)];
     assert!(
         checker_window.contains("co_await harc_rt::wait_until(_slot"),
+        "v1 emits a coroutine await inside the checker callback: {checker_window}"
+    );
+}
+
+#[test]
+fn a_timed_wait_until_inside_an_on_handler_is_uncompilable_in_v1() {
+    let src = r#"test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            wait until dut.count_out == 1 timeout 4 cycles
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("a timed handler wait-until must be fenced"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("void checker/service callback"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the invalid callback");
+    let checker_start = v1
+        .find("_checkers.push_back([&]() {")
+        .expect("v1 registers the statement-position handler");
+    let checker_window = &v1[checker_start..v1.len().min(checker_start + 1800)];
+    assert!(
+        checker_window.contains("co_await harc_rt::wait_until_timeout(_slot"),
         "v1 emits a coroutine await inside the checker callback: {checker_window}"
     );
 }
