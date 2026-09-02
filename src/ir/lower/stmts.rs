@@ -5523,6 +5523,9 @@ impl FuncBuilder<'_> {
         let nested_direct_coroutine_untimed_wait_until = self.inline_frames.is_empty()
             && !direct_coroutine_untimed_wait_until
             && block_contains_wait_until(&h.body, false);
+        let nested_direct_coroutine_timed_wait_until = self.inline_frames.is_empty()
+            && !direct_coroutine_timed_wait_until
+            && block_contains_wait_until(&h.body, true);
         use crate::ir::{CycleHandlerKind, CycleHandlerSchema};
         self.require_test_body("an `on ... end on` handler")?;
         if h.hook.is_some() {
@@ -5823,6 +5826,15 @@ impl FuncBuilder<'_> {
                  `co_await wait_until_timeout` inside that callback and the generated C++ \
                  does not compile — move the wait into the run body, or gate the run body \
                  on the same condition",
+                super::V1Status::EmitsUncompilable,
+            ));
+        }
+        if nested_direct_coroutine_timed_wait_until {
+            return Err(super::not_implemented(
+                "a timed `wait until` nested inside control flow in a statement-position `on` handler body",
+                "v1 still emits the nested coroutine `co_await wait_until_timeout` inside the \
+                 handler's void checker/service callback, so the generated C++ does not compile — \
+                 move the wait into the run body, or gate the run body on the same condition",
                 super::V1Status::EmitsUncompilable,
             ));
         }
