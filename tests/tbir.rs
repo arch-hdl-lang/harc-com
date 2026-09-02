@@ -28701,7 +28701,7 @@ fn a_guaranteed_nested_named_clock_handler_wait_reports_v1_recursion() {
     clock clk = 10ns
     clock aux = 4ns
     run
-        on true
+        on ((true))
             if true
                 wait 1 cycle on aux
             end if
@@ -28874,6 +28874,38 @@ end test T"#;
         lower::V1Status::EmitsUncompilable,
     );
     assert!(msg.contains("untimed `wait until`"), "got: {msg}");
+}
+
+#[test]
+fn parenthesized_boolean_paths_reach_named_clock_handler_wait() {
+    let true_src = r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on true
+            if ((true))
+                wait 1 cycle on aux
+            end if
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(true_src).expect_err("parentheses do not hide a literal-true path"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively firing"), "got: {msg}");
+
+    let false_src = true_src.replace(
+        "            if ((true))\n                wait 1 cycle on aux\n            end if\n",
+        "            if ((false))\n                log(info, \"unreachable\")\n            else\n                wait 1 cycle on aux\n            end if\n",
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&false_src).expect_err("parentheses do not hide a literal-false path"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively firing"), "got: {msg}");
 }
 
 #[test]

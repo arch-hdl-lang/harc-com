@@ -5811,7 +5811,7 @@ impl FuncBuilder<'_> {
             && !nested_direct_coroutine_untimed_wait_until
             && !nested_direct_coroutine_timed_wait_until
             && matches!(h.edge, crate::ast::EdgeMode::Rising)
-            && matches!(&*h.event.kind, ExprKind::Bool(true))
+            && literal_bool_value(&h.event) == Some(true)
             && block_entry_guarantees_named_wait(&h.body);
         if guaranteed_reentrant_nested_named_wait {
             return Err(super::not_implemented(
@@ -7233,14 +7233,14 @@ fn block_entry_guarantees_named_wait(block: &crate::ast::Block) -> bool {
     };
     match &first.kind {
         StmtKind::Wait { clock: Some(_), .. } => true,
-        StmtKind::If(s) if matches!(&*s.cond.kind, ExprKind::Bool(true)) => {
+        StmtKind::If(s) if literal_bool_value(&s.cond) == Some(true) => {
             block_entry_guarantees_named_wait(&s.then_block)
         }
         StmtKind::If(s)
-            if matches!(&*s.cond.kind, ExprKind::Bool(false))
+            if literal_bool_value(&s.cond) == Some(false)
                 && s.elsifs
                     .iter()
-                    .all(|(cond, _)| matches!(&*cond.kind, ExprKind::Bool(false))) =>
+                    .all(|(cond, _)| literal_bool_value(cond) == Some(false)) =>
         {
             s.else_block
                 .as_ref()
@@ -7251,6 +7251,14 @@ fn block_entry_guarantees_named_wait(block: &crate::ast::Block) -> bool {
         }
         StmtKind::Loop(body) => block_entry_guarantees_named_wait(body),
         _ => false,
+    }
+}
+
+fn literal_bool_value(expr: &AstExpr) -> Option<bool> {
+    match &*expr.kind {
+        ExprKind::Bool(value) => Some(*value),
+        ExprKind::Paren(inner) => literal_bool_value(inner),
+        _ => None,
     }
 }
 
