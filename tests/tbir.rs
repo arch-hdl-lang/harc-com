@@ -31805,10 +31805,13 @@ end test T"#;
     );
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive checker");
-    let helper = v1.find("settle = [&]").expect("v1 emits the helper lambda");
+    let settle = v1_callable_symbol(&v1, "settle");
+    let helper = v1
+        .find(&format!("{settle} = [&]"))
+        .expect("v1 emits the helper lambda");
     let window = &v1[helper..v1.len().min(helper + 900)];
     assert!(
-        window.contains("tick();") && v1.contains("!(bool)(settle() == 1)"),
+        window.contains("tick();") && v1.contains(&format!("!(bool)({settle}() == 1)")),
         "the checker calls a helper whose synchronous wait ticks: {window}"
     );
 
@@ -32723,7 +32726,7 @@ end test T"#;
         .expect("v1 registers the statement-position handler in the checker pass");
     let checker_window = &v1[checker_start..v1.len().min(checker_start + 1800)];
     assert!(
-        checker_window.contains("while (clocks_[1].rising_count < _target)"),
+        checker_window.contains("while (clocks_[1].rising_count < _target"),
         "v1 emits the named-clock wait inside the checker: {checker_window}"
     );
     assert!(
@@ -32810,8 +32813,9 @@ end test T"#;
     assert!(msg.contains("unbounded recursion"), "got: {msg}");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the re-entrant helper call");
+    let delay_once = v1_callable_symbol(&v1, "delay_once");
     let helper_start = v1
-        .find("auto delay_once = [&]")
+        .find(&format!("auto {delay_once} = [&]"))
         .expect("v1 emits the helper as a synchronous lambda");
     let helper_window = &v1[helper_start..v1.len().min(helper_start + 1000)];
     assert!(
@@ -32823,7 +32827,7 @@ end test T"#;
         .expect("v1 registers the boolean handler");
     let checker_window = &v1[checker_start..v1.len().min(checker_start + 1200)];
     assert!(
-        checker_window.contains("delay_once()"),
+        checker_window.contains(&format!("{delay_once}()")),
         "v1 calls the ticking helper before updating trigger state: {checker_window}"
     );
 
@@ -32915,11 +32919,14 @@ end test T"#;
     assert!(msg.contains("trigger") && msg.contains("unbounded recursion"), "{msg}");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive trigger");
-    let helper = v1.find("settle = [&]").expect("v1 emits the helper lambda");
+    let settle = v1_callable_symbol(&v1, "settle");
+    let helper = v1
+        .find(&format!("{settle} = [&]"))
+        .expect("v1 emits the helper lambda");
     let helper_window = &v1[helper..v1.len().min(helper + 900)];
     assert!(helper_window.contains("tick();"), "helper wait is synchronous: {helper_window}");
     assert!(
-        v1.contains("_curr = (bool)(settle() > 0);"),
+        v1.contains(&format!("_curr = (bool)({settle}() > 0);")),
         "the checker evaluates the helper trigger: {v1}"
     );
 
@@ -45873,14 +45880,17 @@ end impl SpTest"#
         "{msg}"
     );
     let v1 = cpp_tb::emit(&merged_src(&composite)).expect("v1 emits the recursive checker");
-    let helper = v1.find("settle = [&]").expect("v1 emits the helper lambda");
+    let settle = v1_callable_symbol(&v1, "settle");
+    let helper = v1
+        .find(&format!("{settle} = [&]"))
+        .expect("v1 emits the helper lambda");
     let helper_window = &v1[helper..v1.len().min(helper + 900)];
     assert!(
         helper_window.contains("tick();"),
         "helper wait is synchronous: {helper_window}"
     );
     assert!(
-        v1.contains("_period = (int64_t)(settle() + 0)"),
+        v1.contains(&format!("_period = (int64_t)({settle}() + 0)")),
         "the periodic checker evaluates the helper: {v1}"
     );
 
