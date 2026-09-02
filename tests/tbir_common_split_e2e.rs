@@ -3619,13 +3619,17 @@ fn tbir_common_extern_string_and_ref_source_profile_match_self_contained() {
         &std::fs::read_to_string(&manifest_path).expect("read rebuilt manifest"),
     )
     .expect("parse rebuilt manifest");
-    assert_ne!(
+    // The native build identity keeps source paths but deliberately excludes
+    // their contents: Verilator's Makefile sees the changed reference source
+    // and recompiles only that input, while reusable generated C++ objects
+    // and common artifacts remain intact.
+    assert_eq!(
         first_manifest["build_profile"], second_manifest["build_profile"],
-        "reference-source content did not invalidate the common build profile"
+        "reference-source content must not invalidate the common build profile"
     );
     assert!(
-        !rebuild_log.contains(", 0 rewritten,"),
-        "reference-source edit did not republish common artifacts:\n{rebuild_log}"
+        rebuild_log.contains(", 0 rewritten,"),
+        "reference-source edit unexpectedly republished common artifacts:\n{rebuild_log}"
     );
 
     let _ = std::fs::remove_dir_all(inputs);
