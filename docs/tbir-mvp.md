@@ -10047,6 +10047,17 @@ former `transaction` group lives in
      shared conservative fallback, so the inventory remains 92 textual
      matches (91 constructors plus the helper definition).
 
+204. **Synchronous helper waits in concurrent checks (2026-09-01).**
+
+     A helper that executes an unqualified cycle wait is inlined into v1's
+     per-cycle checker expression with a synchronous `tick()`. That call runs
+     the checker pass again, recursively re-entering the expression rather
+     than advancing it safely. Concurrent assertions, assumptions, and cover
+     witnesses now report this measured `SilentlyMisLowers` outcome. Other
+     checker contexts, hoisted reads, and ordinary call edges retain the shared
+     conservative fallback, so the raw inventory remains 92 textual matches
+     (91 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

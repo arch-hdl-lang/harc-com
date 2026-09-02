@@ -27765,14 +27765,12 @@ end test T"#,
     );
 }
 
-/// A concurrent check body runs inside a per-cycle closure with no
-/// statement slot, so anything needing a statement-level step (here an
-/// inlined impure helper) must be rejected rather than mis-lowered into
-/// running once at registration.
+/// A suspending helper in a concurrent check becomes a synchronous `tick()`
+/// inside v1's checker. `tick()` runs the checker list again, so evaluating
+/// the expression recursively re-enters itself instead of advancing safely.
 #[test]
 fn a_check_body_needing_a_statement_step_is_rejected() {
-    let err = lower_src(
-        r#"function settle() -> uint<8>
+    let src = r#"function settle() -> uint<8>
     wait 1 cycle
     return 1
 end function settle
@@ -27783,13 +27781,20 @@ test T
         assert rose(dut.a) |-> settle() == 1
         wait 1 cycle
     end run
-end test T"#,
-    )
-    .expect_err("a suspending helper inside a check body must not lower");
-    let msg = assert_unsupported(&err);
+end test T"#;
+    let err = lower_src(src).expect_err("a suspending helper inside a check body must not lower");
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
     assert!(
-        msg.contains("concurrent") && msg.contains("statement-level step"),
+        msg.contains("concurrent") && msg.contains("unbounded recursion"),
         "got: {msg}"
+    );
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive checker");
+    let helper = v1.find("settle = [&]").expect("v1 emits the helper lambda");
+    let window = &v1[helper..v1.len().min(helper + 900)];
+    assert!(
+        window.contains("tick();") && v1.contains("!(bool)(settle() == 1)"),
+        "the checker calls a helper whose synchronous wait ticks: {window}"
     );
 }
 
