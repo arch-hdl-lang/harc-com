@@ -10086,6 +10086,17 @@ former `transaction` group lives in
      conservative fallback, so the raw inventory remains 92 textual matches
      (91 constructors plus the helper definition).
 
+207. **Composite suspending-helper boolean triggers (2026-09-02).**
+
+     A statement-position `on <bool-expr>` trigger is evaluated in v1's
+     per-cycle checker. When its composite expression inlines a helper whose
+     entry step is an unconditional positive-literal synchronous wait, that
+     helper calls `tick()` and recursively re-enters the same trigger. TBIR now
+     reports the measured `SilentlyMisLowers` outcome. Zero,
+     runtime-dependent, conditional, and other statement-producing trigger
+     shapes retain the conservative fallback, so the inventory remains 92
+     textual matches (91 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
