@@ -10247,6 +10247,14 @@ former `transaction` group lives in
      verdict. The inventory remains 92 textual matches (91 constructors plus
      the helper definition).
 
+223. **Parenthesized boolean paths to named-clock waits (2026-09-02).**
+
+     Parentheses no longer hide literal `true`/`false` conditions from the
+     guaranteed named-wait proof. The classifier unwraps any number of
+     parentheses while leaving runtime and foldable-but-not-literal conditions
+     conservative. The inventory remains 92 textual matches (91 constructors
+     plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
