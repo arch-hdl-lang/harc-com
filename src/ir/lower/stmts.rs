@@ -5831,6 +5831,24 @@ impl FuncBuilder<'_> {
             self.blocks[self.current].stmts.len(),
         );
         if after != before {
+            let added_sync_wait = matches!(
+                self.blocks[before.0].term,
+                Some(Terminator::WaitCyclesSync(..))
+            ) || self.blocks[before.1..]
+                .iter()
+                .any(|block| matches!(block.term, Some(Terminator::WaitCyclesSync(..))));
+            let is_concurrent_check = construct.starts_with("a concurrent ")
+                || construct == "a `cover` witness";
+            if added_sync_wait && is_concurrent_check {
+                return Err(not_implemented(
+                    construct,
+                    "v1 evaluates the suspending helper inside the per-cycle checker and its \
+                     synchronous `tick()` re-enters that same checker, causing unbounded \
+                     recursion when the expression is evaluated — move the helper call out \
+                     of the concurrent expression",
+                    V1Status::SilentlyMisLowers,
+                ));
+            }
             return Err(unsupported(
                 construct,
                 "the body needs a statement-level step (a hoisted DUT read, an inlined \

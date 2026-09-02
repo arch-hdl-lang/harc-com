@@ -580,6 +580,10 @@ not applicable before requesting review:
    the generated C++ cannot compile. Named-clock, wall-time, and helper-mediated
    waits retain the shared conservative fallback, leaving 92 textual matches
    (91 constructors plus the helper definition).
+   A synchronous cycle wait introduced by an inlined helper in a concurrent
+   property or cover expression is classified by v1's recursive `tick()`
+   behavior. Other checker contexts and statement-producing expressions retain
+   the shared fallback, so the raw inventory remains 92 textual matches.
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
