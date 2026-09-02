@@ -32670,19 +32670,6 @@ test T
         wait 2 cycles
     end run
 end test T"#,
-        r#"function install_timeout()
-    on true
-        wait until false timeout 1 cycles
-    end on
-end function install_timeout
-
-test T
-    let dut : Top
-    run
-        install_timeout()
-        wait 2 cycles
-    end run
-end test T"#,
     ];
     for src in cases {
         let err = lower_src(src).expect_err("a suspending handler body must not lower");
@@ -32723,6 +32710,188 @@ end test T"#;
         checker_window.contains("for (auto& _c : _checkers) _c();"),
         "v1 re-enters the checker list after the wait: {checker_window}"
     );
+}
+
+#[test]
+fn a_guaranteed_nested_named_clock_handler_wait_reports_v1_recursion() {
+    let src = r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on true
+            if true
+                wait 1 cycle on aux
+            end if
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("the guaranteed nested named wait must be fenced"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively firing"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive handler");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target)"), "{v1}");
+    assert!(v1.contains("for (auto& _c : _checkers) _c();"), "{v1}");
+
+    let mixed = src.replace(
+        "            end if\n",
+        "            end if\n            wait until false\n",
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&mixed).expect_err("the coroutine failure must outrank recursion"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("untimed `wait until`"), "got: {msg}");
+}
+
+#[test]
+fn a_literal_false_else_named_clock_handler_wait_reports_v1_recursion() {
+    let src = r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on true
+            if false
+                log(info, "unreachable")
+            else
+                wait 1 cycle on aux
+            end if
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("the literal-false else wait must be fenced"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively firing"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive else arm");
+    assert!(v1.contains("if (false)"), "{v1}");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target)"), "{v1}");
+
+    let reachable_elsif = src.replace(
+        "            else\n",
+        "            elsif true\n                log(info, \"taken\")\n            else\n",
+    );
+    assert_unsupported(
+        &lower_src(&reachable_elsif).expect_err("a reachable elsif keeps the fallback"),
+    );
+}
+
+#[test]
+fn all_false_elsif_paths_reach_named_clock_handler_wait() {
+    let src = r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on true
+            if false
+                log(info, "unreachable")
+            elsif false
+                log(info, "also unreachable")
+            else
+                wait 1 cycle on aux
+            end if
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("all-false conditions guarantee the else wait"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively firing"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive else arm");
+    assert!(v1.contains("else if (false)"), "{v1}");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target)"), "{v1}");
+
+    let runtime_elsif = src.replace("            elsif false\n", "            elsif dut.rst == 1\n");
+    assert_unsupported(
+        &lower_src(&runtime_elsif).expect_err("a runtime-dependent elsif keeps the fallback"),
+    );
+}
+
+#[test]
+fn a_positive_literal_repeat_reaches_named_clock_handler_wait() {
+    let src = r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on true
+            repeat 2
+                wait 1 cycle on aux
+            end repeat
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("a positive repeat guarantees its first iteration"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively firing"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive repeat body");
+    assert!(v1.contains("for (int64_t _r = 0; _r < 2; _r++)"), "{v1}");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target)"), "{v1}");
+
+    let zero = src.replace("            repeat 2\n", "            repeat 0\n");
+    assert_unsupported(&lower_src(&zero).expect_err("a zero repeat keeps the fallback"));
+    let runtime = src.replace("            repeat 2\n", "            repeat dut.rst\n");
+    assert_unsupported(&lower_src(&runtime).expect_err("a runtime repeat keeps the fallback"));
+}
+
+#[test]
+fn an_unconditional_loop_reaches_named_clock_handler_wait() {
+    let src = r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on true
+            loop
+                wait 1 cycle on aux
+            end loop
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("an unconditional loop guarantees its first iteration"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively firing"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive loop body");
+    assert!(v1.contains("while (true)"), "{v1}");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target)"), "{v1}");
+
+    let conditional = src.replace(
+        "                wait 1 cycle on aux\n",
+        "                if dut.rst == 1\n                    wait 1 cycle on aux\n                end if\n",
+    );
+    assert_unsupported(
+        &lower_src(&conditional).expect_err("a conditional loop-entry wait keeps the fallback"),
+    );
+
+    let uncompilable = src.replace(
+        "                wait 1 cycle on aux\n",
+        "                wait 1 cycle on aux\n                wait until false\n",
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&uncompilable).expect_err("wait-until must outrank loop recursion"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("untimed `wait until`"), "got: {msg}");
 }
 
 #[test]
@@ -33026,6 +33195,35 @@ end test T"#;
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive callback");
     assert!(v1.contains("while (!(false)) tick();"), "{v1}");
     assert!(v1.contains("_checkers.push_back([&]()"), "{v1}");
+}
+
+#[test]
+fn a_timed_helper_defined_on_handler_reports_v1_recursion() {
+    let src = r#"function install_timeout()
+    on true
+        wait until false timeout 1 cycles
+    end on
+end function install_timeout
+
+test T
+    let dut : Top
+    run
+        install_timeout()
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("a timed helper-defined handler must be fenced"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively fires"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive callback");
+    assert!(
+        v1.contains("while (!(false) && ((int64_t)cycle_count - _wu_start) < _wu_budget)"),
+        "{v1}"
+    );
+    assert!(v1.contains("tick();"), "{v1}");
 }
 
 #[test]

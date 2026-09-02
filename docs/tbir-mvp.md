@@ -10126,8 +10126,8 @@ former `transaction` group lives in
      statement-position `on` handler no longer advertises v1. The legacy
      emitter places `co_await wait_until_timeout` inside the void handler
      callback, so the generated C++ cannot compile. TBIR reports
-     `EmitsUncompilable`; helper-defined and helper-mediated timed waits retain
-     the shared fallback. The inventory remains 92 textual
+     `EmitsUncompilable`; other helper-defined and helper-mediated timed waits
+     retain the shared fallback. The inventory remains 92 textual
      matches (91 constructors plus the helper definition).
 
 211. **Synchronous helper waits in boolean handler bodies (2026-09-02).**
@@ -10191,6 +10191,61 @@ former `transaction` group lives in
      `SilentlyMisLowers`; direct run-body handlers retain their distinct
      coroutine diagnostic. The inventory remains 92 textual matches (91
      constructors plus the helper definition).
+
+217. **Timed waits in helper-defined boolean handlers (2026-09-02).**
+
+     A helper-installed constant-true rising handler whose entry is an
+     always-false wait with a positive literal timeout now reports the same
+     guaranteed v1 recursion. The synchronous timeout loop must tick before
+     the handler can update its edge cell, so TBIR reports
+     `SilentlyMisLowers`. Zero/runtime budgets, conditional waits, and other
+     phases remain conservative. The inventory remains 92 textual matches (91
+     constructors plus the helper definition).
+
+218. **Guaranteed nested named-clock handler waits (2026-09-02).**
+
+     A constant-true rising checker handler whose entry control is a literal
+     true branch leading directly to a named-clock wait now reports v1's
+     guaranteed recursion. v1 explicitly runs the checker list after the wait
+     before updating the handler edge cell. Runtime-dependent and false
+     branches remain conservative. The inventory remains 92 textual matches
+     (91 constructors plus the helper definition).
+
+219. **Literal-false else-path named-clock waits (2026-09-02).**
+
+     The guaranteed named-wait proof now follows the `else` entry of a
+     literal-false `if` with no `elsif` arms. In a constant-true rising checker
+     handler this path necessarily reaches v1's nested checker pass before edge
+     state changes,
+     so TBIR reports `SilentlyMisLowers`. Missing else blocks and intervening
+     `elsif` arms remain conservative here; item 220 extends the proof through
+     chains whose conditions are all literal false. The inventory remains 92
+     textual matches (91 constructors plus the helper definition).
+
+220. **All-false elsif paths to named-clock waits (2026-09-02).**
+
+     The guaranteed named-wait proof now crosses an `if` whose condition and
+     every `elsif` condition are literal false, then follows its `else` entry.
+     Runtime-dependent or literal-true `elsif` conditions remain conservative.
+     The inventory remains 92 textual matches (91 constructors plus the helper
+     definition).
+
+221. **Positive literal repeat paths to named-clock waits (2026-09-02).**
+
+     The guaranteed named-wait proof now enters a `repeat` body when its count
+     is a positive integer literal, since v1 must execute at least one
+     iteration before the checker edge cell can update. Zero, negative, and
+     runtime-dependent counts remain conservative. The inventory remains 92
+     textual matches (91 constructors plus the helper definition).
+
+222. **Unconditional loop paths to named-clock waits (2026-09-02).**
+
+     The guaranteed named-wait proof now enters an unconditional `loop` body,
+     which v1 executes at least once. Only a body-entry path already proven to
+     reach the named-clock wait is classified; conditional paths remain
+     conservative, and source `wait until` failures retain their stronger
+     verdict. The inventory remains 92 textual matches (91 constructors plus
+     the helper definition).
 
 ## Next steps
 
