@@ -5877,6 +5877,28 @@ impl FuncBuilder<'_> {
                 super::V1Status::SilentlyMisLowers,
             ));
         }
+        let guaranteed_reentrant_helper_defined_untimed_wait = !self.inline_frames.is_empty()
+            && !h.periodic
+            && matches!(h.phase, crate::ast::OnPhase::Checker)
+            && matches!(h.edge, crate::ast::EdgeMode::Rising)
+            && matches!(&*h.event.kind, ExprKind::Bool(true))
+            && block_contains_wait_until(&h.body, false)
+            && matches!(
+                &f.blocks[f.entry.index()].terminator,
+                Terminator::WaitUntil { preds, .. }
+                    if preds.len() == 1
+                        && matches!(preds[0].expr, Expr::Literal { value: 0, .. })
+            );
+        if guaranteed_reentrant_helper_defined_untimed_wait {
+            return Err(super::not_implemented(
+                "an untimed wait in a helper-defined statement-position `on` handler",
+                "v1 emits the helper-defined handler as a synchronous callback; its \
+                 always-false wait polls with `tick()`, recursively firing the same \
+                 constant-true rising handler before edge state is updated — install the \
+                 handler directly in the run body and move its wait into run control flow",
+                super::V1Status::SilentlyMisLowers,
+            ));
+        }
         let guaranteed_reentrant_helper_wait = !h.periodic
             && matches!(h.phase, crate::ast::OnPhase::Checker)
             && matches!(h.edge, crate::ast::EdgeMode::Rising)
