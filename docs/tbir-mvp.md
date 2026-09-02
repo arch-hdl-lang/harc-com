@@ -10162,6 +10162,16 @@ former `transaction` group lives in
      distinct. The inventory remains 92 textual matches (91 constructors plus
      the helper definition).
 
+214. **Untimed helper wait-until in boolean handler bodies (2026-09-02).**
+
+     A direct constant-true rising handler that calls a helper whose entry is
+     an unconditional `wait until false` now reports v1's measured recursive
+     behavior. The helper polls synchronously with `tick()`, re-entering the
+     same checker before its edge state changes. TBIR reports
+     `SilentlyMisLowers`; source-written waits, conditional predicates, and
+     other handler phases retain their separate paths. The inventory remains
+     92 textual matches (91 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
