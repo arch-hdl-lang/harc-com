@@ -11900,6 +11900,48 @@ end test T
     assert!(!apply_cpp.contains("Missing"));
 }
 
+/// Component-scope `apply` reaches the shared component-schema builder rather
+/// than the test or bound-transactor arms, but v1 gives it the same semantics:
+/// the aspect name is never resolved and the emitted component is byte-for-byte
+/// identical to the control.
+#[test]
+fn a_component_scope_apply_is_dropped_by_v1_without_a_false_escape_hatch() {
+    for keyword in ["agent", "env"] {
+        let control = format!(
+            r#"{keyword} Worker
+    n : uint<8> default 0
+    hookable bump()
+        n = n + 1
+    end bump
+end {keyword} Worker
+
+test T
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test T
+"#
+        );
+        let with_apply = control.replace(
+            "    hookable bump()\n",
+            "    apply Missing.Policy\n    hookable bump()\n",
+        );
+
+        lower_src(&control).unwrap_or_else(|err| panic!("{keyword} control lowers: {err}"));
+        let err = lower_src(&with_apply)
+            .err()
+            .unwrap_or_else(|| panic!("{keyword} apply must remain rejected"));
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains("`apply` item in component `Worker`"), "{msg}");
+
+        let control_cpp = cpp_tb::emit(&merged_src(&control)).expect("v1 emits control");
+        let apply_cpp = cpp_tb::emit(&merged_src(&with_apply)).expect("v1 emits apply");
+        assert_eq!(apply_cpp, control_cpp, "v1 drops {keyword}-scope apply");
+        assert!(!apply_cpp.contains("Missing"));
+    }
+}
+
 /// The transactor state-field arms, one row per LANDING the guard
 /// admits — not one probe per arm.
 ///

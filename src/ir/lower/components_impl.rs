@@ -919,20 +919,11 @@ pub(crate) fn lower_component_schema(
                         V1Status::SilentlyMisLowers,
                     ));
                 }
-                // NOT probed at this landing. v1's handling of `apply`
-                // differs by position and by whether the named package is
-                // declared — in a test body a declared package is rejected
-                // while an undeclared name is accepted — so the component
-                // landing needs its own anchored probe before any claim
-                // about v1 is made here.
                 ComponentItem::Apply(_) => {
-                    // Detail deliberately says nothing about WHERE to put it:
-                    // test scope rejects `apply` too (`TestItem::Apply` in
-                    // `mod.rs`), so naming that scope would send the user
-                    // somewhere that also fails.
-                    return Err(unsupported(
+                    return Err(super::not_implemented(
                         &format!("an `apply` item in component `{name}`"),
-                        "",
+                        "v1 drops component-scope aspect activation without resolving its name or changing the generated component",
+                        super::V1Status::SilentlyMisLowers,
                     ));
                 }
             }
