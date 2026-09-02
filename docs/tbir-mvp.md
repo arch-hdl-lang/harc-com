@@ -10097,6 +10097,18 @@ former `transaction` group lives in
      shapes retain the conservative fallback, so the inventory remains 92
      textual matches (91 constructors plus the helper definition).
 
+208. **Named-clock waits in statement-position handlers (2026-09-02).**
+
+     A named-clock `wait` in a statement-position `on` handler runs inside
+     v1's per-cycle checker callback. After advancing the selected clock, v1
+     unconditionally invokes the full checker list before the boolean
+     trigger's edge state is updated, recursively entering the same handler
+     before its first invocation returns. TBIR now reports this measured
+     `SilentlyMisLowers` outcome for an unconditional entry wait in the
+     checker phase. Conditional, periodic, post-eval, wall-time, and
+     helper-mediated waits retain the conservative fallback, so the inventory
+     remains 92 textual matches (91 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

@@ -5732,8 +5732,9 @@ impl FuncBuilder<'_> {
         // The handler runs from a void per-cycle checker callback. v1 lowers
         // an unqualified cycle wait to `co_await` inside that callback, which
         // cannot be a coroutine under its void ABI and therefore does not
-        // compile. Other suspending terminators take different v1 paths; keep
-        // the shared conservative fence below until each one is measured.
+        // compile. A named-clock wait takes a different broken path: v1 emits
+        // an explicit checker pass after the wait, recursively invoking this
+        // same handler while it is already running.
         if f.blocks.iter().any(|b| {
             matches!(
                 b.terminator,
@@ -5747,6 +5748,28 @@ impl FuncBuilder<'_> {
                      wait into the run body, or gate the run body on the same condition with \
                      `wait until`",
                 super::V1Status::EmitsUncompilable,
+            ));
+        }
+        // This recursion proof is deliberately narrow. The entry terminator
+        // makes the named wait unconditional; a checker-phase boolean handler
+        // has not updated its edge state before running the body, so the
+        // nested checker pass fires the same handler again. Periodic handlers
+        // update their last-fired stamp first, and post-eval handlers live in
+        // a different service vector, so those shapes retain the fallback.
+        let guaranteed_reentrant_named_wait = !h.periodic
+            && matches!(h.phase, crate::ast::OnPhase::Checker)
+            && matches!(
+                &f.blocks[f.entry.index()].terminator,
+                Terminator::WaitCycles(_, Some(_), _)
+            );
+        if guaranteed_reentrant_named_wait {
+            return Err(super::not_implemented(
+                "a named-clock `wait` inside a statement-position `on` handler body",
+                "v1 runs the body from a per-cycle checker and emits another complete checker \
+                 pass after the named-clock wait, recursively re-entering the same handler — \
+                 move the wait into the run body, or gate the run body on the same condition \
+                 with `wait until`",
+                super::V1Status::SilentlyMisLowers,
             ));
         }
         if super::function_suspends(&f) {
