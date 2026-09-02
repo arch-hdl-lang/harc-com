@@ -7246,6 +7246,19 @@ fn block_entry_guarantees_named_wait(block: &crate::ast::Block) -> bool {
                 .as_ref()
                 .is_some_and(block_entry_guarantees_named_wait)
         }
+        StmtKind::Repeat(s) if positive_int_literal(&s.count) => {
+            block_entry_guarantees_named_wait(&s.body)
+        }
+        _ => false,
+    }
+}
+
+fn positive_int_literal(expr: &AstExpr) -> bool {
+    match &*expr.kind {
+        ExprKind::Int(s) => super::exprs::parse_int_literal_expr(expr)
+            .or_else(|| super::exprs::parse_sized_int_literal(s))
+            .is_some_and(|value| value > 0),
+        ExprKind::Paren(inner) => positive_int_literal(inner),
         _ => false,
     }
 }
