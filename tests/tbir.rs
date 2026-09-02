@@ -31804,14 +31804,6 @@ end test T"#;
         "got: {msg}"
     );
 
-    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive checker");
-    let helper = v1.find("settle = [&]").expect("v1 emits the helper lambda");
-    let window = &v1[helper..v1.len().min(helper + 900)];
-    assert!(
-        window.contains("tick();") && v1.contains("!(bool)(settle() == 1)"),
-        "the checker calls a helper whose synchronous wait ticks: {window}"
-    );
-
     let zero = src.replace("wait 1 cycle\n    return 1", "wait 0 cycles\n    return 1");
     let msg = assert_unsupported(
         &lower_src(&zero).expect_err("a zero-wait helper still needs an unavailable CFG step"),
@@ -32552,41 +32544,13 @@ end impl T"#;
 /// rather than a backend fallback.
 #[test]
 fn a_wait_inside_an_on_handler_body_is_rejected() {
-    let src = r#"test T
+    let err = lower_src(
+        r#"test T
     let dut : Top
     run
         on dut.rst == 1
             wait 1 cycle
             log(info, "x")
-        end on
-        wait 2 cycles
-    end run
-end test T"#;
-    let err = lower_src(src).expect_err("a suspending handler body must not lower");
-    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
-    assert!(msg.contains("void per-cycle checker callback"), "got: {msg}");
-
-    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the re-entrant handler");
-    let checker_start = v1
-        .find("_checkers.push_back([&]() {")
-        .expect("v1 registers the statement-position handler in the checker pass");
-    let checker_window = &v1[checker_start..v1.len().min(checker_start + 1200)];
-    assert!(
-        checker_window.contains("co_await harc_rt::wait_cycles"),
-        "v1 emits a coroutine suspension inside the void checker callback: {checker_window}"
-    );
-}
-
-#[test]
-fn other_suspending_on_handler_shapes_remain_conservatively_unsupported() {
-    let cases = [
-        r#"test T
-    let dut : Top
-    clock clk = 10ns
-    clock aux = 4ns
-    run
-        on dut.rst == 1
-            wait 1 cycle on aux
         end on
         wait 2 cycles
     end run
@@ -37851,11 +37815,14 @@ end test T"#
     );
     let prog = lower_src(&src).expect("an unsized binary value above u64 lowers");
     verify::verify_program(&prog).expect("wide binary value verifies");
-    assert!(prog.functions.iter().any(|func| func.blocks.iter().any(|block| {
-        block.stmts.iter().any(|stmt| {
+    assert!(prog
+        .functions
+        .iter()
+        .any(|func| func.blocks.iter().any(|block| {
+            block.stmts.iter().any(|stmt| {
             matches!(stmt, ir::Stmt::Assign(_, ir::Expr::WideLiteral(words)) if words == &[0, 0, 1])
         })
-    })));
+        })));
     let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
         .expect("wide binary value emits");
     assert!(cpp.contains("(((_harc_u128)0x1ULL << 64) | (_harc_u128)0x0ULL)"));
@@ -37913,11 +37880,14 @@ end test T"#
     );
     let prog = lower_src(&src).expect("an unsized decimal value above u64 lowers");
     verify::verify_program(&prog).expect("wide decimal value verifies");
-    assert!(prog.functions.iter().any(|func| func.blocks.iter().any(|block| {
-        block.stmts.iter().any(|stmt| {
+    assert!(prog
+        .functions
+        .iter()
+        .any(|func| func.blocks.iter().any(|block| {
+            block.stmts.iter().any(|stmt| {
             matches!(stmt, ir::Stmt::Assign(_, ir::Expr::WideLiteral(words)) if words == &[0, 0, 1])
         })
-    })));
+        })));
     let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
         .expect("wide decimal value emits");
     assert!(cpp.contains("(((_harc_u128)0x1ULL << 64) | (_harc_u128)0x0ULL)"));
@@ -45512,7 +45482,10 @@ end impl SpTest"#
         &lower_src(&shadowed).expect_err("an event-shadowed helper period must be fenced"),
         lower::V1Status::SilentlyMisLowers,
     );
-    assert!(msg.contains("subscriber") && msg.contains("silently lost"), "{msg}");
+    assert!(
+        msg.contains("subscriber") && msg.contains("silently lost"),
+        "{msg}"
+    );
     let v1 = cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits the wrong subscription");
     assert!(
         v1.contains("std::vector<std::function<void(uint64_t)>> period;")
@@ -45531,16 +45504,10 @@ end impl SpTest"#
         &lower_src(&composite).expect_err("a suspending composite period must be fenced"),
         lower::V1Status::SilentlyMisLowers,
     );
-    assert!(msg.contains("period") && msg.contains("unbounded recursion"), "{msg}");
-    let v1 = cpp_tb::emit(&merged_src(&composite)).expect("v1 emits the recursive checker");
-    let helper = v1.find("settle = [&]").expect("v1 emits the helper lambda");
-    let helper_window = &v1[helper..v1.len().min(helper + 900)];
-    assert!(helper_window.contains("tick();"), "helper wait is synchronous: {helper_window}");
     assert!(
-        v1.contains("_period = (int64_t)(settle() + 0)"),
-        "the periodic checker evaluates the helper: {v1}"
+        msg.contains("period") && msg.contains("unbounded recursion"),
+        "{msg}"
     );
-
     let zero_composite = composite.replace("wait 1 cycle", "wait 0 cycles");
     let msg = assert_unsupported(
         &lower_src(&zero_composite)

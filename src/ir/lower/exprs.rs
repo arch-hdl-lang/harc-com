@@ -6438,8 +6438,8 @@ fn parse_wide_sized_decimal_literal(s: &str) -> Option<Vec<u32>> {
     if words.len() <= 2 {
         return None;
     }
-    let value_bits = (words.len() as u64 - 1) * 32
-        + u64::from(32 - words.last().copied()?.leading_zeros());
+    let value_bits =
+        (words.len() as u64 - 1) * 32 + u64::from(32 - words.last().copied()?.leading_zeros());
     (value_bits <= u64::from(width)).then_some(words)
 }
 

@@ -5882,8 +5882,8 @@ impl FuncBuilder<'_> {
                     _
                 )) if *value > 0
             );
-            let is_concurrent_check = construct.starts_with("a concurrent ")
-                || construct == "a `cover` witness";
+            let is_concurrent_check =
+                construct.starts_with("a concurrent ") || construct == "a `cover` witness";
             if guaranteed_sync_tick && is_concurrent_check {
                 return Err(not_implemented(
                     construct,
@@ -5894,9 +5894,7 @@ impl FuncBuilder<'_> {
                     V1Status::SilentlyMisLowers,
                 ));
             }
-            if guaranteed_sync_tick
-                && construct == "a statement-position periodic handler period"
-            {
+            if guaranteed_sync_tick && construct == "a statement-position periodic handler period" {
                 return Err(not_implemented(
                     construct,
                     "v1 evaluates the composite period inside the per-cycle checker; its \
