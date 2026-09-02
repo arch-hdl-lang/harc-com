@@ -5786,6 +5786,10 @@ impl FuncBuilder<'_> {
         // a different service vector, so those shapes retain the fallback.
         let guaranteed_reentrant_named_wait = !h.periodic
             && matches!(h.phase, crate::ast::OnPhase::Checker)
+            && !direct_coroutine_untimed_wait_until
+            && !direct_coroutine_timed_wait_until
+            && !nested_direct_coroutine_untimed_wait_until
+            && !nested_direct_coroutine_timed_wait_until
             && matches!(
                 &f.blocks[f.entry.index()].terminator,
                 Terminator::WaitCycles(_, Some(_), _)
@@ -5797,6 +5801,24 @@ impl FuncBuilder<'_> {
                  pass after the named-clock wait, recursively re-entering the same handler — \
                  move the wait into the run body, or gate the run body on the same condition \
                  with `wait until`",
+                super::V1Status::SilentlyMisLowers,
+            ));
+        }
+        let guaranteed_reentrant_nested_named_wait = !h.periodic
+            && matches!(h.phase, crate::ast::OnPhase::Checker)
+            && !direct_coroutine_untimed_wait_until
+            && !direct_coroutine_timed_wait_until
+            && !nested_direct_coroutine_untimed_wait_until
+            && !nested_direct_coroutine_timed_wait_until
+            && matches!(h.edge, crate::ast::EdgeMode::Rising)
+            && matches!(&*h.event.kind, ExprKind::Bool(true))
+            && block_entry_guarantees_named_wait(&h.body);
+        if guaranteed_reentrant_nested_named_wait {
+            return Err(super::not_implemented(
+                "a guaranteed nested named-clock `wait` inside a statement-position `on` handler body",
+                "v1 reaches the named-clock wait through unconditional control flow, then runs \
+                 the checker list again before updating this constant-true rising handler's edge \
+                 state, recursively firing the same handler — move the wait into the run body",
                 super::V1Status::SilentlyMisLowers,
             ));
         }
@@ -7203,6 +7225,19 @@ fn block_contains_wait_until(block: &crate::ast::Block, timed: bool) -> bool {
     }
 
     block.stmts.iter().any(|s| stmt_contains(s, timed))
+}
+
+fn block_entry_guarantees_named_wait(block: &crate::ast::Block) -> bool {
+    let Some(first) = block.stmts.first() else {
+        return false;
+    };
+    match &first.kind {
+        StmtKind::Wait { clock: Some(_), .. } => true,
+        StmtKind::If(s) if matches!(&*s.cond.kind, ExprKind::Bool(true)) => {
+            block_entry_guarantees_named_wait(&s.then_block)
+        }
+        _ => false,
+    }
 }
 
 fn entry_has_false_positive_timed_wait(f: &crate::ir::TbFunction) -> bool {

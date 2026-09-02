@@ -10202,6 +10202,15 @@ former `transaction` group lives in
      phases remain conservative. The inventory remains 92 textual matches (91
      constructors plus the helper definition).
 
+218. **Guaranteed nested named-clock handler waits (2026-09-02).**
+
+     A constant-true rising checker handler whose entry control is a literal
+     true branch leading directly to a named-clock wait now reports v1's
+     guaranteed recursion. v1 explicitly runs the checker list after the wait
+     before updating the handler edge cell. Runtime-dependent and false
+     branches remain conservative. The inventory remains 92 textual matches
+     (91 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
