@@ -571,6 +571,10 @@ not applicable before requesting review:
    no-op both backends already emit. The sole enabled declaration is retained
    regardless of source order. Removing the conditional subset constructor
    leaves 93 textual matches (92 constructors plus the helper definition).
+   Component-scope `apply` now shares the measured test/transactor verdict:
+   v1 drops the item without resolving its aspect or changing emitted output.
+   Replacing the stale constructor leaves 92 textual matches (91 constructors
+   plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

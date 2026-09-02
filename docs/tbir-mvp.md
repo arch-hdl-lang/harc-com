@@ -10029,6 +10029,14 @@ former `transaction` group lives in
      diagnostic. This removes the conditional subset constructor and leaves
      93 textual matches (92 constructors plus the helper definition).
 
+202. **Component-scope apply classification (2026-09-01).**
+
+     `apply` in the shared component-schema path now carries the same measured
+     verdict as test and bound-transactor positions: v1 drops the item without
+     resolving the aspect name or changing emitted output. Agent and env
+     controls pin the shared arm byte-for-byte. Replacing the stale constructor
+     leaves 92 textual matches (91 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
