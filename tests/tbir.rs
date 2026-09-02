@@ -28523,14 +28523,13 @@ end impl T"#;
     );
 }
 
-/// A `wait` inside a statement-position `on` body lowers to `tick()`,
-/// and `tick()` runs the checker pass that called the body — unbounded
-/// recursion once the trigger fires. v1 emits the same shape; refuse
-/// rather than reproduce it.
+/// An unqualified cycle `wait` inside a statement-position `on` body becomes
+/// `co_await` in v1's void checker callback, so its generated C++ cannot
+/// compile. Other suspension forms take different paths and remain behind the
+/// conservative shared fence until measured separately.
 #[test]
 fn a_wait_inside_an_on_handler_body_is_rejected() {
-    let err = lower_src(
-        r#"test T
+    let src = r#"test T
     let dut : Top
     run
         on dut.rst == 1
@@ -28539,11 +28538,65 @@ fn a_wait_inside_an_on_handler_body_is_rejected() {
         end on
         wait 2 cycles
     end run
+end test T"#;
+    let err = lower_src(src).expect_err("a suspending handler body must not lower");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("void per-cycle checker callback"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the re-entrant handler");
+    let checker_start = v1
+        .find("_checkers.push_back([&]() {")
+        .expect("v1 registers the statement-position handler in the checker pass");
+    let checker_window = &v1[checker_start..v1.len().min(checker_start + 1200)];
+    assert!(
+        checker_window.contains("co_await harc_rt::wait_cycles"),
+        "v1 emits a coroutine suspension inside the void checker callback: {checker_window}"
+    );
+}
+
+#[test]
+fn other_suspending_on_handler_shapes_remain_conservatively_unsupported() {
+    let cases = [
+        r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on dut.rst == 1
+            wait 1 cycle on aux
+        end on
+        wait 2 cycles
+    end run
 end test T"#,
-    )
-    .expect_err("a suspending handler body must not lower");
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("re-enters that same pass"), "got: {msg}");
+        r#"test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            wait 1ps
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+        r#"function settle(d: Top)
+    d.rst = 0
+    wait 1 cycle
+end function settle
+
+test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            settle(dut)
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+    ];
+    for src in cases {
+        let err = lower_src(src).expect_err("a suspending handler body must not lower");
+        let msg = assert_unsupported(&err);
+        assert!(msg.contains("per-cycle checker pass"), "got: {msg}");
+    }
 }
 
 /// A check body may legitimately read a local of the function that
