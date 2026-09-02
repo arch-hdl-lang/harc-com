@@ -10143,6 +10143,16 @@ former `transaction` group lives in
      inventory remains 92 textual matches (91 constructors plus the helper
      definition).
 
+212. **Nested untimed wait-until in statement-position handlers (2026-09-02).**
+
+     An untimed `wait until` written beneath ordinary control flow in a direct
+     run-body `on` handler reaches the same v1 void callback as a top-level
+     wait. v1 emits the nested `co_await wait_until`, so its generated C++ is
+     uncompilable; TBIR now reports `EmitsUncompilable`. Source-AST traversal
+     deliberately stops at nested handlers and does not confuse helper-inlined
+     waits with direct source. The inventory remains 92 textual matches (91
+     constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
