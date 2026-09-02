@@ -743,7 +743,8 @@ pub(crate) fn lower_component_schema(
     // raw-signal `on <bool-expr>`); a monitor handler synthesizes its
     // `valid && ready` trigger + payload capture in pass 2.
     let mut cycle_asts: Vec<(&crate::ast::OnHandler, Option<String>, Activation)> = Vec::new();
-    // At most one `watchdog` per component (the second is rejected).
+    // At most one enabled `watchdog` per component. Disabled declarations are
+    // semantic no-ops and are ignored regardless of source order.
     let mut watchdog_ast: Option<(&crate::ast::WatchdogDecl, Activation)> = None;
     // An event-driven transactor may carry a module-typed DUT handle field
     // (`dut : AxiLiteRegs`); a Named non-component type is then a DUT
@@ -873,19 +874,17 @@ pub(crate) fn lower_component_schema(
                 // reservation and pass-2 body lowering re-classify identically.
                 ComponentItem::OnHandler(h) => on_asts.push((h, activation)),
                 ComponentItem::Watchdog(w) => {
-                    if let Some(prior_disabled) =
-                        watchdog_ast.as_ref().map(|(prior, _)| prior.disabled)
-                    {
-                        if !prior_disabled && !w.disabled {
-                            return Err(super::not_implemented(
-                                &format!("a second enabled `watchdog` on `{name}`"),
-                                "a component may declare at most one `watchdog`; v1 emits duplicate same-named watchdog lambdas and the generated C++ does not compile",
-                                super::V1Status::EmitsUncompilable,
-                            ));
-                        }
-                        return Err(unsupported(
-                            &format!("a second `watchdog` on `{name}` when either declaration is disabled"),
-                            "a component may declare at most one `watchdog`",
+                    // A disabled declaration is a semantic no-op in both
+                    // backends. Ignore any number of them and retain the sole
+                    // enabled watchdog regardless of source order.
+                    if w.disabled {
+                        continue;
+                    }
+                    if watchdog_ast.is_some() {
+                        return Err(super::not_implemented(
+                            &format!("a second enabled `watchdog` on `{name}`"),
+                            "v1 emits duplicate same-named watchdog lambdas and the generated C++ does not compile",
+                            super::V1Status::EmitsUncompilable,
                         ));
                     }
                     watchdog_ast = Some((w, activation));

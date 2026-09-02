@@ -31299,14 +31299,23 @@ impl T for Tb
     end run
 end impl T"#
         );
-        let err = lower_src(&src).expect_err("duplicate watchdogs remain outside TBIR");
-        let msg = assert_unsupported(&err);
-        assert!(msg.contains("disabled") && msg.contains("watchdog"), "{msg}");
+        let prog = lower_src(&src).expect("disabled watchdog declarations are semantic no-ops");
+        verify::verify_program(&prog).expect("duplicate disabled watchdog IR verifies");
+        let producer = prog
+            .components
+            .iter()
+            .find(|component| component.name == "Producer")
+            .expect("Producer component schema");
+        assert_eq!(
+            producer.watchdog.is_some(),
+            emitted == 1,
+            "TBIR must retain exactly the enabled watchdog"
+        );
         let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits before C++ compilation");
         assert_eq!(
             v1.matches("auto Producer_watchdog =").count(),
             emitted,
-            "disabled watchdogs must not manufacture a duplicate lambda: {v1}"
+            "disabled watchdogs must not manufacture a lambda: {v1}"
         );
     }
 }

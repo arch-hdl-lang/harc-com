@@ -566,6 +566,11 @@ not applicable before requesting review:
    containing `watchdog disabled` retain an honest unsupported verdict because
    v1 skips those declarations. The raw inventory therefore remains 94 textual
    matches (93 constructors plus the helper definition).
+   Duplicate watchdog declarations containing at most one enabled declaration
+   now lower by treating every `watchdog disabled` spelling as the semantic
+   no-op both backends already emit. The sole enabled declaration is retained
+   regardless of source order. Removing the conditional subset constructor
+   leaves 93 textual matches (92 constructors plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
