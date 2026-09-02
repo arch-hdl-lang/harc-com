@@ -10115,8 +10115,8 @@ former `transaction` group lives in
      statement-position `on` handler no longer advertises v1. The legacy
      emitter places `co_await wait_until` inside the handler's void
      checker/service callback, making the generated C++ uncompilable. TBIR
-     reports `EmitsUncompilable` with rewrite guidance. Nested-control,
-     helper-defined, helper-mediated, timed, and wall-time waits retain the
+     reports `EmitsUncompilable` with rewrite guidance. Helper-defined,
+     helper-mediated, timed, and wall-time waits retain the
      shared fallback, so the inventory remains 92 textual matches (91
      constructors plus the helper definition).
 
@@ -10126,8 +10126,8 @@ former `transaction` group lives in
      statement-position `on` handler no longer advertises v1. The legacy
      emitter places `co_await wait_until_timeout` inside the void handler
      callback, so the generated C++ cannot compile. TBIR reports
-     `EmitsUncompilable`; nested-control, helper-defined, and helper-mediated
-     timed waits retain the shared fallback. The inventory remains 92 textual
+     `EmitsUncompilable`; helper-defined and helper-mediated timed waits retain
+     the shared fallback. The inventory remains 92 textual
      matches (91 constructors plus the helper definition).
 
 211. **Synchronous helper waits in boolean handler bodies (2026-09-02).**
@@ -10152,6 +10152,15 @@ former `transaction` group lives in
      deliberately stops at nested handlers and does not confuse helper-inlined
      waits with direct source. The inventory remains 92 textual matches (91
      constructors plus the helper definition).
+
+213. **Nested timed wait-until in statement-position handlers (2026-09-02).**
+
+     The same source-provenance walk now classifies `wait until ... timeout`
+     beneath ordinary control flow in a direct run-body handler. v1 emits
+     `co_await wait_until_timeout` in the void callback, so TBIR reports
+     `EmitsUncompilable`; helper-mediated and nested-handler waits remain
+     distinct. The inventory remains 92 textual matches (91 constructors plus
+     the helper definition).
 
 ## Next steps
 

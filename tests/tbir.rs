@@ -28807,6 +28807,36 @@ end test T"#;
 }
 
 #[test]
+fn a_nested_timed_wait_until_inside_an_on_handler_is_uncompilable_in_v1() {
+    let src = r#"test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            if true
+                wait until dut.count_out == 1 timeout 4 cycles
+            end if
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("a nested timed handler wait-until must be fenced"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("nested inside control flow"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the invalid callback");
+    let checker_start = v1
+        .find("_checkers.push_back([&]() {")
+        .expect("v1 registers the statement-position handler");
+    let checker_window = &v1[checker_start..v1.len().min(checker_start + 2200)];
+    assert!(
+        checker_window.contains("co_await harc_rt::wait_until_timeout(_slot"),
+        "v1 emits the nested timed coroutine await inside the checker callback: {checker_window}"
+    );
+}
+
+#[test]
 fn a_positive_sync_helper_wait_inside_an_on_handler_reports_v1_recursion() {
     let src = r#"function delay_once()
     wait 1 cycle
