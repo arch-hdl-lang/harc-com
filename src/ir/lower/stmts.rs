@@ -5866,21 +5866,40 @@ impl FuncBuilder<'_> {
             self.blocks[self.current].stmts.len(),
         );
         if after != before {
-            let added_sync_wait = matches!(
-                self.blocks[before.0].term,
-                Some(Terminator::WaitCyclesSync(..))
-            ) || self.blocks[before.1..]
-                .iter()
-                .any(|block| matches!(block.term, Some(Terminator::WaitCyclesSync(..))));
+            // A sync-wait terminator somewhere in the inlined CFG does not
+            // prove that v1 calls `tick()`: `wait 0 cycles`, a runtime count,
+            // or a conditional/unreachable wait may execute zero iterations.
+            // Restrict the recursion verdict to the shape that guarantees at
+            // least one tick on every evaluation: the entry block ends in an
+            // unconditional positive-literal synchronous wait.
+            let guaranteed_sync_tick = matches!(
+                &self.blocks[before.0].term,
+                Some(Terminator::WaitCyclesSync(
+                    Expr::Literal { value, .. },
+                    _
+                )) if *value > 0
+            );
             let is_concurrent_check = construct.starts_with("a concurrent ")
                 || construct == "a `cover` witness";
-            if added_sync_wait && is_concurrent_check {
+            if guaranteed_sync_tick && is_concurrent_check {
                 return Err(not_implemented(
                     construct,
                     "v1 evaluates the suspending helper inside the per-cycle checker and its \
                      synchronous `tick()` re-enters that same checker, causing unbounded \
                      recursion when the expression is evaluated — move the helper call out \
                      of the concurrent expression",
+                    V1Status::SilentlyMisLowers,
+                ));
+            }
+            if guaranteed_sync_tick
+                && construct == "a statement-position periodic handler period"
+            {
+                return Err(not_implemented(
+                    construct,
+                    "v1 evaluates the composite period inside the per-cycle checker; its \
+                     inlined helper executes a synchronous `tick()` that re-enters the same \
+                     checker, causing unbounded recursion — bind the helper result before \
+                     registering the handler",
                     V1Status::SilentlyMisLowers,
                 ));
             }

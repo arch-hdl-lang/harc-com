@@ -580,15 +580,20 @@ not applicable before requesting review:
    the generated C++ cannot compile. Named-clock, wall-time, and helper-mediated
    waits retain the shared conservative fallback, leaving 92 textual matches
    (91 constructors plus the helper definition).
-   A synchronous cycle wait introduced by an inlined helper in a concurrent
-   property or cover expression is classified by v1's recursive `tick()`
-   behavior. Other checker contexts and statement-producing expressions retain
-   the shared fallback, so the raw inventory remains 92 textual matches.
+   An unconditional positive-literal synchronous cycle wait introduced by an
+   inlined helper in a concurrent property or cover expression is classified
+   by v1's recursive `tick()` behavior. Zero, runtime-dependent, conditional,
+   and other statement-producing shapes retain the shared fallback, so the raw
+   inventory remains 92 textual matches.
    A bare helper-call period in a statement-position periodic handler is now
    classified by v1's invalid event-subscription emission (`helper.push_back`).
    A same-named event local makes that subscription compile but silently loses
    the period, and receives a separate verdict. This routes around the shared
    fallback and leaves the raw count at 92.
+   Composite periodic expressions that inline an unconditional positive-
+   literal synchronous helper wait now carry v1's recursive-checker verdict.
+   Zero, runtime-dependent, conditional, and other statement-producing
+   expressions retain the shared fallback, leaving the raw count at 92.
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

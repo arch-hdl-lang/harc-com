@@ -10049,14 +10049,16 @@ former `transaction` group lives in
 
 204. **Synchronous helper waits in concurrent checks (2026-09-01).**
 
-     A helper that executes an unqualified cycle wait is inlined into v1's
-     per-cycle checker expression with a synchronous `tick()`. That call runs
+     A helper that unconditionally executes a positive-literal unqualified
+     cycle wait is inlined into v1's per-cycle checker expression with a
+     synchronous `tick()`. That call runs
      the checker pass again, recursively re-entering the expression rather
      than advancing it safely. Concurrent assertions, assumptions, and cover
-     witnesses now report this measured `SilentlyMisLowers` outcome. Other
-     checker contexts, hoisted reads, and ordinary call edges retain the shared
-     conservative fallback, so the raw inventory remains 92 textual matches
-     (91 constructors plus the helper definition).
+     witnesses now report this measured `SilentlyMisLowers` outcome. Zero,
+     runtime-dependent, or conditional waits, other checker contexts, hoisted
+     reads, and ordinary call edges retain the shared conservative fallback,
+     so the raw inventory remains 92 textual matches (91 constructors plus the
+     helper definition).
 
 205. **Bare helper-call periodic periods (2026-09-01).**
 
@@ -10071,6 +10073,18 @@ former `transaction` group lives in
      statement-producing-expression fallback remains for composite periods,
      so the raw inventory stays at 92 textual matches (91 constructors plus
      the helper definition).
+
+206. **Composite suspending-helper periodic periods (2026-09-01).**
+
+     Wrapping a suspending helper call in a composite period expression avoids
+     v1's bare-call event-subscription path, but evaluates the helper inside
+     the periodic checker. When an unconditional positive-literal wait is the
+     helper's entry step, its synchronous `tick()` runs that checker again,
+     recursively re-entering the period expression. TBIR now reports this
+     measured `SilentlyMisLowers` outcome. Zero, runtime-dependent,
+     conditional, and other statement-producing periods retain the shared
+     conservative fallback, so the raw inventory remains 92 textual matches
+     (91 constructors plus the helper definition).
 
 ## Next steps
 
