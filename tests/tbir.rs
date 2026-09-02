@@ -32966,7 +32966,8 @@ end test T"#;
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the re-entrant helper");
     assert!(v1.contains("while (!(false)) tick();"), "{v1}");
-    assert!(v1.contains("settle_until();"), "{v1}");
+    let settle_until = v1_callable_symbol(&v1, "settle_until");
+    assert!(v1.contains(&format!("{settle_until}();")), "{v1}");
 }
 
 #[test]
