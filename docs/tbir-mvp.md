@@ -10037,6 +10037,16 @@ former `transaction` group lives in
      controls pin the shared arm byte-for-byte. Replacing the stale constructor
      leaves 92 textual matches (91 constructors plus the helper definition).
 
+203. **Direct cycle-wait statement-position handler classification (2026-09-01).**
+
+     A direct unqualified cycle `wait` inside a statement-position `on`
+     handler no longer advertises v1. The legacy emitter lowers that wait to
+     `co_await` inside a void `_checkers` callback, so the generated C++ cannot
+     compile. TBIR reports `EmitsUncompilable` with the existing rewrite
+     guidance. Named-clock, wall-time, and helper-mediated waits retain the
+     shared conservative fallback, so the inventory remains 92 textual
+     matches (91 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

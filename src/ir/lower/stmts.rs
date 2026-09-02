@@ -5694,17 +5694,32 @@ impl FuncBuilder<'_> {
             self.ctx.owner,
         )?;
 
-        // The handler runs FROM the per-cycle checker pass, which `tick()`
-        // drives. A `wait` in the body lowers to `tick()`, so the body
-        // would re-enter the checker pass that called it and recurse
-        // until the stack runs out. v1 has the same shape and the same
-        // hazard; refuse rather than reproduce it.
+        // The handler runs from a void per-cycle checker callback. v1 lowers
+        // an unqualified cycle wait to `co_await` inside that callback, which
+        // cannot be a coroutine under its void ABI and therefore does not
+        // compile. Other suspending terminators take different v1 paths; keep
+        // the shared conservative fence below until each one is measured.
+        if f.blocks.iter().any(|b| {
+            matches!(
+                b.terminator,
+                Terminator::WaitCycles(_, None, _)
+            )
+        }) {
+            return Err(super::not_implemented(
+                "an unqualified cycle `wait` inside a statement-position `on` handler body",
+                "the body runs from a void per-cycle checker callback; v1 emits `co_await` \
+                     inside that callback and the generated C++ does not compile — move the \
+                     wait into the run body, or gate the run body on the same condition with \
+                     `wait until`",
+                super::V1Status::EmitsUncompilable,
+            ));
+        }
         if super::function_suspends(&f) {
             return Err(unsupported(
                 "a `wait` inside a statement-position `on` handler body",
-                "the body runs from the per-cycle checker pass, and a wait there re-enters \
-                 that same pass — move the wait into the run body, or gate the run body on \
-                 the same condition with `wait until`",
+                "the body runs from the per-cycle checker pass, and waits are not yet \
+                 represented safely there — move the wait into the run body, or gate the \
+                 run body on the same condition with `wait until`",
             ));
         }
         self.commit_pending_function(pending_id, f);

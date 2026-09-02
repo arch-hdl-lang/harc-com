@@ -575,6 +575,11 @@ not applicable before requesting review:
    v1 drops the item without resolving its aspect or changing emitted output.
    Replacing the stale constructor leaves 92 textual matches (91 constructors
    plus the helper definition).
+   A direct unqualified cycle wait in a statement-position `on` body no longer
+   advertises v1: v1 emits `co_await` inside a void `_checkers` callback, so
+   the generated C++ cannot compile. Named-clock, wall-time, and helper-mediated
+   waits retain the shared conservative fallback, leaving 92 textual matches
+   (91 constructors plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
