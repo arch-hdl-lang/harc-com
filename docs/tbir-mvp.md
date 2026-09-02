@@ -9971,6 +9971,16 @@ former `transaction` group lives in
      reduces the raw inventory to 96 textual matches (95 constructors plus the
      helper definition).
 
+196. **Wide unsized binary literals in general expressions (2026-09-01).**
+
+     Plain `0b...` values above `u64` now lower into the shared LSB-first
+     `WideLiteral` carrier instead of falling through the generic integer
+     diagnostic. Values through 64 bits retain the ordinary scalar path;
+     wider values preserve every high bit in explicitly wide destinations.
+     The generic fallback remains for wide decimal and octal spellings, so
+     the raw inventory remains 96 textual matches (95 constructors plus the
+     helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

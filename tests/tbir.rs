@@ -32995,6 +32995,30 @@ end impl T
 }
 
 #[test]
+fn wide_unsized_binary_literals_lower_in_general_value_positions() {
+    let literal = format!("0b1{}", "0".repeat(64));
+    let src = format!(
+        r#"test T
+    let dut : Top
+    run
+        let value : uint<128> = {literal}
+        assert value == {literal} else fail("wide binary")
+    end run
+end test T"#
+    );
+    let prog = lower_src(&src).expect("an unsized binary value above u64 lowers");
+    verify::verify_program(&prog).expect("wide binary value verifies");
+    assert!(prog.functions.iter().any(|func| func.blocks.iter().any(|block| {
+        block.stmts.iter().any(|stmt| {
+            matches!(stmt, ir::Stmt::Assign(_, ir::Expr::WideLiteral(words)) if words == &[0, 0, 1])
+        })
+    })));
+    let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+        .expect("wide binary value emits");
+    assert!(cpp.contains("(((_harc_u128)0x1ULL << 64) | (_harc_u128)0x0ULL)"));
+}
+
+#[test]
 fn wide_sized_decimal_literals_lower_in_general_value_positions() {
     let src = r#"
 testbench Tb

@@ -543,6 +543,11 @@ not applicable before requesting review:
    them in value position. Removing the stale constructor reduces the raw
    inventory to 96 textual matches (95 constructors plus the helper
    definition).
+   Unsized binary values above `u64` now reuse the wide literal carrier while
+   native-width values retain their scalar representation. Wide decimal and
+   octal spellings still share the generic integer fallback, so the raw
+   inventory remains 96 textual matches (95 constructors plus the helper
+   definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

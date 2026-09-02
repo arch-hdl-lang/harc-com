@@ -1030,6 +1030,9 @@ impl FuncBuilder<'_> {
                 if let Some(words) = parse_wide_hex_literal(s) {
                     return Ok(Expr::WideLiteral(words));
                 }
+                if let Some(words) = parse_wide_binary_literal(s) {
+                    return Ok(Expr::WideLiteral(words));
+                }
                 if let Some(words) = parse_wide_sized_binary_literal(s) {
                     return Ok(Expr::WideLiteral(words));
                 }
@@ -5741,6 +5744,26 @@ pub(crate) fn parse_wide_hex_literal(s: &str) -> Option<Vec<u32>> {
     while remaining > 0 {
         let start = remaining.saturating_sub(8);
         words.push(u32::from_str_radix(&hex[start..remaining], 16).ok()?);
+        remaining = start;
+    }
+    Some(words)
+}
+
+/// Binary counterpart of [`parse_wide_hex_literal`]. Values that fit the
+/// native scalar carrier stay on the ordinary literal path; wider values are
+/// split directly into the wide carrier's LSB-first 32-bit words.
+fn parse_wide_binary_literal(s: &str) -> Option<Vec<u32>> {
+    let t = s.replace('_', "");
+    let digits = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B"))?;
+    let significant = digits.trim_start_matches('0');
+    if significant.len() <= 64 || significant.chars().any(|c| !matches!(c, '0' | '1')) {
+        return None;
+    }
+    let mut words = Vec::with_capacity(significant.len().div_ceil(32));
+    let mut remaining = significant.len();
+    while remaining > 0 {
+        let start = remaining.saturating_sub(32);
+        words.push(u32::from_str_radix(&significant[start..remaining], 2).ok()?);
         remaining = start;
     }
     Some(words)
