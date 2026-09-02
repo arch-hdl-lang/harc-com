@@ -10238,6 +10238,15 @@ former `transaction` group lives in
      runtime-dependent counts remain conservative. The inventory remains 92
      textual matches (91 constructors plus the helper definition).
 
+222. **Unconditional loop paths to named-clock waits (2026-09-02).**
+
+     The guaranteed named-wait proof now enters an unconditional `loop` body,
+     which v1 executes at least once. Only a body-entry path already proven to
+     reach the named-clock wait is classified; conditional paths remain
+     conservative, and source `wait until` failures retain their stronger
+     verdict. The inventory remains 92 textual matches (91 constructors plus
+     the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

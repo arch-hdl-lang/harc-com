@@ -28833,6 +28833,50 @@ end test T"#;
 }
 
 #[test]
+fn an_unconditional_loop_reaches_named_clock_handler_wait() {
+    let src = r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on true
+            loop
+                wait 1 cycle on aux
+            end loop
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("an unconditional loop guarantees its first iteration"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively firing"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive loop body");
+    assert!(v1.contains("while (true)"), "{v1}");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target)"), "{v1}");
+
+    let conditional = src.replace(
+        "                wait 1 cycle on aux\n",
+        "                if dut.rst == 1\n                    wait 1 cycle on aux\n                end if\n",
+    );
+    assert_unsupported(
+        &lower_src(&conditional).expect_err("a conditional loop-entry wait keeps the fallback"),
+    );
+
+    let uncompilable = src.replace(
+        "                wait 1 cycle on aux\n",
+        "                wait 1 cycle on aux\n                wait until false\n",
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&uncompilable).expect_err("wait-until must outrank loop recursion"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("untimed `wait until`"), "got: {msg}");
+}
+
+#[test]
 fn an_untimed_wait_until_inside_an_on_handler_is_uncompilable_in_v1() {
     let src = r#"test T
     let dut : Top
