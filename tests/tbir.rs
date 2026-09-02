@@ -27796,6 +27796,12 @@ end test T"#;
         window.contains("tick();") && v1.contains("!(bool)(settle() == 1)"),
         "the checker calls a helper whose synchronous wait ticks: {window}"
     );
+
+    let zero = src.replace("wait 1 cycle\n    return 1", "wait 0 cycles\n    return 1");
+    let msg = assert_unsupported(
+        &lower_src(&zero).expect_err("a zero-wait helper still needs an unavailable CFG step"),
+    );
+    assert!(msg.contains("statement-level step"), "got: {msg}");
 }
 
 /// `cover` registers a witness counter and reports it at end of test. The
@@ -40799,6 +40805,34 @@ end impl SpTest"#
             && v1.contains("period.push_back([&]"),
         "the local event absorbs the would-be periodic registration: {v1}"
     );
+
+    // Wrapping a suspending helper call in arithmetic avoids v1's mistaken
+    // event-subscription route, but evaluates the helper in the periodic
+    // checker. Its synchronous tick re-enters that checker recursively.
+    let composite = format!(
+        "function settle() -> uint<8>\n    wait 1 cycle\n    return 2\nend function settle\n\n{}",
+        src("settle() + 0", "")
+    );
+    let msg = assert_not_implemented(
+        &lower_src(&composite).expect_err("a suspending composite period must be fenced"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("period") && msg.contains("unbounded recursion"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&composite)).expect("v1 emits the recursive checker");
+    let helper = v1.find("settle = [&]").expect("v1 emits the helper lambda");
+    let helper_window = &v1[helper..v1.len().min(helper + 900)];
+    assert!(helper_window.contains("tick();"), "helper wait is synchronous: {helper_window}");
+    assert!(
+        v1.contains("_period = (int64_t)(settle() + 0)"),
+        "the periodic checker evaluates the helper: {v1}"
+    );
+
+    let zero_composite = composite.replace("wait 1 cycle", "wait 0 cycles");
+    let msg = assert_unsupported(
+        &lower_src(&zero_composite)
+            .expect_err("a zero-wait composite still needs an unavailable CFG step"),
+    );
+    assert!(msg.contains("statement-level step"), "{msg}");
 
     // A non-positive literal remains rejected. v1 emits
     // the handler and its own `period > 0` guard never lets it fire —
