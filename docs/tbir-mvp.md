@@ -10218,8 +10218,17 @@ former `transaction` group lives in
      handler this path necessarily reaches v1's nested checker pass before edge
      state changes,
      so TBIR reports `SilentlyMisLowers`. Missing else blocks and intervening
-     `elsif` arms remain conservative. The inventory remains 92 textual matches
-     (91 constructors plus the helper definition).
+     `elsif` arms remain conservative here; item 220 extends the proof through
+     chains whose conditions are all literal false. The inventory remains 92
+     textual matches (91 constructors plus the helper definition).
+
+220. **All-false elsif paths to named-clock waits (2026-09-02).**
+
+     The guaranteed named-wait proof now crosses an `if` whose condition and
+     every `elsif` condition are literal false, then follows its `else` entry.
+     Runtime-dependent or literal-true `elsif` conditions remain conservative.
+     The inventory remains 92 textual matches (91 constructors plus the helper
+     definition).
 
 ## Next steps
 
