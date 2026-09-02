@@ -28612,9 +28612,9 @@ end test T"#,
         wait 2 cycles
     end run
 end test T"#,
-        r#"function settle(d: Top)
+r#"function settle(d: Top)
     d.rst = 0
-    wait 1 cycle
+    wait 0 cycles
 end function settle
 
 test T
@@ -28773,6 +28773,110 @@ end test T"#;
     assert!(
         checker_window.contains("co_await harc_rt::wait_until_timeout(_slot"),
         "v1 emits a coroutine await inside the checker callback: {checker_window}"
+    );
+}
+
+#[test]
+fn a_positive_sync_helper_wait_inside_an_on_handler_reports_v1_recursion() {
+    let src = r#"function delay_once()
+    wait 1 cycle
+end function delay_once
+
+test T
+    let dut : Top
+    run
+        on true
+            delay_once()
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("a positive synchronous helper wait must be fenced"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("unbounded recursion"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the re-entrant helper call");
+    let helper_start = v1
+        .find("auto delay_once = [&]")
+        .expect("v1 emits the helper as a synchronous lambda");
+    let helper_window = &v1[helper_start..v1.len().min(helper_start + 1000)];
+    assert!(
+        helper_window.contains("for (int _w = 0; _w < 1; _w++) tick();"),
+        "v1 helper synchronously ticks: {helper_window}"
+    );
+    let checker_start = v1
+        .find("_checkers.push_back([&]() {")
+        .expect("v1 registers the boolean handler");
+    let checker_window = &v1[checker_start..v1.len().min(checker_start + 1200)];
+    assert!(
+        checker_window.contains("delay_once()"),
+        "v1 calls the ticking helper before updating trigger state: {checker_window}"
+    );
+
+    let periodic = src.replace("on true", "on 1 cycles");
+    assert_unsupported(
+        &lower_src(&periodic).expect_err("periodic helper waits retain the fallback"),
+    );
+    let post_eval = src.replace("on true", "on true phase post_eval");
+    assert_unsupported(
+        &lower_src(&post_eval).expect_err("post-eval helper waits retain the fallback"),
+    );
+
+    let runtime = r#"function delay_count(n: uint<8>)
+    wait n cycles
+end function delay_count
+
+test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            delay_count(1)
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    assert_unsupported(
+        &lower_src(runtime).expect_err("runtime-count helper waits retain the fallback"),
+    );
+
+    let conditional = r#"function maybe_delay()
+    if false
+        wait 1 cycle
+    end if
+end function maybe_delay
+
+test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            maybe_delay()
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    assert_unsupported(
+        &lower_src(conditional).expect_err("conditional helper waits retain the fallback"),
+    );
+
+    let changed_trigger = r#"function clear_then_delay(d: Top)
+    d.rst = 0
+    wait 1 cycle
+end function clear_then_delay
+
+test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            clear_then_delay(dut)
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    assert_unsupported(
+        &lower_src(changed_trigger)
+            .expect_err("a helper that changes its trigger retains the fallback"),
     );
 }
 
