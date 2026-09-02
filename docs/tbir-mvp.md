@@ -10020,6 +10020,15 @@ former `transaction` group lives in
      honest unsupported verdict and the one-watchdog rule. The raw inventory
      remains 94 textual matches (93 constructors plus the helper definition).
 
+201. **Disabled duplicate component watchdogs (2026-09-01).**
+
+     `watchdog disabled` is now treated as a semantic no-op while component
+     schemas are collected. Any number of disabled declarations may surround
+     the sole enabled watchdog without changing its source-order-independent
+     schema; two enabled watchdogs retain the measured v1-uncompilable
+     diagnostic. This removes the conditional subset constructor and leaves
+     93 textual matches (92 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
