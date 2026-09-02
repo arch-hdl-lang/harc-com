@@ -10011,6 +10011,15 @@ former `transaction` group lives in
      testbench instead of advertising v1. This removes one constructor and
      leaves 94 textual matches (93 constructors plus the helper definition).
 
+200. **Duplicate component watchdog classification (2026-09-01).**
+
+     A second enabled `watchdog` on one component no longer advertises v1. The
+     legacy emitter writes two same-named watchdog lambda declarations, so its
+     C++ cannot compile; TBIR reports `EmitsUncompilable`. If either declaration
+     is `watchdog disabled`, v1 skips it, so those combinations retain the
+     honest unsupported verdict and the one-watchdog rule. The raw inventory
+     remains 94 textual matches (93 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

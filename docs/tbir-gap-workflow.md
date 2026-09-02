@@ -561,6 +561,11 @@ not applicable before requesting review:
    `connect` block like every other transactor path: v1 drops it byte-for-byte,
    so it is `SilentlyMisLowers`, not a TBIR gap with a v1 escape hatch. This
    leaves 94 textual matches (93 constructors plus the helper definition).
+   A second enabled component watchdog now records v1's actual outcome: two
+   same-named lambda declarations and uncompilable generated C++. Combinations
+   containing `watchdog disabled` retain an honest unsupported verdict because
+   v1 skips those declarations. The raw inventory therefore remains 94 textual
+   matches (93 constructors plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
