@@ -28570,20 +28570,44 @@ fn other_suspending_on_handler_shapes_remain_conservatively_unsupported() {
     let cases = [
         r#"test T
     let dut : Top
-    clock clk = 10ns
-    clock aux = 4ns
     run
         on dut.rst == 1
-            wait 1 cycle on aux
+            wait 1ps
         end on
         wait 2 cycles
     end run
 end test T"#,
         r#"test T
     let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
     run
         on dut.rst == 1
-            wait 1ps
+            if false
+                wait 1 cycle on aux
+            end if
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+        r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on dut.rst == 1 phase post_eval
+            wait 0 cycles on aux
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+        r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on 1 cycles
+            wait 0 cycles on aux
         end on
         wait 2 cycles
     end run
@@ -28608,6 +28632,40 @@ end test T"#,
         let msg = assert_unsupported(&err);
         assert!(msg.contains("per-cycle checker pass"), "got: {msg}");
     }
+}
+
+#[test]
+fn a_named_clock_wait_inside_an_on_handler_reports_v1_recursion() {
+    let src = r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on dut.rst == 1
+            wait 1 cycle on aux
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("a named-clock handler wait must be fenced"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively re-entering"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the re-entrant handler");
+    let checker_start = v1
+        .find("_checkers.push_back([&]() {")
+        .expect("v1 registers the statement-position handler in the checker pass");
+    let checker_window = &v1[checker_start..v1.len().min(checker_start + 1800)];
+    assert!(
+        checker_window.contains("while (clocks_[1].rising_count < _target)"),
+        "v1 emits the named-clock wait inside the checker: {checker_window}"
+    );
+    assert!(
+        checker_window.contains("for (auto& _c : _checkers) _c();"),
+        "v1 re-enters the checker list after the wait: {checker_window}"
+    );
 }
 
 #[test]
