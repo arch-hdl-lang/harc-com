@@ -7249,6 +7249,7 @@ fn block_entry_guarantees_named_wait(block: &crate::ast::Block) -> bool {
         StmtKind::Repeat(s) if positive_int_literal(&s.count) => {
             block_entry_guarantees_named_wait(&s.body)
         }
+        StmtKind::Loop(body) => block_entry_guarantees_named_wait(body),
         _ => false,
     }
 }
