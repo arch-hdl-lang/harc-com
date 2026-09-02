@@ -31804,6 +31804,14 @@ end test T"#;
         "got: {msg}"
     );
 
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive checker");
+    let helper = v1.find("settle = [&]").expect("v1 emits the helper lambda");
+    let window = &v1[helper..v1.len().min(helper + 900)];
+    assert!(
+        window.contains("tick();") && v1.contains("!(bool)(settle() == 1)"),
+        "the checker calls a helper whose synchronous wait ticks: {window}"
+    );
+
     let zero = src.replace("wait 1 cycle\n    return 1", "wait 0 cycles\n    return 1");
     let msg = assert_unsupported(
         &lower_src(&zero).expect_err("a zero-wait helper still needs an unavailable CFG step"),
@@ -32544,8 +32552,7 @@ end impl T"#;
 /// rather than a backend fallback.
 #[test]
 fn a_wait_inside_an_on_handler_body_is_rejected() {
-    let err = lower_src(
-        r#"test T
+    let src = r#"test T
     let dut : Top
     run
         on dut.rst == 1
@@ -32554,16 +32561,373 @@ fn a_wait_inside_an_on_handler_body_is_rejected() {
         end on
         wait 2 cycles
     end run
-end test T"#,
-    )
-    .expect_err("a suspending handler body must not lower");
-    assert!(matches!(err, lower::LowerError::Invalid(_)), "{err:?}");
-    let msg = err.to_string();
+end test T"#;
+    let err = lower_src(src).expect_err("a suspending handler body must not lower");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("void per-cycle checker callback"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the re-entrant handler");
+    let checker_start = v1
+        .find("_checkers.push_back([&]() {")
+        .expect("v1 registers the statement-position handler in the checker pass");
+    let checker_window = &v1[checker_start..v1.len().min(checker_start + 1200)];
     assert!(
-        msg.contains("statement-position cycle handler"),
-        "got: {msg}"
+        checker_window.contains("co_await harc_rt::wait_cycles"),
+        "v1 emits a coroutine suspension inside the void checker callback: {checker_window}"
     );
-    assert!(msg.contains("must complete without waiting"), "got: {msg}");
+}
+
+#[test]
+fn other_suspending_on_handler_shapes_remain_conservatively_unsupported() {
+    let cases = [
+        r#"test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            wait 1ps
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+        r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on dut.rst == 1
+            if false
+                wait 1 cycle on aux
+            end if
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+        r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on dut.rst == 1 phase post_eval
+            wait 0 cycles on aux
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+        r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on 1 cycles
+            wait 0 cycles on aux
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+r#"function settle(d: Top)
+    d.rst = 0
+    wait 0 cycles
+end function settle
+
+test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            settle(dut)
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+        r#"function settle_until()
+    wait until false
+end function settle_until
+
+test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            settle_until()
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+        r#"function install()
+    on true
+        wait until false
+    end on
+end function install
+
+test T
+    let dut : Top
+    run
+        install()
+        wait 2 cycles
+    end run
+end test T"#,
+        r#"function settle_until_timeout()
+    wait until false timeout 1 cycles
+end function settle_until_timeout
+
+test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            settle_until_timeout()
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+        r#"function install_timeout()
+    on true
+        wait until false timeout 1 cycles
+    end on
+end function install_timeout
+
+test T
+    let dut : Top
+    run
+        install_timeout()
+        wait 2 cycles
+    end run
+end test T"#,
+    ];
+    for src in cases {
+        let err = lower_src(src).expect_err("a suspending handler body must not lower");
+        let msg = assert_unsupported(&err);
+        assert!(msg.contains("per-cycle checker pass"), "got: {msg}");
+    }
+}
+
+#[test]
+fn a_named_clock_wait_inside_an_on_handler_reports_v1_recursion() {
+    let src = r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on dut.rst == 1
+            wait 1 cycle on aux
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("a named-clock handler wait must be fenced"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively re-entering"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the re-entrant handler");
+    let checker_start = v1
+        .find("_checkers.push_back([&]() {")
+        .expect("v1 registers the statement-position handler in the checker pass");
+    let checker_window = &v1[checker_start..v1.len().min(checker_start + 1800)];
+    assert!(
+        checker_window.contains("while (clocks_[1].rising_count < _target)"),
+        "v1 emits the named-clock wait inside the checker: {checker_window}"
+    );
+    assert!(
+        checker_window.contains("for (auto& _c : _checkers) _c();"),
+        "v1 re-enters the checker list after the wait: {checker_window}"
+    );
+}
+
+#[test]
+fn an_untimed_wait_until_inside_an_on_handler_is_uncompilable_in_v1() {
+    let src = r#"test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            wait until dut.count_out == 1
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("an untimed handler wait-until must be fenced"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("void checker/service callback"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the invalid callback");
+    let checker_start = v1
+        .find("_checkers.push_back([&]() {")
+        .expect("v1 registers the statement-position handler");
+    let checker_window = &v1[checker_start..v1.len().min(checker_start + 1400)];
+    assert!(
+        checker_window.contains("co_await harc_rt::wait_until(_slot"),
+        "v1 emits a coroutine await inside the checker callback: {checker_window}"
+    );
+}
+
+#[test]
+fn a_timed_wait_until_inside_an_on_handler_is_uncompilable_in_v1() {
+    let src = r#"test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            wait until dut.count_out == 1 timeout 4 cycles
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("a timed handler wait-until must be fenced"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("void checker/service callback"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the invalid callback");
+    let checker_start = v1
+        .find("_checkers.push_back([&]() {")
+        .expect("v1 registers the statement-position handler");
+    let checker_window = &v1[checker_start..v1.len().min(checker_start + 1800)];
+    assert!(
+        checker_window.contains("co_await harc_rt::wait_until_timeout(_slot"),
+        "v1 emits a coroutine await inside the checker callback: {checker_window}"
+    );
+}
+
+#[test]
+fn a_positive_sync_helper_wait_inside_an_on_handler_reports_v1_recursion() {
+    let src = r#"function delay_once()
+    wait 1 cycle
+end function delay_once
+
+test T
+    let dut : Top
+    run
+        on true
+            delay_once()
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("a positive synchronous helper wait must be fenced"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("unbounded recursion"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the re-entrant helper call");
+    let helper_start = v1
+        .find("auto delay_once = [&]")
+        .expect("v1 emits the helper as a synchronous lambda");
+    let helper_window = &v1[helper_start..v1.len().min(helper_start + 1000)];
+    assert!(
+        helper_window.contains("for (int _w = 0; _w < 1; _w++) tick();"),
+        "v1 helper synchronously ticks: {helper_window}"
+    );
+    let checker_start = v1
+        .find("_checkers.push_back([&]() {")
+        .expect("v1 registers the boolean handler");
+    let checker_window = &v1[checker_start..v1.len().min(checker_start + 1200)];
+    assert!(
+        checker_window.contains("delay_once()"),
+        "v1 calls the ticking helper before updating trigger state: {checker_window}"
+    );
+
+    let periodic = src.replace("on true", "on 1 cycles");
+    assert_unsupported(
+        &lower_src(&periodic).expect_err("periodic helper waits retain the fallback"),
+    );
+    let post_eval = src.replace("on true", "on true phase post_eval");
+    assert_unsupported(
+        &lower_src(&post_eval).expect_err("post-eval helper waits retain the fallback"),
+    );
+
+    let runtime = r#"function delay_count(n: uint<8>)
+    wait n cycles
+end function delay_count
+
+test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            delay_count(1)
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    assert_unsupported(
+        &lower_src(runtime).expect_err("runtime-count helper waits retain the fallback"),
+    );
+
+    let conditional = r#"function maybe_delay()
+    if false
+        wait 1 cycle
+    end if
+end function maybe_delay
+
+test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            maybe_delay()
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    assert_unsupported(
+        &lower_src(conditional).expect_err("conditional helper waits retain the fallback"),
+    );
+
+    let changed_trigger = r#"function clear_then_delay(d: Top)
+    d.rst = 0
+    wait 1 cycle
+end function clear_then_delay
+
+test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            clear_then_delay(dut)
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    assert_unsupported(
+        &lower_src(changed_trigger)
+            .expect_err("a helper that changes its trigger retains the fallback"),
+    );
+}
+
+#[test]
+fn a_composite_suspending_on_trigger_reports_v1_recursion() {
+    let src = r#"function settle() -> uint<8>
+    wait 1 cycle
+    return 1
+end function settle
+
+test T
+    let dut : Top
+    run
+        on settle() > 0
+            log(info, "fired")
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("a suspending trigger must be fenced"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("trigger") && msg.contains("unbounded recursion"), "{msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive trigger");
+    let helper = v1.find("settle = [&]").expect("v1 emits the helper lambda");
+    let helper_window = &v1[helper..v1.len().min(helper + 900)];
+    assert!(helper_window.contains("tick();"), "helper wait is synchronous: {helper_window}");
+    assert!(
+        v1.contains("_curr = (bool)(settle() > 0);"),
+        "the checker evaluates the helper trigger: {v1}"
+    );
+
+    let zero = src.replace("wait 1 cycle", "wait 0 cycles");
+    let msg = assert_unsupported(
+        &lower_src(&zero).expect_err("a zero-wait trigger still needs an unavailable CFG step"),
+    );
+    assert!(msg.contains("statement-level step"), "{msg}");
 }
 
 #[test]
@@ -45508,6 +45872,18 @@ end impl SpTest"#
         msg.contains("period") && msg.contains("unbounded recursion"),
         "{msg}"
     );
+    let v1 = cpp_tb::emit(&merged_src(&composite)).expect("v1 emits the recursive checker");
+    let helper = v1.find("settle = [&]").expect("v1 emits the helper lambda");
+    let helper_window = &v1[helper..v1.len().min(helper + 900)];
+    assert!(
+        helper_window.contains("tick();"),
+        "helper wait is synchronous: {helper_window}"
+    );
+    assert!(
+        v1.contains("_period = (int64_t)(settle() + 0)"),
+        "the periodic checker evaluates the helper: {v1}"
+    );
+
     let zero_composite = composite.replace("wait 1 cycle", "wait 0 cycles");
     let msg = assert_unsupported(
         &lower_src(&zero_composite)

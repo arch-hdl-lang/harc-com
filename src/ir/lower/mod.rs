@@ -8579,6 +8579,22 @@ pub(crate) fn placeholder_function(id: FunctionId) -> TbFunction {
     }
 }
 
+/// Whether any block of `f` ends in a terminator that advances simulated
+/// time. Used to keep a suspending body out of a context that cannot
+/// suspend (a per-cycle checker closure).
+pub(crate) fn function_suspends(f: &TbFunction) -> bool {
+    f.blocks.iter().any(|b| {
+        matches!(
+            b.terminator,
+            Terminator::WaitCycles(..)
+                | Terminator::WaitCyclesSync(..)
+                | Terminator::WaitUntil { .. }
+                | Terminator::WaitUntilTimeout { .. }
+                | Terminator::WaitTimePs(..)
+        )
+    })
+}
+
 pub(crate) fn reserve_tb_record_names(b: &mut FuncBuilder<'_>, ctx: &LowerCtx) {
     for (name, _) in &ctx.tb_record_fields {
         b.reserve_local_name(name);

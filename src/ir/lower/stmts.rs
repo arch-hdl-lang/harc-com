@@ -5514,6 +5514,28 @@ impl FuncBuilder<'_> {
     /// hook vectors the component path owns, and event subscriptions
     /// (`on <ev>(arg)`) need a subscriber list on a component field.
     fn lower_on_handler(&mut self, h: &crate::ast::OnHandler) -> Result<(), LowerError> {
+        // Preserve the source/emission distinction that TBIR helper inlining
+        // otherwise erases. v1 emits a top-level wait written directly in a
+        // run-body handler under coroutine mode. A handler defined inside a
+        // helper, or a helper-mediated wait in the handler body, is emitted
+        // through an ordinary synchronous lambda instead.
+        let direct_coroutine_untimed_wait_until = self.inline_frames.is_empty()
+            && h.body.stmts.iter().any(|s| {
+                matches!(
+                    &s.kind,
+                    StmtKind::WaitUntil { timeout: None, .. }
+                )
+            });
+        let direct_coroutine_timed_wait_until = self.inline_frames.is_empty()
+            && h.body.stmts.iter().any(|s| {
+                matches!(
+                    &s.kind,
+                    StmtKind::WaitUntil {
+                        timeout: Some(_),
+                        ..
+                    }
+                )
+            });
         use crate::ir::{CycleHandlerKind, CycleHandlerSchema};
         self.require_test_body("an `on ... end on` handler")?;
         if h.hook.is_some() {
@@ -5750,6 +5772,98 @@ impl FuncBuilder<'_> {
             self.ctx.owner,
         )?;
 
+        // The handler runs from a void per-cycle checker callback. v1 lowers
+        // an unqualified cycle wait to `co_await` inside that callback, which
+        // cannot be a coroutine under its void ABI and therefore does not
+        // compile. A named-clock wait takes a different broken path: v1 emits
+        // an explicit checker pass after the wait, recursively invoking this
+        // same handler while it is already running.
+        if f.blocks.iter().any(|b| {
+            matches!(
+                b.terminator,
+                Terminator::WaitCycles(_, None, _)
+            )
+        }) {
+            return Err(super::not_implemented(
+                "an unqualified cycle `wait` inside a statement-position `on` handler body",
+                "the body runs from a void per-cycle checker callback; v1 emits `co_await` \
+                     inside that callback and the generated C++ does not compile — move the \
+                     wait into the run body, or gate the run body on the same condition with \
+                     `wait until`",
+                super::V1Status::EmitsUncompilable,
+            ));
+        }
+        // This recursion proof is deliberately narrow. The entry terminator
+        // makes the named wait unconditional; a checker-phase boolean handler
+        // has not updated its edge state before running the body, so the
+        // nested checker pass fires the same handler again. Periodic handlers
+        // update their last-fired stamp first, and post-eval handlers live in
+        // a different service vector, so those shapes retain the fallback.
+        let guaranteed_reentrant_named_wait = !h.periodic
+            && matches!(h.phase, crate::ast::OnPhase::Checker)
+            && matches!(
+                &f.blocks[f.entry.index()].terminator,
+                Terminator::WaitCycles(_, Some(_), _)
+            );
+        if guaranteed_reentrant_named_wait {
+            return Err(super::not_implemented(
+                "a named-clock `wait` inside a statement-position `on` handler body",
+                "v1 runs the body from a per-cycle checker and emits another complete checker \
+                 pass after the named-clock wait, recursively re-entering the same handler — \
+                 move the wait into the run body, or gate the run body on the same condition \
+                 with `wait until`",
+                super::V1Status::SilentlyMisLowers,
+            ));
+        }
+        if direct_coroutine_untimed_wait_until {
+            return Err(super::not_implemented(
+                "an untimed `wait until` inside a statement-position `on` handler body",
+                "the body runs from a void checker/service callback; v1 emits a coroutine \
+                 `co_await wait_until` inside that callback and the generated C++ does not \
+                 compile — move the wait into the run body, or gate the run body on the same \
+                 condition",
+                super::V1Status::EmitsUncompilable,
+            ));
+        }
+        if direct_coroutine_timed_wait_until {
+            return Err(super::not_implemented(
+                "a timed `wait until` inside a statement-position `on` handler body",
+                "the body runs from a void checker/service callback; v1 emits a coroutine \
+                 `co_await wait_until_timeout` inside that callback and the generated C++ \
+                 does not compile — move the wait into the run body, or gate the run body \
+                 on the same condition",
+                super::V1Status::EmitsUncompilable,
+            ));
+        }
+        let guaranteed_reentrant_helper_wait = !h.periodic
+            && matches!(h.phase, crate::ast::OnPhase::Checker)
+            && matches!(h.edge, crate::ast::EdgeMode::Rising)
+            && matches!(&*h.event.kind, ExprKind::Bool(true))
+            && matches!(
+                &f.blocks[f.entry.index()].terminator,
+                Terminator::WaitCyclesSync(
+                    Expr::Literal { value, .. },
+                    _
+                ) if *value > 0
+            );
+        if guaranteed_reentrant_helper_wait {
+            return Err(super::not_implemented(
+                "a synchronously suspending helper inside a statement-position `on` handler body",
+                "v1 calls the helper from a per-cycle checker; its positive synchronous \
+                 `tick()` re-enters the same boolean trigger before the trigger state is \
+                 updated, causing unbounded recursion — move the helper call into the run \
+                 body, or gate the run body on the same condition",
+                super::V1Status::SilentlyMisLowers,
+            ));
+        }
+        if super::function_suspends(&f) {
+            return Err(unsupported(
+                "a `wait` inside a statement-position `on` handler body",
+                "the body runs from the per-cycle checker pass, and waits are not yet \
+                 represented safely there — move the wait into the run body, or gate the \
+                 run body on the same condition with `wait until`",
+            ));
+        }
         self.commit_pending_function(pending_id, f);
         let id = {
             let mut tables = self.side_tables.borrow_mut();
@@ -5898,6 +6012,16 @@ impl FuncBuilder<'_> {
                 return Err(not_implemented(
                     construct,
                     "v1 evaluates the composite period inside the per-cycle checker; its \
+                     inlined helper executes a synchronous `tick()` that re-enters the same \
+                     checker, causing unbounded recursion — bind the helper result before \
+                     registering the handler",
+                    V1Status::SilentlyMisLowers,
+                ));
+            }
+            if guaranteed_sync_tick && construct == "an `on <bool-expr>` trigger" {
+                return Err(not_implemented(
+                    construct,
+                    "v1 evaluates the composite trigger inside the per-cycle checker; its \
                      inlined helper executes a synchronous `tick()` that re-enters the same \
                      checker, causing unbounded recursion — bind the helper result before \
                      registering the handler",

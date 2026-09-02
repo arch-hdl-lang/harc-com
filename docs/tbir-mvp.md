@@ -10086,6 +10086,63 @@ former `transaction` group lives in
      conservative fallback, so the raw inventory remains 92 textual matches
      (91 constructors plus the helper definition).
 
+207. **Composite suspending-helper boolean triggers (2026-09-02).**
+
+     A statement-position `on <bool-expr>` trigger is evaluated in v1's
+     per-cycle checker. When its composite expression inlines a helper whose
+     entry step is an unconditional positive-literal synchronous wait, that
+     helper calls `tick()` and recursively re-enters the same trigger. TBIR now
+     reports the measured `SilentlyMisLowers` outcome. Zero,
+     runtime-dependent, conditional, and other statement-producing trigger
+     shapes retain the conservative fallback, so the inventory remains 92
+     textual matches (91 constructors plus the helper definition).
+
+208. **Named-clock waits in statement-position handlers (2026-09-02).**
+
+     A named-clock `wait` in a statement-position `on` handler runs inside
+     v1's per-cycle checker callback. After advancing the selected clock, v1
+     unconditionally invokes the full checker list before the boolean
+     trigger's edge state is updated, recursively entering the same handler
+     before its first invocation returns. TBIR now reports this measured
+     `SilentlyMisLowers` outcome for an unconditional entry wait in the
+     checker phase. Conditional, periodic, post-eval, wall-time, and
+     helper-mediated waits retain the conservative fallback, so the inventory
+     remains 92 textual matches (91 constructors plus the helper definition).
+
+209. **Untimed wait-until in statement-position handlers (2026-09-02).**
+
+     A top-level untimed `wait until` written directly in a run-body
+     statement-position `on` handler no longer advertises v1. The legacy
+     emitter places `co_await wait_until` inside the handler's void
+     checker/service callback, making the generated C++ uncompilable. TBIR
+     reports `EmitsUncompilable` with rewrite guidance. Nested-control,
+     helper-defined, helper-mediated, timed, and wall-time waits retain the
+     shared fallback, so the inventory remains 92 textual matches (91
+     constructors plus the helper definition).
+
+210. **Timed wait-until in statement-position handlers (2026-09-02).**
+
+     A top-level `wait until ... timeout` written directly in a run-body
+     statement-position `on` handler no longer advertises v1. The legacy
+     emitter places `co_await wait_until_timeout` inside the void handler
+     callback, so the generated C++ cannot compile. TBIR reports
+     `EmitsUncompilable`; nested-control, helper-defined, and helper-mediated
+     timed waits retain the shared fallback. The inventory remains 92 textual
+     matches (91 constructors plus the helper definition).
+
+211. **Synchronous helper waits in boolean handler bodies (2026-09-02).**
+
+     A checker-phase constant-true rising handler whose entry path calls a
+     helper with an unconditional positive-literal cycle wait no longer
+     advertises v1. The helper's synchronous `tick()` traverses `_checkers`
+     again before v1 updates the trigger's edge state, so the still-true edge
+     recursively fires the same handler. TBIR reports this measured
+     `SilentlyMisLowers` outcome. DUT-dependent triggers (including helpers
+     that change their trigger), zero, runtime-dependent, conditional,
+     periodic, and post-eval shapes retain the shared fallback, so the
+     inventory remains 92 textual matches (91 constructors plus the helper
+     definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
