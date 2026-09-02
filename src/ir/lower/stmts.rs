@@ -5510,6 +5510,16 @@ impl FuncBuilder<'_> {
                     StmtKind::WaitUntil { timeout: None, .. }
                 )
             });
+        let direct_coroutine_timed_wait_until = self.inline_frames.is_empty()
+            && h.body.stmts.iter().any(|s| {
+                matches!(
+                    &s.kind,
+                    StmtKind::WaitUntil {
+                        timeout: Some(_),
+                        ..
+                    }
+                )
+            });
         use crate::ir::{CycleHandlerKind, CycleHandlerSchema};
         self.require_test_body("an `on ... end on` handler")?;
         if h.hook.is_some() {
@@ -5791,6 +5801,16 @@ impl FuncBuilder<'_> {
                  `co_await wait_until` inside that callback and the generated C++ does not \
                  compile — move the wait into the run body, or gate the run body on the same \
                  condition",
+                super::V1Status::EmitsUncompilable,
+            ));
+        }
+        if direct_coroutine_timed_wait_until {
+            return Err(super::not_implemented(
+                "a timed `wait until` inside a statement-position `on` handler body",
+                "the body runs from a void checker/service callback; v1 emits a coroutine \
+                 `co_await wait_until_timeout` inside that callback and the generated C++ \
+                 does not compile — move the wait into the run body, or gate the run body \
+                 on the same condition",
                 super::V1Status::EmitsUncompilable,
             ));
         }
