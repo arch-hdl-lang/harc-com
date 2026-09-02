@@ -3105,7 +3105,8 @@ end test SourceEnvTest
 /// `connect` belongs to env/agent/testbench composition. The component
 /// lowering route for analysis-source transactors must reject an active-only
 /// declaration instead of silently dropping it while collecting the ordinary
-/// and `when active` surfaces.
+/// and `when active` surfaces. v1 drops this declaration too, so the
+/// diagnostic must not advertise it as an escape hatch.
 #[test]
 fn analysis_source_transactor_active_connect_is_rejected() {
     let src = r#"
@@ -3121,7 +3122,7 @@ end transactor Relay
 
 testbench RelayTb
     dut : Top
-    relay : Relay passive
+    relay : Relay active
 end testbench RelayTb
 
 impl RelayTest for RelayTb
@@ -3131,10 +3132,21 @@ impl RelayTest for RelayTb
 end impl RelayTest
 "#;
     let err = lower_src(src).expect_err("active transactor connects cannot be silently dropped");
-    let msg = assert_unsupported(&err);
+    let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
     assert!(
         msg.contains("when active") && msg.contains("connect") && msg.contains("Relay"),
         "{msg}"
+    );
+    assert!(msg.contains("emits nothing"), "{msg}");
+
+    let without = src.replace(
+        "        connect\n            ignored.observed -> ignored.accept\n        end connect\n",
+        "",
+    );
+    assert_eq!(
+        cpp_tb::emit(&merged_src(src)).expect("v1 emits the connect spelling"),
+        cpp_tb::emit(&merged_src(&without)).expect("v1 emits the control"),
+        "v1 drops the analysis-source connect block byte-for-byte"
     );
 }
 

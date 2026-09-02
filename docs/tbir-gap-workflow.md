@@ -557,6 +557,10 @@ not applicable before requesting review:
    generic literal catch-all is now an `Invalid` malformed-AST invariant.
    Octal remains outside the source language. Removing that constructor leaves
    95 textual matches (94 constructors plus the helper definition).
+   The component-only analysis-source transactor path now classifies its
+   `connect` block like every other transactor path: v1 drops it byte-for-byte,
+   so it is `SilentlyMisLowers`, not a TBIR gap with a v1 escape hatch. This
+   leaves 94 textual matches (93 constructors plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
