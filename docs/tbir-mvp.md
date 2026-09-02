@@ -10226,9 +10226,10 @@ former `transaction` group lives in
 
      The guaranteed named-wait proof now crosses an `if` whose condition and
      every `elsif` condition are literal false, then follows its `else` entry.
-     Runtime-dependent or literal-true `elsif` conditions remain conservative.
-     The inventory remains 92 textual matches (91 constructors plus the helper
-     definition).
+     Runtime-dependent or literal-true `elsif` conditions remain conservative
+     for this all-false-to-else proof; item 224 follows a first reachable
+     literal-true arm. The inventory remains 92 textual matches (91
+     constructors plus the helper definition).
 
 221. **Positive literal repeat paths to named-clock waits (2026-09-02).**
 
@@ -10254,6 +10255,14 @@ former `transaction` group lives in
      parentheses while leaving runtime and foldable-but-not-literal conditions
      conservative. The inventory remains 92 textual matches (91 constructors
      plus the helper definition).
+
+224. **Literal-true elsif paths to named-clock waits (2026-09-02).**
+
+     After a literal-false `if` and any literal-false `elsif` arms, the
+     guaranteed named-wait proof now follows the first literal-true `elsif`
+     body. A runtime-dependent condition before that arm remains conservative.
+     The inventory remains 92 textual matches (91 constructors plus the helper
+     definition).
 
 ## Next steps
 
