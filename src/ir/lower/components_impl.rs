@@ -847,9 +847,10 @@ pub(crate) fn lower_component_schema(
                     } else {
                         ""
                     };
-                    return Err(unsupported(
+                    return Err(super::not_implemented(
                         &format!("a `connect` declaration{placement} on transactor `{name}`"),
-                        "connect declarations are supported on env, agent, and testbench composition, not on analysis-source transactors",
+                        "v1 emits nothing for analysis-source transactor connect blocks; wire the endpoints from an env, agent, or testbench instead",
+                        super::V1Status::SilentlyMisLowers,
                     ));
                 }
                 // Testbench lifecycle blocks are parser-restricted already;

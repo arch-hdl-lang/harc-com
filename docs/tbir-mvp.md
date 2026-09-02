@@ -10002,6 +10002,15 @@ former `transaction` group lives in
      the raw inventory to 95 textual matches (94 constructors plus the helper
      definition).
 
+199. **Analysis-source transactor connect classification (2026-09-01).**
+
+     A `connect` inside the component-only analysis-source transactor path now
+     carries the same measured verdict as every other transactor-owned
+     connect: v1 drops the block byte-for-byte. TBIR therefore reports
+     `SilentlyMisLowers` and directs the edge to an owning env, agent, or
+     testbench instead of advertising v1. This removes one constructor and
+     leaves 94 textual matches (93 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
