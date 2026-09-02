@@ -10130,6 +10130,19 @@ former `transaction` group lives in
      timed waits retain the shared fallback. The inventory remains 92 textual
      matches (91 constructors plus the helper definition).
 
+211. **Synchronous helper waits in boolean handler bodies (2026-09-02).**
+
+     A checker-phase constant-true rising handler whose entry path calls a
+     helper with an unconditional positive-literal cycle wait no longer
+     advertises v1. The helper's synchronous `tick()` traverses `_checkers`
+     again before v1 updates the trigger's edge state, so the still-true edge
+     recursively fires the same handler. TBIR reports this measured
+     `SilentlyMisLowers` outcome. DUT-dependent triggers (including helpers
+     that change their trigger), zero, runtime-dependent, conditional,
+     periodic, and post-eval shapes retain the shared fallback, so the
+     inventory remains 92 textual matches (91 constructors plus the helper
+     definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

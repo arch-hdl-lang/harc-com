@@ -5814,6 +5814,27 @@ impl FuncBuilder<'_> {
                 super::V1Status::EmitsUncompilable,
             ));
         }
+        let guaranteed_reentrant_helper_wait = !h.periodic
+            && matches!(h.phase, crate::ast::OnPhase::Checker)
+            && matches!(h.edge, crate::ast::EdgeMode::Rising)
+            && matches!(&*h.event.kind, ExprKind::Bool(true))
+            && matches!(
+                &f.blocks[f.entry.index()].terminator,
+                Terminator::WaitCyclesSync(
+                    Expr::Literal { value, .. },
+                    _
+                ) if *value > 0
+            );
+        if guaranteed_reentrant_helper_wait {
+            return Err(super::not_implemented(
+                "a synchronously suspending helper inside a statement-position `on` handler body",
+                "v1 calls the helper from a per-cycle checker; its positive synchronous \
+                 `tick()` re-enters the same boolean trigger before the trigger state is \
+                 updated, causing unbounded recursion — move the helper call into the run \
+                 body, or gate the run body on the same condition",
+                super::V1Status::SilentlyMisLowers,
+            ));
+        }
         if super::function_suspends(&f) {
             return Err(unsupported(
                 "a `wait` inside a statement-position `on` handler body",
