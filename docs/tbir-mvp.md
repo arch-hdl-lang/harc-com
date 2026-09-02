@@ -10115,8 +10115,8 @@ former `transaction` group lives in
      statement-position `on` handler no longer advertises v1. The legacy
      emitter places `co_await wait_until` inside the handler's void
      checker/service callback, making the generated C++ uncompilable. TBIR
-     reports `EmitsUncompilable` with rewrite guidance. Helper-defined,
-     helper-mediated, timed, and wall-time waits retain the
+     reports `EmitsUncompilable` with rewrite guidance. Other helper-defined
+     and helper-mediated shapes, timed waits, and wall-time waits retain the
      shared fallback, so the inventory remains 92 textual matches (91
      constructors plus the helper definition).
 
@@ -10181,6 +10181,16 @@ former `transaction` group lives in
      `SilentlyMisLowers`. Zero/runtime budgets and conditional waits remain
      conservative. The inventory remains 92 textual matches (91 constructors
      plus the helper definition).
+
+216. **Untimed waits in helper-defined boolean handlers (2026-09-02).**
+
+     A helper that installs a constant-true rising handler containing an
+     unconditional `wait until false` now reports its guaranteed v1 recursion.
+     The helper-defined callback is synchronous, so its polling `tick()` fires
+     the handler again before edge state changes. TBIR reports
+     `SilentlyMisLowers`; direct run-body handlers retain their distinct
+     coroutine diagnostic. The inventory remains 92 textual matches (91
+     constructors plus the helper definition).
 
 ## Next steps
 

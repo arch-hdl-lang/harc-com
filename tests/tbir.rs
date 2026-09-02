@@ -28639,19 +28639,6 @@ test T
         wait 2 cycles
     end run
 end test T"#,
-        r#"function install()
-    on true
-        wait until false
-    end on
-end function install
-
-test T
-    let dut : Top
-    run
-        install()
-        wait 2 cycles
-    end run
-end test T"#,
         r#"function settle_until_timeout()
     wait until false timeout 1 cycles
 end function settle_until_timeout
@@ -28993,6 +28980,32 @@ end test T"#;
         "{v1}"
     );
     assert!(v1.contains("tick();"), "{v1}");
+}
+
+#[test]
+fn an_untimed_helper_defined_on_handler_reports_v1_recursion() {
+    let src = r#"function install()
+    on true
+        wait until false
+    end on
+end function install
+
+test T
+    let dut : Top
+    run
+        install()
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("a helper-defined blocking handler must be fenced"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively firing"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive callback");
+    assert!(v1.contains("while (!(false)) tick();"), "{v1}");
+    assert!(v1.contains("_checkers.push_back([&]()"), "{v1}");
 }
 
 #[test]
