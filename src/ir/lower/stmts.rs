@@ -5903,6 +5903,16 @@ impl FuncBuilder<'_> {
                     V1Status::SilentlyMisLowers,
                 ));
             }
+            if guaranteed_sync_tick && construct == "an `on <bool-expr>` trigger" {
+                return Err(not_implemented(
+                    construct,
+                    "v1 evaluates the composite trigger inside the per-cycle checker; its \
+                     inlined helper executes a synchronous `tick()` that re-enters the same \
+                     checker, causing unbounded recursion — bind the helper result before \
+                     registering the handler",
+                    V1Status::SilentlyMisLowers,
+                ));
+            }
             return Err(unsupported(
                 construct,
                 "the body needs a statement-level step (a hoisted DUT read, an inlined \

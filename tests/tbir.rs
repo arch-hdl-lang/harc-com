@@ -28610,6 +28610,44 @@ end test T"#,
     }
 }
 
+#[test]
+fn a_composite_suspending_on_trigger_reports_v1_recursion() {
+    let src = r#"function settle() -> uint<8>
+    wait 1 cycle
+    return 1
+end function settle
+
+test T
+    let dut : Top
+    run
+        on settle() > 0
+            log(info, "fired")
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("a suspending trigger must be fenced"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("trigger") && msg.contains("unbounded recursion"), "{msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive trigger");
+    let helper = v1.find("settle = [&]").expect("v1 emits the helper lambda");
+    let helper_window = &v1[helper..v1.len().min(helper + 900)];
+    assert!(helper_window.contains("tick();"), "helper wait is synchronous: {helper_window}");
+    assert!(
+        v1.contains("_curr = (bool)(settle() > 0);"),
+        "the checker evaluates the helper trigger: {v1}"
+    );
+
+    let zero = src.replace("wait 1 cycle", "wait 0 cycles");
+    let msg = assert_unsupported(
+        &lower_src(&zero).expect_err("a zero-wait trigger still needs an unavailable CFG step"),
+    );
+    assert!(msg.contains("statement-level step"), "{msg}");
+}
+
 /// A check body may legitimately read a local of the function that
 /// registered it (the emitted closure captures it by reference, exactly
 /// as v1 does). `harc dump-ir` renders check bodies outside any local

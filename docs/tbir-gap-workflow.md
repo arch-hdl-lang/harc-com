@@ -594,6 +594,9 @@ not applicable before requesting review:
    literal synchronous helper wait now carry v1's recursive-checker verdict.
    Zero, runtime-dependent, conditional, and other statement-producing
    expressions retain the shared fallback, leaving the raw count at 92.
+   Composite boolean triggers that inline an unconditional positive-literal
+   synchronous helper wait now carry the same measured recursive-checker
+   verdict. Uncertain trigger shapes retain the fallback; the count stays 92.
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
