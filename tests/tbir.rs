@@ -28626,6 +28626,32 @@ test T
         wait 2 cycles
     end run
 end test T"#,
+        r#"function settle_until()
+    wait until false
+end function settle_until
+
+test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            settle_until()
+        end on
+        wait 2 cycles
+    end run
+end test T"#,
+        r#"function install()
+    on true
+        wait until false
+    end on
+end function install
+
+test T
+    let dut : Top
+    run
+        install()
+        wait 2 cycles
+    end run
+end test T"#,
     ];
     for src in cases {
         let err = lower_src(src).expect_err("a suspending handler body must not lower");
@@ -28665,6 +28691,34 @@ end test T"#;
     assert!(
         checker_window.contains("for (auto& _c : _checkers) _c();"),
         "v1 re-enters the checker list after the wait: {checker_window}"
+    );
+}
+
+#[test]
+fn an_untimed_wait_until_inside_an_on_handler_is_uncompilable_in_v1() {
+    let src = r#"test T
+    let dut : Top
+    run
+        on dut.rst == 1
+            wait until dut.count_out == 1
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("an untimed handler wait-until must be fenced"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("void checker/service callback"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the invalid callback");
+    let checker_start = v1
+        .find("_checkers.push_back([&]() {")
+        .expect("v1 registers the statement-position handler");
+    let checker_window = &v1[checker_start..v1.len().min(checker_start + 1400)];
+    assert!(
+        checker_window.contains("co_await harc_rt::wait_until(_slot"),
+        "v1 emits a coroutine await inside the checker callback: {checker_window}"
     );
 }
 

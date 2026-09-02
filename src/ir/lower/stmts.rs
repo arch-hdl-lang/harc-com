@@ -5498,6 +5498,18 @@ impl FuncBuilder<'_> {
     /// hook vectors the component path owns, and event subscriptions
     /// (`on <ev>(arg)`) need a subscriber list on a component field.
     fn lower_on_handler(&mut self, h: &crate::ast::OnHandler) -> Result<(), LowerError> {
+        // Preserve the source/emission distinction that TBIR helper inlining
+        // otherwise erases. v1 emits a top-level wait written directly in a
+        // run-body handler under coroutine mode. A handler defined inside a
+        // helper, or a helper-mediated wait in the handler body, is emitted
+        // through an ordinary synchronous lambda instead.
+        let direct_coroutine_untimed_wait_until = self.inline_frames.is_empty()
+            && h.body.stmts.iter().any(|s| {
+                matches!(
+                    &s.kind,
+                    StmtKind::WaitUntil { timeout: None, .. }
+                )
+            });
         use crate::ir::{CycleHandlerKind, CycleHandlerSchema};
         self.require_test_body("an `on ... end on` handler")?;
         if h.hook.is_some() {
@@ -5770,6 +5782,16 @@ impl FuncBuilder<'_> {
                  move the wait into the run body, or gate the run body on the same condition \
                  with `wait until`",
                 super::V1Status::SilentlyMisLowers,
+            ));
+        }
+        if direct_coroutine_untimed_wait_until {
+            return Err(super::not_implemented(
+                "an untimed `wait until` inside a statement-position `on` handler body",
+                "the body runs from a void checker/service callback; v1 emits a coroutine \
+                 `co_await wait_until` inside that callback and the generated C++ does not \
+                 compile — move the wait into the run body, or gate the run body on the same \
+                 condition",
+                super::V1Status::EmitsUncompilable,
             ));
         }
         if super::function_suspends(&f) {
