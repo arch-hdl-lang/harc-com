@@ -10109,6 +10109,17 @@ former `transaction` group lives in
      helper-mediated waits retain the conservative fallback, so the inventory
      remains 92 textual matches (91 constructors plus the helper definition).
 
+209. **Untimed wait-until in statement-position handlers (2026-09-02).**
+
+     A top-level untimed `wait until` written directly in a run-body
+     statement-position `on` handler no longer advertises v1. The legacy
+     emitter places `co_await wait_until` inside the handler's void
+     checker/service callback, making the generated C++ uncompilable. TBIR
+     reports `EmitsUncompilable` with rewrite guidance. Nested-control,
+     helper-defined, helper-mediated, timed, and wall-time waits retain the
+     shared fallback, so the inventory remains 92 textual matches (91
+     constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
