@@ -9981,6 +9981,15 @@ former `transaction` group lives in
      the raw inventory remains 96 textual matches (95 constructors plus the
      helper definition).
 
+197. **Wide unsized decimal literals in general expressions (2026-09-01).**
+
+     Plain decimal values above `u64` now reuse the exact multiply-add word
+     conversion used by sized decimal literals and lower into `WideLiteral`.
+     Native-width values stay scalars, and the conversion remains bounded by
+     the parser's decimal digit limit. Wide octal is the remaining valid
+     spelling behind the generic fallback, so the raw inventory remains 96
+     textual matches (95 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

@@ -33056,6 +33056,30 @@ end impl T
     assert!(msg.contains("oversized native C++ literal"), "{msg}");
 }
 
+#[test]
+fn wide_unsized_decimal_literals_lower_in_general_value_positions() {
+    let literal = "18446744073709551616"; // 2^64
+    let src = format!(
+        r#"test T
+    let dut : Top
+    run
+        let value : uint<128> = {literal}
+        assert value == {literal} else fail("wide decimal")
+    end run
+end test T"#
+    );
+    let prog = lower_src(&src).expect("an unsized decimal value above u64 lowers");
+    verify::verify_program(&prog).expect("wide decimal value verifies");
+    assert!(prog.functions.iter().any(|func| func.blocks.iter().any(|block| {
+        block.stmts.iter().any(|stmt| {
+            matches!(stmt, ir::Stmt::Assign(_, ir::Expr::WideLiteral(words)) if words == &[0, 0, 1])
+        })
+    })));
+    let cpp = tbir::emit(&prog, &merged_src(&src), &cpp_tb::EmitOpts::default())
+        .expect("wide decimal value emits");
+    assert!(cpp.contains("(((_harc_u128)0x1ULL << 64) | (_harc_u128)0x0ULL)"));
+}
+
 /// A regblock register `@ <addr>` offset and `reset` value now FOLD,
 /// through the same helper as the addrmap base and size. Like those,
 /// this puts TB-IR ahead of v1 rather than level with it: v1 folds both

@@ -4418,6 +4418,7 @@ impl Parser {
         match self.peek_kind().cloned() {
             Some(TokenKind::DecLiteral(s)) => {
                 self.advance();
+                check_decimal_literal(&s, span0)?;
                 Ok(Expr::new(ExprKind::Int(s), span0))
             }
             Some(TokenKind::HexLiteral(s)) | Some(TokenKind::BinLiteral(s)) => {
@@ -4636,6 +4637,20 @@ impl Parser {
 /// Longest sized DECIMAL literal that gets sized exactly. Bounds the
 /// quadratic fallback in `significant_bits`; see the check that uses it.
 const MAX_EXACT_DECIMAL_DIGITS: usize = 4096;
+
+fn check_decimal_literal(text: &str, span: Span) -> Result<(), CompileError> {
+    let digits = text.bytes().filter(|byte| *byte != b'_').count();
+    if digits > MAX_EXACT_DECIMAL_DIGITS {
+        return Err(CompileError::invalid_literal(
+            &format!(
+                "decimal literal has {digits} digits; the maximum is {MAX_EXACT_DECIMAL_DIGITS}"
+            ),
+            "write the value in hexadecimal (`0x`) or binary (`0b`) — those are exact at any length",
+            span,
+        ));
+    }
+    Ok(())
+}
 
 /// A `${...}` capture inside a string literal is not part of the token
 /// stream — the whole string is one `StringLit`, and both backends

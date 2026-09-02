@@ -10436,6 +10436,26 @@ fn an_absurdly_long_sized_decimal_literal_is_capped() {
     );
 }
 
+#[test]
+fn an_absurdly_long_unsized_decimal_literal_is_capped() {
+    let at_cap = "9".repeat(4096);
+    assert!(
+        literal_parses(&at_cap),
+        "4096 unsized decimal digits is at the cap and must be accepted"
+    );
+    let over = "9".repeat(4097);
+    let err = parse_err_with_literal(&over);
+    assert!(
+        err.contains("4097 digits") && err.contains("maximum is 4096"),
+        "got: {err}"
+    );
+    let long_hex = format!("0x{}", "F".repeat(50000));
+    assert!(
+        literal_parses(&long_hex),
+        "a 50 000-digit hexadecimal value is structural and remains uncapped"
+    );
+}
+
 /// The point of rejecting rather than choosing. harc#565's table had two
 /// programs that the same mask rule could not both satisfy while `4'hFF`
 /// was legal: masking at the declared 4 made `keep (len +% 4'hFF) ==
