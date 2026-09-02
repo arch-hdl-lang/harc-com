@@ -501,7 +501,10 @@ fn plan_common_tests_impl(
         return Err(EmitError("no `test` declaration found".into()));
     }
 
-    preflight_regblock_placement(prog)?;
+    // Reuse the catalog only when register-block preflight needed it. For
+    // ordinary suites, defer analysis until after the established structural
+    // validation gates below so their diagnostics retain their prior order.
+    let callable_catalog = preflight_regblock_placement(prog)?;
     if extern_declarations.is_empty() && program_has_extern_calls(prog) {
         return Err(EmitError(
             "TB-IR common layout requires source-backed external-function declarations".to_string(),
@@ -515,8 +518,12 @@ fn plan_common_tests_impl(
                 .to_string(),
         )
     })?;
-    let dut_access = crate::ir::passes::dut_access::analyze(prog, dut_interface)
-        .map_err(|error| EmitError(format!("TB-IR common layout {error}")))?;
+    let dut_access = if opts.program_verified {
+        crate::ir::passes::dut_access::analyze_verified(prog, dut_interface)
+    } else {
+        crate::ir::passes::dut_access::analyze(prog, dut_interface)
+    }
+    .map_err(|error| EmitError(format!("TB-IR common layout {error}")))?;
     validate_dut_access_features(&dut_access)?;
     let vec_lane_widths = dut_access
         .interface()
@@ -531,7 +538,14 @@ fn plan_common_tests_impl(
     let runtime_cells = crate::ir::passes::runtime_cells::analyze(prog)
         .map_err(|error| EmitError(format!("TB-IR common layout {error}")))?;
     let shared_types = plan_shared_types(prog)?;
-    let (callables, shared_callables, contextual_tseqs) = plan_callables(prog)?;
+    // One immutable catalog now supplies both any register-block preflight
+    // and all common-layout callable placement/ordering decisions.
+    let callable_catalog = match callable_catalog {
+        Some(catalog) => catalog,
+        None => crate::ir::passes::callable_placement::analyze(prog)
+            .map_err(|error| EmitError(format!("TB-IR common layout {error}")))?,
+    };
+    let (callables, shared_callables, contextual_tseqs) = plan_callables(prog, &callable_catalog)?;
     let bus_access = crate::ir::passes::bus_access::analyze(prog, dut_interface)
         .map_err(|error| EmitError(format!("TB-IR common layout {error}")))?;
     let bus_adapters = shared_callables
@@ -878,13 +892,15 @@ fn program_has_extern_calls(prog: &TbProgram) -> bool {
     })
 }
 
-fn preflight_regblock_placement(prog: &TbProgram) -> Result<(), EmitError> {
+fn preflight_regblock_placement(
+    prog: &TbProgram,
+) -> Result<Option<ir::passes::callable_placement::CallableCatalog>, EmitError> {
     if !prog
         .testbenches
         .iter()
         .any(|schema| !schema.regblock_bindings.is_empty())
     {
-        return Ok(());
+        return Ok(None);
     }
     let catalog = crate::ir::passes::callable_placement::analyze(prog)
         .map_err(|error| EmitError(format!("TB-IR common layout {error}")))?;
@@ -905,7 +921,7 @@ fn preflight_regblock_placement(prog: &TbProgram) -> Result<(), EmitError> {
             reason,
         ));
     }
-    Ok(())
+    Ok(Some(catalog))
 }
 
 fn validate_program_tables(prog: &TbProgram, has_randomize_plan: bool) -> Result<(), EmitError> {
@@ -1371,6 +1387,7 @@ fn push_ir_type_dependency(
 
 fn plan_callables(
     prog: &TbProgram,
+    catalog: &ir::passes::callable_placement::CallableCatalog,
 ) -> Result<
     (
         Vec<CommonCallablePlan>,
@@ -1379,8 +1396,6 @@ fn plan_callables(
     ),
     EmitError,
 > {
-    let catalog = crate::ir::passes::callable_placement::analyze(prog)
-        .map_err(|error| EmitError(format!("TB-IR common layout {error}")))?;
     for index in 0..prog.testbench_types.len() {
         catalog
             .testbench_method_order(ir::TestbenchTypeId(index as u32))

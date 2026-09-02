@@ -652,6 +652,11 @@ pub struct EmitOpts {
     /// shape so shared code never reconstructs an access contract from a
     /// signal name.
     pub dut_interface: Option<crate::ir::passes::dut_access::DutInterfaceCatalog>,
+    /// The caller has already run `verify_program` on the TB-IR. This lets
+    /// DUT-access planning validate only its resolved view instead of
+    /// repeating the unchanged baseline verifier pass. Public emitter users
+    /// leave this false to retain planner-first diagnostics for malformed IR.
+    pub program_verified: bool,
     /// Canonical command/tool inputs that affect common-layout build reuse but
     /// are not otherwise represented in the lowered program or DUT catalog.
     /// The common planner owns the resulting fingerprint so renderers cannot

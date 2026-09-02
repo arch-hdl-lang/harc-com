@@ -6321,6 +6321,37 @@ fn callable_placement_shares_one_explicit_bound_bus_adapter() {
     assert_eq!(runtime.matches("TinyDriver_drive(").count(), 1, "{runtime}");
 }
 
+/// A rising-edge component handler shares the bound-bus adapter ABI with its
+/// method body. In common layout the function lives in the runtime while each
+/// capsule supplies its physical DUT-port adapters.
+#[test]
+fn common_bound_bus_rising_cycle_handler_passes_adapter_arguments() {
+    let source_text = BOUND_BUS_PLACEMENT_SRC.replacen(
+        "    end when\nend transactor TinyDriver",
+        "    end when\n\n    on calls < 200 rising\n        calls = calls + bus.req.data\n    end on\nend transactor TinyDriver",
+        1,
+    );
+    let source = parse_source(&source_text).expect("bound-bus cycle source parses");
+    let program = lower::lower_program(&source).expect("bound-bus cycle source lowers");
+    verify::verify_program(&program).expect("bound-bus cycle program verifies");
+    let (_, opts) = bound_bus_program(false);
+
+    let plan = tbir::common::plan_common_tests(&program, &opts, "cycle_bus__")
+        .expect("bound-bus cycle handler plans in the common layout");
+    let runtime = tbir::common::emit_common_runtime(&plan).expect("runtime emits");
+    assert!(
+        runtime.contains("void TinyDriver_cycle_h")
+            && runtime.contains("HarcBusSignalRef<uint64_t> _harc_bus_signal_0"),
+        "a bound-bus cycle handler owns an adapter parameter:\n{runtime}"
+    );
+    let capsule = tbir::common::emit_common_capsule(&plan, 0).expect("capsule emits");
+    assert!(
+        capsule.contains("TinyDriver_cycle_h")
+            && capsule.contains("ctx, _harc_run_state.driver_a, "),
+        "a rising-edge callback must pass its bound-bus adapter:\n{capsule}"
+    );
+}
+
 #[test]
 fn shared_tlm_adapter_preserves_record_response_type() {
     let source = parse_source(

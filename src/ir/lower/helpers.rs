@@ -765,18 +765,6 @@ impl FuncBuilder<'_> {
             .map(|pname| format!("parameter `{pname}` of extern fn `{name}`"))
             .collect();
         let lowered = self.lower_checked_ordered_args(&arg_exprs, &ptys, &slots, false)?;
-        for (i, v) in lowered.iter().enumerate() {
-            // Arity is checked above and `pnames`/`ptys` come from the same
-            // declaration, so both indexes are total.
-            let slot = &slots[i];
-            // Validate against the declared type, including supported
-            // sequence parameters. Record signatures are rejected while the
-            // extern declaration table is built.
-            if let Err(error) = self.check_slot_ir(v, &ptys[i], slot) {
-                self.record_error_span(arg_exprs[i].span);
-                return Err(error);
-            }
-        }
         Ok(Expr::Call(
             CallTarget::ExternFn {
                 name: name.to_string(),

@@ -175,8 +175,12 @@ impl SuiteScaffold {
             .dut_interface
             .as_ref()
             .map(|interface| {
-                ir::passes::dut_access::analyze(prog, interface)
-                    .map_err(|error| EmitError(format!("tbir: {error}")))
+                let plan = if opts.program_verified {
+                    ir::passes::dut_access::analyze_verified(prog, interface)
+                } else {
+                    ir::passes::dut_access::analyze(prog, interface)
+                };
+                plan.map_err(|error| EmitError(format!("tbir: {error}")))
             })
             .transpose()?;
         let bus_access = opts
@@ -2668,9 +2672,16 @@ fn emit_lifecycle_checkers(
                     ir::CycleEdge::Level => unreachable!(),
                 };
                 writeln!(out, "{INDENT}{INDENT}if ({cond}) {{").ok();
-                let call = run_context
-                    .map(|context| format!("{lambda}({context}, {inst_path})"))
-                    .unwrap_or_else(|| format!("{lambda}({inst_path})"));
+                let call = component_callable_call(
+                    prog,
+                    ch.function,
+                    &lambda,
+                    inst_path,
+                    &[],
+                    bound_bus,
+                    bus_adapters,
+                    run_context,
+                )?;
                 writeln!(out, "{INDENT}{INDENT}{INDENT}{call};").ok();
                 writeln!(out, "{INDENT}{INDENT}}}").ok();
                 writeln!(out, "{INDENT}{INDENT}{previous} = {tag}_curr;").ok();

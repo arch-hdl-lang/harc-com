@@ -666,9 +666,30 @@ impl std::fmt::Display for DutAccessPlanError {
 
 impl std::error::Error for DutAccessPlanError {}
 
+/// Build a DUT-access plan for an arbitrary program. This compatibility
+/// entry point preserves planner-first diagnostics for callers that inspect
+/// deliberately malformed IR in tests and tooling.
 pub fn analyze(
     prog: &TbProgram,
     interface: &DutInterfaceCatalog,
+) -> Result<DutAccessPlan, DutAccessPlanError> {
+    analyze_impl(prog, interface, false)
+}
+
+/// Build a DUT-access plan after the caller has already verified `prog`.
+/// Native emission follows that pipeline, so it can avoid the redundant
+/// baseline verifier pass.
+pub fn analyze_verified(
+    prog: &TbProgram,
+    interface: &DutInterfaceCatalog,
+) -> Result<DutAccessPlan, DutAccessPlanError> {
+    analyze_impl(prog, interface, true)
+}
+
+fn analyze_impl(
+    prog: &TbProgram,
+    interface: &DutInterfaceCatalog,
+    baseline_verified: bool,
 ) -> Result<DutAccessPlan, DutAccessPlanError> {
     let first_test = prog.tests.first().ok_or_else(|| {
         DutAccessPlanError("DUT access planning requires at least one test".to_string())
@@ -1245,7 +1266,13 @@ pub fn analyze(
     }
 
     propagate_inferred_local_types(prog, interface, &entries, &mut inferred_local_types)?;
-    validate_resolved_scalar_uses(prog, interface, &entries, &inferred_local_types)?;
+    validate_resolved_scalar_uses(
+        prog,
+        interface,
+        &entries,
+        &inferred_local_types,
+        baseline_verified,
+    )?;
 
     probes.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
     let mut accesses = entries.into_values().collect::<Vec<_>>();
@@ -1399,6 +1426,7 @@ fn validate_resolved_scalar_uses(
     interface: &DutInterfaceCatalog,
     entries: &BTreeMap<DutAccessIdentity, DutAccessEntry>,
     inferred: &BTreeMap<(FunctionId, LocalId), IrType>,
+    baseline_verified: bool,
 ) -> Result<(), DutAccessPlanError> {
     let mut resolved_program = prog.clone();
     for ((function, local), ty) in inferred {
@@ -1411,25 +1439,30 @@ fn validate_resolved_scalar_uses(
             }
         }
     }
-    let baseline_errors = super::super::verify::verify_program(prog)
-        .err()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|error| error.to_string())
-        .collect::<BTreeSet<_>>();
-    if let Err(errors) = super::super::verify::verify_program(&resolved_program) {
-        let new_errors = errors
-            .iter()
+    // Native emitters have already verified the original program, so they
+    // only need this one resolved-view verification. The public planner also
+    // supports malformed-IR inspection; retain its established diagnostics
+    // by filtering errors that existed before resolution in that path.
+    let baseline_errors = if baseline_verified {
+        BTreeSet::new()
+    } else {
+        super::super::verify::verify_program(prog)
+            .err()
+            .unwrap_or_default()
+            .into_iter()
             .map(|error| error.to_string())
-            .filter(|error| !baseline_errors.contains(error))
+            .collect()
+    };
+    if let Err(errors) = super::super::verify::verify_program(&resolved_program) {
+        let errors = errors
+            .iter()
+            .filter(|error| baseline_verified || !baseline_errors.contains(&error.to_string()))
+            .map(|error| error.to_string())
             .collect::<Vec<_>>();
-        if new_errors.is_empty() {
-            // Preserve the planner's established deterministic diagnostics
-            // for malformed IR that was already invalid before DUT typing.
-        } else {
+        if !errors.is_empty() {
             return Err(DutAccessPlanError(format!(
                 "resolved DUT read types invalidate downstream IR transfers:\n{}",
-                new_errors
+                errors
                     .iter()
                     .map(|error| format!("  - {error}"))
                     .collect::<Vec<_>>()

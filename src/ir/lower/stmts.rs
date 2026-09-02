@@ -4709,24 +4709,6 @@ impl FuncBuilder<'_> {
             }
             lowered.push(value);
         }
-        // Same rule as the component-method call one screen up, at the
-        // transactor spelling of it. The schema had to learn
-        // `param_tys` for this — it carried only names, so there was
-        // nothing here to type-check against.
-        for (i, (a, ty)) in lowered.iter().zip(param_tys.iter()).enumerate() {
-            let pname = param_names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("#{}", i + 1));
-            if let Err(error) = self.check_slot_ir(
-                a,
-                ty,
-                &format!("parameter `{pname}` of `{schema_name}.{method}`"),
-            ) {
-                self.record_error_span(arg_exprs[i].span);
-                return Err(error);
-            }
-        }
         Ok(Some(Expr::Call(
             crate::ir::CallTarget::TransactorMethod {
                 bus_field: tb_field,
@@ -4864,24 +4846,6 @@ impl FuncBuilder<'_> {
                 value = self.materialize_ordered_value_as(value, hint);
             }
             lowered.push(value);
-        }
-        // The SIBLING spelling of the parameter rule — `inner(1)` from
-        // another method of the same transactor, where the bound-
-        // instance spelling is `drv.inner(1)`. Arity is checked above,
-        // so the zip is total.
-        for (i, (a, ty)) in lowered.iter().zip(param_tys.iter()).enumerate() {
-            let pname = param_names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("#{}", i + 1));
-            if let Err(error) = self.check_slot_ir(
-                a,
-                ty,
-                &format!("parameter `{pname}` of `{transactor}.{name}`"),
-            ) {
-                self.record_error_span(arg_exprs[i].span);
-                return Err(error);
-            }
         }
         Ok(Some(Expr::Call(
             crate::ir::CallTarget::TransactorSelfMethod {

@@ -2029,19 +2029,18 @@ struct CommonManifestInputs {
     probe_stub: Option<PathBuf>,
 }
 
-fn push_build_input_file(
+fn push_build_input_path(
     profile: &mut Vec<String>,
     kind: &str,
     index: usize,
     path: &Path,
 ) -> Result<()> {
     let canonical = fs::canonicalize(path).into_diagnostic()?;
-    let contents = fs::read(&canonical).into_diagnostic()?;
-    profile.push(format!(
-        "{kind}:{index:08}:{}:{}",
-        canonical.display(),
-        harc::codegen::common_artifacts::stable_hash_hex(&contents)
-    ));
+    // Native-build identity owns the generated C++ ABI and toolchain
+    // configuration. Verilator's makefile separately tracks these source
+    // files, so their contents must not evict otherwise reusable common
+    // objects on every RTL/reference-model edit.
+    profile.push(format!("{kind}:{index:08}:{}", canonical.display()));
     Ok(())
 }
 
@@ -2908,13 +2907,13 @@ fn cmd_sim(
             .map_or_else(String::new, |path| path.display().to_string())
     ));
     for (index, path) in ref_src.iter().enumerate() {
-        push_build_input_file(&mut build_profile_inputs, "ref_src", index, path)?;
+        push_build_input_path(&mut build_profile_inputs, "ref_src", index, path)?;
     }
     for (index, path) in vlt.iter().enumerate() {
-        push_build_input_file(&mut build_profile_inputs, "vlt", index, path)?;
+        push_build_input_path(&mut build_profile_inputs, "vlt", index, path)?;
     }
     for (index, path) in sv.iter().enumerate() {
-        push_build_input_file(&mut build_profile_inputs, "sv", index, path)?;
+        push_build_input_path(&mut build_profile_inputs, "sv", index, path)?;
     }
     for (index, value) in external_build_profile_inputs.iter().enumerate() {
         build_profile_inputs.push(format!("external:{index:08}:{value}"));
@@ -2926,6 +2925,8 @@ fn cmd_sim(
         vec_lane_widths,
         dut_port_widths,
         dut_interface,
+        // Every TB-IR route below lowers then verifies before emission.
+        program_verified: true,
         build_profile_inputs,
         common_abi_inputs: common_abi_identity_inputs(&waves, &runtime_abi),
         dut_bus_port_overrides,
@@ -3928,6 +3929,28 @@ mod tests {
         fs::write(&forced, "object").unwrap();
         prepare_native_build_directory(&obj_dir, true, "tbir:common:abi-b:profile-a").unwrap();
         assert!(!forced.exists(), "--rebuild must discard matching objects");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn native_build_identity_tracks_source_paths_not_contents() {
+        let base = temp_dir("native-build-source-path");
+        let source = base.join("dut.sv");
+        fs::write(&source, "module D; endmodule\n").unwrap();
+
+        let profile_for = || {
+            let mut profile = Vec::new();
+            push_build_input_path(&mut profile, "sv", 0, &source).unwrap();
+            profile
+        };
+        let first = profile_for();
+        fs::write(&source, "// changed RTL\nmodule D; endmodule\n").unwrap();
+        let second = profile_for();
+
+        assert_eq!(
+            first, second,
+            "Verilator tracks source contents; an RTL edit must not evict reusable native objects"
+        );
         let _ = fs::remove_dir_all(base);
     }
 

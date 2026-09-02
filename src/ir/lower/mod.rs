@@ -2564,7 +2564,7 @@ fn lower_program_impl(
     // stay `ir::Expr::Call` and backends emit them as plain C++ functions.
     // Records are visible so scalar-valued pure helpers can hold host-side
     // record locals in their file-scope C++ bodies.
-    let helper_ctx = LowerCtx {
+    let mut helper_ctx = LowerCtx {
         source_id: SourceId::default(),
         diagnostics: diagnostics.clone(),
         dut_field: "dut".to_string(),
@@ -2639,8 +2639,9 @@ fn lower_program_impl(
         }
         let id = FunctionId(prog.functions.len() as u32);
         debug_assert_eq!(entry.function, Some(id));
-        let item_ctx = helper_ctx.with_source(file.item_source(item_index));
-        let f = helpers::lower_pure_helper(id, fd, &helper_registry, &item_ctx, &side_tables)?;
+        let f = helper_ctx.with_source(file.item_source(item_index), |item_ctx| {
+            helpers::lower_pure_helper(id, fd, &helper_registry, item_ctx, &side_tables)
+        })?;
         prog.functions.push(f);
     }
 
@@ -2650,7 +2651,7 @@ fn lower_program_impl(
     // and `randomize`, so its ctx carries the records / keep / problem-id
     // / tseq tables — but no test-scope bindings (a tseq cannot poke the
     // DUT, a bus, or a transactor field; those are test-scope only).
-    let tseq_ctx = LowerCtx {
+    let mut tseq_ctx = LowerCtx {
         source_id: SourceId::default(),
         diagnostics: diagnostics.clone(),
         dut_field: "dut".to_string(),
@@ -2709,15 +2710,16 @@ fn lower_program_impl(
         let (expected_id, elem, _, _) = &tseq_records[&decl.name.name];
         let id = FunctionId(prog.functions.len() as u32);
         debug_assert_eq!(id, *expected_id);
-        let item_ctx = tseq_ctx.with_source(file.item_source(item_index));
-        let f = tseqs::lower_tseq(
-            id,
-            decl,
-            elem.clone(),
-            &item_ctx,
-            &helper_registry,
-            &side_tables,
-        )?;
+        let f = tseq_ctx.with_source(file.item_source(item_index), |item_ctx| {
+            tseqs::lower_tseq(
+                id,
+                decl,
+                elem.clone(),
+                item_ctx,
+                &helper_registry,
+                &side_tables,
+            )
+        })?;
         prog.functions.push(f);
     }
 
@@ -2734,19 +2736,26 @@ fn lower_program_impl(
         }
         let id = TransactorId(prog.transactors.len() as u32);
         debug_assert_eq!(Some(&id), transactor_ids.get(&t.name.name));
-        let mut item_ctx = helper_ctx.with_source(file.item_source(item_index));
-        item_ctx.probes = suite_probes.clone();
-        item_ctx.partial_probe_names = suite_probe_catalog.partial_component_probe_names.clone();
-        let (schema, funcs) = transactors::lower_transactor(
-            id,
-            t,
-            FunctionId(prog.functions.len() as u32),
-            &helper_registry,
-            &item_ctx,
-            &buses,
-            &downstream_bus_binds,
-            &side_tables,
-        )?;
+        let saved_probes = std::mem::replace(&mut helper_ctx.probes, suite_probes.clone());
+        let saved_partial_probe_names = std::mem::replace(
+            &mut helper_ctx.partial_probe_names,
+            suite_probe_catalog.partial_component_probe_names.clone(),
+        );
+        let lowered = helper_ctx.with_source(file.item_source(item_index), |item_ctx| {
+            transactors::lower_transactor(
+                id,
+                t,
+                FunctionId(prog.functions.len() as u32),
+                &helper_registry,
+                item_ctx,
+                &buses,
+                &downstream_bus_binds,
+                &side_tables,
+            )
+        });
+        helper_ctx.probes = saved_probes;
+        helper_ctx.partial_probe_names = saved_partial_probe_names;
+        let (schema, funcs) = lowered?;
         prog.transactors.push(schema);
         prog.functions.extend(funcs);
     }
@@ -2873,7 +2882,7 @@ fn lower_program_impl(
     // FunctionIds reserved in pass 1, then sorted into the functions
     // table (their ids are already contiguous from `start_fn`).
     let start_fn = prog.functions.len();
-    let method_ctx = LowerCtx {
+    let mut method_ctx = LowerCtx {
         source_id: SourceId::default(),
         diagnostics: diagnostics.clone(),
         dut_field: "dut".to_string(),
@@ -2941,57 +2950,58 @@ fn lower_program_impl(
     for (i, src) in comp_sources.iter().enumerate() {
         let cid = ir::ComponentId(i as u32);
         let schema = prog.components[i].clone();
-        let source_ctx = method_ctx.with_source(comp_source_ids[i]);
         // A bound-bus event-driven transactor's `on <ev>` handler bodies
         // drive the bound bus's handshake channels (`bus.<ch>.send/recv`,
         // `bus.<ch>.<sig>`). They lower exactly like the bound-initiator
         // BFM: the bound `BusDecl` is visible under the logical `bus` name and
-        // lowered ports retain `BoundBus` provenance. Inject a per-component
-        // context carrying that protocol declaration; everything else mirrors
-        // `method_ctx`.
-        let bound_ctx;
-        let body_ctx: &LowerCtx = if let Some(bus_name) = schema.bound_bus.as_deref() {
-            let Some(bus) = buses.get(bus_name) else {
-                // The THIRD copy of this check — the consumer-BFM path.
-                // Same verdict as the two in `transactors.rs`: a
-                // NEVER-INSTANTIATED `transactor T bound to RegOp`
-                // emits an inert struct under v1 and the file compiles,
-                // so `Invalid` is too strong. Measured: v1's output for
-                // `bound to RegOp` and `bound to uint<8>` differ only in
-                // an auto-coverage solver-site id, and both compile.
-                return Err(not_implemented(
-                    &format!(
-                        "event-driven transactor `{}` bound to `{bus_name}`, which is \
-                         not a `bus` declaration",
-                        schema.name
-                    ),
-                    "v1 rejects it at every instantiation; only a never-instantiated \
-                     declaration gets through, and there it emits an inert struct",
-                    V1Status::Rejects,
-                ));
+        // lowered ports retain `BoundBus` provenance. Only that exceptional
+        // bound-bus context needs a copy; ordinary component methods borrow
+        // the reusable lowering context directly.
+        let bodies = method_ctx.with_source(comp_source_ids[i], |source_ctx| {
+            let bound_ctx;
+            let body_ctx: &LowerCtx = if let Some(bus_name) = schema.bound_bus.as_deref() {
+                let Some(bus) = buses.get(bus_name) else {
+                    // The THIRD copy of this check — the consumer-BFM path.
+                    // Same verdict as the two in `transactors.rs`: a
+                    // NEVER-INSTANTIATED `transactor T bound to RegOp`
+                    // emits an inert struct under v1 and the file compiles,
+                    // so `Invalid` is too strong. Measured: v1's output for
+                    // `bound to RegOp` and `bound to uint<8>` differ only in
+                    // an auto-coverage solver-site id, and both compile.
+                    return Err(not_implemented(
+                        &format!(
+                            "event-driven transactor `{}` bound to `{bus_name}`, which is \
+                             not a `bus` declaration",
+                            schema.name
+                        ),
+                        "v1 rejects it at every instantiation; only a never-instantiated \
+                         declaration gets through, and there it emits an inert struct",
+                        V1Status::Rejects,
+                    ));
+                };
+                let mut bb = source_ctx.clone();
+                bb.bus_bindings.insert(
+                    transactors::INITIATOR_BUS_PLACEHOLDER.to_string(),
+                    (*bus).clone(),
+                );
+                bb.bus_origins.insert(
+                    transactors::INITIATOR_BUS_PLACEHOLDER.to_string(),
+                    ir::PortOrigin::BoundBus,
+                );
+                bound_ctx = bb;
+                &bound_ctx
+            } else {
+                source_ctx
             };
-            let mut bb = source_ctx.clone();
-            bb.bus_bindings.insert(
-                transactors::INITIATOR_BUS_PLACEHOLDER.to_string(),
-                (*bus).clone(),
-            );
-            bb.bus_origins.insert(
-                transactors::INITIATOR_BUS_PLACEHOLDER.to_string(),
-                ir::PortOrigin::BoundBus,
-            );
-            bound_ctx = bb;
-            &bound_ctx
-        } else {
-            &source_ctx
-        };
-        let bodies = components::lower_component_bodies(
-            src,
-            cid,
-            &schema,
-            body_ctx,
-            &helper_registry,
-            &side_tables,
-        )?;
+            components::lower_component_bodies(
+                src,
+                cid,
+                &schema,
+                body_ctx,
+                &helper_registry,
+                &side_tables,
+            )
+        })?;
         // Patch the schema's pass-1 clause placeholders with the
         // resolved period/max_idle expressions (they could only lower
         // once a body context existed).
@@ -3299,6 +3309,12 @@ fn reject_suspending_synchronous_callbacks(
     callbacks: &[SynchronousCallbackSite],
     diagnostics: &LowerDiagnosticRecorder,
 ) -> Result<(), LowerError> {
+    // The placement catalog is only needed to trace a callback's reachable
+    // call graph. Avoid its whole-program SCC/fixpoint analysis for suites
+    // that declare no synchronous callback at all.
+    if callbacks.is_empty() {
+        return Ok(());
+    }
     let catalog = crate::ir::passes::callable_placement::analyze(prog)
         .map_err(|error| LowerError::Invalid(error.to_string()))?;
     for callback in callbacks {
@@ -7760,10 +7776,13 @@ pub(crate) struct LowerCtx {
 }
 
 impl LowerCtx {
-    fn with_source(&self, source_id: SourceId) -> Self {
-        let mut ctx = self.clone();
-        ctx.source_id = source_id;
-        ctx
+    /// Run a declaration lowerer with its originating source ID without
+    /// cloning the immutable schema tables carried by this context.
+    fn with_source<T>(&mut self, source_id: SourceId, f: impl FnOnce(&Self) -> T) -> T {
+        let previous = std::mem::replace(&mut self.source_id, source_id);
+        let result = f(self);
+        self.source_id = previous;
+        result
     }
 
     /// A dynamic list has no finite DUT-wire representation. Record values
