@@ -10126,8 +10126,8 @@ former `transaction` group lives in
      statement-position `on` handler no longer advertises v1. The legacy
      emitter places `co_await wait_until_timeout` inside the void handler
      callback, so the generated C++ cannot compile. TBIR reports
-     `EmitsUncompilable`; helper-defined and helper-mediated timed waits retain
-     the shared fallback. The inventory remains 92 textual
+     `EmitsUncompilable`; other helper-defined and helper-mediated timed waits
+     retain the shared fallback. The inventory remains 92 textual
      matches (91 constructors plus the helper definition).
 
 211. **Synchronous helper waits in boolean handler bodies (2026-09-02).**
@@ -10190,6 +10190,16 @@ former `transaction` group lives in
      the handler again before edge state changes. TBIR reports
      `SilentlyMisLowers`; direct run-body handlers retain their distinct
      coroutine diagnostic. The inventory remains 92 textual matches (91
+     constructors plus the helper definition).
+
+217. **Timed waits in helper-defined boolean handlers (2026-09-02).**
+
+     A helper-installed constant-true rising handler whose entry is an
+     always-false wait with a positive literal timeout now reports the same
+     guaranteed v1 recursion. The synchronous timeout loop must tick before
+     the handler can update its edge cell, so TBIR reports
+     `SilentlyMisLowers`. Zero/runtime budgets, conditional waits, and other
+     phases remain conservative. The inventory remains 92 textual matches (91
      constructors plus the helper definition).
 
 ## Next steps

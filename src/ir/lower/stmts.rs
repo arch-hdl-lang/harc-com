@@ -5899,6 +5899,23 @@ impl FuncBuilder<'_> {
                 super::V1Status::SilentlyMisLowers,
             ));
         }
+        let guaranteed_reentrant_helper_defined_timed_wait = !self.inline_frames.is_empty()
+            && !h.periodic
+            && matches!(h.phase, crate::ast::OnPhase::Checker)
+            && matches!(h.edge, crate::ast::EdgeMode::Rising)
+            && matches!(&*h.event.kind, ExprKind::Bool(true))
+            && block_contains_wait_until(&h.body, true)
+            && entry_has_false_positive_timed_wait(&f);
+        if guaranteed_reentrant_helper_defined_timed_wait {
+            return Err(super::not_implemented(
+                "a timed wait in a helper-defined statement-position `on` handler",
+                "v1 emits the helper-defined handler synchronously; its positive-timeout, \
+                 always-false wait executes `tick()` and recursively fires the same \
+                 constant-true rising handler before edge state is updated — install the \
+                 handler directly in the run body and move its wait into run control flow",
+                super::V1Status::SilentlyMisLowers,
+            ));
+        }
         let guaranteed_reentrant_helper_wait = !h.periodic
             && matches!(h.phase, crate::ast::OnPhase::Checker)
             && matches!(h.edge, crate::ast::EdgeMode::Rising)
