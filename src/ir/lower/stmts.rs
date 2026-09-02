@@ -5520,6 +5520,9 @@ impl FuncBuilder<'_> {
                     }
                 )
             });
+        let nested_direct_coroutine_untimed_wait_until = self.inline_frames.is_empty()
+            && !direct_coroutine_untimed_wait_until
+            && block_contains_wait_until(&h.body, false);
         use crate::ir::{CycleHandlerKind, CycleHandlerSchema};
         self.require_test_body("an `on ... end on` handler")?;
         if h.hook.is_some() {
@@ -5801,6 +5804,15 @@ impl FuncBuilder<'_> {
                  `co_await wait_until` inside that callback and the generated C++ does not \
                  compile — move the wait into the run body, or gate the run body on the same \
                  condition",
+                super::V1Status::EmitsUncompilable,
+            ));
+        }
+        if nested_direct_coroutine_untimed_wait_until {
+            return Err(super::not_implemented(
+                "an untimed `wait until` nested inside control flow in a statement-position `on` handler body",
+                "v1 still emits the nested coroutine `co_await wait_until` inside the handler's \
+                 void checker/service callback, so the generated C++ does not compile — move the \
+                 wait into the run body, or gate the run body on the same condition",
                 super::V1Status::EmitsUncompilable,
             ));
         }
@@ -7060,6 +7072,47 @@ impl FuncBuilder<'_> {
             _ => false,
         }
     }
+}
+
+/// Whether `block` contains a source-written `wait until` of the requested
+/// timeout shape, descending ordinary control flow but not nested handlers.
+/// This preserves source provenance that is lost after helper CFG inlining.
+fn block_contains_wait_until(block: &crate::ast::Block, timed: bool) -> bool {
+    fn stmt_contains(s: &AstStmt, timed: bool) -> bool {
+        match &s.kind {
+            StmtKind::WaitUntil { timeout, .. } => timeout.is_some() == timed,
+            StmtKind::For(s) => block_contains_wait_until(&s.body, timed),
+            StmtKind::Repeat(s) => block_contains_wait_until(&s.body, timed),
+            StmtKind::Loop(b) => block_contains_wait_until(b, timed),
+            StmtKind::While { body, .. } => block_contains_wait_until(body, timed),
+            StmtKind::If(s) => {
+                block_contains_wait_until(&s.then_block, timed)
+                    || s.elsifs
+                        .iter()
+                        .any(|(_, b)| block_contains_wait_until(b, timed))
+                    || s.else_block
+                        .as_ref()
+                        .is_some_and(|b| block_contains_wait_until(b, timed))
+            }
+            StmtKind::After { body, .. } => block_contains_wait_until(body, timed),
+            StmtKind::Fork(s) => s
+                .branches
+                .iter()
+                .any(|b| block_contains_wait_until(b, timed)),
+            StmtKind::Parallel(bs) | StmtKind::Schedule(bs) => bs
+                .iter()
+                .any(|b| block_contains_wait_until(b, timed)),
+            StmtKind::Select(arms) => arms
+                .iter()
+                .any(|a| block_contains_wait_until(&a.action, timed)),
+            // A nested `on` owns a different callback and is classified when
+            // that handler itself is lowered.
+            StmtKind::On(_) => false,
+            _ => false,
+        }
+    }
+
+    block.stmts.iter().any(|s| stmt_contains(s, timed))
 }
 
 /// Children of an AST expression to visit when hoisting message calls,
