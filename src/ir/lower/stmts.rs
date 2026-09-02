@@ -5536,6 +5536,12 @@ impl FuncBuilder<'_> {
                     }
                 )
             });
+        let nested_direct_coroutine_untimed_wait_until = self.inline_frames.is_empty()
+            && !direct_coroutine_untimed_wait_until
+            && block_contains_wait_until(&h.body, false);
+        let nested_direct_coroutine_timed_wait_until = self.inline_frames.is_empty()
+            && !direct_coroutine_timed_wait_until
+            && block_contains_wait_until(&h.body, true);
         use crate::ir::{CycleHandlerKind, CycleHandlerSchema};
         self.require_test_body("an `on ... end on` handler")?;
         if h.hook.is_some() {
@@ -5825,6 +5831,15 @@ impl FuncBuilder<'_> {
                 super::V1Status::EmitsUncompilable,
             ));
         }
+        if nested_direct_coroutine_untimed_wait_until {
+            return Err(super::not_implemented(
+                "an untimed `wait until` nested inside control flow in a statement-position `on` handler body",
+                "v1 still emits the nested coroutine `co_await wait_until` inside the handler's \
+                 void checker/service callback, so the generated C++ does not compile — move the \
+                 wait into the run body, or gate the run body on the same condition",
+                super::V1Status::EmitsUncompilable,
+            ));
+        }
         if direct_coroutine_timed_wait_until {
             return Err(super::not_implemented(
                 "a timed `wait until` inside a statement-position `on` handler body",
@@ -5833,6 +5848,76 @@ impl FuncBuilder<'_> {
                  does not compile — move the wait into the run body, or gate the run body \
                  on the same condition",
                 super::V1Status::EmitsUncompilable,
+            ));
+        }
+        if nested_direct_coroutine_timed_wait_until {
+            return Err(super::not_implemented(
+                "a timed `wait until` nested inside control flow in a statement-position `on` handler body",
+                "v1 still emits the nested coroutine `co_await wait_until_timeout` inside the \
+                 handler's void checker/service callback, so the generated C++ does not compile — \
+                 move the wait into the run body, or gate the run body on the same condition",
+                super::V1Status::EmitsUncompilable,
+            ));
+        }
+        let guaranteed_reentrant_helper_untimed_wait = self.inline_frames.is_empty()
+            && !h.periodic
+            && matches!(h.phase, crate::ast::OnPhase::Checker)
+            && matches!(h.edge, crate::ast::EdgeMode::Rising)
+            && matches!(&*h.event.kind, ExprKind::Bool(true))
+            && !block_contains_wait_until(&h.body, false)
+            && matches!(
+                &f.blocks[f.entry.index()].terminator,
+                Terminator::WaitUntil { preds, .. }
+                    if preds.len() == 1
+                        && matches!(preds[0].expr, Expr::Literal { value: 0, .. })
+            );
+        if guaranteed_reentrant_helper_untimed_wait {
+            return Err(super::not_implemented(
+                "an untimed synchronous helper wait inside a statement-position `on` handler body",
+                "v1 polls the helper's always-false predicate with synchronous `tick()` calls; \
+                 the first tick re-enters the same constant-true rising handler before its edge \
+                 state is updated, causing unbounded recursion — move the helper call into the \
+                 run body",
+                super::V1Status::SilentlyMisLowers,
+            ));
+        }
+        let guaranteed_reentrant_helper_timed_wait = self.inline_frames.is_empty()
+            && !h.periodic
+            && matches!(h.phase, crate::ast::OnPhase::Checker)
+            && matches!(h.edge, crate::ast::EdgeMode::Rising)
+            && matches!(&*h.event.kind, ExprKind::Bool(true))
+            && !block_contains_wait_until(&h.body, true)
+            && entry_has_false_positive_timed_wait(&f);
+        if guaranteed_reentrant_helper_timed_wait {
+            return Err(super::not_implemented(
+                "a timed synchronous helper wait inside a statement-position `on` handler body",
+                "v1 polls the helper's always-false predicate with at least one synchronous \
+                 `tick()`; that tick re-enters the same constant-true rising handler before \
+                 its edge state is updated, causing unbounded recursion — move the helper \
+                 call into the run body",
+                super::V1Status::SilentlyMisLowers,
+            ));
+        }
+        let guaranteed_reentrant_helper_defined_untimed_wait = !self.inline_frames.is_empty()
+            && !h.periodic
+            && matches!(h.phase, crate::ast::OnPhase::Checker)
+            && matches!(h.edge, crate::ast::EdgeMode::Rising)
+            && matches!(&*h.event.kind, ExprKind::Bool(true))
+            && block_contains_wait_until(&h.body, false)
+            && matches!(
+                &f.blocks[f.entry.index()].terminator,
+                Terminator::WaitUntil { preds, .. }
+                    if preds.len() == 1
+                        && matches!(preds[0].expr, Expr::Literal { value: 0, .. })
+            );
+        if guaranteed_reentrant_helper_defined_untimed_wait {
+            return Err(super::not_implemented(
+                "an untimed wait in a helper-defined statement-position `on` handler",
+                "v1 emits the helper-defined handler as a synchronous callback; its \
+                 always-false wait polls with `tick()`, recursively firing the same \
+                 constant-true rising handler before edge state is updated — install the \
+                 handler directly in the run body and move its wait into run control flow",
+                super::V1Status::SilentlyMisLowers,
             ));
         }
         let guaranteed_reentrant_helper_wait = !h.periodic
@@ -7098,6 +7183,66 @@ impl FuncBuilder<'_> {
         };
         Ok(matches!(self.as_component_method_call(callee), Ok(Some(_))))
     }
+}
+
+/// Whether `block` contains a source-written `wait until` of the requested
+/// timeout shape, descending ordinary control flow but not nested handlers.
+/// This preserves source provenance that is lost after helper CFG inlining.
+fn block_contains_wait_until(block: &crate::ast::Block, timed: bool) -> bool {
+    fn stmt_contains(s: &AstStmt, timed: bool) -> bool {
+        match &s.kind {
+            StmtKind::WaitUntil { timeout, .. } => timeout.is_some() == timed,
+            StmtKind::For(s) => block_contains_wait_until(&s.body, timed),
+            StmtKind::Repeat(s) => block_contains_wait_until(&s.body, timed),
+            StmtKind::Loop(b) => block_contains_wait_until(b, timed),
+            StmtKind::While { body, .. } => block_contains_wait_until(body, timed),
+            StmtKind::If(s) => {
+                block_contains_wait_until(&s.then_block, timed)
+                    || s.elsifs
+                        .iter()
+                        .any(|(_, b)| block_contains_wait_until(b, timed))
+                    || s.else_block
+                        .as_ref()
+                        .is_some_and(|b| block_contains_wait_until(b, timed))
+            }
+            StmtKind::After { body, .. } => block_contains_wait_until(body, timed),
+            StmtKind::Fork(s) => s
+                .branches
+                .iter()
+                .any(|b| block_contains_wait_until(b, timed)),
+            StmtKind::Parallel(bs) | StmtKind::Schedule(bs) => bs
+                .iter()
+                .any(|b| block_contains_wait_until(b, timed)),
+            StmtKind::Select(arms) => arms
+                .iter()
+                .any(|a| block_contains_wait_until(&a.action, timed)),
+            // A nested `on` owns a different callback and is classified when
+            // that handler itself is lowered.
+            StmtKind::On(_) => false,
+            _ => false,
+        }
+    }
+
+    block.stmts.iter().any(|s| stmt_contains(s, timed))
+}
+
+fn entry_has_false_positive_timed_wait(f: &crate::ir::TbFunction) -> bool {
+    let entry = &f.blocks[f.entry.index()];
+    let Terminator::WaitUntilTimeout { preds, cycles, .. } = &entry.terminator else {
+        return false;
+    };
+    if preds.len() != 1 || !matches!(preds[0].expr, Expr::Literal { value: 0, .. }) {
+        return false;
+    }
+    let Expr::Local(budget) = cycles else {
+        return false;
+    };
+    entry.stmts.iter().any(|s| {
+        matches!(
+            s,
+            Stmt::Assign(id, Expr::Literal { value, .. }) if id == budget && *value > 0
+        )
+    })
 }
 
 /// Children of an AST expression to visit when hoisting message calls,

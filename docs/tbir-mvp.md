@@ -10115,8 +10115,8 @@ former `transaction` group lives in
      statement-position `on` handler no longer advertises v1. The legacy
      emitter places `co_await wait_until` inside the handler's void
      checker/service callback, making the generated C++ uncompilable. TBIR
-     reports `EmitsUncompilable` with rewrite guidance. Nested-control,
-     helper-defined, helper-mediated, timed, and wall-time waits retain the
+     reports `EmitsUncompilable` with rewrite guidance. Other helper-defined
+     and helper-mediated shapes, timed waits, and wall-time waits retain the
      shared fallback, so the inventory remains 92 textual matches (91
      constructors plus the helper definition).
 
@@ -10126,8 +10126,8 @@ former `transaction` group lives in
      statement-position `on` handler no longer advertises v1. The legacy
      emitter places `co_await wait_until_timeout` inside the void handler
      callback, so the generated C++ cannot compile. TBIR reports
-     `EmitsUncompilable`; nested-control, helper-defined, and helper-mediated
-     timed waits retain the shared fallback. The inventory remains 92 textual
+     `EmitsUncompilable`; helper-defined and helper-mediated timed waits retain
+     the shared fallback. The inventory remains 92 textual
      matches (91 constructors plus the helper definition).
 
 211. **Synchronous helper waits in boolean handler bodies (2026-09-02).**
@@ -10142,6 +10142,55 @@ former `transaction` group lives in
      periodic, and post-eval shapes retain the shared fallback, so the
      inventory remains 92 textual matches (91 constructors plus the helper
      definition).
+
+212. **Nested untimed wait-until in statement-position handlers (2026-09-02).**
+
+     An untimed `wait until` written beneath ordinary control flow in a direct
+     run-body `on` handler reaches the same v1 void callback as a top-level
+     wait. v1 emits the nested `co_await wait_until`, so its generated C++ is
+     uncompilable; TBIR now reports `EmitsUncompilable`. Source-AST traversal
+     deliberately stops at nested handlers and does not confuse helper-inlined
+     waits with direct source. The inventory remains 92 textual matches (91
+     constructors plus the helper definition).
+
+213. **Nested timed wait-until in statement-position handlers (2026-09-02).**
+
+     The same source-provenance walk now classifies `wait until ... timeout`
+     beneath ordinary control flow in a direct run-body handler. v1 emits
+     `co_await wait_until_timeout` in the void callback, so TBIR reports
+     `EmitsUncompilable`; helper-mediated and nested-handler waits remain
+     distinct. The inventory remains 92 textual matches (91 constructors plus
+     the helper definition).
+
+214. **Untimed helper wait-until in boolean handler bodies (2026-09-02).**
+
+     A direct constant-true rising handler that calls a helper whose entry is
+     an unconditional `wait until false` now reports v1's measured recursive
+     behavior. The helper polls synchronously with `tick()`, re-entering the
+     same checker before its edge state changes. TBIR reports
+     `SilentlyMisLowers`; source-written waits, conditional predicates, and
+     other handler phases retain their separate paths. The inventory remains
+     92 textual matches (91 constructors plus the helper definition).
+
+215. **Timed helper wait-until in boolean handler bodies (2026-09-02).**
+
+     The corresponding timed helper shape is now classified when its entry
+     predicate is literal false and its timeout budget is a positive literal.
+     v1 must synchronously tick at least once and recursively re-enters the
+     constant-true rising handler before updating edge state, so TBIR reports
+     `SilentlyMisLowers`. Zero/runtime budgets and conditional waits remain
+     conservative. The inventory remains 92 textual matches (91 constructors
+     plus the helper definition).
+
+216. **Untimed waits in helper-defined boolean handlers (2026-09-02).**
+
+     A helper that installs a constant-true rising handler containing an
+     unconditional `wait until false` now reports its guaranteed v1 recursion.
+     The helper-defined callback is synchronous, so its polling `tick()` fires
+     the handler again before edge state changes. TBIR reports
+     `SilentlyMisLowers`; direct run-body handlers retain their distinct
+     coroutine diagnostic. The inventory remains 92 textual matches (91
+     constructors plus the helper definition).
 
 ## Next steps
 
