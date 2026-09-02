@@ -32567,7 +32567,10 @@ fn a_wait_inside_an_on_handler_body_is_rejected() {
 end test T"#;
     let err = lower_src(src).expect_err("a suspending handler body must not lower");
     let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
-    assert!(msg.contains("void per-cycle checker callback"), "got: {msg}");
+    assert!(
+        msg.contains("void per-cycle checker callback"),
+        "got: {msg}"
+    );
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the re-entrant handler");
     let checker_start = v1
@@ -32627,7 +32630,7 @@ end test T"#,
         wait 2 cycles
     end run
 end test T"#,
-r#"function settle(d: Top)
+        r#"function settle(d: Top)
     d.rst = 0
     wait 0 cycles
 end function settle
@@ -32916,7 +32919,10 @@ end test T"#;
         &lower_src(src).expect_err("a suspending trigger must be fenced"),
         lower::V1Status::SilentlyMisLowers,
     );
-    assert!(msg.contains("trigger") && msg.contains("unbounded recursion"), "{msg}");
+    assert!(
+        msg.contains("trigger") && msg.contains("unbounded recursion"),
+        "{msg}"
+    );
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive trigger");
     let settle = v1_callable_symbol(&v1, "settle");
@@ -32924,7 +32930,10 @@ end test T"#;
         .find(&format!("{settle} = [&]"))
         .expect("v1 emits the helper lambda");
     let helper_window = &v1[helper..v1.len().min(helper + 900)];
-    assert!(helper_window.contains("tick();"), "helper wait is synchronous: {helper_window}");
+    assert!(
+        helper_window.contains("tick();"),
+        "helper wait is synchronous: {helper_window}"
+    );
     assert!(
         v1.contains(&format!("_curr = (bool)({settle}() > 0);")),
         "the checker evaluates the helper trigger: {v1}"
