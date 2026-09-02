@@ -32734,7 +32734,7 @@ end test T"#;
     assert!(msg.contains("recursively firing"), "got: {msg}");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive handler");
-    assert!(v1.contains("while (clocks_[1].rising_count < _target)"), "{v1}");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
     assert!(v1.contains("for (auto& _c : _checkers) _c();"), "{v1}");
 
     let mixed = src.replace(
@@ -32773,7 +32773,7 @@ end test T"#;
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive else arm");
     assert!(v1.contains("if (false)"), "{v1}");
-    assert!(v1.contains("while (clocks_[1].rising_count < _target)"), "{v1}");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
 
     let reachable_elsif = src.replace(
         "            else\n",
@@ -32811,7 +32811,7 @@ end test T"#;
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive else arm");
     assert!(v1.contains("else if (false)"), "{v1}");
-    assert!(v1.contains("while (clocks_[1].rising_count < _target)"), "{v1}");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
 
     let runtime_elsif = src.replace("            elsif false\n", "            elsif dut.rst == 1\n");
     assert_unsupported(
@@ -32842,7 +32842,7 @@ end test T"#;
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive repeat body");
     assert!(v1.contains("for (int64_t _r = 0; _r < 2; _r++)"), "{v1}");
-    assert!(v1.contains("while (clocks_[1].rising_count < _target)"), "{v1}");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
 
     let zero = src.replace("            repeat 2\n", "            repeat 0\n");
     assert_unsupported(&lower_src(&zero).expect_err("a zero repeat keeps the fallback"));
@@ -32873,7 +32873,7 @@ end test T"#;
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive loop body");
     assert!(v1.contains("while (true)"), "{v1}");
-    assert!(v1.contains("while (clocks_[1].rising_count < _target)"), "{v1}");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
 
     let conditional = src.replace(
         "                wait 1 cycle on aux\n",
