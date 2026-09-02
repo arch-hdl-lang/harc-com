@@ -31233,6 +31233,84 @@ end impl T"#,
     );
 }
 
+#[test]
+fn a_second_component_watchdog_does_not_advertise_v1() {
+    let src = r#"agent Producer
+    n : uint<32> default 0
+    watchdog
+        period 2 cycles
+        max_idle 10 cycles
+        log(info, "first")
+    end watchdog
+    watchdog
+        period 3 cycles
+        max_idle 10 cycles
+        log(info, "second")
+    end watchdog
+end agent Producer
+
+testbench Tb
+    dut : Top
+    p : Producer
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#;
+
+    let err = lower_src(src).expect_err("a component may declare only one watchdog");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(
+        msg.contains("second enabled `watchdog`") && msg.contains("duplicate"),
+        "{msg}"
+    );
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits before C++ compilation");
+    assert_eq!(
+        v1.matches("auto Producer_watchdog =").count(),
+        2,
+        "v1 emits two declarations of the same lambda name: {v1}"
+    );
+
+    let enabled = r#"watchdog
+        period 2 cycles
+        max_idle 10 cycles
+    end watchdog"#;
+    let disabled = "watchdog disabled";
+    for (first, second, emitted) in [
+        (enabled, disabled, 1),
+        (disabled, enabled, 1),
+        (disabled, disabled, 0),
+    ] {
+        let src = format!(
+            r#"agent Producer
+    {first}
+    {second}
+end agent Producer
+
+testbench Tb
+    dut : Top
+    p : Producer
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#
+        );
+        let err = lower_src(&src).expect_err("duplicate watchdogs remain outside TBIR");
+        let msg = assert_unsupported(&err);
+        assert!(msg.contains("disabled") && msg.contains("watchdog"), "{msg}");
+        let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits before C++ compilation");
+        assert_eq!(
+            v1.matches("auto Producer_watchdog =").count(),
+            emitted,
+            "disabled watchdogs must not manufacture a duplicate lambda: {v1}"
+        );
+    }
+}
+
 /// A `connect` block on a transactor is not a v1 escape hatch either,
 /// and the evidence is a CONTROL DIFF rather than a grep: v1's emitted
 /// C++ is byte-identical with and without the block.

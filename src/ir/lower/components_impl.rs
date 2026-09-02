@@ -873,9 +873,18 @@ pub(crate) fn lower_component_schema(
                 // reservation and pass-2 body lowering re-classify identically.
                 ComponentItem::OnHandler(h) => on_asts.push((h, activation)),
                 ComponentItem::Watchdog(w) => {
-                    if watchdog_ast.is_some() {
+                    if let Some(prior_disabled) =
+                        watchdog_ast.as_ref().map(|(prior, _)| prior.disabled)
+                    {
+                        if !prior_disabled && !w.disabled {
+                            return Err(super::not_implemented(
+                                &format!("a second enabled `watchdog` on `{name}`"),
+                                "a component may declare at most one `watchdog`; v1 emits duplicate same-named watchdog lambdas and the generated C++ does not compile",
+                                super::V1Status::EmitsUncompilable,
+                            ));
+                        }
                         return Err(unsupported(
-                            &format!("a second `watchdog` on `{name}`"),
+                            &format!("a second `watchdog` on `{name}` when either declaration is disabled"),
                             "a component may declare at most one `watchdog`",
                         ));
                     }
