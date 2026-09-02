@@ -10230,6 +10230,14 @@ former `transaction` group lives in
      The inventory remains 92 textual matches (91 constructors plus the helper
      definition).
 
+221. **Positive literal repeat paths to named-clock waits (2026-09-02).**
+
+     The guaranteed named-wait proof now enters a `repeat` body when its count
+     is a positive integer literal, since v1 must execute at least one
+     iteration before the checker edge cell can update. Zero, negative, and
+     runtime-dependent counts remain conservative. The inventory remains 92
+     textual matches (91 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

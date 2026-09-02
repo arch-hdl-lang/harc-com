@@ -28802,6 +28802,37 @@ end test T"#;
 }
 
 #[test]
+fn a_positive_literal_repeat_reaches_named_clock_handler_wait() {
+    let src = r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on true
+            repeat 2
+                wait 1 cycle on aux
+            end repeat
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("a positive repeat guarantees its first iteration"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively firing"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive repeat body");
+    assert!(v1.contains("for (int64_t _r = 0; _r < 2; _r++)"), "{v1}");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target)"), "{v1}");
+
+    let zero = src.replace("            repeat 2\n", "            repeat 0\n");
+    assert_unsupported(&lower_src(&zero).expect_err("a zero repeat keeps the fallback"));
+    let runtime = src.replace("            repeat 2\n", "            repeat dut.rst\n");
+    assert_unsupported(&lower_src(&runtime).expect_err("a runtime repeat keeps the fallback"));
+}
+
+#[test]
 fn an_untimed_wait_until_inside_an_on_handler_is_uncompilable_in_v1() {
     let src = r#"test T
     let dut : Top
