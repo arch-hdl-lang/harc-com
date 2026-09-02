@@ -10058,6 +10058,20 @@ former `transaction` group lives in
      conservative fallback, so the raw inventory remains 92 textual matches
      (91 constructors plus the helper definition).
 
+205. **Bare helper-call periodic periods (2026-09-01).**
+
+     `on helper() cycles` reaches the periodic AST path, but v1 emits the
+     registration as `helper.push_back(...)`, treating the helper callable as
+     an event subscriber vector. Without a same-named local, the generated C++
+     cannot compile for either pure or suspending helpers. If an event local
+     shadows the helper, lexical lookup makes the subscription compile but
+     silently installs an event handler instead of a periodic checker. TBIR
+     splits `EmitsUncompilable` from `SilentlyMisLowers` on that nearest-local
+     type and suggests binding the result before the handler. The shared
+     statement-producing-expression fallback remains for composite periods,
+     so the raw inventory stays at 92 textual matches (91 constructors plus
+     the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

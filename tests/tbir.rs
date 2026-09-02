@@ -40757,18 +40757,47 @@ end impl SpTest"#
         "the generated checker must re-read the live port: {port_cpp}"
     );
 
-    // A call that needs a statement/CFG step cannot be cached at handler
-    // registration: v1 evaluates the written expression inside the checker.
+    // A bare helper call is parsed as a periodic expression, but v1 emits it
+    // as though the helper were an event channel and calls `.push_back` on
+    // the callable. Pure and suspending helpers both produce uncompilable C++.
+    let pure = format!(
+        "function period() -> uint<8>\n    return 2\nend function period\n\n{}",
+        src("period()", "")
+    );
     let impure = format!(
         "function settle() -> uint<8>\n    wait 1 cycle\n    return 2\nend function settle\n\n{}",
         src("settle()", "")
     );
-    let msg = assert_unsupported(
-        &lower_src(&impure).expect_err("a statement-producing period must be fenced"),
+    for (helper, source) in [("period", pure), ("settle", impure)] {
+        let msg = assert_not_implemented(
+            &lower_src(&source).expect_err("a bare helper period must be fenced"),
+            lower::V1Status::EmitsUncompilable,
+        );
+        assert!(msg.contains("period") && msg.contains("push_back"), "{msg}");
+        let v1 = cpp_tb::emit(&merged_src(&source)).expect("v1 emits the invalid subscription");
+        assert!(
+            v1.contains(&format!("{helper}.push_back([&]")),
+            "v1 treats the helper as an event channel: {v1}"
+        );
+    }
+
+    let shadowed = format!(
+        "function period() -> uint<8>\n    return 2\nend function period\n\n{}",
+        src("period()", "").replace(
+            "    run\n        on",
+            "    run\n        let period : event<uint<8>>\n        on",
+        )
     );
+    let msg = assert_not_implemented(
+        &lower_src(&shadowed).expect_err("an event-shadowed helper period must be fenced"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("subscriber") && msg.contains("silently lost"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&shadowed)).expect("v1 emits the wrong subscription");
     assert!(
-        msg.contains("period") && msg.contains("statement-level step"),
-        "{msg}"
+        v1.contains("std::vector<std::function<void(uint64_t)>> period;")
+            && v1.contains("period.push_back([&]"),
+        "the local event absorbs the would-be periodic registration: {v1}"
     );
 
     // A non-positive literal remains rejected. v1 emits

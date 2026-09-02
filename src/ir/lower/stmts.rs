@@ -5632,6 +5632,41 @@ impl FuncBuilder<'_> {
             //     0 firings in 21 cycles. The program asked for a
             //     handler and got a no-op, silently.
             //
+            let bare_period = super::exprs::unparen_expr(&h.event);
+            if let ExprKind::Call { callee, .. } = &*bare_period.kind {
+                if let ExprKind::Ident(helper) = &*callee.kind {
+                    if self.helpers.contains(&helper.name) {
+                        if self
+                            .lookup(&helper.name)
+                            .is_some_and(|local| matches!(self.local_type(local), IrType::Event(_)))
+                        {
+                            return Err(not_implemented(
+                                "a bare helper call shadowed by an event local as a statement-position periodic handler period",
+                                format!(
+                                    "v1 resolves `{0}.push_back(...)` to the same-named local \
+                                     event channel and installs a subscriber instead of a \
+                                     periodic checker, so the requested period is silently lost — \
+                                     rename the event or bind the helper result to a differently \
+                                     named `let` before the handler",
+                                    helper.name
+                                ),
+                                V1Status::SilentlyMisLowers,
+                            ));
+                        }
+                        return Err(not_implemented(
+                            "a bare helper call used as a statement-position periodic handler period",
+                            format!(
+                                "v1 emits `{0}.push_back(...)` as though `{0}` were an event \
+                                 channel, but `{0}` is a helper callable, so the generated C++ \
+                                 does not compile — bind the helper result to a `let` before the \
+                                 handler and use that name as the period",
+                                helper.name
+                            ),
+                            V1Status::EmitsUncompilable,
+                        ));
+                    }
+                }
+            }
             if is_non_positive_period_literal(&h.event) {
                 return Err(not_implemented(
                     "an `on <N> cycles` handler with a non-positive literal period",
