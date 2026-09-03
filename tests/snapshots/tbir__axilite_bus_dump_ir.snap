@@ -11,8 +11,8 @@ fn fn0 run_AxiLiteBusTest [kind=Run, owner=tb0]
     %0 val : unknown
     %1 saw : unknown
     %2 _anon : unknown
-    %3 __t0 : unknown
-    %4 __t1 : unknown
+    %3 __t0 : bool
+    %4 __t1 : uint<32>
   entry = b0
 
   b0:

@@ -23,14 +23,14 @@
 
 use super::{helpers, not_implemented, unsupported, FuncBuilder, LowerCtx, LowerError, V1Status};
 use crate::ast::{
-    BuiltinTy, ComponentDecl, ComponentField, ComponentItem, ConnectEdge, ExprKind,
-    HookableMethod, TransactorDecl, TransactorMode, TypeArg, TypeExpr,
+    BuiltinTy, ComponentDecl, ComponentField, ComponentItem, ConnectEdge, ExprKind, HookableMethod,
+    TransactorDecl, TransactorMode, TypeArg, TypeExpr,
 };
 use crate::ir::{
-    Activation, ComponentFieldKind, ComponentFieldSchema, ComponentId, ComponentInstanceMode,
-    ComponentKindTag, ComponentMethodSchema, ComponentSchema, ConnectEdgeSchema, EventPayload,
-    FixedVecSchema, FunctionId, FunctionKind, IrType, RecordId, ScoreboardId, TbFunction,
-    Terminator, TypedParam,
+    Activation, ComponentCallableId, ComponentFieldKind, ComponentFieldSchema, ComponentId,
+    ComponentInstanceMode, ComponentKindTag, ComponentMethodSchema, ComponentSchema,
+    ConnectEdgeSchema, EventPayload, FixedVecSchema, FunctionId, FunctionKind, IrType, RecordId,
+    ScoreboardId, TbFunction, Terminator, TypedParam,
 };
 use std::collections::HashMap;
 
@@ -541,6 +541,8 @@ pub(crate) enum CompSource<'a> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_component_schema(
     src: &CompSource<'_>,
+    source_id: crate::ast::SourceId,
+    diagnostics: &super::super::LowerDiagnosticRecorder,
     ids: &HashMap<String, ComponentId>,
     scoreboard_ids: &HashMap<String, ScoreboardId>,
     record_ids: &HashMap<String, RecordId>,
@@ -765,6 +767,16 @@ pub(crate) fn lower_component_schema(
         for it in body {
             match it {
                 ComponentItem::Field(f) => {
+                    if let Some(span) = helpers::nested_string_type_span(Some(&f.ty)) {
+                        diagnostics.record(source_id, span);
+                        return Err(unsupported(
+                            &format!(
+                                "component field `{name}.{}` whose type contains `String`",
+                                f.name.name
+                            ),
+                            "String containers and aggregates are not supported in persistent fields",
+                        ));
+                    }
                     let fk = lower_field(
                         name,
                         f,
@@ -776,7 +788,14 @@ pub(crate) fn lower_component_schema(
                         declared_types,
                         enum_names,
                         declared_records,
-                    )?;
+                    )
+                    .map_err(|error| {
+                        diagnostics.record(
+                            source_id,
+                            f.default.as_ref().map_or(f.span, |default| default.span),
+                        );
+                        error
+                    })?;
                     if fields.iter().any(|x| x.name == f.name.name) {
                         return Err(LowerError::Invalid(format!(
                             "component `{name}` declares field `{}` more than once",
@@ -790,6 +809,29 @@ pub(crate) fn lower_component_schema(
                     });
                 }
                 ComponentItem::Hookable(h) => {
+                    if let Some((param, span)) = h.params.iter().find_map(|param| {
+                        helpers::nested_string_type_span(param.ty.as_ref())
+                            .map(|span| (param, span))
+                    }) {
+                        diagnostics.record(source_id, span);
+                        return Err(unsupported(
+                            &format!(
+                                "component `{name}` method `{}` parameter `{}` whose type contains `String`",
+                                h.name.name, param.name.name
+                            ),
+                            "String containers and aggregates are not supported; use exact top-level `String` for a callable parameter",
+                        ));
+                    }
+                    if let Some(span) = helpers::nested_string_type_span(h.return_ty.as_ref()) {
+                        diagnostics.record(source_id, span);
+                        return Err(unsupported(
+                            &format!(
+                                "component `{name}` method `{}` return type containing `String`",
+                                h.name.name
+                            ),
+                            "String containers and aggregates are not supported; use exact top-level `String` for a callable return",
+                        ));
+                    }
                     let param_names: Vec<String> =
                         h.params.iter().map(|p| p.name.name.clone()).collect();
                     let param_tys = h
@@ -1053,9 +1095,7 @@ pub(crate) fn lower_component_schema(
         validate_cycle_handler(name, h)?;
         if monitor_channel.is_some() && matches!(h.phase, crate::ast::OnPhase::PostEval) {
             return Err(not_implemented(
-                &format!(
-                    "a `phase post_eval` modifier on a bound handshake monitor on `{name}`"
-                ),
+                &format!("a `phase post_eval` modifier on a bound handshake monitor on `{name}`"),
                 "v1 lowers a bound handshake monitor as its fixed-phase actor and silently \
                  ignores the phase modifier",
                 V1Status::SilentlyMisLowers,
@@ -1847,6 +1887,7 @@ pub(crate) fn lower_component_bodies(
                 m.function,
                 m.activation,
                 cid,
+                ComponentCallableId((method_idx - 1) as u32),
                 ctx,
                 helpers,
                 side_tables,
@@ -1867,6 +1908,7 @@ pub(crate) fn lower_component_bodies(
                 h,
                 oh,
                 cid,
+                ComponentCallableId((schema.methods.len() + on_idx - 1) as u32),
                 ctx,
                 helpers,
                 side_tables,
@@ -1890,10 +1932,23 @@ pub(crate) fn lower_component_bodies(
                 ph.function,
                 ph.activation,
                 cid,
+                ComponentCallableId(
+                    (schema.methods.len() + schema.on_handlers.len() + per_idx - 1) as u32,
+                ),
                 ctx,
                 helpers,
                 side_tables,
             )?;
+            side_tables
+                .borrow_mut()
+                .synchronous_callbacks
+                .push(super::SynchronousCallbackSite {
+                    function: ph.function,
+                    pending: false,
+                    kind: super::SynchronousCallbackKind::ComponentPeriodic,
+                    source_id: ctx.source_id,
+                    span: h.span,
+                });
             funcs.push(body);
             periodic_periods.push(period);
         }
@@ -1917,6 +1972,13 @@ pub(crate) fn lower_component_bodies(
                     ch.function,
                     ch.activation,
                     cid,
+                    ComponentCallableId(
+                        (schema.methods.len()
+                            + schema.on_handlers.len()
+                            + schema.periodic_handlers.len()
+                            + cyc_idx
+                            - 1) as u32,
+                    ),
                     ctx,
                     helpers,
                     side_tables,
@@ -1927,11 +1989,28 @@ pub(crate) fn lower_component_bodies(
                     ch.function,
                     ch.activation,
                     cid,
+                    ComponentCallableId(
+                        (schema.methods.len()
+                            + schema.on_handlers.len()
+                            + schema.periodic_handlers.len()
+                            + cyc_idx
+                            - 1) as u32,
+                    ),
                     ctx,
                     helpers,
                     side_tables,
                 )?
             };
+            side_tables
+                .borrow_mut()
+                .synchronous_callbacks
+                .push(super::SynchronousCallbackSite {
+                    function: ch.function,
+                    pending: false,
+                    kind: super::SynchronousCallbackKind::ComponentCycle,
+                    source_id: ctx.source_id,
+                    span: h.span,
+                });
             funcs.push(body);
             cycle_triggers.push(trigger);
         }
@@ -1950,10 +2029,25 @@ pub(crate) fn lower_component_bodies(
                     ws.function,
                     ws.activation,
                     cid,
+                    ComponentCallableId(
+                        (schema.methods.len()
+                            + schema.on_handlers.len()
+                            + schema.periodic_handlers.len()
+                            + schema.cycle_handlers.len()) as u32,
+                    ),
                     ctx,
                     helpers,
                     side_tables,
                 )?;
+                side_tables.borrow_mut().synchronous_callbacks.push(
+                    super::SynchronousCallbackSite {
+                        function: ws.function,
+                        pending: false,
+                        kind: super::SynchronousCallbackKind::ComponentWatchdog,
+                        source_id: ctx.source_id,
+                        span: w.span,
+                    },
+                );
                 funcs.push(body);
                 watchdog_clauses = Some((period, max_idle));
                 break;
@@ -1978,6 +2072,7 @@ fn lower_cycle_body(
     fid: FunctionId,
     activation: Activation,
     cid: ComponentId,
+    member: ComponentCallableId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
     side_tables: &std::cell::RefCell<super::SideTables>,
@@ -2000,33 +2095,32 @@ fn lower_cycle_body(
     let f = b.finish(
         fid,
         format!("comp_cycle_{}", fid.0),
-        FunctionKind::ComponentMethod { component: cid },
+        FunctionKind::ComponentMethod {
+            component: cid,
+            member,
+            method_name: None,
+        },
         None,
     )?;
     Ok((f, trigger))
 }
 
-/// A bound-bus placeholder `PortRef` for `bus.<ch>.<sig>` — the same flat
-/// `bus_<ch>_<sig>` shape `bus::bus_port` builds, with the placeholder bus
-/// prefix (`transactors::INITIATOR_BUS_PLACEHOLDER`) at `port_path[0]`.
-/// `fill_initiator_bus_prefix` rewrites the prefix to the real binding name
-/// at test-binding time, exactly as for the driver's `bus.<ch>.send/recv`
-/// bodies and trigger.
-fn monitor_bus_port(channel: &str, signal: &str) -> crate::ir::PortRef {
-    crate::ir::PortRef {
-        testbench_field: "dut".to_string(),
-        port_path: vec![
-            super::transactors::INITIATOR_BUS_PLACEHOLDER.to_string(),
-            channel.to_string(),
-            signal.to_string(),
-        ],
-        aggregate_path: false,
-        deferred_bus_binding: Some(crate::ir::DeferredBusBinding::Unresolved),
-        direction: None,
-        width: None,
-        access: crate::ir::PortAccess::Port,
-        lane: None,
-    }
+/// A receiver-relative `PortRef` for `bus.<ch>.<sig>`. The logical `bus`
+/// segment preserves the protocol path and `PortOrigin::BoundBus` requires a
+/// concrete per-instance adapter at emission.
+fn monitor_bus_port(
+    channel: &str,
+    signal: &str,
+    value_type: IrType,
+    direction: crate::ir::PortDirection,
+) -> crate::ir::PortRef {
+    super::bus::bus_port(
+        super::transactors::INITIATOR_BUS_PLACEHOLDER,
+        &[channel, signal],
+        crate::ir::PortOrigin::BoundBus,
+        value_type,
+        Some(direction),
+    )
 }
 
 /// Lower an `on bus.<ch>.handshake(arg) ... end on` passive bus-monitor
@@ -2046,6 +2140,7 @@ fn lower_monitor_handshake_body(
     fid: FunctionId,
     activation: Activation,
     cid: ComponentId,
+    member: ComponentCallableId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
     side_tables: &std::cell::RefCell<super::SideTables>,
@@ -2078,7 +2173,24 @@ fn lower_monitor_handshake_body(
             bus.name.name
         )));
     }
-    let payload_sigs: Vec<String> = hs.payload.iter().map(|s| s.name.name.clone()).collect();
+    let payload_sigs = hs
+        .payload
+        .iter()
+        .map(|signal| {
+            (
+                signal.name.name.clone(),
+                helpers::slot_ir_type(Some(&signal.ty), &ctx.record_ids),
+            )
+        })
+        .collect::<Vec<_>>();
+    let signal_direction = |signal: &str| match (hs.role, signal) {
+        (crate::ast::HandshakeRole::Send, "ready")
+        | (crate::ast::HandshakeRole::Receive, "valid") => crate::ir::PortDirection::Out,
+        (crate::ast::HandshakeRole::Send, _) | (crate::ast::HandshakeRole::Receive, "ready") => {
+            crate::ir::PortDirection::In
+        }
+        (crate::ast::HandshakeRole::Receive, _) => crate::ir::PortDirection::Out,
+    };
 
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.self_component = Some(cid);
@@ -2092,16 +2204,29 @@ fn lower_monitor_handshake_body(
     let arg_local = b.declare(&arg_name);
     b.push(crate::ir::Stmt::DutRead(
         arg_local,
-        monitor_bus_port(channel, &payload_sigs[0]),
+        monitor_bus_port(
+            channel,
+            &payload_sigs[0].0,
+            payload_sigs[0].1.clone(),
+            signal_direction(&payload_sigs[0].0),
+        ),
     ));
-    b.set_local_type(arg_local, IrType::UInt(None));
+    b.set_local_type(arg_local, payload_sigs[0].1.clone());
     let mut fields = Vec::with_capacity(payload_sigs.len());
-    fields.push((payload_sigs[0].clone(), arg_local));
-    for sig in &payload_sigs[1..] {
-        let fl = b.declare(&format!("{arg_name}__{sig}"));
-        b.push(crate::ir::Stmt::DutRead(fl, monitor_bus_port(channel, sig)));
-        b.set_local_type(fl, IrType::UInt(None));
-        fields.push((sig.clone(), fl));
+    fields.push((payload_sigs[0].0.clone(), arg_local));
+    for (signal, value_type) in &payload_sigs[1..] {
+        let fl = b.declare(&format!("{arg_name}__{signal}"));
+        b.push(crate::ir::Stmt::DutRead(
+            fl,
+            monitor_bus_port(
+                channel,
+                signal,
+                value_type.clone(),
+                signal_direction(signal),
+            ),
+        ));
+        b.set_local_type(fl, value_type.clone());
+        fields.push((signal.clone(), fl));
     }
     b.recv_payloads.insert(arg_local, fields);
 
@@ -2112,7 +2237,11 @@ fn lower_monitor_handshake_body(
     let f = b.finish(
         fid,
         format!("comp_monitor_{}", fid.0),
-        FunctionKind::ComponentMethod { component: cid },
+        FunctionKind::ComponentMethod {
+            component: cid,
+            member,
+            method_name: None,
+        },
         None,
     )?;
 
@@ -2121,8 +2250,18 @@ fn lower_monitor_handshake_body(
     // `handshake(arg)` call, not a predicate.
     let trigger = crate::ir::Expr::Binary(
         crate::ir::BinOp::And,
-        Box::new(crate::ir::Expr::Port(monitor_bus_port(channel, "valid"))),
-        Box::new(crate::ir::Expr::Port(monitor_bus_port(channel, "ready"))),
+        Box::new(crate::ir::Expr::Port(monitor_bus_port(
+            channel,
+            "valid",
+            IrType::Bool,
+            signal_direction("valid"),
+        ))),
+        Box::new(crate::ir::Expr::Port(monitor_bus_port(
+            channel,
+            "ready",
+            IrType::Bool,
+            signal_direction("ready"),
+        ))),
     );
     Ok((f, trigger))
 }
@@ -2135,6 +2274,7 @@ fn lower_periodic_body(
     fid: FunctionId,
     activation: Activation,
     cid: ComponentId,
+    member: ComponentCallableId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
     side_tables: &std::cell::RefCell<super::SideTables>,
@@ -2159,7 +2299,11 @@ fn lower_periodic_body(
     let f = b.finish(
         fid,
         format!("comp_periodic_{}", fid.0),
-        FunctionKind::ComponentMethod { component: cid },
+        FunctionKind::ComponentMethod {
+            component: cid,
+            member,
+            method_name: None,
+        },
         None,
     )?;
     Ok((f, period))
@@ -2174,6 +2318,7 @@ fn lower_watchdog_body(
     fid: FunctionId,
     activation: Activation,
     cid: ComponentId,
+    member: ComponentCallableId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
     side_tables: &std::cell::RefCell<super::SideTables>,
@@ -2201,7 +2346,11 @@ fn lower_watchdog_body(
     let f = b.finish(
         fid,
         format!("comp_watchdog_{}", fid.0),
-        FunctionKind::ComponentMethod { component: cid },
+        FunctionKind::ComponentMethod {
+            component: cid,
+            member,
+            method_name: None,
+        },
         None,
     )?;
     Ok((f, period, max_idle))
@@ -2215,6 +2364,7 @@ fn lower_on_handler_body(
     h: &crate::ast::OnHandler,
     oh: &crate::ir::OnHandlerSchema,
     cid: ComponentId,
+    member: ComponentCallableId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
     side_tables: &std::cell::RefCell<super::SideTables>,
@@ -2231,9 +2381,9 @@ fn lower_on_handler_body(
         // pair open-coded the conversion with `None`, which is what
         // made a wide payload unrepresentable downstream even once the
         // schema could hold one.
-        EventPayload::Scalar { .. }
-        | EventPayload::Record(_)
-        | EventPayload::FixedVec { .. } => oh.arg_payload.value_ir_type(),
+        EventPayload::Scalar { .. } | EventPayload::Record(_) | EventPayload::FixedVec { .. } => {
+            oh.arg_payload.value_ir_type()
+        }
     };
     // The payload binding. `on <event>(<arg>)` binds the source name as a
     // resolvable local so the body reads it. A no-payload `on <event>()`
@@ -2257,7 +2407,11 @@ fn lower_on_handler_body(
     let mut f = b.finish(
         oh.function,
         format!("comp_on_{}", oh.function.0),
-        FunctionKind::ComponentMethod { component: cid },
+        FunctionKind::ComponentMethod {
+            component: cid,
+            member,
+            method_name: None,
+        },
         None,
     )?;
     // The emitted signature takes the param name from the local, so build
@@ -2286,9 +2440,34 @@ fn on_handler_arg_name(h: &crate::ast::OnHandler) -> String {
 /// local so `for t in txns` lowers to the counted-loop-over-sequence form
 /// (same typing a `let txns = SomeTseq(...)` local would get). A
 /// `TSeq<scalar>` or unresolved element falls back to `Unknown`.
-fn method_param_ir_type(
+pub(crate) fn method_param_ir_type(
     method: &str,
     what: &str,
+    ty: Option<&TypeExpr>,
+    ctx: &LowerCtx,
+) -> Result<IrType, LowerError> {
+    callable_method_param_ir_type(
+        || format!("{what} of component method `{method}` has an unsupported TSeq element type"),
+        ty,
+        ctx,
+    )
+}
+
+pub(crate) fn testbench_method_param_ir_type(
+    method: &str,
+    what: &str,
+    ty: Option<&TypeExpr>,
+    ctx: &LowerCtx,
+) -> Result<IrType, LowerError> {
+    callable_method_param_ir_type(
+        || format!("{what} of testbench method `{method}` has an unsupported TSeq element type"),
+        ty,
+        ctx,
+    )
+}
+
+fn callable_method_param_ir_type(
+    unsupported_tseq_construct: impl FnOnce() -> String,
     ty: Option<&TypeExpr>,
     ctx: &LowerCtx,
 ) -> Result<IrType, LowerError> {
@@ -2296,11 +2475,9 @@ fn method_param_ir_type(
     // `Seq(scalar)` for a scalar one, mirroring how `collect_tseq_records`
     // types a scalar-element tseq result (#453). v1 renders both as
     // `std::vector<T>`; only the element C++ type differs.
-    if let Some(seq) = helpers::callable_tseq_ir_type(
-        format!("{what} of component method `{method}` has an unsupported TSeq element type"),
-        ty,
-        &ctx.record_ids,
-    )? {
+    if let Some(seq) =
+        helpers::callable_tseq_ir_type(unsupported_tseq_construct, ty, &ctx.record_ids)?
+    {
         return Ok(seq);
     }
     if let Some(fixed @ IrType::FixedVec { .. }) =
@@ -2338,7 +2515,7 @@ fn method_param_ir_type(
     Ok(helpers::ir_type_of(ty))
 }
 
-fn method_schema_ir_type(
+pub(crate) fn method_schema_ir_type(
     component: &str,
     method: &str,
     what: &str,
@@ -2347,13 +2524,44 @@ fn method_schema_ir_type(
     record_ids: &HashMap<String, RecordId>,
     allow_fixed_vec: bool,
 ) -> Result<IrType, LowerError> {
-    if let Some(seq) = helpers::callable_tseq_ir_type(
-        format!(
+    callable_method_schema_ir_type(
+        || {
+            format!(
             "{what} of component method `{component}.{method}` has an unsupported TSeq element type"
-        ),
+        )
+        },
         ty,
+        ids,
         record_ids,
-    )? {
+        allow_fixed_vec,
+    )
+}
+
+pub(crate) fn testbench_method_schema_ir_type(
+    method: &str,
+    what: &str,
+    ty: Option<&TypeExpr>,
+    ids: &HashMap<String, ComponentId>,
+    record_ids: &HashMap<String, RecordId>,
+    allow_fixed_vec: bool,
+) -> Result<IrType, LowerError> {
+    callable_method_schema_ir_type(
+        || format!("{what} of testbench method `{method}` has an unsupported TSeq element type"),
+        ty,
+        ids,
+        record_ids,
+        allow_fixed_vec,
+    )
+}
+
+fn callable_method_schema_ir_type(
+    unsupported_tseq_construct: impl FnOnce() -> String,
+    ty: Option<&TypeExpr>,
+    ids: &HashMap<String, ComponentId>,
+    record_ids: &HashMap<String, RecordId>,
+    allow_fixed_vec: bool,
+) -> Result<IrType, LowerError> {
+    if let Some(seq) = helpers::callable_tseq_ir_type(unsupported_tseq_construct, ty, record_ids)? {
         return Ok(seq);
     }
     if allow_fixed_vec {
@@ -2380,6 +2588,7 @@ fn lower_method_body(
     fid: FunctionId,
     activation: Activation,
     cid: ComponentId,
+    member: ComponentCallableId,
     ctx: &LowerCtx,
     helpers: &helpers::HelperRegistry<'_>,
     side_tables: &std::cell::RefCell<super::SideTables>,
@@ -2437,9 +2646,8 @@ fn lower_method_body(
             | IrType::FixedVec { .. }
             | IrType::UInt(_)
             | IrType::SInt(_)
-            | IrType::Bool) => {
-                b.set_local_type(ret, ty)
-            }
+            | IrType::Bool
+            | IrType::String) => b.set_local_type(ret, ty),
             _ => {}
         }
         b.helper_ret = Some(ret);
@@ -2452,7 +2660,11 @@ fn lower_method_body(
     let mut f = b.finish(
         fid,
         format!("comp_method_{}", fid.0),
-        FunctionKind::ComponentMethod { component: cid },
+        FunctionKind::ComponentMethod {
+            component: cid,
+            member,
+            method_name: Some(h.name.name.clone()),
+        },
         None,
     )?;
     f.params = params;
@@ -2905,14 +3117,9 @@ pub(crate) fn is_builtin_component_predicate(name: &str) -> bool {
 pub(crate) fn connect_payload_matches_ir_type(payload: &EventPayload, ty: &IrType) -> bool {
     match (payload, ty) {
         (_, IrType::Unknown) => true,
-        (
-            EventPayload::Scalar { .. },
-            IrType::UInt(_) | IrType::SInt(_) | IrType::Bool,
-        ) => true,
+        (EventPayload::Scalar { .. }, IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) => true,
         (EventPayload::Record(source), IrType::Record(sink)) => *source == *sink,
-        (EventPayload::FixedVec { .. }, IrType::FixedVec { .. }) => {
-            payload.value_ir_type() == *ty
-        }
+        (EventPayload::FixedVec { .. }, IrType::FixedVec { .. }) => payload.value_ir_type() == *ty,
         _ => false,
     }
 }
@@ -3508,7 +3715,7 @@ pub(crate) fn field_scalar_width_ok(ty: &IrType) -> bool {
     }
 }
 
-fn scalar_width(t: &TypeExpr) -> Option<u32> {
+pub(crate) fn scalar_width(t: &TypeExpr) -> Option<u32> {
     match event_payload_scalar_ir_type(t) {
         Some(IrType::UInt(Some(w))) | Some(IrType::SInt(Some(w))) => Some(w),
         Some(IrType::Bool) => Some(1),
@@ -3565,14 +3772,9 @@ pub(crate) fn fold_field_default(
     // Fast path: a plain literal or bool needs no constant table, and is
     // what almost every `default` actually is.
     let folded = match &*d.kind {
-        ExprKind::Int(lit) => super::exprs::parse_int_literal(lit).map(|bits| super::ConstVal {
-            bits,
-            signed: bits <= i64::MAX as u64,
-        }),
-        ExprKind::Bool(b) => Some(super::ConstVal {
-            bits: *b as u64,
-            signed: true,
-        }),
+        ExprKind::Int(lit) => super::exprs::parse_int_literal(lit)
+            .map(|bits| super::ConstVal::untyped(bits, bits <= i64::MAX as u64)),
+        ExprKind::Bool(b) => Some(super::ConstVal::untyped(*b as u64, true)),
         _ => None,
     };
     // `""` as the self-name: a field default has no enclosing `const` to
@@ -3711,6 +3913,11 @@ impl super::FuncBuilder<'_> {
                     if self.recv_is_scoreboard_sub(head_cid, &recv[1..]) {
                         return Ok(None);
                     }
+                    // Queue methods on method-bearing component/scoreboard
+                    // fields also belong to the queue lowering lane.
+                    if self.as_component_queue_call(callee)?.is_some() {
+                        return Ok(None);
+                    }
                     let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
                     let comp = &self.ctx.components[cid.index()];
                     if comp.method(&method).is_none() {
@@ -3783,6 +3990,20 @@ impl super::FuncBuilder<'_> {
                                 comp.name, method.name, recv.name
                             )));
                         }
+                        let method_schema = comp
+                            .method(&method.name)
+                            .expect("the arm above returns for every absent method");
+                        if let Some(mode) = self.component_local_instance_mode(local) {
+                            self.require_component_activation(
+                                &recv.name,
+                                cid,
+                                mode,
+                                &[],
+                                method_schema.activation,
+                                "method",
+                                &method.name,
+                            )?;
+                        }
                         return Ok(Some((
                             ComponentBase::Local(local),
                             cid,
@@ -3845,7 +4066,7 @@ impl super::FuncBuilder<'_> {
     }
 
     /// Resolve a `<recv>.<queue>.<method>(...)` access on a composite-
-    /// component `queue<T>` field. Two receiver shapes (mirroring the
+    /// component `queue<T>` field. Three receiver shapes (mirroring the
     /// scalar-field resolvers):
     ///   * self-relative `errors.push(e)` inside a method body — `callee`
     ///     is `Field { Ident(queue), method }` and `queue` names a queue
@@ -3854,6 +4075,9 @@ impl super::FuncBuilder<'_> {
     ///     `Field { <path>.<queue>, method }`, the head names a test-scope
     ///     component local, and the resolved sub-component has a queue
     ///     field `queue`.
+    ///   * self-relative sub-component path `model.pending.size()` inside
+    ///     a component method — the receiver is rooted at the synthetic
+    ///     `self` path used by component method calls and field reads.
     /// Returns `(base, queue_field, method)` when it resolves; `None` when
     /// the access is not a component-queue call (a different resolver may
     /// claim it). A path that reaches a component but whose terminal field
@@ -3902,11 +4126,53 @@ impl super::FuncBuilder<'_> {
         if path.len() < 2 {
             return Ok(None);
         }
-        let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) else {
-            return Ok(None);
-        };
         let (recv, queue) = path.split_at(path.len() - 1);
         let queue = queue[0].clone();
+        let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) else {
+            // Component methods have no test-scope binding name for
+            // `self`; an unshadowed leading sub-component field is rooted
+            // at the component whose body is being lowered.
+            if self.lookup(&path[0]).is_some() {
+                return Ok(None);
+            }
+            let Some(self_cid) = self.self_component else {
+                return Ok(None);
+            };
+            let self_schema = &self.ctx.components[self_cid.index()];
+            if !matches!(
+                self_schema.field(&recv[0]).map(|field| &field.kind),
+                Some(ComponentFieldKind::Sub { .. } | ComponentFieldKind::ScoreboardSub { .. })
+            ) {
+                return Ok(None);
+            }
+            if self.recv_is_scoreboard_sub(self_cid, recv) {
+                return Ok(None);
+            }
+            let cid = self.resolve_component_recv(self_cid, recv)?;
+            let comp = &self.ctx.components[cid.index()];
+            let Some(field) = comp.field(&queue) else {
+                return Ok(None);
+            };
+            if !matches!(field.kind, ComponentFieldKind::Queue { .. }) {
+                return Ok(None);
+            }
+            self.require_self_sub_activation(
+                &recv[0],
+                self_cid,
+                field.activation,
+                "queue",
+                &queue,
+            )?;
+            return Ok(Some((
+                ComponentBase::Path(
+                    std::iter::once("self".to_string())
+                        .chain(recv.iter().cloned())
+                        .collect(),
+                ),
+                queue,
+                method.name.clone(),
+            )));
+        };
         // A receiver ending in a data-only scoreboard sub is a scoreboard
         // queue op, not a component-queue op — let the scoreboard handlers
         // claim it.
@@ -3937,72 +4203,369 @@ impl super::FuncBuilder<'_> {
         )))
     }
 
-    /// Lower a whole-component value copy of a test-scope sub-component:
-    /// `checker.sb = sb` / `responder.model = model`. Returns `true` when
-    /// consumed. The LHS is `<dst-path>.<sub-field>` where the terminal
-    /// field is a `Sub` component field; the RHS is a single-segment
-    /// test-scope component local (or `_tb`-prefixed) of the SAME component
-    /// type. Anything else returns `false` (a later resolver / the
-    /// scalar-field rejection claims it).
+    fn has_explicit_tb_component_prefix(&self, path: &[String]) -> bool {
+        path.len() >= 2
+            && Some(path[0].as_str()) == self.ctx.tb_field.as_deref()
+            && self.ctx.component_fields.contains_key(&path[1])
+    }
+
+    /// Resolve a whole-component value used by a sub-component copy or a
+    /// typed component-local initializer. Component-typed locals are direct
+    /// values; test-scope and self-relative paths may traverse `Sub` fields.
+    pub(crate) fn component_copy_source(
+        &self,
+        value: &AstExpr,
+    ) -> Result<Option<(ComponentBase, ComponentId)>, LowerError> {
+        let Some(raw_path) = dotted_path(value) else {
+            return Ok(None);
+        };
+        let explicit_tb = self.has_explicit_tb_component_prefix(&raw_path);
+        let path = self.strip_tb_prefix(&raw_path);
+        let Some(root) = path.first() else {
+            return Ok(None);
+        };
+
+        if !explicit_tb {
+            if let Some(local) = self.lookup(root) {
+                let Some(component) = self.component_of_local(local) else {
+                    return Ok(None);
+                };
+                if path.len() != 1 {
+                    return Err(unsupported(
+                        &format!(
+                            "a whole-component copy from a nested path rooted at component local `{root}`"
+                        ),
+                        "copy the component local itself; nested component-local bases are not represented yet",
+                    ));
+                }
+                return Ok(Some((ComponentBase::Local(local), component)));
+            }
+        }
+
+        if let Some(&component) = self.ctx.component_fields.get(root) {
+            if path.len() == 1 {
+                return Ok(Some((ComponentBase::Path(path.to_vec()), component)));
+            }
+            let tail = &path[1..];
+            let (field, receiver) = tail.split_last().expect("non-empty component path tail");
+            if self.recv_is_scoreboard_sub(component, receiver) {
+                return Ok(None);
+            }
+            let owner = self.resolve_component_copy_path(component, receiver)?;
+            let Some((resolved, _, activation)) =
+                self.resolve_component_copy_subfield(owner, field)?
+            else {
+                return Ok(None);
+            };
+            self.require_component_activation(
+                root,
+                component,
+                self.binding_mode(root),
+                receiver,
+                activation,
+                "sub-component field",
+                field,
+            )?;
+            return Ok(Some((ComponentBase::Path(path.to_vec()), resolved)));
+        }
+
+        if root == "self" {
+            let Some(component) = self.self_component else {
+                return Ok(None);
+            };
+            if path.len() == 1 {
+                return Ok(Some((ComponentBase::SelfField, component)));
+            }
+            let Some(resolved) = self.resolve_self_component_copy_field(&path[1..])? else {
+                return Ok(None);
+            };
+            return Ok(Some((ComponentBase::Path(path.to_vec()), resolved)));
+        }
+
+        if let Some(component) = self.self_component {
+            if matches!(
+                self.ctx.components[component.index()]
+                    .field(root)
+                    .map(|field| &field.kind),
+                Some(ComponentFieldKind::Sub { .. })
+            ) {
+                let Some(resolved) = self.resolve_self_component_copy_field(path)? else {
+                    return Ok(None);
+                };
+                let mut base = Vec::with_capacity(path.len() + 1);
+                base.push("self".to_string());
+                base.extend_from_slice(path);
+                return Ok(Some((ComponentBase::Path(base), resolved)));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Resolve the receiver and terminal `Sub` field of a whole-component
+    /// assignment. A local at the root wins over a self field of the same
+    /// name, preserving ordinary lexical shadowing.
+    fn component_copy_destination(
+        &self,
+        target: &AstExpr,
+    ) -> Result<Option<(ComponentBase, Option<String>, ComponentId)>, LowerError> {
+        let Some(raw_path) = dotted_path(target) else {
+            return Ok(None);
+        };
+        let explicit_tb = self.has_explicit_tb_component_prefix(&raw_path);
+        let path = self.strip_tb_prefix(&raw_path);
+        let Some(root) = path.first() else {
+            return Ok(None);
+        };
+
+        if !explicit_tb {
+            if let Some(local) = self.lookup(root) {
+                let Some(component) = self.component_of_local(local) else {
+                    return Ok(None);
+                };
+                if path.len() == 1 {
+                    return Ok(None);
+                }
+                let field_path = &path[1..];
+                let (field, receiver) = field_path
+                    .split_last()
+                    .expect("a local component destination has a field");
+                let owner = self.resolve_component_copy_path(component, receiver)?;
+                let Some((copied, _, activation)) =
+                    self.resolve_component_copy_subfield(owner, field)?
+                else {
+                    return Ok(None);
+                };
+                self.require_component_activation(
+                    root,
+                    component,
+                    self.component_local_instance_mode(local).flatten(),
+                    receiver,
+                    activation,
+                    "sub-component field",
+                    field,
+                )?;
+                return Ok(Some((
+                    ComponentBase::Local(local),
+                    Some(field_path.join(".")),
+                    copied,
+                )));
+            }
+        }
+
+        if let Some(&component) = self.ctx.component_fields.get(root) {
+            if path.len() == 1 {
+                return Ok(Some((ComponentBase::Path(path.to_vec()), None, component)));
+            }
+            let (receiver, field) = path.split_at(path.len() - 1);
+            if self.recv_is_scoreboard_sub(component, &receiver[1..]) {
+                return Ok(None);
+            }
+            let owner = self.resolve_component_copy_path(component, &receiver[1..])?;
+            let Some((copied, _, activation)) =
+                self.resolve_component_copy_subfield(owner, &field[0])?
+            else {
+                return Ok(None);
+            };
+            self.require_component_activation(
+                root,
+                component,
+                self.binding_mode(root),
+                &receiver[1..],
+                activation,
+                "sub-component field",
+                &field[0],
+            )?;
+            return Ok(Some((
+                ComponentBase::Path(receiver.to_vec()),
+                Some(field[0].clone()),
+                copied,
+            )));
+        }
+
+        if root == "self" {
+            if self.self_component.is_none() {
+                return Ok(None);
+            }
+            if path.len() == 1 {
+                return Ok(None);
+            }
+            let field_path = &path[1..];
+            let Some(copied) = self.resolve_self_component_copy_field(field_path)? else {
+                return Ok(None);
+            };
+            return Ok(Some((
+                ComponentBase::SelfField,
+                Some(field_path.join(".")),
+                copied,
+            )));
+        }
+
+        let Some(component) = self.self_component else {
+            return Ok(None);
+        };
+        if path.len() == 1 {
+            let Some(copied) = self.resolve_self_component_copy_field(path)? else {
+                return Ok(None);
+            };
+            return Ok(Some((ComponentBase::SelfField, Some(root.clone()), copied)));
+        }
+        if !matches!(
+            self.ctx.components[component.index()]
+                .field(root)
+                .map(|field| &field.kind),
+            Some(ComponentFieldKind::Sub { .. })
+        ) {
+            return Ok(None);
+        }
+        let Some(copied) = self.resolve_self_component_copy_field(path)? else {
+            return Ok(None);
+        };
+        let (receiver, field) = path.split_at(path.len() - 1);
+        let mut base = Vec::with_capacity(receiver.len() + 1);
+        base.push("self".to_string());
+        base.extend_from_slice(receiver);
+        Ok(Some((
+            ComponentBase::Path(base),
+            Some(field[0].clone()),
+            copied,
+        )))
+    }
+
+    fn resolve_component_copy_subfield(
+        &self,
+        owner: ComponentId,
+        field: &str,
+    ) -> Result<Option<(ComponentId, Option<ComponentInstanceMode>, Activation)>, LowerError> {
+        let Some(schema) = self.ctx.components.get(owner.index()) else {
+            return Err(LowerError::Invalid(format!(
+                "whole-component copy references missing component c{}",
+                owner.0
+            )));
+        };
+        let Some(field_schema) = schema.field(field) else {
+            return Err(LowerError::Invalid(format!(
+                "component `{}` has no field `{field}` in whole-component assignment",
+                schema.name
+            )));
+        };
+        let ComponentFieldKind::Sub { component, mode } = field_schema.kind else {
+            return Ok(None);
+        };
+        Ok(Some((component, mode, field_schema.activation)))
+    }
+
+    fn resolve_self_component_copy_field(
+        &self,
+        path: &[String],
+    ) -> Result<Option<ComponentId>, LowerError> {
+        let Some(self_component) = self.self_component else {
+            return Ok(None);
+        };
+        let Some((field, receiver)) = path.split_last() else {
+            return Ok(None);
+        };
+        if receiver.is_empty() {
+            let Some((copied, _, activation)) =
+                self.resolve_component_copy_subfield(self_component, field)?
+            else {
+                return Ok(None);
+            };
+            self.require_self_activation(activation, "sub-component field", field)?;
+            return Ok(Some(copied));
+        }
+
+        let root = &receiver[0];
+        let Some((head, inherited_mode, root_activation)) =
+            self.resolve_component_copy_subfield(self_component, root)?
+        else {
+            return Ok(None);
+        };
+        self.require_self_activation(root_activation, "sub-component field", root)?;
+        let nested_receiver = &receiver[1..];
+        let owner = self.resolve_component_copy_path(head, nested_receiver)?;
+        let Some((copied, _, activation)) = self.resolve_component_copy_subfield(owner, field)?
+        else {
+            return Ok(None);
+        };
+        self.require_component_activation(
+            root,
+            head,
+            inherited_mode,
+            nested_receiver,
+            activation,
+            "sub-component field",
+            field,
+        )?;
+        Ok(Some(copied))
+    }
+
+    fn resolve_component_copy_path(
+        &self,
+        mut component: ComponentId,
+        path: &[String],
+    ) -> Result<ComponentId, LowerError> {
+        for segment in path {
+            let Some(schema) = self.ctx.components.get(component.index()) else {
+                return Err(LowerError::Invalid(format!(
+                    "whole-component copy references missing component c{}",
+                    component.0
+                )));
+            };
+            component = match schema.field(segment).map(|field| &field.kind) {
+                Some(ComponentFieldKind::Sub { component, .. }) => *component,
+                Some(_) => {
+                    return Err(LowerError::Invalid(format!(
+                        "field `{}` of component `{}` is not a sub-component",
+                        segment, schema.name
+                    )))
+                }
+                None => {
+                    return Err(LowerError::Invalid(format!(
+                        "component `{}` has no field `{segment}` in whole-component assignment",
+                        schema.name
+                    )))
+                }
+            };
+        }
+        Ok(component)
+    }
+
+    /// Lower a whole-component value copy. Both sides are resolved to their
+    /// exact component schema before the IR statement is constructed.
     pub(crate) fn lower_component_sub_assign(
         &mut self,
         target: &AstExpr,
         value: &AstExpr,
     ) -> Result<bool, LowerError> {
-        let Some(path) = dotted_path(target) else {
+        let Some((dst, field, dst_component)) = self.component_copy_destination(target)? else {
             return Ok(false);
         };
-        let path = self.strip_tb_prefix(&path);
-        if path.len() < 2 {
-            return Ok(false);
+        let Some((src, src_component)) = self.component_copy_source(value)? else {
+            return Err(LowerError::Invalid(format!(
+                "whole component assignment{} requires a component value",
+                field
+                    .as_deref()
+                    .map(|field| format!(" to `{field}`"))
+                    .unwrap_or_default()
+            )));
+        };
+        if src_component != dst_component {
+            let src_name = &self.ctx.components[src_component.index()].name;
+            let dst_name = &self.ctx.components[dst_component.index()].name;
+            return Err(LowerError::Invalid(format!(
+                "cannot copy component `{src_name}` into component destination{} of type \
+                 `{dst_name}`",
+                field
+                    .as_deref()
+                    .map(|field| format!(" `{field}`"))
+                    .unwrap_or_default()
+            )));
         }
-        let Some(&head_cid) = self.ctx.component_fields.get(&path[0]) else {
-            return Ok(false);
-        };
-        let (recv, field) = path.split_at(path.len() - 1);
-        let field = field[0].clone();
-        // A receiver ending in a data-only scoreboard sub is not a
-        // component sub-copy — let the scoreboard handlers claim it.
-        if self.recv_is_scoreboard_sub(head_cid, &recv[1..]) {
-            return Ok(false);
+        match field {
+            Some(field) => self.push(IrStmt::ComponentSubAssign { dst, field, src }),
+            None => self.push(IrStmt::ComponentAssign { dst, src }),
         }
-        let cid = self.resolve_component_recv(head_cid, &recv[1..])?;
-        let comp = &self.ctx.components[cid.index()];
-        let Some(ComponentFieldKind::Sub { component, .. }) = comp.field(&field).map(|f| &f.kind)
-        else {
-            return Ok(false);
-        };
-        let dst_sub = *component;
-        // RHS must be a test-scope component local of the same type.
-        let Some(src_path) = dotted_path(value) else {
-            return Ok(false);
-        };
-        let src_path = self.strip_tb_prefix(&src_path);
-        let Some(&src_cid) = src_path
-            .first()
-            .and_then(|h| self.ctx.component_fields.get(h))
-        else {
-            return Ok(false);
-        };
-        // Resolve through any further sub-path on the RHS (usually none).
-        let src_resolved = self.resolve_component_recv(src_cid, &src_path[1..])?;
-        if src_resolved != dst_sub {
-            return Err(unsupported(
-                &format!(
-                    "copying component `{}` into sub-component field `{}.{field}` of a \
-                     different type `{}`",
-                    self.ctx.components[src_resolved.index()].name,
-                    recv.join("."),
-                    self.ctx.components[dst_sub.index()].name
-                ),
-                "",
-            ));
-        }
-        self.push(IrStmt::ComponentSubAssign {
-            dst: ComponentBase::Path(recv.to_vec()),
-            field,
-            src: ComponentBase::Path(src_path.to_vec()),
-        });
         Ok(true)
     }
 
@@ -4025,13 +4588,23 @@ impl super::FuncBuilder<'_> {
                 )
             })?,
             ComponentBase::Path(path) => {
-                let head_cid = *self.ctx.component_fields.get(&path[0]).ok_or_else(|| {
-                    unsupported(
-                        &format!("`{}` is not a component-typed test field", path[0]),
-                        "",
-                    )
-                })?;
-                self.resolve_component_recv(head_cid, &path[1..])?
+                if path.first().map(String::as_str) == Some("self") {
+                    let self_cid = self.self_component.ok_or_else(|| {
+                        unsupported(
+                            &format!("a self-relative queue `{queue}` outside a component body"),
+                            "",
+                        )
+                    })?;
+                    self.resolve_component_recv(self_cid, &path[1..])?
+                } else {
+                    let head_cid = *self.ctx.component_fields.get(&path[0]).ok_or_else(|| {
+                        unsupported(
+                            &format!("`{}` is not a component-typed test field", path[0]),
+                            "",
+                        )
+                    })?;
+                    self.resolve_component_recv(head_cid, &path[1..])?
+                }
             }
             // A component-typed method-param local never owns a queue
             // field access (only method dispatch reaches a `Local` base).
@@ -4865,6 +5438,54 @@ impl super::FuncBuilder<'_> {
         }
     }
 
+    /// Materialize a value-returning component method at the current source
+    /// position. Component calls are statement edges in TB-IR, so every value
+    /// use receives one typed temporary and the surrounding expression sees
+    /// only that local.
+    pub(crate) fn lower_component_call_value(
+        &mut self,
+        callee: &AstExpr,
+        args: &[CallArg],
+    ) -> Result<Option<IrExpr>, LowerError> {
+        let Some((base, component, method)) = self.as_component_method_call(callee)? else {
+            return Ok(None);
+        };
+        let schema = self.ctx.components[component.index()]
+            .method(&method)
+            .cloned()
+            .expect("component-call resolution guarantees a declared method");
+        if !schema.has_ret {
+            return Err(LowerError::Invalid(format!(
+                "component method `{}.{method}` returns no value and cannot be used in value position",
+                self.ctx.components[component.index()].name
+            )));
+        }
+        if self.in_fmt_args {
+            return Err(unsupported(
+                &format!("component method call `.{method}(...)` inside a message"),
+                "log/fail messages evaluate lazily; hoist the call into a `let` first",
+            ));
+        }
+
+        let owner = format!("`{}.{method}`", self.ctx.components[component.index()].name);
+        let lowered = self.lower_component_call_args(
+            args,
+            Some((&schema.param_names, &schema.param_tys, &owner)),
+        )?;
+        self.check_component_call_args(component, &method, &lowered, args)?;
+        let dest = self.fresh_temp();
+        self.set_local_type(dest, schema.ret_ty.unwrap_or(IrType::Unknown));
+        self.push(IrStmt::ComponentCall {
+            base,
+            component,
+            method,
+            function: schema.function,
+            args: lowered,
+            dest: Some(dest),
+        });
+        Ok(Some(IrExpr::Local(dest)))
+    }
+
     /// Lower the args of a component method call (port-hoisted, like any
     /// host-side call).
     /// `declared` is the callee's parameter names when the caller
@@ -4875,9 +5496,9 @@ impl super::FuncBuilder<'_> {
     pub(crate) fn lower_component_call_args(
         &mut self,
         args: &[CallArg],
-        declared: Option<&[String]>,
+        declared: Option<(&[String], &[IrType], &str)>,
     ) -> Result<Vec<IrExpr>, LowerError> {
-        if let Some(declared) = declared {
+        if let Some((declared, types, owner)) = declared {
             // With the parameter list in hand the three cases split:
             // a name in its own position is inert (v1 drops names and
             // binds by position, so it emits exactly the positional
@@ -4887,20 +5508,32 @@ impl super::FuncBuilder<'_> {
             // ask "is there more than one argument?", so it refused the
             // inert form too.
             super::reject_misplaced_named_args(args, declared, "a component method call")?;
+            if args.len() != declared.len() {
+                return Err(LowerError::Invalid(format!(
+                    "component method {owner} takes {} argument(s), call passes {}",
+                    declared.len(),
+                    args.len()
+                )));
+            }
             // `lower_expr_no_ports`, matching the positional path below
             // exactly. An earlier draft used `lower_expr` here and the
             // verifier caught it: `PortInDisallowedPosition` on a
             // `ComponentCall arg`. A named argument must lower through
             // the same seam as a positional one, or "the name is inert"
             // stops being true.
-            let mut out = Vec::with_capacity(args.len());
-            for a in args {
-                let (CallArg::Expr(e) | CallArg::Named { value: e, .. }) = a;
-                out.push(self.lower_expr_no_ports(e)?);
-            }
-            return Ok(out);
+            let exprs: Vec<&AstExpr> = args
+                .iter()
+                .map(|a| match a {
+                    CallArg::Expr(e) | CallArg::Named { value: e, .. } => e,
+                })
+                .collect();
+            let slots: Vec<String> = declared
+                .iter()
+                .map(|name| format!("parameter `{name}` of {owner}"))
+                .collect();
+            return self.lower_checked_ordered_args(&exprs, types, &slots, false);
         }
-        let mut out = Vec::with_capacity(args.len());
+        let mut exprs = Vec::with_capacity(args.len());
         for a in args {
             let CallArg::Expr(e) = a else {
                 // No CODEGEN site in v1 reads an argument name: of the
@@ -4965,7 +5598,7 @@ impl super::FuncBuilder<'_> {
                     let CallArg::Named { value, .. } = a else {
                         unreachable!("the expression arm returned above")
                     };
-                    out.push(self.lower_event_arg_expr(value)?);
+                    exprs.push(value);
                     continue;
                 }
                 // "component call", not "method call": every method
@@ -4982,9 +5615,28 @@ impl super::FuncBuilder<'_> {
                     V1Status::SilentlyMisLowers,
                 ));
             };
-            out.push(self.lower_event_arg_expr(e)?);
+            exprs.push(e);
         }
-        Ok(out)
+        self.lower_ordered_event_arg_exprs(&exprs)
+    }
+
+    fn lower_ordered_event_arg_exprs(
+        &mut self,
+        exprs: &[&AstExpr],
+    ) -> Result<Vec<IrExpr>, LowerError> {
+        let effects: Vec<bool> = exprs
+            .iter()
+            .map(|expr| self.expr_has_effectful_value_prelude(expr))
+            .collect();
+        let mut lowered = Vec::with_capacity(exprs.len());
+        for (index, expr) in exprs.iter().enumerate() {
+            let mut value = self.lower_event_arg_expr(expr)?;
+            if effects[index + 1..].iter().any(|effect| *effect) {
+                value = self.materialize_ordered_value(value);
+            }
+            lowered.push(value);
+        }
+        Ok(lowered)
     }
 
     fn lower_event_arg_expr(&mut self, value: &AstExpr) -> Result<IrExpr, LowerError> {
@@ -5266,11 +5918,7 @@ impl super::FuncBuilder<'_> {
         }
         let lowered = self.lower_component_call_args(args, None)?;
         if let Some(payload) = self.component_event_payload(cid, &event) {
-            self.check_event_payload_arg(
-                &lowered[0],
-                &payload,
-                &format!("event `{event}`"),
-            )?;
+            self.check_event_payload_arg(&lowered[0], &payload, &format!("event `{event}`"))?;
         }
         self.push(IrStmt::ComponentEmit {
             base: ComponentBase::SelfField,
@@ -5426,6 +6074,7 @@ impl super::FuncBuilder<'_> {
         // any name here too.
         let (CallArg::Expr(n_expr) | CallArg::Named { value: n_expr, .. }) = &args[0];
         let n = self.lower_expr_no_ports(n_expr)?;
+        self.validate_numeric_expr(&n, "idle cycle count")?;
         Ok(Some(IrExpr::ComponentIdle {
             base,
             subpath,
@@ -5479,6 +6128,7 @@ impl super::FuncBuilder<'_> {
         // name can only bind where the position already put it.
         let (CallArg::Expr(n_expr) | CallArg::Named { value: n_expr, .. }) = &args[0];
         let n = self.lower_expr_no_ports(n_expr)?;
+        self.validate_numeric_expr(&n, "quiesced cycle count")?;
 
         // Collect every leaf sub-component instance path under the receiver.
         let mut leaves: Vec<Vec<String>> = Vec::new();

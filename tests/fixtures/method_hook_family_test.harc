@@ -1,5 +1,5 @@
-// Method-hook family parity: nested component resolution, signed method
-// parameters, and statement-position registration timing.
+// v1 type-scoped method-hook fixture. TB-IR's exact-instance contract is
+// exercised independently in method_hook_exact_instance_test.
 
 domain SysDomain
   freq_mhz: 100
@@ -86,8 +86,8 @@ impl MethodHookFamilyTest for MethodHookFamilyTb
             registration_order = registration_order * 10 + 3
         end on
         env.watcher.note(5)
-        // v1 hook vectors are component-type scoped, so a same-typed sibling
-        // also fires both registrations. TBIR must preserve that contract.
+        // This v1-only fixture uses component-type-scoped hook vectors, so a
+        // same-typed sibling also fires both registrations.
         env.sibling.note(7)
 
         // A post hook fires only after natural completion. The explicit

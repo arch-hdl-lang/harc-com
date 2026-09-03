@@ -1,35 +1,37 @@
 ---
 source: tests/tbir.rs
+assertion_line: 26858
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
   testbench tb0 CounterLifecycleTb { dut: Top } field expected:uint<32>=0
   testbench tb1 CounterLifecycleTb { dut: Top } field expected:uint<32>=0
-  test LifecycleBumpFive tb=tb0 run=fn2 check=fn3
-  test LifecycleBumpThree tb=tb1 run=fn4 check=fn5
+  test LifecycleBumpFive tb=tb0 run=fn3 check=fn4
+  test LifecycleBumpThree tb=tb1 run=fn5 check=fn6
 
-fn fn0 __tb_lifecycle_CounterLifecycleTb_Setup [kind=TestbenchLifecycle(tb0, setup), owner=tb0]
-  locals:
-    %0 __t0 : unknown
+fn fn0 tb_method_0_reset [kind=TestbenchMethod(tbt0)]
   entry = b0
 
   b0:
-    Assign(%__t0, 0)
     DutWrite(dut.rst, 1)
     DutWrite(dut.en, 0)
-    -> WaitCyclesSync(2, b2)
+    -> WaitCycles(2, b1)
 
   b1:
-    -> Return
+    DutWrite(dut.rst, 0)
+    -> WaitCycles(1, b2)
 
   b2:
-    DutWrite(dut.rst, 0)
-    -> WaitCyclesSync(1, b3)
+    -> Return
 
-  b3:
-    -> Jump(b1)
+fn fn1 __tb_lifecycle_CounterLifecycleTb_Setup [kind=TestbenchLifecycle(tb0, setup), owner=tb0]
+  entry = b0
 
-fn fn1 __tb_lifecycle_CounterLifecycleTb_Check [kind=TestbenchLifecycle(tb0, check), owner=tb0]
+  b0:
+    TestbenchCall(fn0())
+    -> Return
+
+fn fn2 __tb_lifecycle_CounterLifecycleTb_Check [kind=TestbenchLifecycle(tb0, check), owner=tb0]
   entry = b0
 
   b0:
@@ -37,11 +39,11 @@ fn fn1 __tb_lifecycle_CounterLifecycleTb_Check [kind=TestbenchLifecycle(tb0, che
     Log(info, "shared final check passed")
     -> Return
 
-fn fn2 run_LifecycleBumpFive [kind=Run, owner=tb0]
+fn fn3 run_LifecycleBumpFive [kind=Run, owner=tb0]
   entry = b0
 
   b0:
-    -> TbLifecycleCall { fn0, b1 }
+    -> TbLifecycleCall { fn1, b1 }
 
   b1:
     DutWrite(dut.en, 1)
@@ -52,20 +54,20 @@ fn fn2 run_LifecycleBumpFive [kind=Run, owner=tb0]
     TbFieldWrite(_tb.expected, 5)
     -> Return
 
-fn fn3 check_LifecycleBumpFive [kind=Check, owner=tb0]
+fn fn4 check_LifecycleBumpFive [kind=Check, owner=tb0]
   entry = b0
 
   b0:
-    -> TbLifecycleCall { fn1, b1 }
+    -> TbLifecycleCall { fn2, b1 }
 
   b1:
     -> Return
 
-fn fn4 run_LifecycleBumpThree [kind=Run, owner=tb1]
+fn fn5 run_LifecycleBumpThree [kind=Run, owner=tb1]
   entry = b0
 
   b0:
-    -> TbLifecycleCall { fn0, b1 }
+    -> TbLifecycleCall { fn1, b1 }
 
   b1:
     DutWrite(dut.en, 1)
@@ -76,11 +78,11 @@ fn fn4 run_LifecycleBumpThree [kind=Run, owner=tb1]
     TbFieldWrite(_tb.expected, 3)
     -> Return
 
-fn fn5 check_LifecycleBumpThree [kind=Check, owner=tb1]
+fn fn6 check_LifecycleBumpThree [kind=Check, owner=tb1]
   entry = b0
 
   b0:
-    -> TbLifecycleCall { fn1, b1 }
+    -> TbLifecycleCall { fn2, b1 }
 
   b1:
     -> Return

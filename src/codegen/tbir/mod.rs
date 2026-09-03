@@ -11,6 +11,7 @@
 //! Function bodies use a loop-switch over `BlockId` instead of
 //! re-structured control flow; see `func.rs`.
 
+pub mod common;
 mod covergroup;
 mod expr;
 mod func;
@@ -39,42 +40,58 @@ const INDENT: &str = "    ";
 /// case — the unused `dut` handle stays a nullptr (synthetic tests use a
 /// bare `dut` local).
 fn needs_tb_struct(tb: &ir::TestbenchSchema) -> bool {
-    !tb.synthetic || !tb.state_fields.is_empty()
+    !tb.synthetic || !tb.state_fields.is_empty() || !tb.record_fields.is_empty()
 }
 
-/// Whether this testbench installs a user hook on this transactor method.
-/// Both test-scope and statement-position registrations are represented by
-/// `MethodHookSubscribe`; restricting the scan to `owner` prevents a shared
-/// transactor schema from leaking hook vectors between tests.
-pub(super) fn has_transactor_method_hook_subscription(
+pub(super) fn emit_component_dut_bindings(
+    out: &mut String,
     prog: &TbProgram,
-    owner: ir::TestbenchId,
-    transactor: ir::TransactorId,
-    method: &str,
-) -> bool {
-    prog.functions
-        .iter()
-        .filter(|f| f.owner == Some(owner))
-        .any(|f| {
-            f.blocks.iter().any(|b| {
-                b.stmts.iter().any(|s| {
-                    matches!(
-                        s,
-                        ir::Stmt::MethodHookSubscribe {
-                            target: ir::MethodHookTarget::Transactor {
-                                transactor: target,
-                                method: target_method,
-                                ..
-                            },
-                            ..
-                        } if *target == transactor && target_method == method
-                    )
-                })
-            })
-        })
+    component: ir::ComponentId,
+    instance: &str,
+    dut_type: &str,
+    dut_receiver: &str,
+    depth: usize,
+) -> Result<(), EmitError> {
+    let schema = prog.components.get(component.index()).ok_or_else(|| {
+        EmitError(format!(
+            "tbir: component DUT binding references missing component c{}",
+            component.0
+        ))
+    })?;
+    let pad = INDENT.repeat(depth);
+    for field in &schema.fields {
+        match &field.kind {
+            ir::ComponentFieldKind::Dut {
+                dut_type: field_type,
+            } => {
+                if field_type != dut_type {
+                    return Err(EmitError(format!(
+                        "tbir: component `{}` DUT field `{}` has module type `{field_type}`, expected `{dut_type}`",
+                        schema.name, field.name
+                    )));
+                }
+                writeln!(out, "{pad}{instance}.{} = {dut_receiver};", field.name).ok();
+            }
+            ir::ComponentFieldKind::Sub {
+                component: child, ..
+            } => {
+                emit_component_dut_bindings(
+                    out,
+                    prog,
+                    *child,
+                    &format!("{instance}.{}", field.name),
+                    dut_type,
+                    dut_receiver,
+                    depth,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
-/// Component counterpart of `has_transactor_method_hook_subscription`.
+/// Whether this testbench installs a user hook on this component method.
 pub(super) fn has_component_method_hook_subscription(
     prog: &TbProgram,
     owner: ir::TestbenchId,
@@ -124,9 +141,17 @@ pub struct SuiteScaffold {
     uses_constraint_solver: bool,
     problem_table_cpp: String,
     randomize_snippets: Vec<String>,
+    randomize_site_states: Vec<crate::codegen::cpp_tb::TbirRandomizeSiteState>,
+    runtime_cells: ir::passes::runtime_cells::RuntimeCellPlan,
+    dut_access: Option<ir::passes::dut_access::DutAccessPlan>,
+    bus_access: Option<ir::passes::bus_access::BusAccessPlan>,
 }
 
 impl SuiteScaffold {
+    pub fn bus_access(&self) -> Option<&ir::passes::bus_access::BusAccessPlan> {
+        self.bus_access.as_ref()
+    }
+
     /// `dut_scope` is the phrase used in the multi-DUT diagnostic — "one
     /// binary" for whole-program emission, "one split binary" for a split
     /// build.
@@ -143,35 +168,50 @@ impl SuiteScaffold {
         // All tests in one binary share the DUT type (same v0 rule as v1).
         let dut_type = validate_tests_share_dut(prog, dut_scope)?;
 
-        // `generate_if`-gated bus signals: lowering kept every binding's gates
-        // intact but could not evaluate them (no param env). Resolve each
-        // ACCESSED bus-bound signal's gate against the effective param env now
-        // (the emitter has `EmitOpts` + the `SourceFile`), erroring on a
-        // gated-OFF access exactly as v1's `bus_signal_present` / gated-OFF
-        // diagnostic does. A gated-OFF signal that is never accessed is silent.
+        // Preserve the source-level gate diagnostic before physical catalog
+        // validation can report the intentionally absent gated-off port.
         check_gated_bus_access(prog, file, opts)?;
+        let dut_access = opts
+            .dut_interface
+            .as_ref()
+            .map(|interface| {
+                let plan = if opts.program_verified {
+                    ir::passes::dut_access::analyze_verified(prog, interface)
+                } else {
+                    ir::passes::dut_access::analyze(prog, interface)
+                };
+                plan.map_err(|error| EmitError(format!("tbir: {error}")))
+            })
+            .transpose()?;
+        let bus_access = opts
+            .dut_interface
+            .as_ref()
+            .map(|interface| {
+                ir::passes::bus_access::analyze(prog, interface)
+                    .map_err(|error| EmitError(format!("tbir: {error}")))
+            })
+            .transpose()?;
 
         // Constraint-solver wiring (randomize sites). The runtime problem
         // table + per-site Z3-solve snippets are emitted by v1's shared
         // constraint codegen ("only the call site moves to the IR backend").
         // Empty when the program has no randomize site — the TB then never
         // links Z3, exactly like v1.
-        let problem_table_cpp = if prog.constraint_sites.is_empty() {
+        let randomize = crate::codegen::cpp_tb::plan_tbir_randomize_emission(
+            file,
+            opts,
+            &prog.constraint_sites,
+            5,
+        )?;
+        let problem_table_cpp = if randomize.runtime_table.problems.is_empty() {
             String::new()
         } else {
-            let solver_table = crate::solver::problem_table::build_typed_solver_problem_table(file);
-            let runtime_table =
-                crate::solver::runtime::RuntimeProblemTable::from_typed_solver_table(&solver_table);
-            if runtime_table.problems.is_empty() {
-                String::new()
-            } else {
-                runtime_table.render_cpp_table("_harc_runtime_random_problem_table")
-            }
+            randomize
+                .runtime_table
+                .render_cpp_inline_descriptors("_harc_runtime_random_problem_table")
         };
-        // Per-`ConstraintRef` Z3-solve snippets, emitted at the loop-switch
-        // body depth (run/check fn = depth 2 → block stmts at depth 5).
-        let randomize_snippets =
-            crate::codegen::cpp_tb::emit_randomize_snippets(file, opts, &prog.constraint_sites, 5)?;
+        let randomize_snippets = randomize.snippets;
+        let randomize_site_states = randomize.site_states;
         // The runtime metadata table intentionally excludes component-scope
         // sites. Include detection must follow the source/codegen decision,
         // not table non-emptiness, or a component-only kept struct emits Z3
@@ -182,7 +222,11 @@ impl SuiteScaffold {
         // root struct's full definition (`V<Top>___024root.h`) — the `rootp`
         // member in `V<Top>.h` is only a forward-declared pointer. Mirrors
         // v1's `aggregated_probes` include gate. See docs/probe-signals.md.
-        let has_probes = program_has_probes(prog);
+        let has_probes = dut_access
+            .as_ref()
+            .map_or_else(|| program_has_probes(prog), |plan| plan.uses_probe());
+        let runtime_cells = ir::passes::runtime_cells::analyze(prog)
+            .map_err(|error| EmitError(format!("tbir: {error}")))?;
         if opts.cosim.is_some() && opts.mt {
             return Err(EmitError(
                 "--cosim dpi does not support --mt yet (actor worker threads \
@@ -197,6 +241,10 @@ impl SuiteScaffold {
             uses_constraint_solver,
             problem_table_cpp,
             randomize_snippets,
+            randomize_site_states,
+            runtime_cells,
+            dut_access,
+            bus_access,
         })
     }
 }
@@ -271,10 +319,12 @@ fn referenced_lifecycle_fns(prog: &TbProgram, test_indices: &[usize]) -> HashSet
 fn emit_shared_lifecycle_defs(
     out: &mut String,
     prog: &TbProgram,
-    opts: &EmitOpts,
+    vec_lane_widths: &HashMap<String, u32>,
     randomize_snippets: &[String],
     dut_type: &str,
+    dut_access: Option<&ir::passes::dut_access::DutAccessPlan>,
     map: &HashMap<ir::FunctionId, func::LifecycleEmit>,
+    common_context: bool,
     static_linkage: bool,
     referenced: Option<&HashSet<ir::FunctionId>>,
 ) -> Result<(), EmitError> {
@@ -297,9 +347,11 @@ fn emit_shared_lifecycle_defs(
                 &tb.name,
                 &prog.records,
                 &tb.bus_bindings,
-                &opts.vec_lane_widths,
+                vec_lane_widths,
                 randomize_snippets,
                 dut_type,
+                dut_access,
+                common_context,
                 static_linkage,
                 map,
             )?,
@@ -310,9 +362,11 @@ fn emit_shared_lifecycle_defs(
                 &tb.name,
                 &prog.records,
                 &tb.bus_bindings,
-                &opts.vec_lane_widths,
+                vec_lane_widths,
                 randomize_snippets,
                 dut_type,
+                dut_access,
+                common_context,
                 static_linkage,
                 map,
             )?,
@@ -422,8 +476,14 @@ fn emit_selected_tests(
 
     // Scoreboard structs (data-only host-state records — they never name
     // a TB or DUT type), before the testbench structs that hold them.
-    for sb in &prog.scoreboards {
-        runtime::scoreboard_struct(&mut out, sb, &prog.records);
+    for (index, sb) in prog.scoreboards.iter().enumerate() {
+        runtime::scoreboard_struct(
+            &mut out,
+            ir::ScoreboardId(index as u32),
+            sb,
+            &prog.records,
+            &scaffold.runtime_cells,
+        )?;
     }
 
     // Composite-component structs (env/agent cluster). A component holds
@@ -435,11 +495,13 @@ fn emit_selected_tests(
         runtime::component_struct(
             &mut out,
             prog,
+            ir::ComponentId(ci as u32),
             &prog.components[ci],
             &prog.components,
             &prog.scoreboards,
             &prog.records,
-        );
+            &scaffold.runtime_cells,
+        )?;
     }
 
     // Lowered pure helpers — file-scope C++ functions. Declaration
@@ -451,26 +513,12 @@ fn emit_selected_tests(
         .filter(|f| f.kind == ir::FunctionKind::Helper)
         .collect();
     for h in &helpers {
-        func::emit_helper_prototype(&mut out, h, &prog.records);
+        func::emit_helper_prototype(&mut out, prog, h)?;
     }
     if !helpers.is_empty() {
         writeln!(out).ok();
     }
     crate::codegen::cpp_tb::emit_extern_fn_decls(&mut out, file);
-    // Concurrent-`cover` hit counters. File scope so the end-of-test
-    // summary — emitted in the test's `run_*` function, outside the run
-    // coroutine that registers the witness closure — can read them.
-    if !prog.cover_checks.is_empty() {
-        for c in &prog.cover_checks {
-            writeln!(
-                &mut out,
-                "static uint64_t {} = 0;",
-                func::cover_counter_name(&c.tag)
-            )
-            .ok();
-        }
-        writeln!(out).ok();
-    }
     // Covergroup structs are leaf observables, but hook-triggered sampler
     // bodies may call pure helpers or extern reference functions, so their
     // forward declarations must be visible before the struct definition.
@@ -491,7 +539,7 @@ fn emit_selected_tests(
     // boundary (run and check are separate IR functions). See
     // `needs_tb_struct`.
     let mut seen = HashSet::new();
-    for tb in &prog.testbenches {
+    for (testbench_index, tb) in prog.testbenches.iter().enumerate() {
         if needs_tb_struct(tb) && seen.insert(tb.name.clone()) {
             let cov_fields: Vec<(String, String)> = tb
                 .cov_fields
@@ -505,16 +553,19 @@ fn emit_selected_tests(
                 .collect();
             runtime::tb_struct(
                 &mut out,
-                &tb.name,
+                ir::TestbenchId(testbench_index as u32),
+                tb,
                 dut_type,
                 &cov_fields,
                 &tb.state_fields,
+                &tb.record_fields,
                 &sb_fields,
                 &prog.records,
-            );
+                &scaffold.runtime_cells,
+            )?;
         }
     }
-    runtime::context_struct(&mut out, dut_type);
+    runtime::context_struct(&mut out, dut_type, &scaffold.randomize_site_states);
 
     // #619 M4b: emit each shareable reusable-testbench lifecycle body ONCE
     // at file scope — a plain `void` function for a non-suspending body, a
@@ -544,10 +595,12 @@ fn emit_selected_tests(
     emit_shared_lifecycle_defs(
         &mut out,
         prog,
-        opts,
+        &opts.vec_lane_widths,
         &scaffold.randomize_snippets,
         dut_type,
+        scaffold.dut_access.as_ref(),
         &outofline_lifecycle,
+        /* common_context */ false,
         /* static_linkage */ true,
         Some(&referenced_lifecycle),
     )?;
@@ -560,6 +613,8 @@ fn emit_selected_tests(
             dut_type,
             opts,
             &scaffold.randomize_snippets,
+            &scaffold.runtime_cells,
+            scaffold.dut_access.as_ref(),
             &outofline_lifecycle,
         )?;
     }
@@ -603,48 +658,6 @@ pub struct SplitCppPlan {
     pub test_names: Vec<String>,
     pub shards: Vec<SplitShardPlan>,
     scaffold: SuiteScaffold,
-}
-
-/// M0: Category accounting for generated C++ bytes.
-///
-/// Splits the self-contained shard's byte count into the categories that
-/// M2 will move out of shards. All fields are byte lengths of the
-/// *would-be* separate artifacts when the same `SuiteScaffold` and program
-/// are emitted through the separate path. The `shared` field is the sum of
-/// every category except `shards` and `dispatcher`; `per_shard_avg` is
-/// useful for estimating the effect of `group_size`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CategoryBytes {
-    pub preamble: usize,
-    pub records: usize,
-    pub scoreboards: usize,
-    pub components: usize,
-    pub helpers: usize,
-    pub tb_and_context: usize,
-    pub covergroups: usize,
-    pub problem_table: usize,
-    pub interface_total: usize,
-    pub common_total: usize,
-    pub dispatcher: usize,
-    pub shards_total: usize,
-    pub shards_avg: usize,
-    pub total_self_contained: usize,
-    pub total_separate: usize,
-}
-
-/// M1: Planned separate-compilation build — interface header, common
-/// implementation source, dispatcher, plus shards that contain only
-/// test-owned bodies. Keeps the same `SplitShardPlan` for shard
-/// membership so drivers can reuse `emit_split_shards` machinery, but
-/// shards are no longer self-contained.
-pub struct SeparateCppPlan {
-    pub interface: GeneratedCppFile,
-    pub common: GeneratedCppFile,
-    pub dispatcher: GeneratedCppFile,
-    /// Every test in the suite, in program order.
-    pub test_names: Vec<String>,
-    pub shards: Vec<SplitShardPlan>,
-    pub scaffold: SuiteScaffold,
 }
 
 /// Plan a dispatcher plus one or more self-contained C++ translation units
@@ -721,621 +734,6 @@ pub fn plan_split_tests(
         shards,
         scaffold,
     })
-}
-
-/// M1: Plan an interface + common + dispatcher + shards split build for TB-IR.
-/// Like `plan_split_tests` but shards will be *non-self-contained*: they
-/// contain only test-owned `run_<Test>` wrappers and include the
-/// interface header for shared declarations.
-pub fn plan_separate_tests(
-    prog: &TbProgram,
-    file: &SourceFile,
-    opts: &EmitOpts,
-    file_prefix: &str,
-    group_size: usize,
-) -> Result<SeparateCppPlan, EmitError> {
-    let group_size = group_size.max(1);
-    if prog.tests.is_empty() {
-        return Err(EmitError("no `test` declaration found".into()));
-    }
-    if opts.cosim.is_some() {
-        return Err(EmitError(
-            "--cosim dpi does not support split-test builds yet (the split \
-             dispatcher links against per-shard `main()` functions; co-sim \
-             emission replaces `main()` with DPI entrypoints)"
-                .into(),
-        ));
-    }
-    let scaffold = SuiteScaffold::build(prog, file, opts, "one split binary")?;
-
-    let test_names: Vec<String> = prog.tests.iter().map(|t| t.name.clone()).collect();
-    let all: Vec<usize> = (0..test_names.len()).collect();
-    let shards: Vec<SplitShardPlan> = all
-        .chunks(group_size)
-        .enumerate()
-        .map(|(index, test_indices)| SplitShardPlan {
-            index,
-            filename: if group_size == 1 {
-                format!(
-                    "{file_prefix}test_{}.cpp",
-                    crate::codegen::cpp_tb::sanitize_file_component(&test_names[test_indices[0]])
-                )
-            } else {
-                format!("{file_prefix}shard{}.cpp", index + 1)
-            },
-            test_indices: test_indices.to_vec(),
-        })
-        .collect();
-
-    {
-        let mut names: Vec<&str> = shards.iter().map(|s| s.filename.as_str()).collect();
-        names.sort_unstable();
-        let before = names.len();
-        names.dedup();
-        if names.len() != before {
-            return Err(EmitError(
-                "separate plan produced two shards with the same filename".into(),
-            ));
-        }
-        debug_assert!(
-            names.len() == before,
-            "separate plan produced two shards with the same filename"
-        );
-    }
-
-    Ok(SeparateCppPlan {
-        interface: GeneratedCppFile {
-            filename: format!("{file_prefix}suite.hpp"),
-            contents: String::new(),
-        },
-        common: GeneratedCppFile {
-            filename: format!("{file_prefix}common.cpp"),
-            contents: String::new(),
-        },
-        dispatcher: GeneratedCppFile {
-            filename: format!("{file_prefix}main.cpp"),
-            contents: emit_split_dispatcher(&test_names),
-        },
-        test_names,
-        shards,
-        scaffold,
-    })
-}
-
-/// M0: Category accounting — byte breakdown of the separate vs self-contained
-/// layouts for the same program. Reports how many bytes move out of shards
-/// into the shared interface/common artifacts (M2).
-pub fn separate_category_bytes(
-    prog: &TbProgram,
-    file: &SourceFile,
-    opts: &EmitOpts,
-    file_prefix: &str,
-    group_size: usize,
-) -> Result<CategoryBytes, EmitError> {
-    let plan_self = plan_split_tests(prog, file, opts, file_prefix, group_size)?;
-    let plan_sep = plan_separate_tests(prog, file, opts, file_prefix, group_size)?;
-
-    // Emit representative artifacts and measure.
-    let interface = emit_separate_interface_with_prefix(prog, file, opts, &plan_sep.scaffold, file_prefix)?;
-    let common = emit_separate_common_with_prefix(prog, file, opts, &plan_sep.scaffold, file_prefix)?;
-    let dispatcher = emit_split_dispatcher(&plan_sep.test_names).len();
-    let mut shards_total = 0usize;
-    for shard in &plan_sep.shards {
-        shards_total += emit_separate_shard_with_prefix(prog, file, opts, &plan_sep.scaffold, shard, file_prefix)?.len();
-    }
-    // Self-contained total: sum of all shards + dispatcher (each shard repeats scaffold).
-    let mut self_total = 0usize;
-    for shard in &plan_self.shards {
-        self_total += emit_split_shard(prog, file, opts, &plan_self, shard)?.len();
-    }
-    self_total += plan_self.dispatcher.contents.len();
-
-    let interface_len = interface.len();
-    let common_len = common.len();
-    // Heuristic split of interface vs common from their emitted contents.
-    // For now, treat preamble+structs+prototypes as interface, helpers+tables as common.
-    // The sum is what matters for the ratio.
-    let shards_avg = if plan_sep.shards.is_empty() {
-        0
-    } else {
-        shards_total / plan_sep.shards.len()
-    };
-    let total_separate = interface_len + common_len + dispatcher + shards_total;
-
-    // Detailed preamble/records/etc. are approximated by re-emitting each
-    // section in isolation and measuring. This keeps accounting independent
-    // of the main emit path and cheap (no extra lowering).
-    let preamble = {
-        let mut out = String::new();
-        runtime::preamble(
-            &mut out,
-            &plan_sep.scaffold.dut_type,
-            &plan_sep.test_names,
-            &plan_sep.scaffold.problem_table_cpp,
-            plan_sep.scaffold.uses_constraint_solver,
-            plan_sep.scaffold.has_probes,
-            opts.cosim.as_ref(),
-        );
-        out.len()
-    };
-    let records = {
-        let mut out = String::new();
-        let order = record_emit_order(&prog.records);
-        for &i in &order {
-            record_struct(&mut out, &prog.records[i], &prog.records);
-        }
-        out.len()
-    };
-    let scoreboards = {
-        let mut out = String::new();
-        for sb in &prog.scoreboards {
-            runtime::scoreboard_struct(&mut out, sb, &prog.records);
-        }
-        out.len()
-    };
-    let components = {
-        let mut out = String::new();
-        for ci in component_emit_order(prog) {
-            runtime::component_struct(
-                &mut out,
-                prog,
-                &prog.components[ci],
-                &prog.components,
-                &prog.scoreboards,
-                &prog.records,
-            );
-        }
-        out.len()
-    };
-    let helpers = {
-        let mut out = String::new();
-        let helpers: Vec<&ir::TbFunction> = prog
-            .functions
-            .iter()
-            .filter(|f| f.kind == ir::FunctionKind::Helper)
-            .collect();
-        for h in &helpers {
-            func::emit_helper_prototype(&mut out, h, &prog.records);
-        }
-        for h in &helpers {
-            let _ = func::emit_helper_function(&mut out, prog, h);
-        }
-        out.len()
-    };
-    let tb_and_context = {
-        let mut out = String::new();
-        let mut seen = HashSet::new();
-        for tb in &prog.testbenches {
-            if needs_tb_struct(tb) && seen.insert(tb.name.clone()) {
-                let cov_fields: Vec<(String, String)> = tb
-                    .cov_fields
-                    .iter()
-                    .map(|(f, cg)| (f.clone(), prog.covgroups[cg.index()].name.clone()))
-                    .collect();
-                let sb_fields: Vec<(String, String)> = tb
-                    .scoreboard_fields
-                    .iter()
-                    .map(|(f, sb)| (f.clone(), prog.scoreboards[sb.index()].name.clone()))
-                    .collect();
-                runtime::tb_struct(
-                    &mut out,
-                    &tb.name,
-                    &plan_sep.scaffold.dut_type,
-                    &cov_fields,
-                    &tb.state_fields,
-                    &sb_fields,
-                    &prog.records,
-                );
-            }
-        }
-        runtime::context_struct(&mut out, &plan_sep.scaffold.dut_type);
-        out.len()
-    };
-    let covergroups = {
-        let mut out = String::new();
-        for cg in &prog.covgroups {
-            covergroup::covgroup_struct(&mut out, cg);
-        }
-        out.len()
-    };
-
-    Ok(CategoryBytes {
-        preamble,
-        records,
-        scoreboards,
-        components,
-        helpers,
-        tb_and_context,
-        covergroups,
-        problem_table: plan_sep.scaffold.problem_table_cpp.len(),
-        interface_total: interface_len,
-        common_total: common_len,
-        dispatcher,
-        shards_total,
-        shards_avg,
-        total_self_contained: self_total,
-        total_separate,
-    })
-}
-
-/// M2: Emit only the interface header for the separate build.
-///
-/// Contains suite-wide declarations that every shard needs: includes,
-/// record/transaction/scoreboard/component/covergroup/tb layouts,
-/// `HarcTestContext` (deepened for M3), helper prototypes, and immutable
-/// solver descriptors. No `run_<Test>` bodies, no dispatcher.
-pub fn emit_separate_interface(
-    prog: &TbProgram,
-    file: &SourceFile,
-    opts: &EmitOpts,
-    scaffold: &SuiteScaffold,
-) -> Result<String, EmitError> {
-    emit_separate_interface_with_prefix(prog, file, opts, scaffold, "")
-}
-
-/// Internal helper with explicit header prefix handling.
-pub fn emit_separate_interface_with_prefix(
-    prog: &TbProgram,
-    file: &SourceFile,
-    opts: &EmitOpts,
-    scaffold: &SuiteScaffold,
-    _file_prefix: &str,
-) -> Result<String, EmitError> {
-    let mut out = String::new();
-    out.push_str("#pragma once\n\n");
-    // Interface includes — same preamble but without the mutable
-    // `harc_rng` definition and without the problem table body.
-    // Those live in the common source (M3).
-    let mut preamble_no_rng = String::new();
-    runtime::preamble(
-        &mut preamble_no_rng,
-        &scaffold.dut_type,
-        &[],
-        "",
-        scaffold.uses_constraint_solver,
-        scaffold.has_probes,
-        opts.cosim.as_ref(),
-    );
-    // Strip the `harc_rng` definition from preamble for the header;
-    // it will be re-emitted as `extern` / per-context in the deepened
-    // context.
-    if preamble_no_rng.contains("static harc_rt::random::HarcRng harc_rng;") {
-        preamble_no_rng = preamble_no_rng.replace(
-            "static harc_rt::random::HarcRng harc_rng;\nstatic inline uint64_t harc_rng_next() {\n    return harc_rng.next();\n}\n\n",
-            "extern harc_rt::random::HarcRng harc_rng;\ninline uint64_t harc_rng_next() { return harc_rng.next(); }\n\n",
-        );
-    }
-    out.push_str(&preamble_no_rng);
-    // Records, scoreboards, components, covergroups — type layouts only.
-    let order = record_emit_order(&prog.records);
-    for &i in &order {
-        record_struct(&mut out, &prog.records[i], &prog.records);
-    }
-    if prog.records.iter().any(|r| {
-        r.fields
-            .iter()
-            .any(|f| matches!(f.ty, ir::IrType::Seq(_)))
-    }) {
-        out.push_str(&crate::codegen::cpp_tb::emit_record_randomize_helpers(
-            file, opts, &prog.records, &order,
-        )?);
-    }
-    for sb in &prog.scoreboards {
-        runtime::scoreboard_struct(&mut out, sb, &prog.records);
-    }
-    for ci in component_emit_order(prog) {
-        runtime::component_struct(
-            &mut out,
-            prog,
-            &prog.components[ci],
-            &prog.components,
-            &prog.scoreboards,
-            &prog.records,
-        );
-    }
-    let helpers: Vec<&ir::TbFunction> = prog
-        .functions
-        .iter()
-        .filter(|f| f.kind == ir::FunctionKind::Helper)
-        .collect();
-    for h in &helpers {
-        func::emit_helper_prototype(&mut out, h, &prog.records);
-    }
-    if !helpers.is_empty() {
-        writeln!(out).ok();
-    }
-    crate::codegen::cpp_tb::emit_extern_fn_decls(&mut out, file);
-    for cg in &prog.covgroups {
-        covergroup::covgroup_struct(&mut out, cg);
-    }
-    let mut seen = HashSet::new();
-    for tb in &prog.testbenches {
-        if needs_tb_struct(tb) && seen.insert(tb.name.clone()) {
-            let cov_fields: Vec<(String, String)> = tb
-                .cov_fields
-                .iter()
-                .map(|(f, cg)| (f.clone(), prog.covgroups[cg.index()].name.clone()))
-                .collect();
-            let sb_fields: Vec<(String, String)> = tb
-                .scoreboard_fields
-                .iter()
-                .map(|(f, sb)| (f.clone(), prog.scoreboards[sb.index()].name.clone()))
-                .collect();
-            runtime::tb_struct(
-                &mut out,
-                &tb.name,
-                &scaffold.dut_type,
-                &cov_fields,
-                &tb.state_fields,
-                &sb_fields,
-                &prog.records,
-            );
-        }
-    }
-    // M3: Deepened HarcTestContext — owns DUT, scheduler, trace, log,
-    // coverage, RNG, and exposes lifecycle methods. Header declares the
-    // struct and its methods; common defines them.
-    runtime::context_struct_deepened(&mut out, &scaffold.dut_type);
-    // Immutable solver descriptors — emitted as `static` in header for
-    // now so shards see the `prepare_call` helper. M6 will move the
-    // mutable call-site counters into per-context state and keep only
-    // the descriptor table in common with an `extern` declaration here.
-    if !scaffold.problem_table_cpp.is_empty() {
-        out.push_str(&scaffold.problem_table_cpp);
-        writeln!(out).ok();
-    }
-    // #619 M4b: forward declarations for the shared out-of-line lifecycle
-    // functions/coroutines whose definitions live in the common `.cpp`, so
-    // each shard can call them. Empty unless HARC_TBIR_NATIVE_LIFECYCLE
-    // minted the TestbenchLifecycle functions.
-    let outofline_lifecycle = shareable_lifecycle_map(prog);
-    if !outofline_lifecycle.is_empty() {
-        out.push_str("\n// #619 M4b: shared testbench-lifecycle prototypes (defined in common).\n");
-        emit_shared_lifecycle_prototypes(&mut out, prog, &outofline_lifecycle);
-    }
-    Ok(out)
-}
-
-/// M2/M3: Emit the common implementation source.
-///
-/// Owns out-of-line definitions for helpers, record helpers, solver table,
-/// and the deepened `HarcTestContext` methods. Compiled once per suite.
-pub fn emit_separate_common(
-    prog: &TbProgram,
-    file: &SourceFile,
-    opts: &EmitOpts,
-    scaffold: &SuiteScaffold,
-) -> Result<String, EmitError> {
-    emit_separate_common_with_prefix(prog, file, opts, scaffold, "")
-}
-
-pub fn emit_separate_common_with_prefix(
-    prog: &TbProgram,
-    _file: &SourceFile,
-    opts: &EmitOpts,
-    scaffold: &SuiteScaffold,
-    file_prefix: &str,
-) -> Result<String, EmitError> {
-    let mut out = String::new();
-    writeln!(out, "// Auto-generated by harc — do not edit.").ok();
-    writeln!(out, "// TB-IR common implementation (M2/M3 separate compilation).").ok();
-    writeln!(out, "#include \"{file_prefix}suite.hpp\"").ok();
-    writeln!(out, "#include \"harc_thread_rt.h\"").ok();
-    writeln!(out, "#include \"harc_random_rt.h\"").ok();
-    writeln!(out).ok();
-    // Solver problem table: for M2, keep it in the interface header
-    // (static) so shards see the `prepare_call` helper. The common
-    // source does not redefine it to avoid duplicate definitions when
-    // it includes the header. M6 will move the mutable call-site
-    // counters into per-context state and keep only the descriptor
-    // table in common with an `extern` declaration in the header.
-    // Mutable RNG instance — one per suite binary, reset per test via
-    // HarcTestContext::start(). For M3, this will move into the
-    // context's `rng` member.
-    out.push_str("harc_rt::random::HarcRng harc_rng;\n\n");
-    // Helper definitions
-    let helpers: Vec<&ir::TbFunction> = prog
-        .functions
-        .iter()
-        .filter(|f| f.kind == ir::FunctionKind::Helper)
-        .collect();
-    for h in &helpers {
-        func::emit_helper_function(&mut out, prog, h)?;
-        writeln!(out).ok();
-    }
-    // Deepened HarcTestContext method definitions (M3)
-    runtime::context_methods(&mut out, &scaffold.dut_type);
-    // #619 M4b: shared out-of-line testbench-lifecycle definitions — compiled
-    // ONCE per suite here (external linkage), called from every shard via the
-    // header prototypes. This is the cross-shard de-duplication #619 targets.
-    // Empty unless HARC_TBIR_NATIVE_LIFECYCLE minted the TestbenchLifecycle
-    // functions. Reaches ambient state exactly like the monolithic emission:
-    // the deepened `HarcTestContext` is a superset of the simple one (same
-    // `dut`/`errors`/`_fatal`/`cycle_count`/`trace`/`log_ctx`/`_checkers`
-    // members), and `harc_rng` is the common-defined global declared `extern`
-    // in the header.
-    let outofline_lifecycle = shareable_lifecycle_map(prog);
-    if !outofline_lifecycle.is_empty() {
-        writeln!(out).ok();
-        emit_shared_lifecycle_defs(
-            &mut out,
-            prog,
-            opts,
-            &scaffold.randomize_snippets,
-            &scaffold.dut_type,
-            &outofline_lifecycle,
-            /* static_linkage */ false,
-            // Common `.cpp`: emit ALL shareable bodies (external linkage);
-            // different shards call different ones, and an unused EXTERNAL
-            // function does not warn, so no per-TU reference filter.
-            None,
-        )?;
-    }
-    Ok(out)
-}
-
-/// M2: Emit one shard for the separate build — test-owned bodies only.
-///
-/// The shard includes the interface header for shared declarations and
-/// emits only the selected `run_<Test>` wrappers. No record/component/
-/// helper definitions are repeated.
-pub fn emit_separate_shard(
-    prog: &TbProgram,
-    file: &SourceFile,
-    opts: &EmitOpts,
-    scaffold: &SuiteScaffold,
-    shard: &SplitShardPlan,
-) -> Result<String, EmitError> {
-    emit_separate_shard_with_prefix(prog, file, opts, scaffold, shard, "")
-}
-
-pub fn emit_separate_shard_with_prefix(
-    prog: &TbProgram,
-    _file: &SourceFile,
-    opts: &EmitOpts,
-    scaffold: &SuiteScaffold,
-    shard: &SplitShardPlan,
-    file_prefix: &str,
-) -> Result<String, EmitError> {
-    let mut out = String::new();
-    writeln!(out, "// Auto-generated by harc — do not edit.").ok();
-    writeln!(out, "#include \"{file_prefix}suite.hpp\"").ok();
-    writeln!(out, "#include \"harc_thread_rt.h\"").ok();
-    writeln!(out).ok();
-    // #619 M4b: cross-shard de-dup — the shared lifecycle DEFINITIONS live
-    // once in the common `.cpp` (external linkage) with prototypes in the
-    // header this shard includes, so here we lower each `TbLifecycleCall` to
-    // the real call / drive-loop against that single definition (NOT a
-    // per-shard re-inline). Same map the interface + common used, so the call
-    // sites, prototypes, and definitions agree.
-    let outofline_lifecycle = shareable_lifecycle_map(prog);
-    for &idx in &shard.test_indices {
-        emit_test(
-            &mut out,
-            prog,
-            &prog.tests[idx],
-            &scaffold.dut_type,
-            opts,
-            &scaffold.randomize_snippets,
-            &outofline_lifecycle,
-        )?;
-    }
-    Ok(out)
-}
-
-/// M2: Emit all separate shards in parallel, analogous to `emit_split_shards`.
-/// Each shard is handed to `on_shard` on the worker that produced it.
-pub fn emit_separate_shards<F>(
-    prog: &TbProgram,
-    file: &SourceFile,
-    opts: &EmitOpts,
-    plan: &SeparateCppPlan,
-    jobs: usize,
-    file_prefix: &str,
-    on_shard: F,
-) -> Result<Vec<usize>, EmitError>
-where
-    F: Fn(&SplitShardPlan, String, Duration) -> Result<(), EmitError> + Sync,
-{
-    debug_assert!(
-        plan.shards
-            .iter()
-            .all(|s| s.test_indices.iter().all(|&i| i < prog.tests.len())),
-        "separate plan was built for a different program than the one being emitted"
-    );
-    if jobs <= 1 || plan.shards.len() <= 1 {
-        let mut delivered = Vec::with_capacity(plan.shards.len());
-        for (pos, shard) in plan.shards.iter().enumerate() {
-            let started = Instant::now();
-            let cpp = emit_separate_shard_with_prefix(
-                prog, file, opts, &plan.scaffold, shard, file_prefix,
-            )?;
-            on_shard(shard, cpp, started.elapsed())?;
-            delivered.push(pos);
-        }
-        return Ok(delivered);
-    }
-
-    let cursor = AtomicUsize::new(0);
-    let fail_limit = AtomicUsize::new(usize::MAX);
-    let first_err: Mutex<Option<(usize, EmitError)>> = Mutex::new(None);
-    type Payload = Box<dyn std::any::Any + Send + 'static>;
-    let first_panic: Mutex<Option<(usize, Payload)>> = Mutex::new(None);
-    let delivered: Mutex<Vec<usize>> = Mutex::new(Vec::with_capacity(plan.shards.len()));
-
-    let record_err = |i: usize, e: EmitError| {
-        fail_limit.fetch_min(i, Ordering::Relaxed);
-        let mut slot = first_err.lock().unwrap_or_else(|p| p.into_inner());
-        if slot.as_ref().is_none_or(|(j, _)| i < *j) {
-            *slot = Some((i, e));
-        }
-    };
-    let record_panic = |i: usize, payload: Payload| {
-        fail_limit.fetch_min(i, Ordering::Relaxed);
-        let mut slot = first_panic.lock().unwrap_or_else(|p| p.into_inner());
-        if slot.as_ref().is_none_or(|(j, _)| i < *j) {
-            *slot = Some((i, payload));
-        }
-    };
-
-    std::thread::scope(|scope| {
-        for _ in 0..jobs {
-            let cursor = &cursor;
-            let fail_limit = &fail_limit;
-            let record_err = &record_err;
-            let on_shard = &on_shard;
-            let delivered = &delivered;
-            let spawned = std::thread::Builder::new()
-                .stack_size(8 * 1024 * 1024)
-                .spawn_scoped(scope, move || loop {
-                    let i = cursor.fetch_add(1, Ordering::Relaxed);
-                    if i >= plan.shards.len() {
-                        break;
-                    }
-                    if i > fail_limit.load(Ordering::Relaxed) {
-                        continue;
-                    }
-                    let started = Instant::now();
-                    let cpp = match emit_separate_shard_with_prefix(
-                        prog, file, opts, &plan.scaffold, &plan.shards[i], file_prefix,
-                    ) {
-                        Ok(cpp) => cpp,
-                        Err(e) => {
-                            record_err(i, e);
-                            continue;
-                        }
-                    };
-                    if i > fail_limit.load(Ordering::Relaxed) {
-                        continue;
-                    }
-                    let handed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        on_shard(&plan.shards[i], cpp, started.elapsed())
-                    }));
-                    match handed {
-                        Ok(Ok(())) => delivered.lock().unwrap_or_else(|p| p.into_inner()).push(i),
-                        Ok(Err(e)) => record_err(i, e),
-                        Err(payload) => record_panic(i, payload),
-                    }
-                });
-            if let Err(e) = spawned {
-                record_err(
-                    usize::MAX,
-                    EmitError(format!("could not spawn separate shard emission worker: {e}")),
-                );
-                break;
-            }
-        }
-    });
-
-    if let Some((_, payload)) = first_panic.into_inner().unwrap_or_else(|p| p.into_inner()) {
-        std::panic::resume_unwind(payload);
-    }
-    if let Some((_, e)) = first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
-        return Err(e);
-    }
-    let mut delivered = delivered.into_inner().unwrap_or_else(|p| p.into_inner());
-    delivered.sort_unstable();
-    Ok(delivered)
 }
 
 /// Emit one shard of a planned split build, borrowing the verified program.
@@ -1670,14 +1068,72 @@ fn emit_split_dispatcher(test_names: &[String]) -> String {
 /// so this walks both statement-level `PortRef`s and the expression
 /// trees those statements carry.
 fn program_has_probes(prog: &TbProgram) -> bool {
-    if prog
-        .functions
-        .iter()
-        .any(|f| f.blocks.iter().any(|b| b.stmts.iter().any(stmt_has_probe)))
-    {
+    let mut found = false;
+    for function in &prog.functions {
+        for block in &function.blocks {
+            for stmt in &block.stmts {
+                if stmt_has_probe(stmt) {
+                    return true;
+                }
+            }
+            ir::visit::try_visit_terminator_exprs(&block.terminator, &mut |expr| {
+                found |= expr_has_probe(expr);
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .unwrap_or_else(|error| match error {});
+            if found {
+                return true;
+            }
+        }
+    }
+    if prog.components.iter().any(|component| {
+        component
+            .periodic_handlers
+            .iter()
+            .any(|handler| expr_has_probe(&handler.period))
+            || component
+                .cycle_handlers
+                .iter()
+                .any(|handler| expr_has_probe(&handler.trigger))
+            || component.watchdog.as_ref().is_some_and(|watchdog| {
+                watchdog.period.as_ref().is_some_and(expr_has_probe)
+                    || watchdog.max_idle.as_ref().is_some_and(expr_has_probe)
+            })
+    }) {
         return true;
     }
-    let mut found = false;
+    if prog.testbenches.iter().any(|testbench| {
+        testbench
+            .cycle_services
+            .iter()
+            .any(|service| expr_has_probe(&service.trigger))
+    }) {
+        return true;
+    }
+    for schema in &prog.covgroups {
+        for point in &schema.points {
+            if expr_has_probe(&point.target) {
+                return true;
+            }
+            for bin in &point.bins {
+                for value in &bin.values {
+                    let has_probe = match value {
+                        ir::CovBinValue::Eq(ir::CovBinBound::Runtime(expr)) => expr_has_probe(expr),
+                        ir::CovBinValue::Range { lo, hi } => {
+                            [lo, hi].into_iter().flatten().any(|bound| match bound {
+                                ir::CovBinBound::Runtime(expr) => expr_has_probe(expr),
+                                ir::CovBinBound::Const(_) => false,
+                            })
+                        }
+                        ir::CovBinValue::Eq(ir::CovBinBound::Const(_)) => false,
+                    };
+                    if has_probe {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
     for_each_check_body_expr(prog, |e| found |= expr_has_probe(e));
     found
 }
@@ -1687,112 +1143,32 @@ fn port_is_probe(p: &ir::PortRef) -> bool {
 }
 
 fn expr_has_probe(e: &ir::Expr) -> bool {
-    use ir::Expr::*;
-    match e {
-        Port(p) => port_is_probe(p),
-        Binary(_, a, b) => expr_has_probe(a) || expr_has_probe(b),
-        Unary(_, a) => expr_has_probe(a),
-        BitSlice { target, .. } => expr_has_probe(target),
-        BitSliceDyn { target, hi, lo } => {
-            expr_has_probe(target) || expr_has_probe(hi) || expr_has_probe(lo)
+    let mut found = false;
+    ir::visit::walk_expr(e, &mut |expr| match expr {
+        ir::Expr::Port(port) | ir::Expr::PortSnapshotLane { port, .. } => {
+            found |= port_is_probe(port)
         }
-        Ternary(c, a, b) => expr_has_probe(c) || expr_has_probe(a) || expr_has_probe(b),
-        WidthCast { inner, .. } => expr_has_probe(inner),
-        Call(_, args) => args.iter().any(expr_has_probe),
-        ComponentIdle { n, .. } | TransactorIdle { n, .. } => expr_has_probe(n),
-        ComponentVecElement {
-            index, inner_index, ..
-        }
-        | TbFieldVecElement {
-            index, inner_index, ..
-        } => expr_has_probe(index) || inner_index.as_deref().is_some_and(expr_has_probe),
-        TransactorStateRecordField {
-            mid_indices, index, ..
-        } => {
-            mid_indices.iter().any(|(_, idx)| expr_has_probe(idx))
-                || index.as_deref().is_some_and(expr_has_probe)
-        }
-        _ => false,
-    }
-}
-
-fn fmt_has_probe(args: &ir::FmtArgs) -> bool {
-    args.args.iter().any(|a| expr_has_probe(&a.expr))
+        _ => {}
+    });
+    found
 }
 
 fn stmt_has_probe(s: &ir::Stmt) -> bool {
-    use ir::Stmt::*;
-    match s {
-        DutWrite(p, e) => port_is_probe(p) || expr_has_probe(e),
-        DutRead(_, p) | ProbeRelease(p) => port_is_probe(p),
-        Assign(_, e)
-        | RecordRead { addr: e, .. }
-        | RecordFieldWrite { value: e, .. }
-        | RecordWriteCb { value: e, .. }
-        | TbFieldWrite { value: e, .. }
-        | TbQueuePush { value: e, .. }
-        | TransactorStateWrite { value: e, .. }
-        | ComponentFieldWrite { value: e, .. }
-        | TransactorCall { call: e, .. }
-        | TransactorSelfCall { call: e, .. } => expr_has_probe(e),
-        RecordWrite { addr, value, .. } => expr_has_probe(addr) || expr_has_probe(value),
-        TransactorStateRecordFieldWrite {
-            mid_indices,
-            index,
-            value,
-            ..
-        } => {
-            mid_indices.iter().any(|(_, idx)| expr_has_probe(idx))
-                || index.as_ref().is_some_and(expr_has_probe)
-                || expr_has_probe(value)
+    if match s {
+        ir::Stmt::DutWrite(port, _) | ir::Stmt::DutRead(_, port) | ir::Stmt::ProbeRelease(port) => {
+            port_is_probe(port)
         }
-        ComponentVecElementWrite {
-            index,
-            inner_index,
-            value,
-            ..
-        }
-        | TbFieldVecElementWrite {
-            index,
-            inner_index,
-            value,
-            ..
-        } => {
-            expr_has_probe(index)
-                || inner_index.as_ref().is_some_and(expr_has_probe)
-                || expr_has_probe(value)
-        }
-        AssertCheck { cond, on_fail } | AssumeCheck { cond, on_fail } => {
-            expr_has_probe(cond) || fmt_has_probe(on_fail)
-        }
-        Log { args, .. } => fmt_has_probe(args),
-        FailDiag { guard, args } => {
-            guard.as_ref().is_some_and(expr_has_probe) || fmt_has_probe(args)
-        }
-        ScoreboardOp { op, .. } => match op {
-            ir::ScoreboardOp::QueuePush { value, .. }
-            | ir::ScoreboardOp::ScalarWrite { value, .. } => expr_has_probe(value),
-            ir::ScoreboardOp::QueuePop { .. } => false,
-        },
-        ComponentEmit { args, .. } | ComponentCall { args, .. } => args.iter().any(expr_has_probe),
-        SeqPush { value, .. }
-        | ComponentQueuePush { value, .. }
-        | TransactorStateQueuePush { value, .. } => expr_has_probe(value),
-        ComponentQueuePop { .. }
-        | ComponentSubAssign { .. }
-        | TransactorStateQueuePop { .. }
-        | TbQueuePop { .. } => false,
-        TlmFork(desc) => desc.args.iter().any(expr_has_probe),
-        TlmJoinAll(pending) => pending.iter().any(|p| p.args.iter().any(expr_has_probe)),
-        // The check BODY is a program-level schema, not a statement
-        // operand — `program_has_probes` walks `property_checks` /
-        // `cover_checks` directly so a probe read inside a concurrent
-        // property is still seen.
-        EventEmit { args, .. } => args.iter().any(expr_has_probe),
-        EventSubscribe { .. } | MethodHookSubscribe { .. } => false,
-        PropertyCheck(_) | CoverCheck(_) | CycleHandler(_) => false,
-        RecordInit(_, _) | AggregateInit(_) | CovReport(_) => false,
+        _ => false,
+    } {
+        return true;
     }
+    let mut found = false;
+    ir::visit::try_visit_stmt_exprs(s, &mut |expr| {
+        found |= expr_has_probe(expr);
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .unwrap_or_else(|error| match error {});
+    found
 }
 
 /// Invoke `f` on every expression that makes up a concurrent-check body
@@ -1855,7 +1231,7 @@ struct GatedBus<'a> {
 /// `arch build`'s flattened port set for the same DUT override. Ungated
 /// signals, and gated-ON signals, resolve normally; a gated-OFF signal
 /// that is never accessed is silent (it simply never reaches a PortRef).
-fn check_gated_bus_access(
+pub fn check_gated_bus_access(
     prog: &TbProgram,
     file: &SourceFile,
     opts: &EmitOpts,
@@ -1987,200 +1363,37 @@ fn gated_off_error(
 /// expression trees). Parallels `stmt_has_probe`'s traversal, collecting
 /// instead of testing.
 fn for_each_port_in_stmt(s: &ir::Stmt, f: &mut impl FnMut(&ir::PortRef)) {
-    use ir::Stmt::*;
     match s {
-        DutWrite(p, e) => {
-            f(p);
-            for_each_port_in_expr(e, f);
+        ir::Stmt::DutWrite(port, _) | ir::Stmt::DutRead(_, port) | ir::Stmt::ProbeRelease(port) => {
+            f(port)
         }
-        DutRead(_, p) | ProbeRelease(p) => f(p),
-        // `RecordFieldWrite` carries an optional element `index` (`rec.f[i]
-        // = v`) — walk it too, so a gated DUT port nested in a write-index
-        // is scanned (#454). Today a write-index hoists to a `DutRead`, so
-        // this is defensive completeness; without it, any future inline
-        // write-index would silently escape the gated-port scan.
-        RecordFieldWrite {
-            value,
-            mid_indices,
-            index,
-            ..
-        } => {
-            for_each_port_in_expr(value, f);
-            for (_, idx) in mid_indices {
-                for_each_port_in_expr(idx, f);
-            }
-            if let Some(idx) = index {
-                for_each_port_in_expr(idx, f);
-            }
-        }
-        Assign(_, e)
-        | RecordRead { addr: e, .. }
-        | RecordWriteCb { value: e, .. }
-        | TbFieldWrite { value: e, .. }
-        | TbQueuePush { value: e, .. }
-        | TransactorStateWrite { value: e, .. }
-        | ComponentFieldWrite { value: e, .. }
-        | TransactorCall { call: e, .. }
-        | TransactorSelfCall { call: e, .. } => for_each_port_in_expr(e, f),
-        RecordWrite { addr, value, .. } => {
-            for_each_port_in_expr(addr, f);
-            for_each_port_in_expr(value, f);
-        }
-        TransactorStateRecordFieldWrite {
-            mid_indices,
-            index,
-            value,
-            ..
-        } => {
-            for (_, idx) in mid_indices {
-                for_each_port_in_expr(idx, f);
-            }
-            if let Some(idx) = index {
-                for_each_port_in_expr(idx, f);
-            }
-            for_each_port_in_expr(value, f);
-        }
-        ComponentVecElementWrite {
-            index,
-            inner_index,
-            value,
-            ..
-        }
-        | TbFieldVecElementWrite {
-            index,
-            inner_index,
-            value,
-            ..
-        } => {
-            for_each_port_in_expr(index, f);
-            if let Some(inner) = inner_index {
-                for_each_port_in_expr(inner, f);
-            }
-            for_each_port_in_expr(value, f);
-        }
-        AssertCheck { cond, on_fail } | AssumeCheck { cond, on_fail } => {
-            for_each_port_in_expr(cond, f);
-            for_each_port_in_fmt(on_fail, f);
-        }
-        Log { args, .. } => for_each_port_in_fmt(args, f),
-        FailDiag { guard, args } => {
-            if let Some(g) = guard {
-                for_each_port_in_expr(g, f);
-            }
-            for_each_port_in_fmt(args, f);
-        }
-        ScoreboardOp { op, .. } => match op {
-            ir::ScoreboardOp::QueuePush { value, .. }
-            | ir::ScoreboardOp::ScalarWrite { value, .. } => for_each_port_in_expr(value, f),
-            ir::ScoreboardOp::QueuePop { .. } => {}
-        },
-        ComponentEmit { args, .. } | ComponentCall { args, .. } => {
-            args.iter().for_each(|a| for_each_port_in_expr(a, f))
-        }
-        SeqPush { value, .. }
-        | ComponentQueuePush { value, .. }
-        | TransactorStateQueuePush { value, .. } => for_each_port_in_expr(value, f),
-        ComponentQueuePop { .. }
-        | ComponentSubAssign { .. }
-        | TransactorStateQueuePop { .. }
-        | TbQueuePop { .. } => {}
-        TlmFork(desc) => desc.args.iter().for_each(|a| for_each_port_in_expr(a, f)),
-        TlmJoinAll(pending) => pending
-            .iter()
-            .for_each(|p| p.args.iter().for_each(|a| for_each_port_in_expr(a, f))),
-        // Check bodies are walked at program level — see
-        // `for_each_check_body_expr`.
-        EventEmit { args, .. } => args.iter().for_each(|a| for_each_port_in_expr(a, f)),
-        EventSubscribe { .. } | MethodHookSubscribe { .. } => {}
-        PropertyCheck(_) | CoverCheck(_) | CycleHandler(_) => {}
-        RecordInit(_, _) | AggregateInit(_) | CovReport(_) => {}
+        _ => {}
     }
+    ir::visit::try_visit_stmt_exprs(s, &mut |expr| {
+        for_each_port_in_expr(expr, f);
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .unwrap_or_else(|error| match error {});
 }
 
 /// Invoke `f` on every `PortRef` in a block terminator's expression
 /// operands (`Branch`/`WaitCycles`/`WaitUntil` conditions can read a bus
 /// signal).
 fn for_each_port_in_term(t: &ir::Terminator, f: &mut impl FnMut(&ir::PortRef)) {
-    use ir::Terminator::*;
-    match t {
-        Branch(e, _, _) | WaitCycles(e, _, _) | WaitCyclesSync(e, _) => for_each_port_in_expr(e, f),
-        WaitUntil { preds, .. } => preds.iter().for_each(|p| for_each_port_in_expr(&p.expr, f)),
-        WaitUntilTimeout { preds, cycles, .. } => {
-            preds.iter().for_each(|p| for_each_port_in_expr(&p.expr, f));
-            for_each_port_in_expr(cycles, f);
-        }
-        Fatal(args) => for_each_port_in_fmt(args, f),
-        // The re-inlined lifecycle body carries its own port operands; the
-        // caller frame's terminator has none (#619 M4a).
-        Jump(_) | WaitTimePs(_, _) | Randomize { .. } | TbLifecycleCall { .. } | Return => {}
-    }
-}
-
-fn for_each_port_in_fmt(args: &ir::FmtArgs, f: &mut impl FnMut(&ir::PortRef)) {
-    args.args
-        .iter()
-        .for_each(|a| for_each_port_in_expr(&a.expr, f));
+    ir::visit::try_visit_terminator_exprs(t, &mut |expr| {
+        for_each_port_in_expr(expr, f);
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .unwrap_or_else(|error| match error {});
 }
 
 /// Invoke `f` on every `PortRef` in an expression tree. Parallels
 /// `expr_has_probe`'s structural traversal.
 fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
-    use ir::Expr::*;
-    match e {
-        Port(p) => f(p),
-        RecordField {
-            mid_indices, index, ..
-        } => {
-            for (_, i) in mid_indices {
-                for_each_port_in_expr(i, f);
-            }
-            if let Some(i) = index {
-                for_each_port_in_expr(i, f);
-            }
-        }
-        Binary(_, a, b) => {
-            for_each_port_in_expr(a, f);
-            for_each_port_in_expr(b, f);
-        }
-        Unary(_, a) => for_each_port_in_expr(a, f),
-        BitSlice { target, .. } => for_each_port_in_expr(target, f),
-        BitSliceDyn { target, hi, lo } => {
-            for_each_port_in_expr(target, f);
-            for_each_port_in_expr(hi, f);
-            for_each_port_in_expr(lo, f);
-        }
-        Ternary(c, a, b) => {
-            for_each_port_in_expr(c, f);
-            for_each_port_in_expr(a, f);
-            for_each_port_in_expr(b, f);
-        }
-        WidthCast { inner, .. } => for_each_port_in_expr(inner, f),
-        SeqIndex { index, .. } => for_each_port_in_expr(index, f),
-        Call(_, args) => args.iter().for_each(|a| for_each_port_in_expr(a, f)),
-        ComponentIdle { n, .. } | TransactorIdle { n, .. } => for_each_port_in_expr(n, f),
-        ComponentVecElement {
-            index, inner_index, ..
-        }
-        | TbFieldVecElement {
-            index, inner_index, ..
-        } => {
-            for_each_port_in_expr(index, f);
-            if let Some(inner) = inner_index {
-                for_each_port_in_expr(inner, f);
-            }
-        }
-        TransactorStateRecordField {
-            mid_indices, index, ..
-        } => {
-            for (_, idx) in mid_indices {
-                for_each_port_in_expr(idx, f);
-            }
-            if let Some(idx) = index {
-                for_each_port_in_expr(idx, f);
-            }
-        }
+    ir::visit::walk_expr(e, &mut |expr| match expr {
+        ir::Expr::Port(port) | ir::Expr::PortSnapshotLane { port, .. } => f(port),
         _ => {}
-    }
+    });
 }
 
 /// C++ storage type for a record field's scalar (or Vec element) type,
@@ -2188,6 +1401,7 @@ fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
 pub(super) fn field_scalar_cty(ty: &ir::IrType) -> String {
     match ty {
         ir::IrType::Bool => "bool".to_string(),
+        ir::IrType::String => "const char*".to_string(),
         // A nested-vector element renders as a nested `std::array`, the
         // recursion terminating at the scalar leaf. `Vec<Vec<uint<8>,2>,2>`
         // → `std::array<std::array<uint64_t, 2>, 2>`, matching v1.
@@ -2208,6 +1422,59 @@ pub(super) fn aggregate_value_cty(ty: &ir::IrType, records: &[ir::RecordSchema])
         }
         scalar => field_scalar_cty(scalar),
     }
+}
+
+/// C++ value/parameter carrier for a callable `IrType`. This is the single
+/// recursive resolver behind hook signatures, transactor and component method
+/// parameter/return lists, helper and testbench-method signatures, and callable
+/// locals. Record / record-sequence / component values keep their schema
+/// carriers; a sequence element and a fixed-vector dimension both recurse
+/// through the aggregate carrier, so `Seq<Vec<T, N>>` renders
+/// `std::vector<std::array<…>>` exactly like a standalone `Vec<T, N>`, and
+/// every callable surface agrees on the spelling. Scalar leaves use the scalar
+/// ABI carrier (`local_scalar_cty`).
+pub(super) fn callable_value_cty(prog: &TbProgram, ty: &ir::IrType) -> Result<String, EmitError> {
+    Ok(match ty {
+        ir::IrType::Record(record) => prog
+            .records
+            .get(record.index())
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: callable value references missing record r{}",
+                    record.0
+                ))
+            })?
+            .name
+            .clone(),
+        ir::IrType::RecordSeq(record) => format!(
+            "std::vector<{}>",
+            prog.records
+                .get(record.index())
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: callable value references missing record r{}",
+                        record.0
+                    ))
+                })?
+                .name
+        ),
+        ir::IrType::Seq(elem) => {
+            format!("std::vector<{}>", aggregate_value_cty(elem, &prog.records))
+        }
+        ir::IrType::FixedVec { .. } => aggregate_value_cty(ty, &prog.records),
+        ir::IrType::Component(component) => prog
+            .components
+            .get(component.index())
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: callable value references missing component c{}",
+                    component.0
+                ))
+            })?
+            .name
+            .clone(),
+        other => local_scalar_cty(other),
+    })
 }
 
 /// C++ storage type for a loop-switch local / method param. Unsigned and
@@ -2232,6 +1499,7 @@ pub(super) fn local_scalar_cty(ty: &ir::IrType) -> String {
             "_harc_u128".to_string()
         }
         ir::IrType::SInt(_) => "int64_t".to_string(),
+        ir::IrType::String => "const char*".to_string(),
         _ => "uint64_t".to_string(),
     }
 }
@@ -2277,7 +1545,53 @@ fn record_packed_width(r: &ir::RecordSchema, records: &[ir::RecordSchema]) -> Op
     })
 }
 
-fn record_struct(out: &mut String, r: &ir::RecordSchema, records: &[ir::RecordSchema]) {
+pub(super) fn common_record_declaration(
+    out: &mut String,
+    r: &ir::RecordSchema,
+    records: &[ir::RecordSchema],
+) {
+    record_members(out, r, records);
+    writeln!(out, "bool operator==(const {0}& a, const {0}& b);", r.name).ok();
+    writeln!(out, "bool operator!=(const {0}& a, const {0}& b);", r.name).ok();
+    writeln!(out).ok();
+    // These helpers are templates over the Verilated pin representation.
+    // Keep them with the shared record declaration so both the common
+    // runtime and capsule-local target responders can instantiate them.
+    record_pack_helpers(out, r, records);
+}
+
+pub(super) fn common_record_definitions(out: &mut String, r: &ir::RecordSchema) {
+    if r.fields.is_empty() {
+        writeln!(
+            out,
+            "bool operator==(const {0}& a, const {0}& b) {{ (void)a; (void)b; return true; }}",
+            r.name
+        )
+        .ok();
+    } else {
+        let eq = r
+            .fields
+            .iter()
+            .map(|f| format!("a.{0} == b.{0}", f.name))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        writeln!(
+            out,
+            "bool operator==(const {0}& a, const {0}& b) {{ return {eq}; }}",
+            r.name
+        )
+        .ok();
+    }
+    writeln!(
+        out,
+        "bool operator!=(const {0}& a, const {0}& b) {{ return !(a == b); }}",
+        r.name
+    )
+    .ok();
+    writeln!(out).ok();
+}
+
+fn record_members(out: &mut String, r: &ir::RecordSchema, records: &[ir::RecordSchema]) {
     writeln!(out, "struct {} {{", r.name).ok();
     for f in &r.fields {
         if let ir::IrType::Seq(elem) = &f.ty {
@@ -2326,6 +1640,10 @@ fn record_struct(out: &mut String, r: &ir::RecordSchema, records: &[ir::RecordSc
         writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
     }
     writeln!(out, "}};").ok();
+}
+
+fn record_struct(out: &mut String, r: &ir::RecordSchema, records: &[ir::RecordSchema]) {
+    record_members(out, r, records);
     if r.fields.is_empty() {
         writeln!(
             out,
@@ -2848,8 +2166,53 @@ fn edge_is_enabled(
         ir::resolve_component_path_mode(&prog.components, owner, inherited, &edge.sink_path)
             .expect("verified component connect sink path")
             .effective_mode;
-    ir::component_mode_includes_activation(source_mode, edge.src_activation)
-        && ir::component_mode_includes_activation(sink_mode, edge.sink_activation)
+    ir::component_connect_modes_enabled(source_mode, sink_mode, edge)
+}
+
+fn persistent_setup_capture(run_context: Option<&str>) -> String {
+    run_context
+        .map(|context| {
+            format!("_harc_callback_state = &_harc_run_state, _harc_callback_context = &{context}")
+        })
+        .unwrap_or_else(|| "&".to_string())
+}
+
+fn emit_persistent_setup_bindings(out: &mut String, depth: usize, run_context: Option<&str>) {
+    if run_context.is_none() {
+        return;
+    }
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    writeln!(out, "{pad}auto& _harc_run_state = *_harc_callback_state;").ok();
+    writeln!(out, "{pad}auto& ctx = *_harc_callback_context;").ok();
+    writeln!(out, "{pad}auto* dut = ctx.dut;").ok();
+    writeln!(out, "{pad}auto& errors = ctx.errors;").ok();
+    writeln!(out, "{pad}auto& _fatal = ctx.fatal;").ok();
+    writeln!(out, "{pad}auto& cycle_count = ctx.cycle_count;").ok();
+    writeln!(out, "{pad}auto& trace = ctx.trace;").ok();
+    writeln!(out, "{pad}auto& log_ctx = ctx.log_ctx;").ok();
+    writeln!(out, "{pad}auto& _checkers = ctx._checkers;").ok();
+    writeln!(
+        out,
+        "{pad}auto& _post_eval_services = ctx._post_eval_services;"
+    )
+    .ok();
+    writeln!(out, "{pad}auto& _auto_cov_reports = ctx._auto_cov_reports;").ok();
+    writeln!(out, "{pad}auto& harc_rng = ctx.rng;").ok();
+    writeln!(
+        out,
+        "{pad}auto sim_log_line = [&](const char* sev, const char* fmt, ...) {{"
+    )
+    .ok();
+    writeln!(out, "{pad1}va_list ap;").ok();
+    writeln!(out, "{pad1}va_start(ap, fmt);").ok();
+    writeln!(
+        out,
+        "{pad1}harc_rt::log::harc_log_vline(log_ctx.sim_log, &trace, cycle_count, sev, fmt, ap);"
+    )
+    .ok();
+    writeln!(out, "{pad1}va_end(ap);").ok();
+    writeln!(out, "{pad}}};").ok();
 }
 
 /// Register every `on <ev>(arg)` handler on `component` (and nested
@@ -2870,20 +2233,55 @@ fn emit_on_handler_regs(
     // cooperative-default path, so default output is unchanged.
     skip_top_on_handlers: bool,
     mode: Option<ir::ComponentInstanceMode>,
-) {
+    bound_bus: Option<&ir::BusBindingSchema>,
+    bus_adapters: Option<&[expr::TestbenchBusAdapterPlan]>,
+    run_context: Option<&str>,
+) -> Result<(), EmitError> {
     let comp = &prog.components[component.index()];
+    let input_heartbeat = runtime::component_heartbeat_field(
+        comp,
+        ir::passes::runtime_cells::ComponentHeartbeat::Input,
+    );
     if !skip_top_on_handlers {
         for oh in &comp.on_handlers {
             if !ir::component_mode_includes_activation(mode, oh.activation) {
                 continue;
             }
             let lambda = func::on_handler_lambda_name(comp, oh);
-            writeln!(
-                out,
-                "{INDENT}{inst_path}.{}.push_back([&](auto _t) {{ {inst_path}._last_in_cycle = (uint64_t)cycle_count; {lambda}({inst_path}, _t); }});",
-                oh.event
-            )
-            .ok();
+            let call = component_callable_call(
+                prog,
+                oh.function,
+                &lambda,
+                inst_path,
+                &["_t"],
+                bound_bus,
+                bus_adapters,
+                run_context,
+            )?;
+            if run_context.is_some() {
+                let capture = persistent_setup_capture(run_context);
+                writeln!(
+                    out,
+                    "{INDENT}{inst_path}.{}.push_back([{capture}](auto _t) {{",
+                    oh.event
+                )
+                .ok();
+                emit_persistent_setup_bindings(out, 2, run_context);
+                writeln!(
+                    out,
+                    "{INDENT}{INDENT}{inst_path}.{input_heartbeat} = (uint64_t)cycle_count;"
+                )
+                .ok();
+                writeln!(out, "{INDENT}{INDENT}{call};").ok();
+                writeln!(out, "{INDENT}}});").ok();
+            } else {
+                writeln!(
+                    out,
+                    "{INDENT}{inst_path}.{}.push_back([&](auto _t) {{ {inst_path}.{input_heartbeat} = (uint64_t)cycle_count; {call}; }});",
+                    oh.event
+                )
+                .ok();
+            }
         }
     }
     // Recurse into by-value sub-components (an env holding an agent).
@@ -2904,9 +2302,46 @@ fn emit_on_handler_regs(
                 )
                 .expect("verified nested component path")
                 .effective_mode,
-            );
+                bound_bus,
+                bus_adapters,
+                run_context,
+            )?;
         }
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn component_callable_call(
+    prog: &TbProgram,
+    function: ir::FunctionId,
+    symbol: &str,
+    receiver: &str,
+    tail_args: &[&str],
+    bound_bus: Option<&ir::BusBindingSchema>,
+    bus_adapters: Option<&[expr::TestbenchBusAdapterPlan]>,
+    run_context: Option<&str>,
+) -> Result<String, EmitError> {
+    let mut args = Vec::new();
+    if let Some(context) = run_context {
+        args.push(context.to_string());
+    }
+    args.push(receiver.to_string());
+    if let Some(adapters) = bus_adapters {
+        let dut_receiver = run_context
+            .map(|context| format!("{context}.dut"))
+            .unwrap_or_else(|| "dut".to_string());
+        args.extend(func::component_callable_bus_adapter_args(
+            prog,
+            function,
+            adapters,
+            bound_bus,
+            &dut_receiver,
+            symbol,
+        )?);
+    }
+    args.extend(tail_args.iter().map(|arg| (*arg).to_string()));
+    Ok(format!("{symbol}({})", args.join(", ")))
 }
 
 /// Emit one resolved `connect` edge's subscriber push_back, rooted at
@@ -2916,6 +2351,7 @@ fn emit_one_connect(
     prog: &TbProgram,
     inst_path: &str,
     edge: &ir::ConnectEdgeSchema,
+    run_context: Option<&str>,
 ) {
     let prefix = (!inst_path.is_empty()).then(|| inst_path.to_string());
     let src = prefix
@@ -2933,24 +2369,57 @@ fn emit_one_connect(
     match &edge.sink {
         ir::ConnectSink::Method { method } => {
             let sink_comp = &prog.components[edge.sink_component.index()].name;
-            writeln!(
-                out,
-                "{INDENT}{src}.{}.push_back([&](auto _t) {{ {sink_comp}_{method}({sink}, _t); }});",
-                edge.src_event
-            )
-            .ok();
+            let call = run_context
+                .map(|context| format!("{sink_comp}_{method}({context}, {sink}, _t)"))
+                .unwrap_or_else(|| format!("{sink_comp}_{method}({sink}, _t)"));
+            if run_context.is_some() {
+                let capture = persistent_setup_capture(run_context);
+                writeln!(
+                    out,
+                    "{INDENT}{src}.{}.push_back([{capture}](auto _t) {{",
+                    edge.src_event
+                )
+                .ok();
+                emit_persistent_setup_bindings(out, 2, run_context);
+                writeln!(out, "{INDENT}{INDENT}{call};").ok();
+                writeln!(out, "{INDENT}}});").ok();
+            } else {
+                writeln!(
+                    out,
+                    "{INDENT}{src}.{}.push_back([&](auto _t) {{ {call}; }});",
+                    edge.src_event
+                )
+                .ok();
+            }
         }
         ir::ConnectSink::Event { event } => {
             // event→event bridge: forward each emit on the source event into
             // the sink event's own subscriber list, firing the sink driver's
             // registered `on <ev>` handler(s). Mirrors v1's
             // `for (auto& _s : <sink>.<event>) _s(_t);` bridge closure.
-            writeln!(
-                out,
-                "{INDENT}{src}.{}.push_back([&](auto _t) {{ for (auto& _s : {sink}.{event}) _s(_t); }});",
-                edge.src_event
-            )
-            .ok();
+            if run_context.is_some() {
+                let capture = persistent_setup_capture(run_context);
+                writeln!(
+                    out,
+                    "{INDENT}{src}.{}.push_back([{capture}](auto _t) {{",
+                    edge.src_event
+                )
+                .ok();
+                emit_persistent_setup_bindings(out, 2, run_context);
+                writeln!(
+                    out,
+                    "{INDENT}{INDENT}for (auto& _s : {sink}.{event}) _s(_t);"
+                )
+                .ok();
+                writeln!(out, "{INDENT}}});").ok();
+            } else {
+                writeln!(
+                    out,
+                    "{INDENT}{src}.{}.push_back([&](auto _t) {{ for (auto& _s : {sink}.{event}) _s(_t); }});",
+                    edge.src_event
+                )
+                .ok();
+            }
         }
     }
 }
@@ -2968,6 +2437,7 @@ fn emit_nested_connects(
     component: ir::ComponentId,
     inst_path: &str,
     mode: Option<ir::ComponentInstanceMode>,
+    run_context: Option<&str>,
 ) {
     let comp = &prog.components[component.index()];
     for f in &comp.fields {
@@ -2984,10 +2454,10 @@ fn emit_nested_connects(
             .effective_mode;
             for edge in &sub_comp.connects {
                 if edge_is_enabled(prog, *sub, sub_mode, edge) {
-                    emit_one_connect(out, prog, &sub_path, edge);
+                    emit_one_connect(out, prog, &sub_path, edge, run_context);
                 }
             }
-            emit_nested_connects(out, prog, *sub, &sub_path, sub_mode);
+            emit_nested_connects(out, prog, *sub, &sub_path, sub_mode, run_context);
         }
     }
 }
@@ -3000,7 +2470,7 @@ const WATCHDOG_DEFAULT_MAX_IDLE: i64 = 10000;
 
 /// Install the `_checkers` closures for a component's `on <N> cycles`
 /// periodic handlers and its `watchdog` (and those of any nested
-/// sub-component), each gated on a per-instance static last-fire stamp.
+/// sub-component), each gated on a per-instance last-fire stamp.
 /// Mirrors v1's `emit_watchdog_checker` / periodic `_checkers` shape:
 /// every cycle the closure re-reads the period (so a field-backed period
 /// stays test-overridable), fires once it is due, and — for the watchdog
@@ -3008,24 +2478,52 @@ const WATCHDOG_DEFAULT_MAX_IDLE: i64 = 10000;
 fn emit_lifecycle_checkers(
     out: &mut String,
     prog: &TbProgram,
+    runtime_cells: &ir::passes::runtime_cells::RuntimeCellPlan,
     component: ir::ComponentId,
     inst_path: &str,
     mode: Option<ir::ComponentInstanceMode>,
+    dut_type: &str,
+    dut_access: Option<&ir::passes::dut_access::DutAccessPlan>,
+    dut_lane_widths: &std::collections::HashMap<String, u32>,
+    bound_bus: Option<&ir::BusBindingSchema>,
+    bus_adapters: Option<&[expr::TestbenchBusAdapterPlan]>,
+    run_context: Option<&str>,
 ) -> Result<(), EmitError> {
     let comp = &prog.components[component.index()];
+    let callback_capture = persistent_setup_capture(run_context);
+    let periodic_member_base = comp.methods.len() + comp.on_handlers.len();
+    let cycle_member_base = periodic_member_base + comp.periodic_handlers.len();
     // A valid C++ identifier for the static tag (`env.agent` → `env_agent`).
     let inst_tag = inst_path.replace('.', "_");
 
-    for ph in &comp.periodic_handlers {
+    for (periodic_index, ph) in comp.periodic_handlers.iter().enumerate() {
         if !ir::component_mode_includes_activation(mode, ph.activation) {
             continue;
         }
         let lambda = func::periodic_handler_lambda_name(comp, ph);
-        let period = func::clause_count_cpp(prog, ph.function, inst_path, &ph.period)?;
+        let period = func::clause_count_cpp(
+            prog,
+            ph.function,
+            inst_path,
+            dut_type,
+            dut_access,
+            dut_lane_widths,
+            bound_bus,
+            &ph.period,
+        )?;
         let tag = format!("_per_{inst_tag}_{}", ph.function.0);
+        let field = runtime::component_runtime_cell_field(
+            runtime_cells,
+            component,
+            comp,
+            &ir::passes::runtime_cells::RuntimeCellKind::ComponentPeriodicLast {
+                member: ir::ComponentCallableId((periodic_member_base + periodic_index) as u32),
+            },
+        )?;
+        let last = format!("{inst_path}.{field}");
         let svc = ph.phase.service_vec();
-        writeln!(out, "{INDENT}{svc}.push_back([&]() {{").ok();
-        writeln!(out, "{INDENT}{INDENT}static int64_t {tag}_last = 0;").ok();
+        writeln!(out, "{INDENT}{svc}.push_back([{callback_capture}]() {{").ok();
+        emit_persistent_setup_bindings(out, 2, run_context);
         writeln!(
             out,
             "{INDENT}{INDENT}int64_t {tag}_period = (int64_t)({period});"
@@ -3033,15 +2531,25 @@ fn emit_lifecycle_checkers(
         .ok();
         writeln!(
             out,
-            "{INDENT}{INDENT}if ({tag}_period > 0 && (int64_t)cycle_count - {tag}_last >= {tag}_period) {{"
+            "{INDENT}{INDENT}if ({tag}_period > 0 && (int64_t)cycle_count - {last} >= {tag}_period) {{"
         )
         .ok();
         writeln!(
             out,
-            "{INDENT}{INDENT}{INDENT}{tag}_last = (int64_t)cycle_count;"
+            "{INDENT}{INDENT}{INDENT}{last} = (int64_t)cycle_count;"
         )
         .ok();
-        writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}({inst_path});").ok();
+        let call = component_callable_call(
+            prog,
+            ph.function,
+            &lambda,
+            inst_path,
+            &[],
+            bound_bus,
+            bus_adapters,
+            run_context,
+        )?;
+        writeln!(out, "{INDENT}{INDENT}{INDENT}{call};").ok();
         writeln!(out, "{INDENT}{INDENT}}}").ok();
         writeln!(out, "{INDENT}}});").ok();
     }
@@ -3050,12 +2558,21 @@ fn emit_lifecycle_checkers(
     // selected cycle-service closure that re-evaluates the trigger predicate every
     // primary-clock cycle and fires the body when the predicate satisfies
     // the requested edge mode. Mirrors v1's `emit_cycle_trigger`.
-    for ch in &comp.cycle_handlers {
+    for (cycle_index, ch) in comp.cycle_handlers.iter().enumerate() {
         if !ir::component_mode_includes_activation(mode, ch.activation) {
             continue;
         }
         let lambda = func::cycle_handler_lambda_name(comp, ch);
-        let trigger = func::clause_predicate_cpp(prog, ch.function, inst_path, &ch.trigger)?;
+        let trigger = func::clause_predicate_cpp(
+            prog,
+            ch.function,
+            inst_path,
+            dut_type,
+            dut_access,
+            dut_lane_widths,
+            bound_bus,
+            &ch.trigger,
+        )?;
         let tag = format!("_cyc_{inst_tag}_{}", ch.function.0);
         let svc = ch.phase.service_vec();
         if ch.monitor_channel.is_some() {
@@ -3090,36 +2607,84 @@ fn emit_lifecycle_checkers(
             // cycle-service latch is trace-correct under both `--mt` and the
             // default — the latch already fires at the right phases on
             // every `tick()`.
-            writeln!(out, "{INDENT}{svc}.push_back([&]() {{").ok();
-            writeln!(out, "{INDENT}{INDENT}static bool {tag}_cool = false;").ok();
-            writeln!(out, "{INDENT}{INDENT}if ({tag}_cool) {{").ok();
-            writeln!(out, "{INDENT}{INDENT}{INDENT}{tag}_cool = false;").ok();
+            writeln!(out, "{INDENT}{svc}.push_back([{callback_capture}]() {{").ok();
+            emit_persistent_setup_bindings(out, 2, run_context);
+            let field = runtime::component_runtime_cell_field(
+                runtime_cells,
+                component,
+                comp,
+                &ir::passes::runtime_cells::RuntimeCellKind::ComponentCooldown {
+                    member: ir::ComponentCallableId((cycle_member_base + cycle_index) as u32),
+                },
+            )?;
+            let cooldown = format!("{inst_path}.{field}");
+            writeln!(out, "{INDENT}{INDENT}if ({cooldown}) {{").ok();
+            writeln!(out, "{INDENT}{INDENT}{INDENT}{cooldown} = false;").ok();
             writeln!(out, "{INDENT}{INDENT}}} else if ((bool)({trigger})) {{").ok();
-            writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}({inst_path});").ok();
-            writeln!(out, "{INDENT}{INDENT}{INDENT}{tag}_cool = true;").ok();
+            let call = component_callable_call(
+                prog,
+                ch.function,
+                &lambda,
+                inst_path,
+                &[],
+                bound_bus,
+                bus_adapters,
+                run_context,
+            )?;
+            writeln!(out, "{INDENT}{INDENT}{INDENT}{call};").ok();
+            writeln!(out, "{INDENT}{INDENT}{INDENT}{cooldown} = true;").ok();
             writeln!(out, "{INDENT}{INDENT}}}").ok();
             writeln!(out, "{INDENT}}});").ok();
             continue;
         }
-        writeln!(out, "{INDENT}{svc}.push_back([&]() {{").ok();
+        writeln!(out, "{INDENT}{svc}.push_back([{callback_capture}]() {{").ok();
+        emit_persistent_setup_bindings(out, 2, run_context);
         match ch.edge {
             ir::CycleEdge::Level => {
                 writeln!(out, "{INDENT}{INDENT}if ((bool)({trigger})) {{").ok();
-                writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}({inst_path});").ok();
+                let call = component_callable_call(
+                    prog,
+                    ch.function,
+                    &lambda,
+                    inst_path,
+                    &[],
+                    bound_bus,
+                    bus_adapters,
+                    run_context,
+                )?;
+                writeln!(out, "{INDENT}{INDENT}{INDENT}{call};").ok();
                 writeln!(out, "{INDENT}{INDENT}}}").ok();
             }
             ir::CycleEdge::Rising | ir::CycleEdge::Falling => {
-                writeln!(out, "{INDENT}{INDENT}static bool {tag}_prev = false;").ok();
+                let field = runtime::component_runtime_cell_field(
+                    runtime_cells,
+                    component,
+                    comp,
+                    &ir::passes::runtime_cells::RuntimeCellKind::ComponentEdgePrevious {
+                        member: ir::ComponentCallableId((cycle_member_base + cycle_index) as u32),
+                    },
+                )?;
+                let previous = format!("{inst_path}.{field}");
                 writeln!(out, "{INDENT}{INDENT}bool {tag}_curr = (bool)({trigger});").ok();
                 let cond = match ch.edge {
-                    ir::CycleEdge::Rising => format!("!{tag}_prev && {tag}_curr"),
-                    ir::CycleEdge::Falling => format!("{tag}_prev && !{tag}_curr"),
+                    ir::CycleEdge::Rising => format!("!{previous} && {tag}_curr"),
+                    ir::CycleEdge::Falling => format!("{previous} && !{tag}_curr"),
                     ir::CycleEdge::Level => unreachable!(),
                 };
                 writeln!(out, "{INDENT}{INDENT}if ({cond}) {{").ok();
-                writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}({inst_path});").ok();
+                let call = component_callable_call(
+                    prog,
+                    ch.function,
+                    &lambda,
+                    inst_path,
+                    &[],
+                    bound_bus,
+                    bus_adapters,
+                    run_context,
+                )?;
+                writeln!(out, "{INDENT}{INDENT}{INDENT}{call};").ok();
                 writeln!(out, "{INDENT}{INDENT}}}").ok();
-                writeln!(out, "{INDENT}{INDENT}{tag}_prev = {tag}_curr;").ok();
+                writeln!(out, "{INDENT}{INDENT}{previous} = {tag}_curr;").ok();
             }
         }
         writeln!(out, "{INDENT}}});").ok();
@@ -3131,16 +2696,53 @@ fn emit_lifecycle_checkers(
         } else {
             let lambda = func::watchdog_lambda_name(comp, w);
             let period = match &w.period {
-                Some(e) => func::clause_count_cpp(prog, w.function, inst_path, e)?,
+                Some(e) => func::clause_count_cpp(
+                    prog,
+                    w.function,
+                    inst_path,
+                    dut_type,
+                    dut_access,
+                    dut_lane_widths,
+                    bound_bus,
+                    e,
+                )?,
                 None => WATCHDOG_DEFAULT_PERIOD.to_string(),
             };
             let max_idle = match &w.max_idle {
-                Some(e) => func::clause_count_cpp(prog, w.function, inst_path, e)?,
+                Some(e) => func::clause_count_cpp(
+                    prog,
+                    w.function,
+                    inst_path,
+                    dut_type,
+                    dut_access,
+                    dut_lane_widths,
+                    bound_bus,
+                    e,
+                )?,
                 None => WATCHDOG_DEFAULT_MAX_IDLE.to_string(),
             };
             let tag = format!("_wdog_{inst_tag}_{}", w.function.0);
-            writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
-            writeln!(out, "{INDENT}{INDENT}static int64_t {tag}_last = 0;").ok();
+            let input_heartbeat = runtime::component_heartbeat_field(
+                comp,
+                ir::passes::runtime_cells::ComponentHeartbeat::Input,
+            );
+            let output_heartbeat = runtime::component_heartbeat_field(
+                comp,
+                ir::passes::runtime_cells::ComponentHeartbeat::Output,
+            );
+            let field = runtime::component_runtime_cell_field(
+                runtime_cells,
+                component,
+                comp,
+                &ir::passes::runtime_cells::RuntimeCellKind::ComponentWatchdogLast {
+                    member: ir::ComponentCallableId(
+                        (cycle_member_base + comp.cycle_handlers.len()) as u32,
+                    ),
+                },
+            )?;
+            let last = format!("{inst_path}.{field}");
+            writeln!(out, "{INDENT}_checkers.push_back([{callback_capture}]() {{").ok();
+            emit_persistent_setup_bindings(out, 2, run_context);
             writeln!(
                 out,
                 "{INDENT}{INDENT}int64_t {tag}_period = (int64_t)({period});"
@@ -3148,16 +2750,26 @@ fn emit_lifecycle_checkers(
             .ok();
             writeln!(
             out,
-            "{INDENT}{INDENT}if ({tag}_period > 0 && (int64_t)cycle_count - {tag}_last >= {tag}_period) {{"
+            "{INDENT}{INDENT}if ({tag}_period > 0 && (int64_t)cycle_count - {last} >= {tag}_period) {{"
         )
         .ok();
             writeln!(
                 out,
-                "{INDENT}{INDENT}{INDENT}{tag}_last = (int64_t)cycle_count;"
+                "{INDENT}{INDENT}{INDENT}{last} = (int64_t)cycle_count;"
             )
             .ok();
             // 1. User body (typically a heartbeat log).
-            writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}({inst_path});").ok();
+            let call = component_callable_call(
+                prog,
+                w.function,
+                &lambda,
+                inst_path,
+                &[],
+                bound_bus,
+                bus_adapters,
+                run_context,
+            )?;
+            writeln!(out, "{INDENT}{INDENT}{INDENT}{call};").ok();
             // 2. Idle check — trips FAIL when BOTH activity stamps are
             //    `max_idle` cycles behind. Mirrors v1's emit_watchdog idle
             //    block (framework error-counter bump on trip).
@@ -3169,8 +2781,8 @@ fn emit_lifecycle_checkers(
             writeln!(
             out,
             "{INDENT}{INDENT}{INDENT}if ({tag}_max_idle > 0 \
-             && (int64_t)((uint64_t)cycle_count - {inst_path}._last_in_cycle) >= {tag}_max_idle \
-             && (int64_t)((uint64_t)cycle_count - {inst_path}._last_out_cycle) >= {tag}_max_idle) {{"
+             && (int64_t)((uint64_t)cycle_count - {inst_path}.{input_heartbeat}) >= {tag}_max_idle \
+             && (int64_t)((uint64_t)cycle_count - {inst_path}.{output_heartbeat}) >= {tag}_max_idle) {{"
         )
         .ok();
             writeln!(
@@ -3194,6 +2806,7 @@ fn emit_lifecycle_checkers(
             emit_lifecycle_checkers(
                 out,
                 prog,
+                runtime_cells,
                 *sub,
                 &sub_path,
                 ir::resolve_component_path_mode(
@@ -3204,45 +2817,44 @@ fn emit_lifecycle_checkers(
                 )
                 .expect("verified nested component path")
                 .effective_mode,
+                dut_type,
+                dut_access,
+                dut_lane_widths,
+                None,
+                bus_adapters,
+                run_context,
             )?;
         }
     }
     Ok(())
 }
 
-/// Register each testbench-scoped `on <N> cycles [phase post_eval]`
-/// periodic service (issue #485). The handler body was already emitted as
-/// a free zero-arg `[&]`-capturing lambda (via the `emit_test_hook` loop),
-/// so this only installs the registration closure: a per-cycle
-/// `_checkers` / `_post_eval_services` push that fires the lambda once
-/// every `period` primary-clock cycles, gated on a static last-fire stamp.
-/// Flow-scope analogue of a component's periodic `emit_lifecycle_checkers`
-/// registration; the period is a compile-time literal in this subset.
 fn emit_tb_periodic_services(
     out: &mut String,
-    prog: &TbProgram,
     tb: &ir::TestbenchSchema,
-    dut_type: &str,
+    runtime_cells: expr::RuntimeCellRenderBinding<'_>,
+    run_context: Option<&str>,
 ) -> Result<(), EmitError> {
+    let callback_capture = persistent_setup_capture(run_context);
     for svc in &tb.periodic_services {
-        // Emit the body lambda HERE (not in the early test-hook loop) so
-        // it sees the composite scoreboard/component instances + method
-        // lambdas declared just above.
-        func::emit_test_hook(out, prog, prog.function(svc.function), dut_type, 1)?;
-        let lambda = &prog.function(svc.function).name;
-        let tag = format!("_tbper_{}", svc.function.0);
+        let lambda = runtime_cells.test_hook(svc.function)?;
+        let kind = ir::passes::runtime_cells::RuntimeCellKind::TestbenchPeriodicLast {
+            function: svc.function,
+            phase: svc.phase.into(),
+        };
+        let last = runtime_cells.testbench_field(&kind)?;
         let period = svc.period;
         let vec = svc.phase.service_vec();
-        writeln!(out, "{INDENT}{vec}.push_back([&]() {{").ok();
-        writeln!(out, "{INDENT}{INDENT}static int64_t {tag}_last = 0;").ok();
+        writeln!(out, "{INDENT}{vec}.push_back([{callback_capture}]() {{").ok();
+        emit_persistent_setup_bindings(out, 2, run_context);
         writeln!(
             out,
-            "{INDENT}{INDENT}if ((int64_t)cycle_count - {tag}_last >= {period}) {{"
+            "{INDENT}{INDENT}if ((int64_t)cycle_count - {last} >= {period}) {{"
         )
         .ok();
         writeln!(
             out,
-            "{INDENT}{INDENT}{INDENT}{tag}_last = (int64_t)cycle_count;"
+            "{INDENT}{INDENT}{INDENT}{last} = (int64_t)cycle_count;"
         )
         .ok();
         writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}();").ok();
@@ -3257,20 +2869,29 @@ fn emit_tb_cycle_services(
     prog: &TbProgram,
     tb: &ir::TestbenchSchema,
     dut_type: &str,
+    dut_access: Option<&ir::passes::dut_access::DutAccessPlan>,
+    dut_lane_widths: &std::collections::HashMap<String, u32>,
+    runtime_cells: expr::RuntimeCellRenderBinding<'_>,
+    run_context: Option<&str>,
 ) -> Result<(), EmitError> {
+    let callback_capture = persistent_setup_capture(run_context);
     for svc in &tb.cycle_services {
-        // Emit the body lambda HERE (after the composite instances +
-        // method lambdas are declared, same as the periodic path) so a
-        // body reading those symbols resolves.
-        func::emit_test_hook(out, prog, prog.function(svc.function), dut_type, 1)?;
-        let lambda = &prog.function(svc.function).name;
-        let trigger = func::tb_service_expr_cpp(prog, svc.function, dut_type, &svc.trigger)?;
+        let lambda = runtime_cells.test_hook(svc.function)?;
+        let trigger = func::tb_service_expr_cpp(
+            prog,
+            svc.function,
+            dut_type,
+            dut_access,
+            dut_lane_widths,
+            &svc.trigger,
+        )?;
         let tag = format!("_tbcyc_{}", svc.function.0);
         let vec = svc.phase.service_vec();
         // Re-evaluate the predicate every primary-clock cycle and fire the
         // body per the recorded edge mode. Mirrors v1's `emit_cycle_trigger`
         // and the transactor cycle-trigger closure in `emit_lifecycle_checkers`.
-        writeln!(out, "{INDENT}{vec}.push_back([&]() {{").ok();
+        writeln!(out, "{INDENT}{vec}.push_back([{callback_capture}]() {{").ok();
+        emit_persistent_setup_bindings(out, 2, run_context);
         match svc.edge {
             ir::CycleEdge::Level => {
                 writeln!(out, "{INDENT}{INDENT}if ((bool)({trigger})) {{").ok();
@@ -3278,17 +2899,21 @@ fn emit_tb_cycle_services(
                 writeln!(out, "{INDENT}{INDENT}}}").ok();
             }
             ir::CycleEdge::Rising | ir::CycleEdge::Falling => {
-                writeln!(out, "{INDENT}{INDENT}static bool {tag}_prev = false;").ok();
+                let kind = ir::passes::runtime_cells::RuntimeCellKind::TestbenchEdgePrevious {
+                    function: svc.function,
+                    phase: svc.phase.into(),
+                };
+                let previous = runtime_cells.testbench_field(&kind)?;
                 writeln!(out, "{INDENT}{INDENT}bool {tag}_curr = (bool)({trigger});").ok();
                 let cond = match svc.edge {
-                    ir::CycleEdge::Rising => format!("!{tag}_prev && {tag}_curr"),
-                    ir::CycleEdge::Falling => format!("{tag}_prev && !{tag}_curr"),
+                    ir::CycleEdge::Rising => format!("!{previous} && {tag}_curr"),
+                    ir::CycleEdge::Falling => format!("{previous} && !{tag}_curr"),
                     ir::CycleEdge::Level => unreachable!(),
                 };
                 writeln!(out, "{INDENT}{INDENT}if ({cond}) {{").ok();
                 writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}();").ok();
                 writeln!(out, "{INDENT}{INDENT}}}").ok();
-                writeln!(out, "{INDENT}{INDENT}{tag}_prev = {tag}_curr;").ok();
+                writeln!(out, "{INDENT}{INDENT}{previous} = {tag}_curr;").ok();
             }
         }
         writeln!(out, "{INDENT}}});").ok();
@@ -3304,19 +2929,19 @@ fn emit_test(
     dut_type: &str,
     opts: &EmitOpts,
     randomize_snippets: &[String],
-    // #619 M4b: TestbenchLifecycle FunctionIds emitted out-of-line for
-    // this suite, mapped to their variant (Plain void call / Coro drive
-    // loop); their definitions are emitted at file scope by the caller (the
-    // enclosing TU for the monolithic/self-contained paths, or the common
-    // `.cpp` for the separate/common layout). A `TbLifecycleCall` to one of
-    // these lowers accordingly; a target absent from the map → the M4a
-    // re-inline. The map is empty only when native lifecycle produced no
-    // shareable body; all emission paths (monolithic, self-contained shard,
-    // and separate/common shard) now pass the shareable map.
+    runtime_cells: &ir::passes::runtime_cells::RuntimeCellPlan,
+    dut_access: Option<&ir::passes::dut_access::DutAccessPlan>,
+    // Native lifecycle functions emitted out-of-line for this layout.
     outofline_lifecycle: &HashMap<ir::FunctionId, func::LifecycleEmit>,
 ) -> Result<(), EmitError> {
     let tb = prog.testbench(test.testbench);
     let clocked = !test.clocks.is_empty();
+    let qualified_clock_wait = prog.functions.iter().any(|function| {
+        function
+            .blocks
+            .iter()
+            .any(|block| matches!(block.terminator, ir::Terminator::WaitCycles(_, Some(_), _)))
+    });
     let cosim = opts.cosim.is_some();
     // Declared clocks work under co-sim without a dedicated lowering:
     // the clocked scheduler's `dut-><clk> = level` writes go through the
@@ -3332,40 +2957,70 @@ fn emit_test(
     // emitted; consumed by the worker-spawn / barrier dance below.
     let mut actor_threads: Vec<(String, String)> = Vec::new();
 
+    let runtime_cell_stem = format!("t{}", test.id.0);
+    let runtime_cells_type = runtime::test_runtime_cells_struct(
+        out,
+        prog,
+        runtime_cells,
+        test,
+        &runtime_cell_stem,
+        &opts.vec_lane_widths,
+        dut_type,
+        dut_access,
+        None,
+    )?;
     runtime::run_prologue(out, &test.name, dut_type, cosim);
     if clocked {
         runtime::clocked_scheduler(out, &test.clocks);
     } else {
         runtime::clockless_scheduler(out);
     }
-    runtime::log_helpers_and_seed(out);
+    runtime::log_helpers_and_seed(out, qualified_clock_wait);
+    let mut outer_names = tb
+        .component_fields
+        .iter()
+        .map(|binding| binding.field.clone())
+        .chain(
+            tb.regblock_bindings
+                .iter()
+                .map(|binding| binding.field.clone()),
+        )
+        .collect::<HashSet<_>>();
+    if needs_tb_struct(tb) {
+        outer_names.insert("_tb".to_string());
+    }
+    let mut runtime_cells_name = "_harc_runtime_cells".to_string();
+    while outer_names.contains(&runtime_cells_name) {
+        runtime_cells_name = format!("_u_{runtime_cells_name}");
+    }
+    if let Some(runtime_cells_type) = &runtime_cells_type {
+        writeln!(
+            out,
+            "{INDENT}{runtime_cells_type} {runtime_cells_name}{{}};"
+        )
+        .ok();
+    }
+    let runtime_cell_binding =
+        runtime_cells_type
+            .as_ref()
+            .map(|_| expr::RuntimeCellRenderBinding {
+                plan: runtime_cells,
+                test,
+                receiver: &runtime_cells_name,
+            });
 
     if needs_tb_struct(tb) {
         writeln!(out, "{INDENT}{} _tb;", tb.name).ok();
     }
-    // Transaction/struct-typed testbench fields are shared host state.
-    // Lowering gives every owning function a synthetic record local of
-    // this name for record-field resolution, while codegen declares the
-    // actual object once here so helper/run/check/hook bodies capture the
-    // same C++ record by reference.
-    for (field, rid) in &tb.record_fields {
-        let rec_ty = &prog.records[rid.index()].name;
-        writeln!(out, "{INDENT}{rec_ty} {field}{{}};").ok();
-    }
-    // Closure-hook regblock mirrors: a binding with `on regs.REG` write
-    // callbacks holds its mirror struct + recursion-depth counter as
-    // SHARED test-scope state (declared once, captured by `[&]`), so the
-    // run coroutine and every callback lambda hit the same cell. The
-    // per-function mirror locals (Run + callbacks) are name-matched to
-    // these and skipped at declaration time. Plain regblock bindings keep
-    // their run-local mirror (no callbacks → no sharing needed).
+    // Regblock mirrors are explicit per-run state shared by every callable in
+    // the owning test. Callback-bearing bindings additionally own one
+    // recursion-depth counter.
     for b in &tb.regblock_bindings {
-        if b.callbacks.is_empty() {
-            continue;
-        }
         let mirror_ty = &prog.records[prog.regblocks[b.regblock.index()].record.index()].name;
         writeln!(out, "{INDENT}{mirror_ty} {}{{}};", b.field).ok();
-        writeln!(out, "{INDENT}uint32_t {}_cb_depth = 0;", b.field).ok();
+        if !b.callbacks.is_empty() {
+            writeln!(out, "{INDENT}uint32_t {}_cb_depth = 0;", b.field).ok();
+        }
     }
     // Composite-component test-scope instances (`let env : AnalysisEnv`,
     // `sb : ScoreboardWithMethods`) are shared by the run coroutine,
@@ -3376,52 +3031,27 @@ fn emit_test(
     for cf in &tb.component_fields {
         let cname = &prog.components[cf.component.index()].name;
         writeln!(out, "{INDENT}{cname} {};", cf.field).ok();
+        emit_component_dut_bindings(out, prog, cf.component, &cf.field, dut_type, "dut", 1)?;
     }
-    // Hook-vector spine for hook-triggered covergroups
-    // (`covergroup G @(drv.send(t) post)`). One
-    // `std::vector<std::function<void(args)>> <Type>_<method>_pre/_post`
-    // per transactor method that any cov field subscribes to, declared
-    // here so both the cov sample-closure push (below) and the method
-    // fan-out (`emit_method`) reach the same vectors by `[&]` capture.
-    // Mirrors v1's `emit_hook_vectors`. Only methods used by THIS
-    // testbench's transactor fields are declared.
-    let mut hook_vector_xactors = HashSet::new();
-    for (_field, xid) in &tb.transactor_fields {
-        if !hook_vector_xactors.insert(*xid) {
+    // Hook-triggered covergroups subscribe to receiver-owned vectors. Declare
+    // every transactor receiver before registering any sampler so the
+    // registration never depends on testbench field order.
+    let mut emitted_state_ty = HashSet::new();
+    for actor in &tb.unbound_state_actors {
+        if !emitted_state_ty.insert(actor.transactor) {
             continue;
         }
-        let schema = prog.transactor(*xid);
-        for m in &schema.methods {
-            if m.cov_hook_subs.is_empty()
-                && !has_transactor_method_hook_subscription(prog, test.testbench, *xid, &m.name)
-            {
-                continue;
-            }
-            covergroup::transactor_hook_vector_decls(out, prog, schema, m, INDENT)?;
-        }
+        runtime::unbound_state_struct_decl(
+            out,
+            prog,
+            actor.transactor,
+            prog.transactor(actor.transactor),
+            &prog.records,
+            runtime_cells,
+        )?;
     }
-    // User method hooks on components follow v1's type-scoped vector
-    // contract (`<Component>_<method>_pre/post`). Keep these separate from
-    // per-instance covergroup vectors stored on the component struct.
-    for (ci, component) in prog.components.iter().enumerate() {
-        for method in &component.methods {
-            if has_component_method_hook_subscription(
-                prog,
-                test.testbench,
-                ir::ComponentId(ci as u32),
-                &method.name,
-            ) {
-                covergroup::hook_vector_decls(
-                    out,
-                    prog,
-                    &component.name,
-                    &method.name,
-                    method.function,
-                    method.param_names.len(),
-                    INDENT,
-                )?;
-            }
-        }
+    for actor in &tb.unbound_state_actors {
+        runtime::unbound_state_var(out, prog, actor.transactor, &actor.storage);
     }
     // Covergroup auto-sampler registration, in testbench-field
     // declaration order — the same `_checkers` slot v1 uses, so
@@ -3459,10 +3089,12 @@ fn emit_test(
             ir::CovTrigger::PosedgeDutClk => {
                 covergroup::sampler_registration(
                     out,
+                    prog,
                     schema,
                     &format!("_tb.{field}"),
                     &opts.vec_lane_widths,
                     &opts.dut_port_widths,
+                    dut_access,
                 )?;
             }
             ir::CovTrigger::Hook {
@@ -3480,6 +3112,10 @@ fn emit_test(
                         schema.name,
                         receiver_path.join(".")
                     )));
+                };
+                let side_name = match side {
+                    crate::ast::HookSide::Pre => "pre",
+                    crate::ast::HookSide::Post => "post",
                 };
                 if let Some(binding) = tb
                     .component_fields
@@ -3508,12 +3144,23 @@ fn emit_test(
                             return None;
                         }
                         let xs = prog.transactor(*xid);
-                        xs.method(method).map(|m| {
-                            (
-                                format!("{}_{}", xs.emission_name(), m.name),
-                                m.function,
-                                m.param_names.len(),
-                            )
+                        xs.method(method).and_then(|m| {
+                            tb.unbound_state_actors
+                                .iter()
+                                .find(|actor| actor.field == *field && actor.transactor == *xid)
+                                .map(|actor| {
+                                    (
+                                        format!(
+                                            "{}.{}",
+                                            actor.storage,
+                                            runtime::transactor_coverage_hook_field(
+                                                xs, &m.name, side_name,
+                                            )
+                                        ),
+                                        m.function,
+                                        m.param_names.len(),
+                                    )
+                                })
                         })
                     })
                     .or_else(|| {
@@ -3524,7 +3171,7 @@ fn emit_test(
                             let comp = &prog.components[binding.component.index()];
                             comp.method(method).map(|m| {
                                 (
-                                    format!("{}._harc_cov_{}", binding.field, m.name),
+                                    format!("{}._harc_cov_{}_{}", binding.field, m.name, side_name),
                                     m.function,
                                     m.param_names.len(),
                                 )
@@ -3545,10 +3192,10 @@ fn emit_test(
                     target.0,
                     target.1,
                     target.2,
-                    *side,
                     &format!("_tb.{field}"),
                     &opts.vec_lane_widths,
                     &opts.dut_port_widths,
+                    dut_access,
                 )?;
             }
         }
@@ -3557,10 +3204,15 @@ fn emit_test(
     // file, declared before the run coroutine so its `[&]` capture sees
     // them (v1's `emit_tseq` placement). Each returns a
     // `std::vector<Record>` and runs the body's randomize/yield loop.
-    for f in &prog.functions {
-        if let ir::FunctionKind::Tseq { .. } = f.kind {
-            func::emit_tseq(out, prog, f, &prog.records, randomize_snippets, 1)?;
-        }
+    for function in func::tseq_emit_order(prog)? {
+        func::emit_tseq(
+            out,
+            prog,
+            prog.function(function),
+            &prog.records,
+            randomize_snippets,
+            1,
+        )?;
     }
     // Transactor method lambdas — one `<Type>_<method>` per method of
     // every transactor the testbench instantiates, declared before the
@@ -3579,50 +3231,29 @@ fn emit_test(
     // type-shared method lambda takes the receiver by reference, so any
     // number of active instances of one type coexist with independent
     // state (`Drv_go(a)` and `Drv_go(b)` mutate `a`/`b` separately).
-    let mut emitted_state_ty = HashSet::new();
-    for actor in &tb.unbound_state_actors {
-        if !emitted_state_ty.insert(actor.transactor) {
-            continue;
-        }
-        runtime::unbound_state_struct_decl(out, prog.transactor(actor.transactor), &prog.records);
-    }
-    for actor in &tb.unbound_state_actors {
-        runtime::unbound_state_var(out, prog.transactor(actor.transactor), &actor.storage);
-    }
     let mut emitted_xactors = HashSet::new();
     for (_, xid) in &tb.transactor_fields {
         if !emitted_xactors.insert(*xid) {
             continue;
         }
-        // For a transactor type instantiated ONLY as `passive`, its
-        // `when active` (`active_only`) methods are never callable, and
-        // `ir::verify` proves it: every call site (verify.rs, transactor
-        // method-call check) and cov-hook subscription to an active-only
-        // method on a passive instance is rejected. So a passive-only type
-        // has no reference to those method definitions — skipping them is
-        // safe (they would be dead code at best). Since #763, though, an
-        // always-on (`!active_only`) `hookable` method IS callable on a
-        // passive instance and its call site IS emitted; the pre-#763 gate
-        // here skipped the WHOLE type (assuming "passive ⇒ no callable
-        // methods"), which dropped those always-on definitions and left the
-        // calls dangling — `use of undeclared identifier` (harc#769). So: a
-        // type with an active instance emits all its methods as before; a
-        // passive-only type emits only its always-on methods (which use the
-        // per-schema state-receiver ABI — a `<State>&` receiver, no baked-in
-        // instance name) and still skips the `active_only` ones. Per-instance
-        // state structs and always-on `on` handlers are emitted elsewhere.
-        // (#494 P0a/P1b, #763, harc#769)
+        // A passive-only transactor type still exposes its always-on methods.
+        // Skip only `when active` methods: #763 permits calls to always-on
+        // hookable methods through a passive instance, so omitting the whole
+        // lambda set leaves those valid call sites dangling.
         let has_active_instance = tb
             .transactor_fields
             .iter()
             .any(|(f, x)| x == xid && !tb.passive_transactor_fields.contains(f));
         let schema = prog.transactor(*xid);
+        let bound_bus = tb
+            .bound_bus_binding(ir::BoundBusOwner::Transactor(*xid))
+            .map_err(|detail| EmitError(format!("tbir: test `{}`: {detail}", test.name)))?;
         // On a passive-only type, emit only the always-on methods.
         for m in &schema.methods {
             if !has_active_instance && m.active_only {
                 continue;
             }
-            func::declare_method_slot(out, prog, schema, m, 1)?;
+            func::declare_method_slot(out, prog, *xid, schema, m, 1)?;
         }
         for m in &schema.methods {
             if !has_active_instance && m.active_only {
@@ -3635,6 +3266,7 @@ fn emit_test(
                 *xid,
                 schema,
                 m,
+                bound_bus,
                 randomize_snippets,
                 1,
             )?;
@@ -3650,7 +3282,15 @@ fn emit_test(
             continue;
         }
         let schema = prog.transactor(actor.transactor);
-        runtime::target_state_struct_inst(out, schema, &actor.instance, &prog.records);
+        runtime::target_state_struct_inst(
+            out,
+            prog,
+            actor.transactor,
+            schema,
+            &actor.instance,
+            &prog.records,
+            runtime_cells,
+        )?;
     }
     for actor in &tb.target_tlm_actors {
         func::emit_target_actor(
@@ -3660,41 +3300,139 @@ fn emit_test(
             &tb.bus_bindings,
             mt,
             &mut actor_threads,
+            None,
             1,
         )?;
     }
 
-    // Composite-component method lambdas — one `<Comp>_<method>` per
-    // method of every component in the file, declared before the run
-    // coroutine so its `[&]` capture (and the connect push_backs below)
-    // see them. Dependency order (subs before holders) so a method body
-    // that calls a sub-component's method sees that lambda first.
+    // Ordinary component methods use the verified callable graph's
+    // dependency-first order, so forward and cross-component calls see their
+    // callees before lambda initialization. Lifecycle handlers remain below.
+    for function in func::component_method_emit_order(prog)? {
+        let body = prog.functions.get(function.index()).ok_or_else(|| {
+            EmitError(format!(
+                "tbir: component method order references missing fn{}",
+                function.0
+            ))
+        })?;
+        let ir::FunctionKind::ComponentMethod {
+            component, member, ..
+        } = body.kind
+        else {
+            return Err(EmitError(format!(
+                "tbir: component method order references fn{} with kind {:?}",
+                function.0, body.kind
+            )));
+        };
+        let comp = prog.components.get(component.index()).ok_or_else(|| {
+            EmitError(format!(
+                "tbir: component method fn{} references missing component c{}",
+                function.0, component.0
+            ))
+        })?;
+        let method = comp
+            .methods
+            .get(member.index())
+            .filter(|method| method.function == function)
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: component `{}` does not own method fn{} at member {}",
+                    comp.name, function.0, member.0
+                ))
+            })?;
+        let bound_bus = tb
+            .bound_bus_binding(ir::BoundBusOwner::Component(component))
+            .map_err(|detail| EmitError(format!("tbir: test `{}`: {detail}", test.name)))?;
+        func::emit_component_method(
+            out,
+            prog,
+            test.testbench,
+            component,
+            comp,
+            method,
+            bound_bus,
+            dut_type,
+            dut_access,
+            &opts.vec_lane_widths,
+            randomize_snippets,
+            1,
+        )?;
+    }
     for ci in component_emit_order(prog) {
         let comp = &prog.components[ci];
-        for m in &comp.methods {
-            func::emit_component_method(
+        let bound_bus = tb
+            .bound_bus_binding(ir::BoundBusOwner::Component(ir::ComponentId(ci as u32)))
+            .map_err(|detail| EmitError(format!("tbir: test `{}`: {detail}", test.name)))?;
+        for oh in &comp.on_handlers {
+            func::emit_component_on_handler(
                 out,
                 prog,
-                test.testbench,
-                ir::ComponentId(ci as u32),
                 comp,
-                m,
+                oh,
+                bound_bus,
+                dut_type,
+                dut_access,
+                &opts.vec_lane_widths,
                 randomize_snippets,
                 1,
             )?;
         }
-        for oh in &comp.on_handlers {
-            func::emit_component_on_handler(out, prog, comp, oh, randomize_snippets, 1)?;
-        }
         for ph in &comp.periodic_handlers {
-            func::emit_component_periodic_handler(out, prog, comp, ph, randomize_snippets, 1)?;
+            func::emit_component_periodic_handler(
+                out,
+                prog,
+                comp,
+                ph,
+                bound_bus,
+                dut_type,
+                dut_access,
+                &opts.vec_lane_widths,
+                randomize_snippets,
+                1,
+            )?;
         }
         for ch in &comp.cycle_handlers {
-            func::emit_component_cycle_handler(out, prog, comp, ch, randomize_snippets, 1)?;
+            func::emit_component_cycle_handler(
+                out,
+                prog,
+                comp,
+                ch,
+                bound_bus,
+                dut_type,
+                dut_access,
+                &opts.vec_lane_widths,
+                randomize_snippets,
+                1,
+            )?;
         }
         if let Some(w) = &comp.watchdog {
-            func::emit_component_watchdog(out, prog, comp, w, randomize_snippets, 1)?;
+            func::emit_component_watchdog(
+                out,
+                prog,
+                comp,
+                w,
+                bound_bus,
+                dut_type,
+                dut_access,
+                &opts.vec_lane_widths,
+                randomize_snippets,
+                1,
+            )?;
         }
+    }
+    for function in func::testbench_method_emit_order(prog, tb.type_id)? {
+        func::emit_testbench_method(
+            out,
+            prog,
+            prog.function(function),
+            test.testbench,
+            &tb.bus_bindings,
+            dut_type,
+            dut_access,
+            &opts.vec_lane_widths,
+            randomize_snippets,
+            1,
+        )?;
     }
     // Closure-hook bodies (`on <obj>.<method> pre/post` method hooks and
     // `on regs.REG` per-register write callbacks) are free `[&]`-capturing
@@ -3702,27 +3440,34 @@ fn emit_test(
     // method has been declared: a valid hook body may call another method,
     // and C++ name lookup requires that callable to exist first. Their
     // subscription/dispatch sites live later in the run/check coroutine.
-    // Periodic/cycle service functions are emitted with their registration
-    // below and are excluded here.
-    let tb_service_fns: HashSet<ir::FunctionId> = tb
-        .periodic_services
-        .iter()
-        .map(|s| s.function)
-        .chain(tb.cycle_services.iter().map(|s| s.function))
-        .collect();
     for f in &prog.functions {
-        if matches!(f.kind, ir::FunctionKind::TestHook)
-            && f.owner == Some(test.testbench)
-            && !tb_service_fns.contains(&f.id)
-        {
-            func::emit_test_hook(out, prog, f, dut_type, 1)?;
+        if runtime::test_hook_belongs_to_test(f, test) {
+            func::emit_test_hook(
+                out,
+                prog,
+                f,
+                dut_type,
+                1,
+                func::TestHookRenderBindings {
+                    flow: func::FlowRenderBindings {
+                        dut_receiver: Some("dut"),
+                        dut_access,
+                        dut_lane_widths: Some(&opts.vec_lane_widths),
+                        clocks: Some(&test.clocks),
+                        ..func::FlowRenderBindings::default()
+                    },
+                    runtime_cells: runtime_cell_binding,
+                    common_contextual_tseqs: None,
+                    durable_capture: false,
+                },
+            )?;
         }
     }
     // Composite-component connection and lifecycle setup for the instances
     // declared above. Keep this after component method lambdas so connect
     // closures can call `<SinkComp>_<method>(...)`.
     for edge in &tb.connects {
-        emit_one_connect(out, prog, "", edge);
+        emit_one_connect(out, prog, "", edge, None);
     }
     for cf in &tb.component_fields {
         // The top component's own `connect` edges (an env's source→sink, or
@@ -3731,10 +3476,10 @@ fn emit_test(
         // `sequencer.dispatched -> drv.req` bridge must be installed).
         for edge in &cf.connects {
             if edge_is_enabled(prog, cf.component, cf.mode, edge) {
-                emit_one_connect(out, prog, &cf.field, edge);
+                emit_one_connect(out, prog, &cf.field, edge, None);
             }
         }
-        emit_nested_connects(out, prog, cf.component, &cf.field, cf.mode);
+        emit_nested_connects(out, prog, cf.component, &cf.field, cf.mode, None);
         // An `active` bound event-driven transactor (`let drv : X active =
         // bind axil`) re-lowers its `on <ev>` driver into a queue-fed
         // worker-coroutine actor on its own `ThreadScheduler` under `--mt`,
@@ -3760,6 +3505,9 @@ fn emit_test(
         // queue nor worker and keeps the synchronous subscriber —
         // byte-identical output.
         let bound_drv = &prog.components[cf.component.index()];
+        let bound_bus = tb
+            .bound_bus_binding(ir::BoundBusOwner::Component(cf.component))
+            .map_err(|detail| EmitError(format!("tbir: test `{}`: {detail}", test.name)))?;
         let relower_driver = mt
             && matches!(cf.mode, Some(ir::ComponentInstanceMode::Active))
             && bound_drv.bound_bus.is_some()
@@ -3770,7 +3518,9 @@ fn emit_test(
                 prog,
                 cf.component,
                 &cf.field,
+                dut_type,
                 &tb.bus_bindings,
+                bound_bus,
                 &mut actor_threads,
                 1,
             )?;
@@ -3782,13 +3532,36 @@ fn emit_test(
         // mirroring v1's `on`-subscriber registration. Suppressed for the
         // top component when its driver was re-lowered into a worker actor
         // above (the worker replaces the synchronous driver under `--mt`).
-        emit_on_handler_regs(out, prog, cf.component, &cf.field, relower_driver, cf.mode);
+        emit_on_handler_regs(
+            out,
+            prog,
+            cf.component,
+            &cf.field,
+            relower_driver,
+            cf.mode,
+            bound_bus,
+            None,
+            None,
+        )?;
         // `on <N> cycles` periodic + `watchdog` lifecycle `_checkers`
         // closures, for this component and any nested sub-components.
         // Bound-bus handshake monitors stay cooperative `_checkers`
         // latches even under `--mt` (see the NOTE in
         // `emit_lifecycle_checkers`), so no actor registration is needed.
-        emit_lifecycle_checkers(out, prog, cf.component, &cf.field, cf.mode)?;
+        emit_lifecycle_checkers(
+            out,
+            prog,
+            runtime_cells,
+            cf.component,
+            &cf.field,
+            cf.mode,
+            dut_type,
+            dut_access,
+            &opts.vec_lane_widths,
+            bound_bus,
+            None,
+            None,
+        )?;
     }
 
     // Testbench-scoped `on <N> cycles [phase post_eval]` periodic services
@@ -3797,10 +3570,45 @@ fn emit_test(
     // primary-clock cycles,
     // gated on a per-service last-fire stamp — the flow-scope analogue of
     // a component's `emit_lifecycle_checkers` periodic registration.
-    emit_tb_periodic_services(out, prog, tb, dut_type)?;
-    emit_tb_cycle_services(out, prog, tb, dut_type)?;
+    if !tb.periodic_services.is_empty() || !tb.cycle_services.is_empty() {
+        let runtime_cell_binding = runtime_cell_binding.ok_or_else(|| {
+            EmitError(format!(
+                "tbir: test `{}` has lifecycle services without runtime-cell storage",
+                test.name
+            ))
+        })?;
+        emit_tb_periodic_services(out, tb, runtime_cell_binding, None)?;
+        emit_tb_cycle_services(
+            out,
+            prog,
+            tb,
+            dut_type,
+            dut_access,
+            &opts.vec_lane_widths,
+            runtime_cell_binding,
+            None,
+        )?;
+    }
 
+    if qualified_clock_wait {
+        writeln!(out, "{INDENT}_harc_advance_actors = [&]() {{").ok();
+        if mt {
+            for (scheduler, _) in &actor_threads {
+                writeln!(out, "{INDENT}{INDENT}{scheduler}.tick();").ok();
+            }
+        } else {
+            writeln!(
+                out,
+                "{INDENT}{INDENT}sched.tick_except(_harc_running_slot);"
+            )
+            .ok();
+        }
+        writeln!(out, "{INDENT}}};").ok();
+    }
     writeln!(out, "{INDENT}harc_rt::ThreadSlot _run_slot;").ok();
+    if qualified_clock_wait {
+        writeln!(out, "{INDENT}_harc_running_slot = &_run_slot;").ok();
+    }
     writeln!(out, "{INDENT}sched.slots.push_back(&_run_slot);").ok();
     writeln!(
         out,
@@ -3811,18 +3619,11 @@ fn emit_test(
         writeln!(out, "{INDENT}{INDENT}_tb.dut = dut;").ok();
     }
     let run = prog.function(test.run);
-    let run_hook_captures: HashSet<ir::LocalId> = run
-        .blocks
-        .iter()
-        .flat_map(|block| &block.stmts)
-        .filter_map(|stmt| match stmt {
-            ir::Stmt::MethodHookSubscribe { captures, .. } => Some(captures.as_slice()),
-            _ => None,
-        })
-        .flatten()
-        .copied()
-        .collect();
-    func::declare_flow_hook_captures(out, prog, run, &run_hook_captures, 2)?;
+    let run_hook_captures: HashSet<ir::LocalId> =
+        ir::passes::runtime_cells::persistent_callback_captures(prog, run)
+            .map_err(|error| EmitError(format!("tbir: {error}")))?
+            .into_iter()
+            .collect();
     func::emit_function(
         out,
         prog,
@@ -3834,20 +3635,42 @@ fn emit_test(
         dut_type,
         &run_hook_captures,
         2,
+        runtime_cell_binding,
+        func::FlowRenderBindings {
+            dut_receiver: Some("dut"),
+            dut_access,
+            dut_lane_widths: Some(&opts.vec_lane_widths),
+            clocks: Some(&test.clocks),
+            ..func::FlowRenderBindings::default()
+        },
         outofline_lifecycle,
     )?;
     if let Some(check) = test.check {
+        let check = prog.function(check);
+        let check_callback_captures: HashSet<ir::LocalId> =
+            ir::passes::runtime_cells::persistent_callback_captures(prog, check)
+                .map_err(|error| EmitError(format!("tbir: {error}")))?
+                .into_iter()
+                .collect();
         func::emit_function(
             out,
             prog,
-            prog.function(check),
+            check,
             &prog.records,
             &tb.bus_bindings,
             &opts.vec_lane_widths,
             randomize_snippets,
             dut_type,
-            &HashSet::new(),
+            &check_callback_captures,
             2,
+            runtime_cell_binding,
+            func::FlowRenderBindings {
+                dut_receiver: Some("dut"),
+                dut_access,
+                dut_lane_widths: Some(&opts.vec_lane_widths),
+                clocks: Some(&test.clocks),
+                ..func::FlowRenderBindings::default()
+            },
             outofline_lifecycle,
         )?;
     }
@@ -3866,14 +3689,14 @@ fn emit_test(
     // shutdown emitters are no-ops when `actor_threads` is empty, so the
     // cooperative single-thread output stays byte-identical to before.
     runtime::drive_bootstrap(out, &actor_threads);
-    runtime::mt_worker_setup(out, &actor_threads);
-    runtime::drive_loop(out, clocked, &actor_threads);
+    runtime::mt_worker_setup(out, &actor_threads, qualified_clock_wait);
+    runtime::drive_loop(out, clocked, &actor_threads, qualified_clock_wait);
     runtime::mt_worker_shutdown(out, &actor_threads);
-    let covers: Vec<&ir::CoverCheckSchema> = test
+    let covers: Vec<(ir::CoverCheckId, &ir::CoverCheckSchema)> = test
         .cover_checks
         .iter()
-        .map(|c| &prog.cover_checks[c.index()])
+        .map(|cover| (*cover, &prog.cover_checks[cover.index()]))
         .collect();
-    runtime::run_epilogue(out, cosim, &covers);
+    runtime::run_epilogue(out, cosim, &covers, &actor_threads, runtime_cell_binding)?;
     Ok(())
 }

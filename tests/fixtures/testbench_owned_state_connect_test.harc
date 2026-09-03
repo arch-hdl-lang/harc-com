@@ -56,6 +56,8 @@ impl OwnedStateConnectTest for OwnedStateConnectTb
         assert nested.sink.sum == 8
         assert pending.size() == 1
         assert records.size() == 1
+        assert pending.front() == 8
+        assert records.front().value == 9
     end run
 
     check

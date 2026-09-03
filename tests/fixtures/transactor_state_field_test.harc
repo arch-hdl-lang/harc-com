@@ -61,7 +61,9 @@ transactor CamStateXactor
             wait 1 cycle
             // Bare-name state writes — TransactorStateWrite.
             last_first = dut.search_first
-            last_any = dut.search_any
+            // The catalog represents this one-bit DUT port as uint<1>;
+            // compare explicitly before storing it in the bool state field.
+            last_any = dut.search_any != 0
             // Bare-name state read + write — TransactorState read,
             // TransactorStateWrite of the incremented value.
             probe_count = probe_count + 1

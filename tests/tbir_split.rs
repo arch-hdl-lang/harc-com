@@ -63,8 +63,9 @@ fn sanitize(name: &str) -> String {
 
 /// Independent reimplementation of the PRE-REFACTOR split algorithm,
 /// built only out of the public `tbir::emit`: clone the program, filter
-/// `.tests` down to the shard, emit the whole thing, then strip the
-/// trailing dispatcher `main()`.
+/// `.tests` down to the shard while retaining each selected test's stable
+/// suite identity, emit the whole thing, then strip the trailing dispatcher
+/// `main()`.
 ///
 /// This is the anchor for the whole refactor. If the planner, the
 /// index-based test selection, the suite-global scaffold reuse, the shard
@@ -121,7 +122,9 @@ fn emit_shards_sorted(
     // collect through a mutex rather than a captured `&mut`.
     let got: Mutex<Vec<(usize, String, String)>> = Mutex::new(Vec::new());
     tbir::emit_split_shards(prog, file, opts, plan, jobs, |shard, cpp, _| {
-        got.lock().unwrap().push((shard.index, shard.filename.clone(), cpp));
+        got.lock()
+            .unwrap()
+            .push((shard.index, shard.filename.clone(), cpp));
         Ok(())
     })
     .expect("shards emit");
@@ -149,8 +152,12 @@ fn assert_matches_reference(
         want.len(),
         "{label} @ group {group_size}: shard count"
     );
-    for (idx, ((_, got_name, got_cpp), (want_name, want_cpp))) in got.iter().zip(&want).enumerate() {
-        assert_eq!(got_name, want_name, "{label} @ group {group_size}: shard {idx} filename");
+    for (idx, ((_, got_name, got_cpp), (want_name, want_cpp))) in got.iter().zip(&want).enumerate()
+    {
+        assert_eq!(
+            got_name, want_name,
+            "{label} @ group {group_size}: shard {idx} filename"
+        );
         assert_eq!(
             got_cpp.len(),
             want_cpp.len(),
@@ -169,9 +176,10 @@ fn assert_matches_reference(
     assert_eq!(plan.dispatcher.filename, format!("{prefix}main.cpp"));
     for t in &prog.tests {
         assert!(
-            plan.dispatcher
-                .contents
-                .contains(&format!("extern int run_{}(int argc, char** argv);", t.name)),
+            plan.dispatcher.contents.contains(&format!(
+                "extern int run_{}(int argc, char** argv);",
+                t.name
+            )),
             "{label}: dispatcher declares run_{}",
             t.name
         );
@@ -353,6 +361,33 @@ fn split_output_matches_pre_refactor_emitter_for_randomize_fixture() {
 }
 
 #[test]
+fn split_reference_preserves_sparse_suite_test_ids_with_runtime_cells() {
+    let merged = merged_src(
+        r#"
+test NoCells
+    let dut : SplitAdder
+    run
+        wait 1 cycle
+    end run
+end test NoCells
+
+test WithCells
+    let dut : SplitAdder
+    run
+        cover dut.sum == 7
+        on 2 cycles
+            log(info, "tick")
+        end on
+        wait 2 cycles
+    end run
+end test WithCells
+"#,
+    );
+    let prog = program(&merged);
+    assert_matches_reference("runtime-cell subset", &merged, &prog, 1);
+}
+
+#[test]
 fn batch_split_api_matches_streaming_api() {
     let merged = merged_src(&mixed_feature_suite());
     let prog = program(&merged);
@@ -372,7 +407,10 @@ fn batch_split_api_matches_streaming_api() {
     }
     assert_eq!(
         batch.test_names,
-        prog.tests.iter().map(|t| t.name.clone()).collect::<Vec<_>>()
+        prog.tests
+            .iter()
+            .map(|t| t.name.clone())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -554,7 +592,10 @@ fn resolve_emit_jobs_clamps_to_shards_and_cap() {
     // Automatic mode is bounded by both the shard count and the memory cap.
     assert_eq!(tbir::resolve_emit_jobs(0, 1), 1);
     let auto = tbir::resolve_emit_jobs(0, 64);
-    assert!((1..=4).contains(&auto), "auto jobs {auto} within the cap of 4");
+    assert!(
+        (1..=4).contains(&auto),
+        "auto jobs {auto} within the cap of 4"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -578,7 +619,10 @@ fn plan_groups_tests_and_names_files() {
     let two = tbir::plan_split_tests(&prog, &merged, &opts, "pfx__", 2).expect("plans");
     assert_eq!(two.shards.len(), 3);
     assert_eq!(
-        two.shards.iter().map(|s| s.test_indices.clone()).collect::<Vec<_>>(),
+        two.shards
+            .iter()
+            .map(|s| s.test_indices.clone())
+            .collect::<Vec<_>>(),
         vec![vec![0, 1], vec![2, 3], vec![4]]
     );
     for (i, shard) in two.shards.iter().enumerate() {
@@ -646,6 +690,142 @@ fn split_plan_emits_no_shared_headers() {
             "split output must stay self-contained .cpp; got {name}"
         );
     }
+}
+
+#[test]
+fn split_shards_render_shared_probe_methods_with_the_dut_type() {
+    let merged = merged_src(
+        r#"agent ProbeUser
+    function read_probe() -> uint<32>
+        return dut.inject
+    end function read_probe
+    function force_probe(value: uint<32>)
+        dut.inject = value
+    end function force_probe
+    function release_probe()
+        release dut.inject
+    end function release_probe
+end agent ProbeUser
+
+test A
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    let user : ProbeUser
+    run
+        let before : uint<32> = user.read_probe()
+        user.force_probe(before + 1)
+        user.release_probe()
+    end run
+end test A
+
+test B
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    let user : ProbeUser
+    run
+        let before : uint<32> = user.read_probe()
+        user.force_probe(before + 2)
+        user.release_probe()
+    end run
+end test B"#,
+    );
+    let prog = program(&merged);
+    let opts = cpp_tb::EmitOpts::default();
+    let accessor = "Top__DOT__harc_probes__DOT__inject";
+
+    let split = tbir::plan_split_tests(&prog, &merged, &opts, "suite__", 1).expect("plans");
+    for shard in &split.shards {
+        let cpp = tbir::emit_split_shard(&prog, &merged, &opts, &split, shard)
+            .expect("self-contained shard emits");
+        assert!(cpp.contains(accessor), "{}:\n{cpp}", shard.filename);
+        assert!(cpp.contains(&format!("{accessor}_drv")), "{cpp}");
+        assert!(cpp.contains(&format!("{accessor}_en")), "{cpp}");
+    }
+}
+
+#[test]
+fn mt_split_bound_driver_actor_renders_probe_access_with_the_dut_type() {
+    let merged = merged_src(
+        r#"bus ProbeBus
+    handshake_channel req: send kind: valid_ready
+        data : uint<8>
+    end handshake_channel req
+end bus ProbeBus
+
+transactor ProbeDriver bound to ProbeBus
+    when active
+        request : in event<uint<8>>
+        on request(value)
+            let before : uint<8> = dut.inject
+            dut.inject = before + value
+            release dut.inject
+        end on
+    end when
+end transactor ProbeDriver
+
+test A
+    let dut : Top
+        probe force inject : uint<8> at core.inject
+    end let dut
+    let bus : ProbeBus = bind dut
+    let drv : ProbeDriver active = bind bus
+    run
+        emit drv.request(1)
+        wait 1 cycle
+    end run
+end test A"#,
+    );
+    let prog = program(&merged);
+    let opts = cpp_tb::EmitOpts {
+        mt: true,
+        ..Default::default()
+    };
+    let accessor = "Top__DOT__harc_probes__DOT__inject";
+
+    let split = tbir::plan_split_tests(&prog, &merged, &opts, "suite__", 1).expect("plans");
+    let cpp = tbir::emit_split_shard(&prog, &merged, &opts, &split, &split.shards[0])
+        .expect("self-contained --mt shard emits");
+    assert!(cpp.contains(&format!("dut->rootp->{accessor}")), "{cpp}");
+    assert!(
+        cpp.contains(&format!("dut->rootp->{accessor}_drv")),
+        "{cpp}"
+    );
+    assert!(cpp.contains(&format!("dut->rootp->{accessor}_en")), "{cpp}");
+    assert!(!cpp.contains("rootp->__DOT__harc_probes"), "{cpp}");
+}
+
+#[test]
+fn mt_split_clause_only_probe_access_includes_the_root_header() {
+    let merged = merged_src(
+        r#"agent ProbeWatcher
+    on dut.enable level
+        log(info, "probe enabled")
+    end on
+end agent ProbeWatcher
+
+test A
+    let dut : Top
+        probe enable : uint<1> at core.enable
+    end let dut
+    let watcher : ProbeWatcher
+    run
+        wait 1 cycle
+    end run
+end test A"#,
+    );
+    let prog = program(&merged);
+    let opts = cpp_tb::EmitOpts {
+        mt: true,
+        ..Default::default()
+    };
+
+    let split = tbir::plan_split_tests(&prog, &merged, &opts, "suite__", 1).expect("plans");
+    let cpp = tbir::emit_split_shard(&prog, &merged, &opts, &split, &split.shards[0])
+        .expect("clause-only self-contained --mt shard emits");
+    assert!(cpp.contains("#include \"VTop___024root.h\""), "{cpp}");
+    assert!(cpp.contains("Top__DOT__harc_probes__DOT__enable"), "{cpp}");
 }
 
 #[test]
@@ -762,16 +942,15 @@ fn failed_emit_delivers_each_shard_at_most_once() {
     for jobs in [1usize, 2, 4, 8] {
         for _ in 0..10 {
             let delivered: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-            let err =
-                tbir::emit_split_shards(&prog, &merged, &opts, &plan, jobs, |shard, _, _| {
-                    delivered.lock().unwrap().push(shard.index);
-                    if shard.index == 5 {
-                        Err(cpp_tb::EmitError("boom".into()))
-                    } else {
-                        Ok(())
-                    }
-                })
-                .expect_err("shard 5 fails");
+            let err = tbir::emit_split_shards(&prog, &merged, &opts, &plan, jobs, |shard, _, _| {
+                delivered.lock().unwrap().push(shard.index);
+                if shard.index == 5 {
+                    Err(cpp_tb::EmitError("boom".into()))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("shard 5 fails");
             assert_eq!(err.to_string(), "boom", "jobs={jobs}");
 
             let delivered = delivered.into_inner().unwrap();
@@ -807,11 +986,12 @@ fn every_shard_is_offered_exactly_once() {
 
     for jobs in [1usize, 2, 4, 16] {
         let seen_cb: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-        let returned = tbir::emit_split_shards(&prog, &merged, &opts, &plan, jobs, |shard, _, _| {
-            seen_cb.lock().unwrap().push(shard.index);
-            Ok(())
-        })
-        .expect("shards emit");
+        let returned =
+            tbir::emit_split_shards(&prog, &merged, &opts, &plan, jobs, |shard, _, _| {
+                seen_cb.lock().unwrap().push(shard.index);
+                Ok(())
+            })
+            .expect("shards emit");
         // The returned indices must agree with what the callback saw, and
         // must come back ascending so a driver can build an ordered file
         // list without sorting.

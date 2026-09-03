@@ -331,7 +331,10 @@ fn m4b_suspending_setup_and_teardown_emit_once_as_coroutines() {
 
     // The non-suspending check is a plain void function, once.
     assert_eq!(
-        count_occurrences(&cpp, "static void _harc_lc__tb_lifecycle_WaitSetupTb_Check("),
+        count_occurrences(
+            &cpp,
+            "static void _harc_lc__tb_lifecycle_WaitSetupTb_Check("
+        ),
         1,
         "non-suspending check must be emitted exactly once as a plain void function"
     );
@@ -448,24 +451,48 @@ fn m4b_split_common_layout_emits_lifecycle_once_in_common() {
     let (iface, common, shards) = with_switch(true, || {
         let prog = lower::lower_program(&merged).expect("lowers (switch on)");
         verify::verify_program(&prog).expect("verifies (switch on)");
-        let opts = cpp_tb::EmitOpts::default();
-        // group_size 1 → one test per shard → two shards, so the
-        // once-in-common / zero-in-shard property is exercised across shards.
-        let plan =
-            tbir::plan_separate_tests(&prog, &merged, &opts, "", 1).expect("separate plan");
-        let iface =
-            tbir::emit_separate_interface_with_prefix(&prog, &merged, &opts, &plan.scaffold, "")
-                .expect("interface");
-        let common =
-            tbir::emit_separate_common_with_prefix(&prog, &merged, &opts, &plan.scaffold, "")
-                .expect("common");
+        let mut opts = cpp_tb::EmitOpts::default();
+        opts.dut_interface = Some(
+            ir::passes::dut_access::DutInterfaceCatalog::new(
+                "Top",
+                vec![
+                    ir::passes::dut_access::DutInterfacePort::new(
+                        "rst",
+                        ir::PortDirection::In,
+                        1,
+                        None,
+                        None,
+                    ),
+                    ir::passes::dut_access::DutInterfacePort::new(
+                        "en",
+                        ir::PortDirection::In,
+                        1,
+                        None,
+                        None,
+                    ),
+                    ir::passes::dut_access::DutInterfacePort::new(
+                        "count_out",
+                        ir::PortDirection::Out,
+                        32,
+                        None,
+                        None,
+                    ),
+                ],
+            )
+            .expect("DUT interface"),
+        );
+        // The common-object plan emits one capsule per test, so two tests
+        // exercise the once-in-runtime / zero-in-capsule property across
+        // independent translation units.
+        let plan = tbir::common::plan_common_tests_with_source(&prog, &merged, &opts, "")
+            .expect("common plan");
+        let publication = plan.publication().expect("publication");
+        let iface = publication.interface().to_string();
+        let common = publication.runtime().expect("runtime");
         let shards: Vec<String> = plan
-            .shards
+            .capsules()
             .iter()
-            .map(|s| {
-                tbir::emit_separate_shard_with_prefix(&prog, &merged, &opts, &plan.scaffold, s, "")
-                    .expect("shard")
-            })
+            .map(|capsule| publication.capsule(capsule).expect("capsule"))
             .collect();
         (iface, common, shards)
     });
@@ -491,7 +518,9 @@ fn m4b_split_common_layout_emits_lifecycle_once_in_common() {
 
     // The header carries a prototype for each (so shards can call them).
     assert!(
-        iface.contains(&format!("{coro_sig}& ctx, WaitSetupTb& _tb, harc_rt::ThreadSlot* _slot);")),
+        iface.contains(&format!(
+            "{coro_sig}& ctx, WaitSetupTb& _tb, harc_rt::ThreadSlot* _slot);"
+        )),
         "interface header must declare the setup coroutine prototype"
     );
     assert!(
@@ -532,17 +561,27 @@ fn m4b_split_common_layout_emits_lifecycle_once_in_common() {
         );
         setup_drives += count_occurrences(
             shard,
-            "_harc_lc__tb_lifecycle_WaitSetupTb_Setup(ctx, _tb, _slot)",
+            "_harc_lc__tb_lifecycle_WaitSetupTb_Setup(ctx, _harc_run_state._harc_testbench, _slot)",
         );
-        check_calls +=
-            count_occurrences(shard, "_harc_lc__tb_lifecycle_WaitSetupTb_Check(ctx, _tb);");
+        check_calls += count_occurrences(
+            shard,
+            "_harc_lc__tb_lifecycle_WaitSetupTb_Check(ctx, _harc_run_state._harc_testbench);",
+        );
         teardown_drives += count_occurrences(
             shard,
-            "_harc_lc__tb_lifecycle_WaitSetupTb_Teardown(ctx, _tb, _slot)",
+            "_harc_lc__tb_lifecycle_WaitSetupTb_Teardown(ctx, _harc_run_state._harc_testbench, _slot)",
         );
     }
-    assert_eq!(setup_drives, shards.len(), "every shard drives the shared setup coroutine");
-    assert_eq!(check_calls, shards.len(), "every shard calls the shared check");
+    assert_eq!(
+        setup_drives,
+        shards.len(),
+        "every shard drives the shared setup coroutine"
+    );
+    assert_eq!(
+        check_calls,
+        shards.len(),
+        "every shard calls the shared check"
+    );
     assert_eq!(
         teardown_drives,
         shards.len(),
@@ -577,7 +616,10 @@ fn m4b_self_contained_split_emits_static_coro_per_shard() {
             .collect::<Vec<String>>()
     });
 
-    assert!(shards.len() >= 2, "group_size 1 must produce ≥2 self-contained shards");
+    assert!(
+        shards.len() >= 2,
+        "group_size 1 must produce ≥2 self-contained shards"
+    );
     for (i, shard) in shards.iter().enumerate() {
         assert_eq!(
             count_occurrences(shard, coro_static),
@@ -709,7 +751,10 @@ fn m4b_tseq_call_in_lifecycle_setup_falls_back_but_check_shares() {
             let body = seg.split("\n}\n").next().unwrap_or("");
             body.contains("Gen(")
         });
-    assert!(!leaked, "tseq lambda `Gen(` must not appear inside an out-of-line lifecycle def");
+    assert!(
+        !leaked,
+        "tseq lambda `Gen(` must not appear inside an out-of-line lifecycle def"
+    );
 }
 
 #[test]
@@ -721,17 +766,14 @@ fn m4b_wait_until_lifecycle_bodies_emit_once_as_coroutines() {
         tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits on")
     });
     for phase in ["Setup", "Check"] {
-        let symbol = format!(
-            "harc_rt::HarcThread _harc_lc__tb_lifecycle_WaitUntilLifecycleTb_{phase}("
-        );
+        let symbol =
+            format!("harc_rt::HarcThread _harc_lc__tb_lifecycle_WaitUntilLifecycleTb_{phase}(");
         assert_eq!(
             count_occurrences(&cpp, &symbol),
             1,
             "wait-until {phase} must be defined once as a coroutine"
         );
-        let call = format!(
-            "_harc_lc__tb_lifecycle_WaitUntilLifecycleTb_{phase}(ctx, _tb, _slot)"
-        );
+        let call = format!("_harc_lc__tb_lifecycle_WaitUntilLifecycleTb_{phase}(ctx, _tb, _slot)");
         assert_eq!(
             count_occurrences(&cpp, &call),
             2,
@@ -749,17 +791,13 @@ fn m4b_coverage_interaction_lifecycle_stays_native_and_out_of_line() {
         tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits on")
     });
     for phase in ["Setup", "Check"] {
-        let definition = format!(
-            "static void _harc_lc__tb_lifecycle_LifecycleCoverageTb_{phase}("
-        );
+        let definition = format!("static void _harc_lc__tb_lifecycle_LifecycleCoverageTb_{phase}(");
         assert_eq!(
             count_occurrences(&cpp, &definition),
             1,
             "coverage interaction {phase} must be defined once out of line"
         );
-        let call = format!(
-            "_harc_lc__tb_lifecycle_LifecycleCoverageTb_{phase}(ctx, _tb);"
-        );
+        let call = format!("_harc_lc__tb_lifecycle_LifecycleCoverageTb_{phase}(ctx, _tb);");
         assert_eq!(
             count_occurrences(&cpp, &call),
             2,

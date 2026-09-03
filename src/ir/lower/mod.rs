@@ -59,17 +59,18 @@ mod tseqs;
 
 use crate::ast::{
     AddrmapDecl, Block, BuiltinTy, BusDecl, CallArg, ClockDecl, ComponentDecl, ComponentItem,
-    ExprKind, HookableMethod, Item, OnPhase, ScopeDecl, SourceFile, Stmt as AstStmt, StmtKind,
-    TestDecl, TestItem, TransactorMode, TypeExpr,
+    ExprKind, HookableMethod, Item, OnPhase, ScopeDecl, SourceFile, SourceId, SourceSite,
+    Stmt as AstStmt, StmtKind, TestDecl, TestItem, TransactorMode, TypeExpr,
 };
 use crate::ir::{
     self, BasicBlock, BlockId, ClockSpec, ComponentSchema, ConstraintRef, ConstraintSite,
-    CovgroupId, CovgroupSchema, FunctionId, FunctionKind, IrType, LocalId, RecordId, RecordSchema,
-    RegblockId, ScoreboardId, ScoreboardSchema, TbFunction, TbProgram, Terminator, TestSchema,
-    TestbenchId, TestbenchSchema, TransactorId, TransactorSchema, TypedLocal, TypedParam,
+    CovgroupId, CovgroupSchema, FunctionId, FunctionKind, IrType, LocalId, ProbeId, ProbeSchema,
+    RecordId, RecordSchema, RegblockId, ScoreboardId, ScoreboardSchema, TbFunction, TbProgram,
+    Terminator, TestSchema, TestbenchId, TestbenchMethodSchema, TestbenchSchema, TestbenchTypeId,
+    TestbenchTypeSchema, TransactorId, TransactorSchema, TypedLocal, TypedParam,
 };
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 #[derive(Debug, Clone)]
@@ -152,6 +153,53 @@ impl std::fmt::Display for LowerError {
 
 impl std::error::Error for LowerError {}
 
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("{error}")]
+pub struct LowerDiagnostic {
+    error: LowerError,
+    source_id: SourceId,
+    #[label("lowering failed here")]
+    span: Option<miette::SourceSpan>,
+}
+
+impl LowerDiagnostic {
+    pub fn error(&self) -> &LowerError {
+        &self.error
+    }
+
+    pub fn source_id(&self) -> SourceId {
+        self.source_id
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct LowerDiagnosticRecorder(Rc<Cell<Option<(SourceId, crate::lexer::Span)>>>);
+
+impl LowerDiagnosticRecorder {
+    fn record(&self, source_id: SourceId, span: crate::lexer::Span) {
+        if self.0.get().is_none() {
+            self.0.set(Some((source_id, span)));
+        }
+    }
+
+    fn checkpoint(&self) -> Option<(SourceId, crate::lexer::Span)> {
+        self.0.get()
+    }
+
+    fn restore(&self, checkpoint: Option<(SourceId, crate::lexer::Span)>) {
+        self.0.set(checkpoint);
+    }
+
+    fn finish(&self, error: LowerError) -> LowerDiagnostic {
+        let (source_id, span) = self.0.get().unwrap_or_default();
+        LowerDiagnostic {
+            error,
+            source_id,
+            span: (span.end > span.start).then(|| crate::diagnostics::span_to_source_span(span)),
+        }
+    }
+}
+
 pub(crate) fn unsupported(construct: &str, detail: impl Into<String>) -> LowerError {
     LowerError::Unsupported {
         construct: construct.to_string(),
@@ -200,6 +248,43 @@ pub(crate) struct SideTables {
     /// here with its slot index as a placeholder id and `lower_program`
     /// assigns real ids once every source-order function is pushed.
     pub pending_functions: Vec<TbFunction>,
+    /// Owner-local identity sources for statement-owned callback sites.
+    /// Separating run/check bodies by stable test name prevents unrelated
+    /// tests from renumbering each other's callback artifacts.
+    pub next_test_hook_site: BTreeMap<ir::TestHookSiteOwner, u32>,
+    synchronous_callbacks: Vec<SynchronousCallbackSite>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SynchronousCallbackKind {
+    StatementCycle,
+    TestbenchPeriodic,
+    TestbenchCycle,
+    ComponentPeriodic,
+    ComponentCycle,
+    ComponentWatchdog,
+}
+
+impl SynchronousCallbackKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::StatementCycle => "statement-position cycle handler",
+            Self::TestbenchPeriodic => "testbench periodic service",
+            Self::TestbenchCycle => "testbench cycle-trigger service",
+            Self::ComponentPeriodic => "component periodic handler",
+            Self::ComponentCycle => "component cycle-trigger handler",
+            Self::ComponentWatchdog => "component watchdog",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SynchronousCallbackSite {
+    function: FunctionId,
+    pending: bool,
+    kind: SynchronousCallbackKind,
+    source_id: SourceId,
+    span: crate::lexer::Span,
 }
 
 impl SideTables {
@@ -218,6 +303,12 @@ impl SideTables {
         }
         for h in &mut self.cycle_handlers {
             h.function = FunctionId(base + h.function.0);
+        }
+        for callback in &mut self.synchronous_callbacks {
+            if callback.pending {
+                callback.function = FunctionId(base + callback.function.0);
+                callback.pending = false;
+            }
         }
         // Subscription statements carry their handler's placeholder id
         // inline in a function body rather than in a schema, so the
@@ -239,23 +330,78 @@ impl SideTables {
     }
 }
 
-/// A folded file-scope constant: 64-bit two's-complement bit pattern
-/// plus the signedness later expressions must evaluate it under. The
-/// signedness is the *declared* type's (`sint<N>` → signed), matching
-/// v1, which stores every ≤64-bit const as `uint64_t`/`int64_t` per
-/// `c_type_for` — the bit pattern is backend-identical and signedness
-/// only changes the value of `>>`, `/`, `%`, and ordered comparisons.
-#[derive(Clone, Copy)]
+/// Provenance of a folded file-scope constant. A typed declaration keeps its
+/// exact IR scalar type; intentionally untyped constants and enum variants
+/// remain distinguishable because their width policy is different at value
+/// use sites.
+#[derive(Clone)]
+pub(crate) enum ConstProvenance {
+    Typed(IrType),
+    Untyped,
+    EnumVariant,
+}
+
+/// A folded file-scope constant: 64-bit two's-complement bit pattern, the
+/// signedness used while folding, and the declaration provenance used when
+/// substituting the value into typed TB-IR expressions.
+#[derive(Clone)]
 pub(crate) struct ConstVal {
     pub(crate) bits: u64,
     pub(crate) signed: bool,
+    pub(crate) provenance: ConstProvenance,
 }
 
 impl ConstVal {
-    fn as_i64(self) -> i64 {
+    pub(crate) fn untyped(bits: u64, signed: bool) -> Self {
+        Self {
+            bits,
+            signed,
+            provenance: ConstProvenance::Untyped,
+        }
+    }
+
+    pub(crate) fn typed(bits: u64, ty: IrType) -> Self {
+        let signed = matches!(ty, IrType::SInt(_));
+        Self {
+            bits,
+            signed,
+            provenance: ConstProvenance::Typed(ty),
+        }
+    }
+
+    pub(crate) fn enum_variant(bits: u64) -> Self {
+        Self {
+            bits,
+            signed: true,
+            provenance: ConstProvenance::EnumVariant,
+        }
+    }
+
+    pub(crate) fn value_type(&self) -> IrType {
+        match &self.provenance {
+            ConstProvenance::Typed(ty) => ty.clone(),
+            ConstProvenance::Untyped | ConstProvenance::EnumVariant => {
+                if self.signed {
+                    IrType::SInt(None)
+                } else {
+                    IrType::UInt(None)
+                }
+            }
+        }
+    }
+
+    fn declared_width(&self) -> Option<u32> {
+        match &self.provenance {
+            ConstProvenance::Typed(IrType::UInt(width) | IrType::SInt(width)) => *width,
+            ConstProvenance::Typed(IrType::Bool) => Some(1),
+            _ => None,
+        }
+    }
+
+    fn as_i64(&self) -> i64 {
         self.bits as i64
     }
-    pub(crate) fn is_negative(self) -> bool {
+    pub(crate) fn is_negative(&self) -> bool {
         self.signed && (self.bits as i64) < 0
     }
 }
@@ -284,9 +430,9 @@ use ConstFoldErr::Invalid as FoldInvalid;
 ///
 /// Deliberately the same shape as v1's `wrap_operand_width`, so the two
 /// backends fold the same set of constant wraps.
-fn const_operand_width(e: &crate::ast::Expr) -> Option<u32> {
+fn const_operand_width(e: &crate::ast::Expr, consts: &HashMap<String, ConstVal>) -> Option<u32> {
     match &*e.kind {
-        ExprKind::Paren(inner) => const_operand_width(inner),
+        ExprKind::Paren(inner) => const_operand_width(inner, consts),
         // A nested wrap composes: `(1 +% 2) +% 3` masks at each step's own
         // operand width. v1's `wrap_operand_width` has this arm; without
         // it TB-IR rejected chains v1 folds.
@@ -297,8 +443,9 @@ fn const_operand_width(e: &crate::ast::Expr) -> Option<u32> {
                 | crate::ast::BinaryOp::MulWrap,
             lhs,
             rhs,
-        } => Some(const_operand_width(lhs)?.max(const_operand_width(rhs)?)),
+        } => Some(const_operand_width(lhs, consts)?.max(const_operand_width(rhs, consts)?)),
         ExprKind::Cast { ty, .. } => exprs::cast_relabel_width(ty),
+        ExprKind::Ident(id) => consts.get(&id.name)?.declared_width(),
         ExprKind::Int(s) => {
             let v = exprs::parse_int_literal(s.as_str())?;
             Some(if v == 0 { 1 } else { 64 - v.leading_zeros() })
@@ -406,6 +553,7 @@ fn check_const_helper_abi_type(
         return Ok(ConstVal {
             bits: value.bits,
             signed: false,
+            provenance: value.provenance,
         });
     };
     let signed = match name {
@@ -423,6 +571,7 @@ fn check_const_helper_abi_type(
     Ok(ConstVal {
         bits: value.bits,
         signed,
+        provenance: value.provenance,
     })
 }
 
@@ -436,26 +585,20 @@ fn fold_const_inner(
     use crate::ast::{BinaryOp, TypeExpr, UnaryOp};
     let boolean = |x: bool| {
         // Comparison / logical results promote like C++ `bool` → `int`.
-        Ok(ConstVal {
-            bits: x as u64,
-            signed: true,
-        })
+        Ok(ConstVal::untyped(x as u64, true))
     };
     match &*e.kind {
         ExprKind::Paren(inner) => fold_const_inner(inner, consts, self_name, helpers, call_stack),
         ExprKind::Int(s) => match exprs::parse_int_literal(s) {
             // Decimal literals above i64::MAX are unsigned, like C++.
-            Some(v) => Ok(ConstVal {
-                bits: v,
-                signed: v <= i64::MAX as u64,
-            }),
+            Some(v) => Ok(ConstVal::untyped(v, v <= i64::MAX as u64)),
             None => Err(ConstFoldErr::Unsupported(format!(
                 "the integer literal `{s}` does not fit the 64-bit constant-evaluation domain"
             ))),
         },
         ExprKind::Bool(b) => boolean(*b),
         ExprKind::Ident(id) => match consts.get(&id.name) {
-            Some(v) => Ok(*v),
+            Some(v) => Ok(v.clone()),
             None if id.name == self_name => Err(FoldInvalid(format!(
                 "references itself — `const {self_name}` is a dependency cycle",
             ))),
@@ -501,24 +644,18 @@ fn fold_const_inner(
                     ..
                 }
             );
-            Ok(ConstVal {
-                bits: v.bits,
-                signed,
-            })
+            Ok(ConstVal::untyped(v.bits, signed))
         }
         ExprKind::Unary { op, expr } => {
             let v = fold_const_inner(expr, consts, self_name, helpers, call_stack)?;
             match op {
-                UnaryOp::Neg => Ok(ConstVal {
-                    bits: v.bits.wrapping_neg(),
+                UnaryOp::Neg => Ok(ConstVal::untyped(
+                    v.bits.wrapping_neg(),
                     // C++: negating an unsigned value stays unsigned.
-                    signed: v.signed,
-                }),
+                    v.signed,
+                )),
                 UnaryOp::Not | UnaryOp::NotKw => boolean(v.bits == 0),
-                UnaryOp::BitNot => Ok(ConstVal {
-                    bits: !v.bits,
-                    signed: v.signed,
-                }),
+                UnaryOp::BitNot => Ok(ConstVal::untyped(!v.bits, v.signed)),
             }
         }
         ExprKind::Binary { op, lhs, rhs } => {
@@ -528,7 +665,7 @@ fn fold_const_inner(
             // (and the comparison/division domain) is signed only when
             // both operands are.
             let signed = a.signed && b.signed;
-            let arith = |bits: u64| Ok(ConstVal { bits, signed });
+            let arith = |bits: u64| Ok(ConstVal::untyped(bits, signed));
             // Shift-amount validation shared by `<<`/`>>`. v1 forwards
             // the raw expression to C++, where an out-of-range amount
             // is UB — reject loudly instead of silently masking.
@@ -563,7 +700,10 @@ fn fold_const_inner(
                     // statically known (a `const` reference, whose
                     // declared type this table does not carry) still
                     // cannot be folded, and v1 rejects it too.
-                    let (wl, wr) = (const_operand_width(lhs), const_operand_width(rhs));
+                    let (wl, wr) = (
+                        const_operand_width(lhs, consts),
+                        const_operand_width(rhs, consts),
+                    );
                     let (Some(wl), Some(wr)) = (wl, wr) else {
                         return Err(FoldInvalid(format!(
                             "the wrapping `{}` operator needs both operands to have a \
@@ -600,10 +740,7 @@ fn fold_const_inner(
                     };
                     // The residue is unsigned (§2.4), regardless of the
                     // operands' signedness.
-                    Ok(ConstVal {
-                        bits: masked,
-                        signed: false,
-                    })
+                    Ok(ConstVal::untyped(masked, false))
                 }
                 BinaryOp::Div | BinaryOp::Mod => {
                     let is_div = matches!(op, BinaryOp::Div);
@@ -635,10 +772,7 @@ fn fold_const_inner(
                     let n = shift_amount(b)?;
                     // C++: the result's signedness is the (promoted)
                     // left operand's, not the pair's.
-                    Ok(ConstVal {
-                        bits: a.bits << n,
-                        signed: a.signed,
-                    })
+                    Ok(ConstVal::untyped(a.bits << n, a.signed))
                 }
                 BinaryOp::Shr => {
                     let n = shift_amount(b)?;
@@ -649,10 +783,7 @@ fn fold_const_inner(
                     } else {
                         a.bits >> n
                     };
-                    Ok(ConstVal {
-                        bits,
-                        signed: a.signed,
-                    })
+                    Ok(ConstVal::untyped(bits, a.signed))
                 }
                 BinaryOp::BitAnd => arith(a.bits & b.bits),
                 BinaryOp::BitOr => arith(a.bits | b.bits),
@@ -763,7 +894,10 @@ fn fold_const_inner(
                 let CallArg::Named { name: written, .. } = arg else {
                     continue;
                 };
-                if declared.get(index).is_some_and(|name| *name == written.name) {
+                if declared
+                    .get(index)
+                    .is_some_and(|name| *name == written.name)
+                {
                     continue;
                 }
                 if let Some(expected) = declared.iter().position(|name| *name == written.name) {
@@ -820,9 +954,8 @@ fn fold_const_inner(
     }
 }
 
-/// Check the folded value against the declared type and pin the
-/// stored signedness to the declaration (issue #521 acceptance
-/// criterion 2). Widths below 64 are *validated*, not truncated: v1
+/// Check the folded value against the declared type and retain that exact
+/// scalar type for later substitution. Widths below 64 are *validated*, not truncated: v1
 /// stores every ≤64-bit const in a 64-bit C type, so silently masking
 /// here would diverge from the legacy backend, and silently keeping an
 /// out-of-range value would make the declared width a lie. A value
@@ -837,10 +970,7 @@ pub(crate) fn check_const_decl_type(
     use crate::ast::{BuiltinTy, TypeArg, TypeExpr};
     let Some(TypeExpr::Builtin { name, args, .. }) = ty else {
         // Untyped `const NAME = expr` — v1 stores it as `int64_t`.
-        return Ok(ConstVal {
-            bits: v.bits,
-            signed: ty.is_none() || v.signed,
-        });
+        return Ok(ConstVal::untyped(v.bits, ty.is_none() || v.signed));
     };
     let width: Option<u32> = args.first().and_then(|a| match a {
         TypeArg::Expr(e) => match &*e.kind {
@@ -871,10 +1001,7 @@ pub(crate) fn check_const_decl_type(
                     ));
                 }
             }
-            Ok(ConstVal {
-                bits: v.bits,
-                signed: false,
-            })
+            Ok(ConstVal::typed(v.bits, IrType::UInt(width)))
         }
         BuiltinTy::SInt | BuiltinTy::SIntCap => {
             if let Some(w) = width.filter(|w| (1..64).contains(w)) {
@@ -892,16 +1019,13 @@ pub(crate) fn check_const_decl_type(
                     ));
                 }
             }
-            Ok(ConstVal {
-                bits: v.bits,
-                signed: true,
-            })
+            Ok(ConstVal::typed(v.bits, IrType::SInt(width)))
         }
-        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Ok(ConstVal {
+        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Ok(ConstVal::typed(
             // v1 emits `static constexpr bool` — C++ bool conversion.
-            bits: (v.bits != 0) as u64,
-            signed: true,
-        }),
+            (v.bits != 0) as u64,
+            IrType::Bool,
+        )),
         _ => Ok(v),
     }
 }
@@ -921,31 +1045,14 @@ fn type_keyword(name: &crate::ast::BuiltinTy) -> &'static str {
 /// into a `LowerError` — or `None` when nothing in `errs` is worth
 /// surfacing.
 ///
-/// Every non-Z3 entry used to be skipped, which threw away these
-/// diagnostics entirely: a `randomize ... with NoSuchRelation(r)`
-/// lowered clean under TB-IR while v1 refused it outright.
+/// Relation errors and String literals surface. The four relation errors are
+/// program errors under either backend: an unknown relation, wrong arity,
+/// recursive expansion, or expansion past the shared size limit. A misplaced
+/// named argument is classified separately because v1 binds it positionally.
 ///
-/// Only the RELATION errors surface. Four of them are program errors
-/// under any backend: a relation that does not exist, one called with
-/// the wrong arity, one that expands into itself, and one whose
-/// expansion is finite but past the shared size limit. Measured against
-/// v1: it rejects all four with "constraint function call not
-/// supported in v0 solver path", so none is an escape hatch and
-/// `Invalid` is the honest verdict. The third used to take the process
-/// down with a stack overflow instead; divergence 62 replaced that with
-/// the same diagnostic as the other two, and divergence 72 gave the
-/// fourth its limit.
-///
-/// The other variants stay discarded ON PURPOSE. They are capability
-/// gaps in the constraint IR, not bad programs:
-/// `DisallowedInConstraint` fires on `s.sample[63:32] != 0` in
-/// `uint64_unique_randomize_test`, a REGISTERED fixture that v1 lowers
-/// and that passes trace equivalence today. Surfacing them would
-/// reject working programs. That is not a guess — all 190 files in
-/// `tests/fixtures` were run through both table builders (184 merge);
-/// two produce non-relation `LowerError`s (`uint64_unique_randomize_
-/// test` and `axi_agent`, the latter `UnresolvedIdent`/`WidthMismatch`/
-/// `BvLitOutOfRange`) and none produces a relation one.
+/// Other `DisallowedInConstraint` variants are constraint-IR capability gaps,
+/// not necessarily invalid programs, so they remain available to backend
+/// paths that can represent them.
 fn surface_constraint_lower_error(
     errs: &[crate::constraints::typed_lower::LowerError],
 ) -> Option<LowerError> {
@@ -966,13 +1073,8 @@ fn surface_constraint_lower_error(
             CErr::RecursiveRelation { name, .. } => {
                 format!("`{name}` expands into itself, so the constraint has no finite form")
             }
-            // `Invalid` like its three siblings, and for the same
-            // reason: v1's expander charges the SAME budget out of the
-            // same constant, so it stops on the same programs and
-            // leaves the call unexpanded, and its translator then
-            // refuses it with "constraint function call not supported
-            // in v0 solver path". Neither backend runs this, so naming
-            // one as the way out would be false.
+            // Both backends enforce the same expansion budget and reject a
+            // relation call left after that limit, so this is a program error.
             CErr::RelationExpansionTooLarge { name, .. } => {
                 format!(
                     "expanding `{name}` exceeds the relation-expansion limit; the form \
@@ -980,13 +1082,9 @@ fn surface_constraint_lower_error(
                      previous one more than once doubles at every level"
                 )
             }
-            // NOT `Invalid`, unlike its four siblings. v1 ACCEPTS a
-            // misplaced name — it emits working C++ with the arguments
-            // silently swapped — so "a program error under every
-            // backend" is literally false here. This is the sweep's
-            // ordinary `SilentlyMisLowers` shape and gets that verdict,
-            // which also keeps the diagnostic from naming v1 as a way
-            // out.
+            // v1 binds named relation arguments positionally and can silently
+            // swap values, so this is a mis-lowering rather than an invalid
+            // program or a usable backend escape hatch.
             CErr::RelationNamedArgMisplaced {
                 name,
                 arg,
@@ -1013,6 +1111,10 @@ fn surface_constraint_lower_error(
                     V1Status::SilentlyMisLowers,
                 ));
             }
+            CErr::DisallowedInConstraint {
+                what: "string literal",
+                ..
+            } => "String values are not supported in randomize constraints".to_string(),
             // Must stay in step with `LowerError::is_relation_error`,
             // which decides when the constraint walk may stop. A
             // relation variant that reaches here unhandled would be
@@ -1181,6 +1283,21 @@ fn native_lifecycle_enabled() -> bool {
 /// shape `TbProgram`. Callers should run `verify::verify_program` on
 /// the result before emission.
 pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
+    lower_program_impl(file, LowerDiagnosticRecorder::default())
+}
+
+/// Lower a merged source file while retaining the narrowest source location
+/// recorded for a rejected construct. CLI entry points use this form so the
+/// existing `LowerError` classification is rendered against the right input.
+pub fn lower_program_diagnostic(file: &SourceFile) -> Result<TbProgram, LowerDiagnostic> {
+    let diagnostics = LowerDiagnosticRecorder::default();
+    lower_program_impl(file, diagnostics.clone()).map_err(|error| diagnostics.finish(error))
+}
+
+fn lower_program_impl(
+    file: &SourceFile,
+    diagnostics: LowerDiagnosticRecorder,
+) -> Result<TbProgram, LowerError> {
     // Capture impl-form testbench bindings BEFORE desugaring clears
     // `for_testbench`.
     let mut tb_of_test: HashMap<String, String> = HashMap::new();
@@ -1218,6 +1335,64 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             crate::codegen::cpp_tb::SharedLifecycleBodies::new(),
         )
     };
+
+    // Component bodies are lowered once, before any individual test. Their
+    // DUT accesses therefore need the suite's validated probe contract, not
+    // an empty test-local map. The same catalog drives the generated SV bind
+    // stub, preventing a probe from being classified one way in IR and
+    // surfaced another way at emission time.
+    let suite_probe_catalog =
+        crate::codegen::sv_stub::collect_suite_probes(&file).map_err(|error| {
+            diagnostics.record(error.source_id(), error.span());
+            if error.is_unsupported_type() {
+                unsupported("a DUT probe declaration", error.to_string())
+            } else {
+                LowerError::Invalid(error.to_string())
+            }
+        })?;
+    let shared_probe_names: HashSet<&str> = suite_probe_catalog
+        .shared_component_probes
+        .iter()
+        .map(|probe| probe.name.name.as_str())
+        .collect();
+    let program_probes: Vec<ProbeSchema> = suite_probe_catalog
+        .probes
+        .iter()
+        .enumerate()
+        .map(|(index, probe)| {
+            let ty = suite_probe_catalog.probe_types[&probe.name.name];
+            ProbeSchema {
+                id: ProbeId(index as u32),
+                dut_type: suite_probe_catalog
+                    .dut_type
+                    .clone()
+                    .expect("a non-empty probe catalog always has a DUT type"),
+                name: probe.name.name.clone(),
+                sv_path: probe.path.clone(),
+                ty,
+                force: probe.force,
+                shared: shared_probe_names.contains(probe.name.name.as_str()),
+            }
+        })
+        .collect();
+    let all_probe_meta: HashMap<String, ProbeMeta> = program_probes
+        .iter()
+        .map(|probe| {
+            (
+                probe.name.clone(),
+                ProbeMeta {
+                    id: probe.id,
+                    force: probe.force,
+                    ty: probe.ty.ir_type(),
+                },
+            )
+        })
+        .collect();
+    let suite_probes: HashMap<String, ProbeMeta> = all_probe_meta
+        .iter()
+        .filter(|(name, _)| shared_probe_names.contains(name.as_str()))
+        .map(|(name, meta)| (name.clone(), meta.clone()))
+        .collect();
 
     // Domain table: `domain D freq_mhz: N` → period_ps = 1_000_000 / N.
     let mut domains: HashMap<String, i64> = HashMap::new();
@@ -1319,7 +1494,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // Helper classification is also needed by callable `const`
     // initializers below. Build it before the const table; the same registry
     // is reused later for ordinary helper lowering and covergroup calls.
-    let helper_registry = helpers::HelperRegistry::build(&file)?;
+    let helper_registry = helpers::HelperRegistry::build(&file, &diagnostics)?;
 
     // File-scope named integer constants: `const NAME : Ty = <expr>`
     // (v1: `static constexpr <cty> NAME = <expr>;`) and `enum Color {
@@ -1336,19 +1511,16 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // unknown/cyclic reference, width violation) gets a precise
     // `Invalid` diagnostic.
     let mut const_vals: HashMap<String, ConstVal> = HashMap::new();
-    for it in &file.items {
+    for (item_index, it) in file.items.iter().enumerate() {
         match it {
             Item::Const(c) => {
-                let folded = fold_const_with_helpers(
-                    &c.value,
-                    &const_vals,
-                    &c.name.name,
-                    &helper_registry,
-                )
-                    .and_then(|v| check_const_decl_type(c.ty.as_ref(), v).map_err(FoldInvalid));
+                let folded =
+                    fold_const_with_helpers(&c.value, &const_vals, &c.name.name, &helper_registry)
+                        .and_then(|v| check_const_decl_type(c.ty.as_ref(), v).map_err(FoldInvalid));
                 let v = match folded {
                     Ok(v) => v,
                     Err(ConstFoldErr::Unsupported(detail)) => {
+                        diagnostics.record(file.item_source(item_index), c.value.span);
                         if const_expr_contains_call(&c.value) {
                             return Err(not_implemented(
                                 &format!("`const {}` initializer", c.name.name),
@@ -1364,6 +1536,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                         ));
                     }
                     Err(ConstFoldErr::Invalid(detail)) => {
+                        diagnostics.record(file.item_source(item_index), c.value.span);
                         return Err(LowerError::Invalid(format!(
                             "`const {}` initializer: {detail}",
                             c.name.name
@@ -1378,10 +1551,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                     // `enum_variants.entry(..).or_insert(i)`. Variant
                     // indices are small non-negative values; v1 emits
                     // them as plain (signed) `int` literals.
-                    const_vals.entry(v.name.clone()).or_insert(ConstVal {
-                        bits: i as u64,
-                        signed: true,
-                    });
+                    const_vals
+                        .entry(v.name.clone())
+                        .or_insert_with(|| ConstVal::enum_variant(i as u64));
                 }
             }
             _ => {}
@@ -1450,16 +1622,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         .map(|(name, owners)| (name.to_string(), owners.join("`, `")))
         .collect();
 
-    // The lowering contexts only need the substituted bit pattern —
-    // use sites emit the 64-bit literal either way.
-    let consts: HashMap<String, u64> = const_vals
-        .iter()
-        .map(|(k, v)| (k.clone(), v.bits))
-        .collect();
-    let const_signed: HashMap<String, bool> = const_vals
-        .iter()
-        .map(|(k, v)| (k.clone(), v.signed))
-        .collect();
+    // Keep each folded value with its declaration provenance so substitutions
+    // preserve the declared width and signedness in every lowering context.
+    let consts = const_vals.clone();
     // `extern function name(...) -> ret` (spec §9) names — calls to
     // these lower to `CallTarget::ExternFn`; the file-scope `extern "C"`
     // forward declarations are emitted by `emit_extern_fn_decls`. Shared
@@ -1517,14 +1682,14 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // pushes schemas in exactly this order, so `RecordId(k)` indexes
     // `record_schemas[k]`. A struct sharing a name with a transaction (or
     // another struct) resolves ambiguously, so reject the collision.
-    let mut record_order: Vec<&Item> = Vec::new();
-    for it in &file.items {
+    let mut record_order: Vec<(SourceId, &Item)> = Vec::new();
+    for (item_index, it) in file.items.iter().enumerate() {
         if let Item::Transaction(t) = it {
             record_ids.insert(t.name.name.clone(), RecordId(record_order.len() as u32));
-            record_order.push(it);
+            record_order.push((file.item_source(item_index), it));
         }
     }
-    for it in &file.items {
+    for (item_index, it) in file.items.iter().enumerate() {
         if let Item::Struct(s) = it {
             let name = &s.name.name;
             if record_ids.contains_key(name) {
@@ -1533,7 +1698,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                 )));
             }
             record_ids.insert(name.clone(), RecordId(record_order.len() as u32));
-            record_order.push(it);
+            record_order.push((file.item_source(item_index), it));
         }
     }
     // Second pass: lower each transaction/struct body's fields with the full
@@ -1544,12 +1709,24 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // resolves `S` via `record_ids` and every record-local op (`RecordInit`
     // / `RecordFieldWrite` / `Expr::RecordField`) works for free.
     let mut record_schemas: Vec<RecordSchema> = Vec::new();
-    for it in record_order {
+    for (source_id, it) in record_order {
         let schema = match it {
-            Item::Transaction(t) => {
-                records::lower_transaction(t, &enum_names, &record_ids, &const_vals)?
-            }
-            Item::Struct(s) => records::lower_struct(s, &enum_names, &record_ids, &const_vals)?,
+            Item::Transaction(t) => records::lower_transaction(
+                t,
+                &enum_names,
+                &record_ids,
+                &const_vals,
+                &diagnostics,
+                source_id,
+            )?,
+            Item::Struct(s) => records::lower_struct(
+                s,
+                &enum_names,
+                &record_ids,
+                &const_vals,
+                &diagnostics,
+                source_id,
+            )?,
             _ => unreachable!("record_order holds only transactions and structs"),
         };
         record_schemas.push(schema);
@@ -1618,32 +1795,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             )
         })
         .collect();
-    // An extern-fn signature type that the emitter renders as a
-    // VERILATED MODULE HANDLE is refused at the DECLARATION, because the
-    // declaration alone is what breaks. `emit_extern_fn_decls` is shared
-    // (tbir calls straight into v1's) and runs every parameter AND the
-    // return type through `c_type_for`, whose `Named` fall-through is
-    // `V{last}*`. The only `V<name>.h` headers ever included are the DUT
-    // module's own (plus its `___024root` when the test declares
-    // probes), so any other name is undeclared and BOTH backends fail to
-    // compile the translation unit, called or not. Hence `Invalid`, and
-    // hence the declaration rather than the call site.
-    //
-    // The question is asked THROUGH the emitter
-    // (`cpp_tb::verilated_handle_name`) rather than restated here, and
-    // that is the whole point. Restating it cost two rounds: first as
-    // "is it a record", which cannot see an enum or a return type, then
-    // as "does HARC declare the name", which was wrong in both
-    // directions at once — it rejected a `struct List` parameter (the
-    // `list`/`Vec` guard on `c_type_for`'s FIRST line renders that
-    // `std::vector<uint64_t>`, and it compiles) while still passing a
-    // bare undeclared `Nope`, a `domain` name and a `bus` name, each of
-    // which emits an undeclared `V*` from both backends.
-    //
-    // The DUT's own type is the one exception, and it is measured:
-    // `extern function ref_peek(d: Top)` emits
-    // `uint64_t ref_peek(VTop* d);` and compiles under both backends,
-    // because `VTop` is precisely the handle that IS in scope.
+    // Extern declarations are emitted even when never called. A named
+    // signature type classified as a Verilated handle becomes `V{name}*`,
+    // but only the DUT model's header is in scope. Reject every other
+    // handle at its declaration, using the emitter's classifier so the
+    // preflight rule stays aligned with the generated ABI.
     let dut_types: std::collections::HashSet<&str> = file
         .items
         .iter()
@@ -1662,34 +1818,46 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         .collect();
     let bad_handle = |t: Option<&TypeExpr>| -> Option<String> {
         let t = t?;
-        // The `Named` fall-through: `V<name>*`, satisfiable only for the
-        // DUT's own type.
+        // A top-level handle is valid only for the DUT model itself.
         if let Some(n) = crate::codegen::cpp_tb::verilated_handle_name(t) {
             if !dut_types.contains(n) {
                 return Some(n.to_string());
             }
         }
-        // …and the ELEMENT of a `TSeq<T>` / `queue<T>`, which is pasted
-        // verbatim into `std::vector<T>` / `HarcQueue<T>`. Satisfiable
-        // for a record (emitted as a C++ struct of that name) and
-        // nothing else — NOT even the DUT: `TSeq<Top>` pastes `Top`,
-        // while the struct that exists is `VTop`. Measured against the
-        // compiling control `TSeq<Beat>`; `TSeq<Nope>`, `TSeq<Top>`,
-        // `TSeq<Color>` and `queue<Nope>` all fail g++ from both
-        // backends.
-        //
-        // This arm is why the previous version's claim to cover
-        // "every parameter AND the return type through `c_type_for`"
-        // was not true of the CHECK: `c_type_for` has three arms that
-        // paste a HARC name, and the rule modelled one.
+        // Container element names are pasted directly into their C++
+        // types, so only emitted record schemas are valid. The DUT is not
+        // an exception here: a container uses `Top`, while the available
+        // model type is `VTop`.
         let n = crate::codegen::cpp_tb::element_type_name(t)?;
         (!record_ids.contains_key(n)).then(|| n.to_string())
     };
     // File order, not `extern_fn_decls` order: that is a `HashMap`, so
     // iterating it named a different offender run to run on the same
     // input. `emit_extern_fn_decls` walks `file.items`; so does this.
-    for it in &file.items {
+    for (item_index, it) in file.items.iter().enumerate() {
         let Item::ExternFn(decl) = it else { continue };
+        if let Some((param, span)) = decl.params.iter().find_map(|param| {
+            helpers::nested_string_type_span(param.ty.as_ref()).map(|span| (param, span))
+        }) {
+            diagnostics.record(file.item_source(item_index), span);
+            return Err(unsupported(
+                &format!(
+                    "extern function `{}` parameter `{}` whose type contains `String`",
+                    decl.name.name, param.name.name
+                ),
+                "String containers and aggregates are not supported; use exact top-level `String` for a callable parameter",
+            ));
+        }
+        if let Some(span) = helpers::nested_string_type_span(decl.return_ty.as_ref()) {
+            diagnostics.record(file.item_source(item_index), span);
+            return Err(unsupported(
+                &format!(
+                    "extern function `{}` return type containing `String`",
+                    decl.name.name
+                ),
+                "String containers and aggregates are not supported; use exact top-level `String` for a callable return",
+            ));
+        }
         let bad = decl
             .params
             .iter()
@@ -1750,7 +1918,12 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // the pure helpers (so FunctionIds stay sequential). Threaded into
     // every `LowerCtx` so a `let txns = Name(...)` resolves the call edge
     // and a `for t in txns` resolves the iteration.
-    let tseq_records = tseqs::collect_tseq_records(&file, &record_ids)?;
+    let tseq_records = tseqs::collect_tseq_records(
+        &file,
+        &record_ids,
+        &diagnostics,
+        FunctionId(helper_registry.pure_count() as u32),
+    )?;
 
     // Type names referenced as a by-value sub-component FIELD of some
     // `env`/`agent` declaration. A purely-structural DUT-poking BFM
@@ -1826,7 +1999,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // than dropped. The ids feed the testbench-field validation below.
     let mut scoreboard_ids: HashMap<String, ScoreboardId> = HashMap::new();
     let mut scoreboard_schemas: Vec<ScoreboardSchema> = Vec::new();
-    for it in &file.items {
+    for (item_index, it) in file.items.iter().enumerate() {
         if let Item::Scoreboard(c) = it {
             // A method-bearing scoreboard needs per-instance state, so it
             // routes to the composite-component table instead of the
@@ -1840,6 +2013,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
                 &declared_record_names,
                 &enum_names,
                 &const_vals,
+                &diagnostics,
+                file.item_source(item_index),
             )?;
             if scoreboard_ids
                 .insert(
@@ -2055,7 +2230,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
 
     // File-level construct gate: anything outside the MVP subset is an
     // explicit Unsupported, never silently dropped.
-    for it in &file.items {
+    for (item_index, it) in file.items.iter().enumerate() {
         match it {
             Item::Use(_)
             | Item::Domain(_)
@@ -2142,6 +2317,50 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             Item::Tseq(_) => {}
             Item::Env(c) | Item::Agent(c) => {
                 if used_tbs.contains(&c.name.name) {
+                    for item in &c.items {
+                        if let ComponentItem::Field(field) = item {
+                            if let Some(span) =
+                                helpers::nested_string_type_span(Some(&field.ty))
+                            {
+                                diagnostics.record(file.item_source(item_index), span);
+                                return Err(unsupported(
+                                    &format!(
+                                        "testbench `{}` field `{}` whose type contains `String`",
+                                        c.name.name, field.name.name
+                                    ),
+                                    "String containers and aggregates are not supported in persistent fields",
+                                ));
+                            }
+                        }
+                        let ComponentItem::Hookable(method) = item else {
+                            continue;
+                        };
+                        if let Some((param, span)) = method.params.iter().find_map(|param| {
+                            helpers::nested_string_type_span(param.ty.as_ref())
+                                .map(|span| (param, span))
+                        }) {
+                            diagnostics.record(file.item_source(item_index), span);
+                            return Err(unsupported(
+                                &format!(
+                                    "testbench `{}` method `{}` parameter `{}` whose type contains `String`",
+                                    c.name.name, method.name.name, param.name.name
+                                ),
+                                "String containers and aggregates are not supported; use exact top-level `String` for a callable parameter",
+                            ));
+                        }
+                        if let Some(span) =
+                            helpers::nested_string_type_span(method.return_ty.as_ref())
+                        {
+                            diagnostics.record(file.item_source(item_index), span);
+                            return Err(unsupported(
+                                &format!(
+                                    "testbench `{}` method `{}` return type containing `String`",
+                                    c.name.name, method.name.name
+                                ),
+                                "String containers and aggregates are not supported; use exact top-level `String` for a callable return",
+                            ));
+                        }
+                    }
                     validate_testbench_component(
                         c,
                         &components,
@@ -2188,6 +2407,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     }
 
     let mut prog = TbProgram {
+        probes: program_probes,
         covgroups,
         records: record_schemas,
         scoreboards: scoreboard_schemas,
@@ -2209,21 +2429,39 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // lowering sees. Drives `ConstraintSite::problem_id`.
     let solver_table = crate::solver::problem_table::build_typed_solver_problem_table(&file);
 
-    // Randomize-target span → problem-id, keyed exactly like v1's
+    // Randomize-target source site → problem-id, keyed exactly like v1's
     // `runtime_randomize_problem_ids` (only Z3-ready sites populate).
-    let mut randomize_problem_ids: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut randomize_problem_ids: HashMap<SourceSite, u64> = HashMap::new();
     for entry in &solver_table.entries {
-        let crate::solver::problem_table::TypedSolverProblemSource::RandomizeSite { span, .. } =
-            entry.source
+        let crate::solver::problem_table::TypedSolverProblemSource::RandomizeSite {
+            source_id,
+            span,
+            ..
+        } = entry.source
         else {
             continue;
         };
         match &entry.build {
             crate::solver::problem_table::TypedSolverProblemBuild::Z3 { typed, .. } => {
-                randomize_problem_ids.insert((span.start, span.end), typed.problem_id.0);
+                randomize_problem_ids.insert(SourceSite::new(source_id, span), typed.problem_id.0);
             }
             crate::solver::problem_table::TypedSolverProblemBuild::LowerError(errs) => {
                 if let Some(err) = surface_constraint_lower_error(errs) {
+                    let error_span = errs
+                        .iter()
+                        .find(|error| {
+                            error.is_relation_error()
+                                || matches!(
+                                    error,
+                                    crate::constraints::typed_lower::LowerError::DisallowedInConstraint {
+                                        what: "string literal",
+                                        ..
+                                    }
+                                )
+                        })
+                        .map(|error| error.span())
+                        .unwrap_or(span);
+                    diagnostics.record(source_id, error_span);
                     return Err(err);
                 }
             }
@@ -2253,6 +2491,33 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &entry.build
         {
             if let Some(err) = surface_constraint_lower_error(errs) {
+                let (source_id, fallback_span) = match entry.source {
+                    crate::solver::problem_table::TypedSolverProblemSource::TransactionTemplate {
+                        source_id,
+                        span,
+                        ..
+                    }
+                    | crate::solver::problem_table::TypedSolverProblemSource::RandomizeSite {
+                        source_id,
+                        span,
+                        ..
+                    } => (source_id, span),
+                };
+                let error_span = errs
+                    .iter()
+                    .find(|error| {
+                        error.is_relation_error()
+                            || matches!(
+                                error,
+                                crate::constraints::typed_lower::LowerError::DisallowedInConstraint {
+                                    what: "string literal",
+                                    ..
+                                }
+                            )
+                    })
+                    .map(|error| error.span())
+                    .unwrap_or(fallback_span);
+                diagnostics.record(source_id, error_span);
                 return Err(err);
             }
         }
@@ -2299,7 +2564,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // stay `ir::Expr::Call` and backends emit them as plain C++ functions.
     // Records are visible so scalar-valued pure helpers can hold host-side
     // record locals in their file-scope C++ bodies.
-    let helper_ctx = LowerCtx {
+    let mut helper_ctx = LowerCtx {
+        source_id: SourceId::default(),
+        diagnostics: diagnostics.clone(),
         dut_field: "dut".to_string(),
         tb_field: None,
         cov_fields: HashMap::new(),
@@ -2314,7 +2581,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         // `TransactorMethod` call edges never appear in pure-helper
         // bodies.
         bus_bindings: HashMap::new(),
-        bus_remaps: HashMap::new(),
+        bus_origins: HashMap::new(),
         transactor_fields: HashMap::new(),
         target_transactor_fields: HashMap::new(),
         passive_transactor_fields: HashSet::new(),
@@ -2326,7 +2593,6 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         consts: consts.clone(),
         properties: properties.clone(),
         owner: None,
-        const_signed: const_signed.clone(),
         ambiguous_variants: ambiguous_variants.clone(),
         enum_names: HashSet::new(),
         tb_scalar_fields: HashMap::new(),
@@ -2334,6 +2600,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
+        tb_method_functions: HashMap::new(),
         test_scope_lets: HashSet::new(),
         regblock_instance_types: regblock_instance_names.clone(),
         regblock_bindings: HashMap::new(),
@@ -2353,13 +2620,14 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         tseqs: HashMap::new(),
         // Pure helpers never access the DUT (probes are test-scope only).
         probes: HashMap::new(),
+        partial_probe_names: HashSet::new(),
         // Extern fns are PURE calls — callable from a pure helper body.
         extern_fns: extern_fns.clone(),
         // Marker calls never appear in helper/tseq/method bodies — only in
         // the shared-lifecycle desugar output for run/check (#619 M4a).
         tb_lifecycle_fns: HashMap::new(),
     };
-    for it in &file.items {
+    for (item_index, it) in file.items.iter().enumerate() {
         let Item::Function(fd) = it else { continue };
         let Some(entry) = helper_registry.get(&fd.name.name) else {
             continue;
@@ -2370,7 +2638,10 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             continue;
         }
         let id = FunctionId(prog.functions.len() as u32);
-        let f = helpers::lower_pure_helper(id, fd, &helper_registry, &helper_ctx, &side_tables)?;
+        debug_assert_eq!(entry.function, Some(id));
+        let f = helper_ctx.with_source(file.item_source(item_index), |item_ctx| {
+            helpers::lower_pure_helper(id, fd, &helper_registry, item_ctx, &side_tables)
+        })?;
         prog.functions.push(f);
     }
 
@@ -2380,7 +2651,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // and `randomize`, so its ctx carries the records / keep / problem-id
     // / tseq tables — but no test-scope bindings (a tseq cannot poke the
     // DUT, a bus, or a transactor field; those are test-scope only).
-    let tseq_ctx = LowerCtx {
+    let mut tseq_ctx = LowerCtx {
+        source_id: SourceId::default(),
+        diagnostics: diagnostics.clone(),
         dut_field: "dut".to_string(),
         tb_field: None,
         cov_fields: HashMap::new(),
@@ -2390,7 +2663,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         record_ids: record_ids.clone(),
         records: prog.records.clone(),
         bus_bindings: HashMap::new(),
-        bus_remaps: HashMap::new(),
+        bus_origins: HashMap::new(),
         transactor_fields: HashMap::new(),
         target_transactor_fields: HashMap::new(),
         passive_transactor_fields: HashSet::new(),
@@ -2402,7 +2675,6 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         consts: consts.clone(),
         properties: properties.clone(),
         owner: None,
-        const_signed: const_signed.clone(),
         ambiguous_variants: ambiguous_variants.clone(),
         enum_names: HashSet::new(),
         tb_scalar_fields: HashMap::new(),
@@ -2410,6 +2682,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
+        tb_method_functions: HashMap::new(),
         test_scope_lets: HashSet::new(),
         regblock_instance_types: regblock_instance_names.clone(),
         regblock_bindings: HashMap::new(),
@@ -2426,16 +2699,27 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         tseqs: tseq_records.clone(),
         // tseq generator bodies never access the DUT.
         probes: HashMap::new(),
+        partial_probe_names: HashSet::new(),
         extern_fns: extern_fns.clone(),
         // Marker calls never appear in helper/tseq/method bodies — only in
         // the shared-lifecycle desugar output for run/check (#619 M4a).
         tb_lifecycle_fns: HashMap::new(),
     };
-    for it in &file.items {
+    for (item_index, it) in file.items.iter().enumerate() {
         let Item::Tseq(decl) = it else { continue };
-        let elem = tseq_records[&decl.name.name].0.clone();
+        let (expected_id, elem, _, _) = &tseq_records[&decl.name.name];
         let id = FunctionId(prog.functions.len() as u32);
-        let f = tseqs::lower_tseq(id, decl, elem, &tseq_ctx, &helper_registry, &side_tables)?;
+        debug_assert_eq!(id, *expected_id);
+        let f = tseq_ctx.with_source(file.item_source(item_index), |item_ctx| {
+            tseqs::lower_tseq(
+                id,
+                decl,
+                elem.clone(),
+                item_ctx,
+                &helper_registry,
+                &side_tables,
+            )
+        })?;
         prog.functions.push(f);
     }
 
@@ -2443,7 +2727,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // `TbFunction` (kind `TransactorBody`) per method. All declarations
     // lower (even unreferenced ones), so unsupported transactor shapes
     // are rejected here rather than dropped.
-    for it in &file.items {
+    for (item_index, it) in file.items.iter().enumerate() {
         let Item::Transactor(t) = it else { continue };
         if components::transactor_is_component(t, env_held(t), &record_ids)
             && !components::transactor_has_target_threads(t)
@@ -2452,16 +2736,26 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         }
         let id = TransactorId(prog.transactors.len() as u32);
         debug_assert_eq!(Some(&id), transactor_ids.get(&t.name.name));
-        let (schema, funcs) = transactors::lower_transactor(
-            id,
-            t,
-            FunctionId(prog.functions.len() as u32),
-            &helper_registry,
-            &helper_ctx,
-            &buses,
-            &downstream_bus_binds,
-            &side_tables,
-        )?;
+        let saved_probes = std::mem::replace(&mut helper_ctx.probes, suite_probes.clone());
+        let saved_partial_probe_names = std::mem::replace(
+            &mut helper_ctx.partial_probe_names,
+            suite_probe_catalog.partial_component_probe_names.clone(),
+        );
+        let lowered = helper_ctx.with_source(file.item_source(item_index), |item_ctx| {
+            transactors::lower_transactor(
+                id,
+                t,
+                FunctionId(prog.functions.len() as u32),
+                &helper_registry,
+                item_ctx,
+                &buses,
+                &downstream_bus_binds,
+                &side_tables,
+            )
+        });
+        helper_ctx.probes = saved_probes;
+        helper_ctx.partial_probe_names = saved_partial_probe_names;
+        let (schema, funcs) = lowered?;
         prog.transactors.push(schema);
         prog.functions.extend(funcs);
     }
@@ -2478,8 +2772,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // rejected precisely (they need the event-handler / sequencer slices,
     // out of this subset).
     let mut comp_sources: Vec<components::CompSource<'_>> = Vec::new();
+    let mut comp_source_ids = Vec::new();
     let mut component_ids: HashMap<String, ir::ComponentId> = HashMap::new();
-    for it in &file.items {
+    for (item_index, it) in file.items.iter().enumerate() {
         let (name, src) = match it {
             Item::Scoreboard(c) if components::scoreboard_is_component(c) => {
                 (&c.name.name, components::CompSource::Scoreboard(c))
@@ -2505,6 +2800,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             )));
         }
         comp_sources.push(src);
+        comp_source_ids.push(file.item_source(item_index));
     }
     // Pass 1: schemas. FunctionIds count up from the current function
     // count (after pure helpers + transactor methods).
@@ -2513,22 +2809,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // for exactly one decision — telling a typo (`weird : NoSuchThing`,
     // which v1 turns into an undeclared `VNoSuchThing*`) from a declared
     // type that simply is not a supported sub-component kind (a
-    // `covergroup`, which v1 handles correctly). Those had shared an arm.
-    // Every type NAME the file declares, in one set. `lower_field` uses it
-    // for exactly one decision — telling a typo (`weird : NoSuchThing`,
-    // which v1 turns into an undeclared `VNoSuchThing*`) from a declared
-    // type that simply is not a supported sub-component kind (a
     // `covergroup`, which v1 handles correctly).
     //
-    // DELIBERATELY OVER-INCLUSIVE. The only consumer asks "is this name
-    // declared?", and the two ways to be wrong are not symmetric: a name
-    // missing from this set produces a false "not declared anywhere"
-    // hard error on a valid program, while a spurious extra name merely
-    // routes back to the honest `Unsupported` this arm used to give. So
-    // every item that carries a name goes in, whether or not it can
-    // currently appear in field position — the first draft whitelisted
-    // the kinds that seemed relevant and omitted `enum`, which broke
-    // exactly the case it was meant to protect.
+    // Deliberately over-inclusive: a missing declaration can turn a supported
+    // type into a false typo error, while an extra declaration only routes to
+    // the normal unsupported-component-kind diagnostic.
     let declared_types: HashSet<String> = file
         .items
         .iter()
@@ -2558,9 +2843,11 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             _ => None,
         })
         .collect();
-    for src in &comp_sources {
+    for (src, source_id) in comp_sources.iter().zip(comp_source_ids.iter().copied()) {
         let schema = components::lower_component_schema(
             src,
+            source_id,
+            &diagnostics,
             &component_ids,
             &scoreboard_ids,
             &record_ids,
@@ -2595,7 +2882,9 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // FunctionIds reserved in pass 1, then sorted into the functions
     // table (their ids are already contiguous from `start_fn`).
     let start_fn = prog.functions.len();
-    let method_ctx = LowerCtx {
+    let mut method_ctx = LowerCtx {
+        source_id: SourceId::default(),
+        diagnostics: diagnostics.clone(),
         dut_field: "dut".to_string(),
         tb_field: None,
         cov_fields: HashMap::new(),
@@ -2605,7 +2894,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         record_ids: record_ids.clone(),
         records: prog.records.clone(),
         bus_bindings: HashMap::new(),
-        bus_remaps: HashMap::new(),
+        bus_origins: HashMap::new(),
         transactor_fields: HashMap::new(),
         target_transactor_fields: HashMap::new(),
         passive_transactor_fields: HashSet::new(),
@@ -2621,7 +2910,6 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         consts: consts.clone(),
         properties: properties.clone(),
         owner: None,
-        const_signed: const_signed.clone(),
         ambiguous_variants: ambiguous_variants.clone(),
         enum_names: HashSet::new(),
         tb_scalar_fields: HashMap::new(),
@@ -2629,6 +2917,7 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         tb_record_fields: Vec::new(),
         regblock_callbacks: HashMap::new(),
         tb_methods: HashMap::new(),
+        tb_method_functions: HashMap::new(),
         test_scope_lets: HashSet::new(),
         regblock_instance_types: regblock_instance_names.clone(),
         regblock_bindings: HashMap::new(),
@@ -2646,11 +2935,12 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         // fallback).
         record_keeps: record_keeps.clone(),
         randomize_problem_ids: HashMap::new(),
-        // Component methods cannot call a tseq generator (test-scope only).
-        tseqs: HashMap::new(),
-        // Component/transactor method bodies access the bound DUT but
-        // never test-scope probes (probes live on `let dut`).
-        probes: HashMap::new(),
+        tseqs: tseq_records.clone(),
+        // Shared component methods may access probes declared by every
+        // test's `let dut` binding. Conflicts were rejected when the
+        // canonical suite catalog was built above.
+        probes: suite_probes.clone(),
+        partial_probe_names: suite_probe_catalog.partial_component_probe_names.clone(),
         extern_fns: extern_fns.clone(),
         // Marker calls never appear in helper/tseq/method bodies — only in
         // the shared-lifecycle desugar output for run/check (#619 M4a).
@@ -2663,49 +2953,55 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
         // A bound-bus event-driven transactor's `on <ev>` handler bodies
         // drive the bound bus's handshake channels (`bus.<ch>.send/recv`,
         // `bus.<ch>.<sig>`). They lower exactly like the bound-initiator
-        // BFM: the bound `BusDecl` is visible under the placeholder prefix
-        // (`transactors::INITIATOR_BUS_PLACEHOLDER`), filled with the real
-        // binding name at test-binding time. Inject a per-component ctx
-        // carrying that binding; everything else mirrors `method_ctx`.
-        let bound_ctx;
-        let body_ctx: &LowerCtx = if let Some(bus_name) = schema.bound_bus.as_deref() {
-            let Some(bus) = buses.get(bus_name) else {
-                // The THIRD copy of this check — the consumer-BFM path.
-                // Same verdict as the two in `transactors.rs`: a
-                // NEVER-INSTANTIATED `transactor T bound to RegOp`
-                // emits an inert struct under v1 and the file compiles,
-                // so `Invalid` is too strong. Measured: v1's output for
-                // `bound to RegOp` and `bound to uint<8>` differ only in
-                // an auto-coverage solver-site id, and both compile.
-                return Err(not_implemented(
-                    &format!(
-                        "event-driven transactor `{}` bound to `{bus_name}`, which is \
-                         not a `bus` declaration",
-                        schema.name
-                    ),
-                    "v1 rejects it at every instantiation; only a never-instantiated \
-                     declaration gets through, and there it emits an inert struct",
-                    V1Status::Rejects,
-                ));
+        // BFM: the bound `BusDecl` is visible under the logical `bus` name and
+        // lowered ports retain `BoundBus` provenance. Only that exceptional
+        // bound-bus context needs a copy; ordinary component methods borrow
+        // the reusable lowering context directly.
+        let bodies = method_ctx.with_source(comp_source_ids[i], |source_ctx| {
+            let bound_ctx;
+            let body_ctx: &LowerCtx = if let Some(bus_name) = schema.bound_bus.as_deref() {
+                let Some(bus) = buses.get(bus_name) else {
+                    // The THIRD copy of this check — the consumer-BFM path.
+                    // Same verdict as the two in `transactors.rs`: a
+                    // NEVER-INSTANTIATED `transactor T bound to RegOp`
+                    // emits an inert struct under v1 and the file compiles,
+                    // so `Invalid` is too strong. Measured: v1's output for
+                    // `bound to RegOp` and `bound to uint<8>` differ only in
+                    // an auto-coverage solver-site id, and both compile.
+                    return Err(not_implemented(
+                        &format!(
+                            "event-driven transactor `{}` bound to `{bus_name}`, which is \
+                             not a `bus` declaration",
+                            schema.name
+                        ),
+                        "v1 rejects it at every instantiation; only a never-instantiated \
+                         declaration gets through, and there it emits an inert struct",
+                        V1Status::Rejects,
+                    ));
+                };
+                let mut bb = source_ctx.clone();
+                bb.bus_bindings.insert(
+                    transactors::INITIATOR_BUS_PLACEHOLDER.to_string(),
+                    (*bus).clone(),
+                );
+                bb.bus_origins.insert(
+                    transactors::INITIATOR_BUS_PLACEHOLDER.to_string(),
+                    ir::PortOrigin::BoundBus,
+                );
+                bound_ctx = bb;
+                &bound_ctx
+            } else {
+                source_ctx
             };
-            let mut bb = method_ctx.clone();
-            bb.bus_bindings.insert(
-                transactors::INITIATOR_BUS_PLACEHOLDER.to_string(),
-                (*bus).clone(),
-            );
-            bound_ctx = bb;
-            &bound_ctx
-        } else {
-            &method_ctx
-        };
-        let bodies = components::lower_component_bodies(
-            src,
-            cid,
-            &schema,
-            body_ctx,
-            &helper_registry,
-            &side_tables,
-        )?;
+            components::lower_component_bodies(
+                src,
+                cid,
+                &schema,
+                body_ctx,
+                &helper_registry,
+                &side_tables,
+            )
+        })?;
         // Patch the schema's pass-1 clause placeholders with the
         // resolved period/max_idle expressions (they could only lower
         // once a body context existed).
@@ -2752,19 +3048,182 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     let _ = start_fn;
     prog.functions.extend(method_funcs);
 
-    // #619 M4a: the once-per-testbench `TestbenchLifecycle` FunctionIds,
-    // keyed by SOURCE-testbench name → phase → function. Shared across all
-    // tests binding the same testbench so each phase body is lowered ONCE;
-    // populated on first bind, reused after. Empty when the switch is off.
+    // Reserve one canonical callable set for every source testbench type.
+    // Test lowering may encounter multiple `impl` blocks for the same type;
+    // their calls all target these FunctionIds rather than cloning/inlining
+    // the method body into each test flow.
+    let mut testbench_type_ids: HashMap<String, TestbenchTypeId> = HashMap::new();
+    let mut testbench_type_for_test: HashMap<String, TestbenchTypeId> = HashMap::new();
+    for it in &file.items {
+        let Item::Test(test) = it else { continue };
+        let type_name = tb_of_test
+            .get(&test.name.name)
+            .cloned()
+            .unwrap_or_else(|| format!("{}_tb", test.name.name));
+        let type_id = if let Some(id) = testbench_type_ids.get(&type_name) {
+            *id
+        } else {
+            let id = TestbenchTypeId(prog.testbench_types.len() as u32);
+            let mut methods = Vec::new();
+            let mut declared_component_fields = Vec::new();
+            if let Some(decl) = components.get(&type_name) {
+                for item in &decl.items {
+                    if let ComponentItem::Field(field) = item {
+                        if let TypeExpr::Named { name, .. } = &field.ty {
+                            if let Some(component) = name
+                                .segments
+                                .last()
+                                .and_then(|segment| component_ids.get(&segment.name))
+                            {
+                                declared_component_fields
+                                    .push((field.name.name.clone(), *component));
+                            }
+                        }
+                    }
+                    let ComponentItem::Hookable(method) = item else {
+                        continue;
+                    };
+                    let method_id = ir::TestbenchMethodId(methods.len() as u32);
+                    let param_tys = method
+                        .params
+                        .iter()
+                        .map(|param| {
+                            components::testbench_method_schema_ir_type(
+                                &method.name.name,
+                                &format!("parameter `{}`", param.name.name),
+                                param.ty.as_ref(),
+                                &component_ids,
+                                &record_ids,
+                                true,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let ret_ty = method
+                        .return_ty
+                        .as_ref()
+                        .map(|ty| {
+                            components::testbench_method_schema_ir_type(
+                                &method.name.name,
+                                "return type",
+                                Some(ty),
+                                &component_ids,
+                                &record_ids,
+                                true,
+                            )
+                        })
+                        .transpose()?;
+                    let module_param_types = method
+                        .params
+                        .iter()
+                        .zip(&param_tys)
+                        .map(|(param, ty)| {
+                            if !matches!(ty, IrType::Unknown) {
+                                return None;
+                            }
+                            match &param.ty {
+                                Some(TypeExpr::Named { name, .. }) => {
+                                    name.segments.last().map(|segment| segment.name.clone())
+                                }
+                                _ => None,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    if method.return_ty.as_ref().is_some_and(|ty| {
+                        matches!(ty, TypeExpr::Named { .. })
+                            && matches!(ret_ty, Some(IrType::Unknown))
+                    }) {
+                        return Err(not_implemented(
+                            &format!(
+                                "testbench method `{}` returning a module value",
+                                method.name.name
+                            ),
+                            "return a scalar, record, component value, or sequence instead",
+                            V1Status::EmitsUncompilable,
+                        ));
+                    }
+                    let function = FunctionId(prog.functions.len() as u32);
+                    let param_names = method
+                        .params
+                        .iter()
+                        .map(|param| param.name.name.clone())
+                        .collect::<Vec<_>>();
+                    let mut locals = param_names
+                        .iter()
+                        .cloned()
+                        .zip(param_tys.iter().cloned())
+                        .map(|(name, ty)| TypedLocal { name, ty })
+                        .collect::<Vec<_>>();
+                    let ret = ret_ty.as_ref().map(|ty| {
+                        let local = LocalId(locals.len() as u32);
+                        locals.push(TypedLocal {
+                            name: "__ret".to_string(),
+                            ty: ty.clone(),
+                        });
+                        local
+                    });
+                    prog.functions.push(TbFunction {
+                        id: function,
+                        name: format!("tb_method_{}_{}", id.0, method.name.name),
+                        kind: FunctionKind::TestbenchMethod {
+                            testbench: id,
+                            method: method_id,
+                            name: method.name.name.clone(),
+                        },
+                        params: param_names
+                            .iter()
+                            .cloned()
+                            .zip(param_tys.iter().cloned())
+                            .map(|(name, ty)| TypedParam { name, ty })
+                            .collect(),
+                        locals,
+                        blocks: vec![BasicBlock {
+                            stmts: Vec::new(),
+                            terminator: Terminator::Return,
+                        }],
+                        entry: BlockId(0),
+                        owner: None,
+                        testbench_record_locals: Vec::new(),
+                        ret,
+                        implicit_returns: vec![BlockId(0)],
+                    });
+                    methods.push(TestbenchMethodSchema {
+                        name: method.name.name.clone(),
+                        function,
+                        param_names,
+                        param_tys,
+                        module_param_types,
+                        ret_ty,
+                        hookable: method.is_hookable,
+                    });
+                }
+            }
+            prog.testbench_types.push(TestbenchTypeSchema {
+                name: type_name.clone(),
+                methods,
+                component_fields: declared_component_fields,
+            });
+            testbench_type_ids.insert(type_name.clone(), id);
+            id
+        };
+        testbench_type_for_test.insert(test.name.name.clone(), type_id);
+    }
+    let mut lowered_testbench_types = HashSet::new();
+    let mut testbench_method_heartbeat_fields = HashMap::new();
+
+    // Preserve the native lifecycle representation added on main. These
+    // functions coexist with canonical testbench methods and are used only
+    // when HARC_TBIR_NATIVE_LIFECYCLE is enabled.
     let mut shared_lifecycle_fns: HashMap<String, HashMap<crate::ast::LifecyclePhase, FunctionId>> =
         HashMap::new();
-    // Preserve pristine bound-initiator schemas/functions across every test
-    // in the file. The first instance can retain the source IDs (keeping the
-    // established single-instance IR stable); later instances clone from
-    // this cache rather than from a body another test already specialized.
+    // Clone a bound initiator only when one test owns multiple *different*
+    // bindings for that source type. The pristine template makes every clone
+    // independent, while normal one-binding-per-test use retains the shared
+    // source callable required by common-object planning.
     let mut bound_initiator_templates = HashMap::new();
     for (index, schema) in prog.transactors.iter().enumerate() {
-        if schema.bound_bus.is_none() || schema.methods.is_empty() || !schema.target_methods.is_empty()
+        if schema.bound_bus.is_none()
+            || schema.methods.is_empty()
+            || !schema.target_methods.is_empty()
         {
             continue;
         }
@@ -2778,14 +3237,17 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             BoundInitiatorTemplate {
                 schema: schema.clone(),
                 functions,
-                claimed: false,
             },
         );
     }
-    for it in &file.items {
+    for (item_index, it) in file.items.iter().enumerate() {
         let Item::Test(t) = it else { continue };
+        let testbench_type = testbench_type_for_test[&t.name.name];
         lower_test(
             t,
+            testbench_type,
+            &mut lowered_testbench_types,
+            &mut testbench_method_heartbeat_fields,
             &tb_of_test,
             &components,
             &component_ids,
@@ -2798,7 +3260,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &unresolved_use_names,
             &enum_names,
             &consts,
-            &const_signed,
+            file.item_source(item_index),
+            diagnostics.clone(),
             &ambiguous_variants,
             &properties,
             &extern_fns,
@@ -2811,7 +3274,8 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
             &always_on_dut_event_host_names,
             &shared_lifecycle_bodies,
             &mut shared_lifecycle_fns,
-            &mut bound_initiator_templates,
+            &bound_initiator_templates,
+            &all_probe_meta,
             &mut prog,
         )?;
     }
@@ -2832,7 +3296,70 @@ pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     // now that transactor method tables exist; records the subscription
     // on the target method's `cov_hook_subs`.
     crate::ir::passes::covergroup_hooks::run(&mut prog)?;
+    reject_suspending_synchronous_callbacks(
+        &prog,
+        &side_tables.synchronous_callbacks,
+        &diagnostics,
+    )?;
     Ok(prog)
+}
+
+fn reject_suspending_synchronous_callbacks(
+    prog: &TbProgram,
+    callbacks: &[SynchronousCallbackSite],
+    diagnostics: &LowerDiagnosticRecorder,
+) -> Result<(), LowerError> {
+    // The placement catalog is only needed to trace a callback's reachable
+    // call graph. Avoid its whole-program SCC/fixpoint analysis for suites
+    // that declare no synchronous callback at all.
+    if callbacks.is_empty() {
+        return Ok(());
+    }
+    let catalog = crate::ir::passes::callable_placement::analyze(prog)
+        .map_err(|error| LowerError::Invalid(error.to_string()))?;
+    for callback in callbacks {
+        let body = prog.function(callback.function);
+        let applicable_tests = match &body.kind {
+            FunctionKind::TestHook {
+                member:
+                    ir::TestHookMember::StatementCycle(site)
+                    | ir::TestHookMember::EventSubscription(site)
+                    | ir::TestHookMember::MethodSubscription(site),
+            } => prog
+                .tests
+                .iter()
+                .filter(|test| test.name == site.owner.test)
+                .collect::<Vec<_>>(),
+            FunctionKind::TestHook { .. } => body
+                .owner
+                .into_iter()
+                .flat_map(|owner| {
+                    prog.tests
+                        .iter()
+                        .filter(move |test| test.testbench == owner)
+                })
+                .collect::<Vec<_>>(),
+            FunctionKind::ComponentMethod { .. } => prog.tests.iter().collect::<Vec<_>>(),
+            _ => prog.tests.iter().collect::<Vec<_>>(),
+        };
+        for test in applicable_tests {
+            let Some(chain) = catalog
+                .advance_time_chain_for_test(prog, callback.function, test)
+                .map_err(|error| LowerError::Invalid(error.to_string()))?
+            else {
+                continue;
+            };
+            diagnostics.record(callback.source_id, callback.span);
+            let names = chain.join(" -> ");
+            return Err(LowerError::Invalid(format!(
+                "{} `{}` may advance simulation time through `{names}` in test `{}`; synchronous lifecycle callbacks run inside checker dispatch and must complete without waiting",
+                callback.kind.label(),
+                body.name,
+                test.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Reject recursive transactor-method call cycles.
@@ -3556,6 +4083,9 @@ fn resolve_test_method_hook<'a>(
 #[allow(clippy::too_many_arguments)]
 fn lower_test(
     t: &TestDecl,
+    testbench_type: TestbenchTypeId,
+    lowered_testbench_types: &mut HashSet<TestbenchTypeId>,
+    testbench_method_heartbeat_fields: &mut HashMap<TestbenchTypeId, HashSet<String>>,
     tb_of_test: &HashMap<String, String>,
     components: &HashMap<String, &ComponentDecl>,
     component_ids: &HashMap<String, ir::ComponentId>,
@@ -3569,14 +4099,15 @@ fn lower_test(
     // Every `enum` NAME in the file — the discriminator v1's payload
     // type mapping keys on (see `lower_event_payload`).
     enum_names: &HashSet<String>,
-    consts: &HashMap<String, u64>,
-    const_signed: &HashMap<String, bool>,
+    consts: &HashMap<String, ConstVal>,
+    source_id: SourceId,
+    diagnostics: LowerDiagnosticRecorder,
     ambiguous_variants: &HashMap<String, String>,
     properties: &HashMap<String, crate::ast::Expr>,
     extern_fns: &ExternFnTable,
     helpers: &helpers::HelperRegistry<'_>,
     record_keeps: &HashMap<String, Vec<crate::ast::Expr>>,
-    randomize_problem_ids: &HashMap<(u32, u32), u32>,
+    randomize_problem_ids: &HashMap<SourceSite, u64>,
     tseq_records: &tseqs::TseqTable,
     side_tables: &RefCell<SideTables>,
     dut_poking_bfm_names: &HashSet<String>,
@@ -3587,9 +4118,11 @@ fn lower_test(
     // Both empty when `HARC_TBIR_NATIVE_LIFECYCLE` is off.
     shared_lifecycle_bodies: &crate::codegen::cpp_tb::SharedLifecycleBodies,
     shared_lifecycle_fns: &mut HashMap<String, HashMap<crate::ast::LifecyclePhase, FunctionId>>,
-    bound_initiator_templates: &mut HashMap<TransactorId, BoundInitiatorTemplate>,
+    bound_initiator_templates: &HashMap<TransactorId, BoundInitiatorTemplate>,
+    suite_probe_meta: &HashMap<String, ProbeMeta>,
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
+    let test_id = ir::TestId(prog.tests.len() as u32);
     if !t.params.is_empty() {
         // The SIXTH landing of the dropped-parameter-list construct, and
         // the only one whose surface syntax is paren params
@@ -3618,9 +4151,10 @@ fn lower_test(
     // Threaded into `LowerCtx::probes` so `dut.<probe>` accesses lower to
     // a `Probe`/`Force` `PortRef`. See docs/probe-signals.md.
     let mut probes: HashMap<String, ProbeMeta> = HashMap::new();
+    let mut testbench_probes: Vec<ProbeId> = Vec::new();
     let mut clocks: Vec<&ClockDecl> = Vec::new();
     let mut scope: Option<&ScopeDecl> = None;
-    let mut bare_stmts: Vec<&AstStmt> = Vec::new();
+    let mut bare_stmts: Vec<SourcedStmt<'_>> = Vec::new();
     // Count of bare statements collected *before* the `scope` block was
     // seen, in test-item order. v1 emits the whole test (bare stmts +
     // scope phases) into one coroutine in source order, so a bare
@@ -3640,7 +4174,7 @@ fn lower_test(
     // statements so a non-regblock candidate can fall back to the
     // bare-statement path. Resolved against the regblock bindings +
     // lowered as `FunctionKind::TestHook` callbacks.
-    let mut reg_cb_asts: Vec<&AstStmt> = Vec::new();
+    let mut reg_cb_asts: Vec<SourcedStmt<'_>> = Vec::new();
     // Named `phase <name> ... end phase <name>` blocks (spec §7.2). Each
     // is callable by `<name>()` from the run/check body; the call site is
     // INLINED with the phase block's statements (v1 emits a `[&]() ->
@@ -3649,6 +4183,7 @@ fn lower_test(
     // in declaration order so a redeclaration is rejected.
     let mut phases: HashMap<String, &Block> = HashMap::new();
     let mut bus_bindings: Vec<ir::BusBindingSchema> = Vec::new();
+    let mut bound_bus_instances: Vec<ir::BoundBusInstanceSchema> = Vec::new();
     let mut bus_binding_decls: HashMap<String, BusDecl> = HashMap::new();
     // Regblock bindings (`let regs : R = bind <helper>`), collected here
     // and validated after the testbench's transactor fields are known
@@ -3688,10 +4223,9 @@ fn lower_test(
     // Bound-to event-driven component instances (`let xact : X active =
     // bind <busbinding>`), collected as (instance, component id, bus-
     // binding field). The component's `on <ev>` handler bodies drive the
-    // bound bus's channels; the placeholder bus prefix in those bodies is
-    // filled with the real binding name (like the initiator-BFM path), and
-    // the instance is registered as a component field. Validated after the
-    // bus bindings are known.
+    // bound bus's channels through a typed per-instance adapter, and the
+    // instance is registered as a component field. Validated after the bus
+    // bindings are known.
     // `(instance, component, bus_field, active)` — `active` distinguishes
     // the `on <ev>` driver instance (re-lowered into a queue-fed worker
     // coroutine under `--mt`) from a `passive` monitor-only instance.
@@ -3704,10 +4238,17 @@ fn lower_test(
     // reference gets a precise rejection (run and check are separate
     // IR functions, so the shared-state form is not representable).
     let mut test_let_stmts: Vec<AstStmt> = Vec::new();
+    let mut test_let_sources: Vec<SourceId> = Vec::new();
     let mut test_let_names: HashSet<String> = HashSet::new();
     let tb_name = tb_of_test.get(&t.name.name).cloned();
 
-    for it in &t.items {
+    for (item_index, it) in t.items.iter().enumerate() {
+        let item_source = t.item_source(item_index);
+        let item_source = if item_source.is_known() {
+            item_source
+        } else {
+            source_id
+        };
         match it {
             TestItem::Let(l) if l.name.name == "dut" => {
                 if !l.bind_remap.is_empty() {
@@ -3728,22 +4269,14 @@ fn lower_test(
                 // only surfaces scalar logic; reject aggregates precisely
                 // (v1's `sv_type_decl` errors at SV-emit time).
                 for p in &l.probes {
-                    let width = probe_scalar_width(&p.ty).ok_or_else(|| {
-                        unsupported(
-                            &format!("probe `{}` of non-scalar type", p.name.name),
-                            "probe types must be uint<N>/sint<N>/bits<N>/bit/bool",
-                        )
+                    let meta = suite_probe_meta.get(&p.name.name).cloned().ok_or_else(|| {
+                        LowerError::Invalid(format!(
+                            "probe `{}` is missing from the validated suite catalog",
+                            p.name.name
+                        ))
                     })?;
-                    if probes
-                        .insert(
-                            p.name.name.clone(),
-                            ProbeMeta {
-                                force: p.force,
-                                width: Some(width),
-                            },
-                        )
-                        .is_some()
-                    {
+                    testbench_probes.push(meta.id);
+                    if probes.insert(p.name.name.clone(), meta).is_some() {
                         return Err(LowerError::Invalid(format!(
                             "duplicate probe `{}` on `let dut`",
                             p.name.name
@@ -3772,7 +4305,8 @@ fn lower_test(
             {
                 let bus_name = type_simple_name(l.ty.as_ref()).unwrap();
                 let decl = buses[bus_name];
-                let (schema, owned) = bus::lower_bus_binding(l, decl)?;
+                let binding_id = ir::BusBindingId(bus_bindings.len() as u32);
+                let (schema, owned) = bus::lower_bus_binding(l, decl, binding_id, record_ids)?;
                 if bus_binding_decls.contains_key(&l.name.name) {
                     // Two bindings with one name would resolve
                     // ambiguously (v1's map silently keeps the last;
@@ -3891,28 +4425,11 @@ fn lower_test(
                     ));
                 }
                 let simple = type_simple_name(l.ty.as_ref()).unwrap();
-                // The BFM host must be `active` — its methods are
-                // test-called (via the regblock frontdoor or directly).
-                //
-                // One arm used to answer both ways of failing that, and
-                // v1 answers them very differently:
-                //
-                //   * NO mode annotation — v1 refuses too, with "let
-                //     helper: transactor instantiation requires a mode
-                //     annotation (`AxilHelper active` or `AxilHelper
-                //     passive`)". A program error under both backends.
-                //   * `passive` — v1 ACCEPTS it and emits output
-                //     byte-identical to the `active` program. It
-                //     ignores the mode entirely, so the user asks for a
-                //     passive instance and gets a driver. (Anti-vacuity:
-                //     for a transactor that HAS both halves the mode
-                //     changes 67 lines of v1's output, so this is v1
-                //     dropping the annotation for a hookable-only
-                //     transactor, not v1 having no notion of mode.)
-                //
-                // The two are told apart by the AST exactly — `None`
-                // versus `Some(wrong)` — so this is a split on the real
-                // distinction, not a shape heuristic.
+                // An initiator BFM must be active because its test-called
+                // methods drive the bus. A missing mode is invalid; a passive
+                // mode is a distinct unsupported request because v1 ignores
+                // that annotation and emits an active driver. The AST preserves
+                // this distinction as `None` versus `Some(Passive)`.
                 match l.ty.as_ref() {
                     Some(TypeExpr::Named {
                         mode: Some(TransactorMode::Active),
@@ -4351,6 +4868,7 @@ fn lower_test(
                     kind: StmtKind::Let(Box::new(l.clone())),
                     span: l.span,
                 });
+                test_let_sources.push(item_source);
             }
             TestItem::Clock(c) => clocks.push(c),
             TestItem::Scope(s) => {
@@ -4397,13 +4915,13 @@ fn lower_test(
                     if h.hook.is_none() && !h.periodic {
                         if let ExprKind::Field { target, .. } = &*h.event.kind {
                             if matches!(&*target.kind, ExprKind::Ident(_)) {
-                                reg_cb_asts.push(s);
+                                reg_cb_asts.push(SourcedStmt::new(s, item_source));
                                 continue;
                             }
                         }
                     }
                 }
-                bare_stmts.push(s)
+                bare_stmts.push(SourcedStmt::new(s, item_source))
             }
             TestItem::Phase(name, body) => {
                 if phases.insert(name.name.clone(), body).is_some() {
@@ -4483,11 +5001,8 @@ fn lower_test(
     // Testbench-field transactor instances declared `passive` (`a :
     // Poker passive`). A passive instance exposes only its passive
     // surface (persistent state + always-on `on` handlers); its `when
-    // active` methods are never callable, so the shared per-type method
-    // bodies are NOT filled with a passive instance name. That is what
-    // lets two passive instances of one stateful type coexist with
-    // independent state (#494 P0a/P1b) — the per-instance state struct is
-    // then the only per-instance piece. Keyed by field name (a subset of
+    // active` methods are never callable. Each instance still owns its
+    // independent state; keyed by field name (a subset of
     // `transactor_fields` keys).
     let mut passive_transactor_fields: HashSet<String> = HashSet::new();
     let mut scoreboard_fields: Vec<(String, ScoreboardId)> = Vec::new();
@@ -4654,7 +5169,7 @@ fn lower_test(
                                 Some(d) => components::fold_field_default(
                                     d,
                                     Some(&f.ty),
-                                    &const_vals_from(consts, const_signed),
+                                    consts,
                                     &format!("testbench field `{}`", f.name.name),
                                 )?,
                             };
@@ -4716,8 +5231,10 @@ fn lower_test(
     // uniformly. They are accessed by their BARE name (test-scope lets
     // aren't `_tb`-prefixed by the desugaring), recorded separately so
     // resolution knows which access shape to expect.
-    let mut bare_transactor_fields: HashSet<String> =
-        test_scope_xactors.iter().map(|(n, _, _)| n.clone()).collect();
+    let mut bare_transactor_fields: HashSet<String> = test_scope_xactors
+        .iter()
+        .map(|(n, _, _)| n.clone())
+        .collect();
     for (name, xid, passive) in &test_scope_xactors {
         if transactor_fields.iter().any(|(f, _)| f == name) {
             return Err(LowerError::Invalid(format!(
@@ -4731,15 +5248,16 @@ fn lower_test(
             passive_transactor_fields.insert(name.clone());
         }
     }
+    let tb_method_functions = prog.testbench_types[testbench_type.index()]
+        .methods
+        .iter()
+        .map(|method| (method.name.clone(), method.function))
+        .collect::<HashMap<_, _>>();
     // Bound-to initiator-side BFM instances (`let helper : H active =
-    // bind axil`). Validate the bound bus binding matches the
-    // transactor's `bound to` bus, specialize its method bodies with the
-    // real binding name, and
-    // register the helper as a bare-name active transactor field so the
-    // regblock `via` frontdoor and direct method calls resolve. The
-    // Additional bound instances get internal schema/function clones. That
-    // keeps concrete bus ports and state storage instance-local; an immutable
-    // lowering-side template prevents an earlier test from poisoning a clone.
+    // bind axil`). Retain their typed per-test bus associations for codegen.
+    // A test that binds one source type to more than one bus receives one
+    // adapter-specialized callable per distinct binding.
+    let mut bound_initiator_specializations = HashMap::new();
     for (instance, xid, bus_field) in &initiator_bfm_binds {
         if transactor_fields.iter().any(|(f, _)| f == instance) {
             return Err(LowerError::Invalid(format!(
@@ -4766,43 +5284,44 @@ fn lower_test(
                 xschema.bound_bus.as_deref().unwrap_or("<none>"),
             )));
         }
-        let template = bound_initiator_templates.get_mut(xid).ok_or_else(|| {
-            LowerError::Invalid(format!(
-                "internal bound-initiator template for `{}` is missing",
-                xschema.name
-            ))
-        })?;
-        let specialized = if template.claimed {
-            specialize_bound_initiator(prog, template, instance, bus_field, &binding.remap)?
-        } else {
-            template.claimed = true;
-            for method in &template.schema.methods {
-                if let Err(previous) = fill_initiator_bus_prefix(
-                    &mut prog.functions[method.function.index()],
-                    bus_field,
-                    &binding.remap,
-                ) {
-                    return Err(LowerError::Invalid(format!(
-                        "pristine bound initiator `{}` unexpectedly retained bus binding \
-                         `{previous}` while selecting `{bus_field}`",
-                        template.schema.name
-                    )));
-                }
-            }
-            *xid
-        };
+        let source_owner = ir::BoundBusOwner::Transactor(*xid);
+        let specialized =
+            if let Some(existing) = bound_initiator_specializations.get(&(*xid, binding.id)) {
+                *existing
+            } else if !bound_bus_instances
+                .iter()
+                .any(|instance| instance.owner == source_owner)
+            {
+                *xid
+            } else {
+                let template = bound_initiator_templates.get(xid).ok_or_else(|| {
+                    LowerError::Invalid(format!(
+                        "internal bound-initiator template for `{}` is missing",
+                        xschema.name
+                    ))
+                })?;
+                let specialized = specialize_bound_initiator(prog, template, instance)?;
+                bound_initiator_specializations.insert((*xid, binding.id), specialized);
+                specialized
+            };
+        bound_initiator_specializations.insert((*xid, binding.id), specialized);
+        bound_bus_instances.push(ir::BoundBusInstanceSchema {
+            field: instance.clone(),
+            owner: ir::BoundBusOwner::Transactor(specialized),
+            binding: binding.id,
+        });
         transactor_fields.push((instance.clone(), specialized));
         bare_transactor_fields.insert(instance.clone());
     }
     // Bound-to event-driven component instances (`let xact : X active =
     // bind axil`). Validate the bound bus binding matches the component's
-    // `bound_bus`, fill the placeholder bus prefix in the (TYPE-shared)
-    // on-handler bodies with the real binding name, and register the
+    // `bound_bus`, retain the adapter on the testbench schema, and register the
     // instance as a composite-component field so `emit xact.req(t)` and
     // `xact.<state>` read-backs resolve through the component machinery.
     // The handler bodies are shared per component TYPE, so the subset is
     // one bound instance per type per file — a second bind to a different
-    // binding would clobber the first's filled prefix, so reject it.
+    // binding is retained in the owning testbench schema and resolved only
+    // while rendering that instance.
     // Instance names of `active` bound event-driven transactors — their
     // `on <ev>` driver re-lowers into a queue-fed worker coroutine under
     // `--mt`. Carried onto each `ComponentFieldBinding` below.
@@ -4846,55 +5365,24 @@ fn lower_test(
                 cschema.bound_bus.as_deref().unwrap_or("<none>"),
             )));
         }
-        // Fill the placeholder bus prefix in every handler body: the
-        // `on req` driver (on-handlers), the `on bus.<ch>.handshake`
-        // monitor bodies (cycle-handlers — their payload-capture DutReads
-        // carry the placeholder prefix), and any methods. The fill is a
-        // no-op when a body carries no placeholder ref (an agent-mode
-        // `dut.<sig>` cycle handler, a non-bus method).
-        let body_fns: Vec<usize> = cschema
-            .on_handlers
-            .iter()
-            .map(|h| h.function.index())
-            .chain(cschema.cycle_handlers.iter().map(|c| c.function.index()))
-            .chain(cschema.methods.iter().map(|m| m.function.index()))
-            .collect();
-        let cname = cschema.name.clone();
-        let remap = binding.remap.clone();
-        for fidx in body_fns {
-            if let Err(prev) =
-                fill_initiator_bus_prefix(&mut prog.functions[fidx], bus_field, &remap)
-            {
-                return Err(unsupported(
-                    &format!(
-                        "bound-to event-driven transactor `{cname}` bound to more than one bus \
-                         binding (`{prev}`, `{bus_field}`)"
-                    ),
-                    "the bound event-driven subset shares one handler body per transactor type; \
-                     multiple instances need per-instance bodies",
-                ));
-            }
+        if let Some(previous) = bound_bus_instances.iter().find(|entry| {
+            entry.owner == ir::BoundBusOwner::Component(*cid) && entry.binding != binding.id
+        }) {
+            let previous_binding = &bus_bindings[previous.binding.index()].field;
+            return Err(unsupported(
+                &format!(
+                    "bound-to event-driven transactor `{}` uses multiple bus bindings in test \
+                     `{}` (`{previous_binding}`, `{bus_field}`)",
+                    cschema.name, t.name.name
+                ),
+                "one emitted component callable set requires one concrete bus adapter per test",
+            ));
         }
-        // Fill the monitor cycle-handlers' synthesized `valid && ready`
-        // triggers too — they live on the schema (rendered standalone in
-        // the per-instance `_checkers` closure), not in the function body,
-        // so the body fill above does not reach them.
-        for ch in prog.components[cid.index()].cycle_handlers.iter_mut() {
-            if ch.monitor_channel.is_some() {
-                if let Err(prev) =
-                    fill_initiator_bus_prefix_expr(&mut ch.trigger, bus_field, &remap)
-                {
-                    return Err(unsupported(
-                        &format!(
-                            "bound-to event-driven transactor `{cname}` bound to more than one \
-                             bus binding (`{prev}`, `{bus_field}`)"
-                        ),
-                        "the bound event-driven subset shares one handler body per transactor \
-                         type; multiple instances need per-instance bodies",
-                    ));
-                }
-            }
-        }
+        bound_bus_instances.push(ir::BoundBusInstanceSchema {
+            field: instance.clone(),
+            owner: ir::BoundBusOwner::Component(*cid),
+            binding: binding.id,
+        });
         // Register as a composite-component instance (same machinery as
         // `let env : AnalysisEnv`): `emit xact.req(t)` fires the handler,
         // `xact.<state>` reads the per-instance state.
@@ -5086,6 +5574,7 @@ fn lower_test(
     // transactor field declaring `write(addr,data)` / `read(addr)`).
     let mut addrmap_bindings_map: HashMap<String, addrmap::AddrmapBindingCtx> = HashMap::new();
     let mut addrmap_init_order: Vec<(String, RecordId)> = Vec::new();
+    let mut addrmap_mirror_helpers: Vec<(String, String)> = Vec::new();
     // Helper maps for instance resolution: regblock type → mirror record
     // id and register table.
     let regblock_record_of: HashMap<String, RecordId> = regblock_ids
@@ -5098,7 +5587,7 @@ fn lower_test(
         .collect();
     // Hoisted: every binding folds against the same table, and
     // rebuilding it per binding is pure waste.
-    let addrmap_consts = const_vals_from(consts, const_signed);
+    let addrmap_consts = consts.clone();
     for (binding, amap_name, helper_field) in &addrmap_binds {
         if regblock_bindings_map.contains_key(binding) || addrmap_bindings_map.contains_key(binding)
         {
@@ -5157,6 +5646,7 @@ fn lower_test(
         )?;
         for (key, rec) in &actx.mirror_inits {
             addrmap_init_order.push((key.clone(), *rec));
+            addrmap_mirror_helpers.push((key.clone(), helper_field.clone()));
         }
         addrmap_bindings_map.insert(binding.clone(), actx);
     }
@@ -5318,12 +5808,10 @@ fn lower_test(
         // INITIATOR BFMs (added to `transactor_fields` alongside the bus-
         // prefix fill), so they share this per-instance state machinery
         // with the unbound DUT-poking form.
-        if xschema.state_fields.is_empty() {
+        if !xschema.requires_runtime_receiver() {
             continue;
         }
-        let xname = xschema.name.clone();
         let is_passive = passive_transactor_fields.contains(field);
-        let is_bound = xschema.bound_bus.is_some();
         if target_state.contains_key(field) {
             return Err(LowerError::Invalid(format!(
                 "name `{field}` is both a stateful transactor instance and a target-TLM \
@@ -5339,30 +5827,10 @@ fn lower_test(
                 .map(|f| (f.name.clone(), f.kind.clone()))
                 .collect(),
         );
-        // Bound-to INITIATOR BFMs still bake the instance name into their
-        // instance-specialized method bodies — those bodies are not invoked
-        // through the state-receiver method lambdas. The unbound DUT-poking
-        // form leaves the placeholders EMPTY so codegen renders them against
-        // the per-call `self_state` receiver, letting multiple active instances
-        // of one type coexist (#494 P1b). A PASSIVE instance's `when active`
-        // methods are never callable, so its bodies are never filled and
-        // never receive a receiver either.
-        if is_bound && !is_passive {
-            let method_fns: Vec<usize> =
-                xschema.methods.iter().map(|m| m.function.index()).collect();
-            let storage = &transactor_storage_names[field];
-            for fidx in method_fns {
-                if let Err(prev) = fill_transactor_state_instance(
-                    &mut prog.functions[fidx],
-                    storage,
-                ) {
-                    return Err(LowerError::Invalid(format!(
-                        "internal bound-initiator specialization for `{xname}` mixed state \
-                         storage `{prev}` and `{field}`"
-                    )));
-                }
-            }
-        }
+        // Bound-initiator methods retain their receiver-relative state and
+        // logical BoundBus ports. Codegen supplies the per-instance state and
+        // bus adapter, which keeps the callable eligible for common layout.
+        let _ = is_passive;
         unbound_state_actors.push(ir::UnboundStateActorSchema {
             field: field.clone(),
             transactor: *xid,
@@ -5449,7 +5917,8 @@ fn lower_test(
     // bare_stmts (it is a cycle-trigger handler, handled there).
     // Resolved callbacks: (binding, register, &OnHandler).
     let mut resolved_reg_cbs: Vec<(String, String, &crate::ast::OnHandler)> = Vec::new();
-    for s in &reg_cb_asts {
+    for sourced in &reg_cb_asts {
+        let s = sourced.stmt;
         let StmtKind::On(h) = &s.kind else {
             unreachable!("collected only StmtKind::On candidates");
         };
@@ -5463,7 +5932,7 @@ fn lower_test(
         let Some(bctx) = regblock_bindings_map.get(&binding) else {
             // Not a regblock binding → a cycle-trigger handler; leave it
             // for the bare-statement path.
-            bare_stmts.push(s);
+            bare_stmts.push(*sourced);
             continue;
         };
         if !bctx.registers.iter().any(|r| r.name == reg) {
@@ -5609,10 +6078,8 @@ fn lower_test(
                     // default uint64 carrier.  The source-ordered assignment
                     // below still lowers the port through DutRead, so using
                     // UInt(None) here only sizes the persistent `_tb` cell.
-                    let untyped_port_init = l
-                        .value
-                        .as_ref()
-                        .is_some_and(is_direct_dut_port_initializer);
+                    let untyped_port_init =
+                        l.value.as_ref().is_some_and(is_direct_dut_port_initializer);
                     if declared_ty.is_none() && inferred_ty.is_none() && !untyped_port_init {
                         return Err(unsupported(
                             &format!(
@@ -5660,9 +6127,11 @@ fn lower_test(
         },
     )?;
     prog.testbenches.push(TestbenchSchema {
+        type_id: testbench_type,
         name: tb_schema_name,
         dut_field: "dut".to_string(),
-        dut_type,
+        dut_type: dut_type.clone(),
+        probes: testbench_probes,
         cov_fields: cov_fields.clone(),
         scalar_fields: scalar_fields.clone(),
         queue_fields: queue_fields.clone(),
@@ -5670,10 +6139,12 @@ fn lower_test(
         connects: tb_connects,
         record_fields: record_fields.clone(),
         bus_bindings: bus_bindings.clone(),
+        bound_bus_instances,
         transactor_fields: transactor_fields.clone(),
         passive_transactor_fields: passive_transactor_fields.clone(),
         scoreboard_fields: scoreboard_fields.clone(),
         regblock_bindings: regblock_binding_schemas,
+        addrmap_mirror_helpers,
         target_tlm_actors: target_tlm_actors.clone(),
         component_fields: component_field_bindings,
         unbound_state_actors,
@@ -5690,20 +6161,20 @@ fn lower_test(
     // Hoisted test-scope lets first (v1 evaluates them at `main` scope
     // before the coroutine bootstraps — i.e. before any body statement
     // and before the first clock edge), then the body in scope order.
-    let mut run_stmts: Vec<&AstStmt> = Vec::with_capacity(test_let_stmts.len());
-    for stmt in &test_let_stmts {
+    let mut run_stmts: Vec<SourcedStmt<'_>> = Vec::with_capacity(test_let_stmts.len());
+    for (stmt, source) in test_let_stmts.iter().zip(test_let_sources.iter().copied()) {
         let StmtKind::Let(l) = &stmt.kind else {
-            run_stmts.push(stmt);
+            run_stmts.push(SourcedStmt::new(stmt, source));
             continue;
         };
         if let Some(init) = promoted_runtime_inits.get(&l.name.name) {
-            run_stmts.push(init);
+            run_stmts.push(SourcedStmt::new(init, source));
         } else if !promoted_lets.contains(&l.name.name) {
-            run_stmts.push(stmt);
+            run_stmts.push(SourcedStmt::new(stmt, source));
         }
     }
     let n_hoisted_lets = run_stmts.len();
-    let mut check_stmts: Vec<&AstStmt> = Vec::new();
+    let mut check_stmts: Vec<SourcedStmt<'_>> = Vec::new();
     // Bare statements that precede the `scope` block run before its
     // setup/run (matching v1's single-coroutine item-order emission);
     // those that follow it run after teardown.
@@ -5736,10 +6207,10 @@ fn lower_test(
     {
         let binding_names: std::collections::HashSet<&str> =
             regblock_bindings_map.keys().map(|s| s.as_str()).collect();
-        let mut scan: Vec<&AstStmt> = bare_stmts.clone();
-        scan.extend(run_stmts.iter().copied().skip(n_hoisted_lets));
-        scan.extend(check_stmts.iter().copied());
-        for s in &scan {
+        let mut scan: Vec<&AstStmt> = bare_stmts.iter().map(|s| s.stmt).collect();
+        scan.extend(run_stmts.iter().skip(n_hoisted_lets).map(|s| s.stmt));
+        scan.extend(check_stmts.iter().map(|s| s.stmt));
+        for s in scan {
             if let Some(detail) = regblock::detect_regblock_residual(s, &binding_names) {
                 return Err(unsupported(
                     &detail,
@@ -5755,20 +6226,11 @@ fn lower_test(
         }
     }
     if scope.is_some() && !bare_stmts.is_empty() {
-        // Bare statements — including a bare `cover` — were already routed
+        // Bare statements — including a bare `cover` — are already routed
         // into the run/check lists by item order above (pre-scope → run
         // front, post-scope → check tail); nothing more to append here.
-        //
-        // A bare `cover` alongside a `scope`/`run` block used to be
-        // rejected because v1 has no correct behavior to mirror: v1
-        // declares each `_cov_<tag>_hits` counter as a `static` LOCAL at
-        // the statement's position inside the run coroutine and then reads
-        // it from the enclosing function's end-of-test summary, so the
-        // emitted C++ does not compile. TB-IR hoists the counter to file
-        // scope (`codegen/tbir/mod.rs`), which makes the lowering
-        // well-defined wherever the statement lands — so the rejection no
-        // longer buys anything and the construct is lowered instead. See
-        // the `cover` divergence note in docs/tbir-mvp.md.
+        // TB-IR's file-scope coverage counters make a bare `cover` well-defined
+        // even when the same test also declares a scoped run block.
     } else {
         // No scope: every bare statement is the run body, in order.
         run_stmts.extend(bare_stmts.iter().copied());
@@ -5787,12 +6249,12 @@ fn lower_test(
     // so a phase may call another; a cycle is rejected.
     if !phases.is_empty() {
         let mut expanded_run = Vec::with_capacity(run_stmts.len());
-        for s in &run_stmts {
+        for &s in &run_stmts {
             expand_phase_calls(s, &phases, &mut Vec::new(), &mut expanded_run, &t.name.name)?;
         }
         run_stmts = expanded_run;
         let mut expanded_check = Vec::with_capacity(check_stmts.len());
-        for s in &check_stmts {
+        for &s in &check_stmts {
             expand_phase_calls(
                 s,
                 &phases,
@@ -5825,7 +6287,12 @@ fn lower_test(
         }
     }
 
-    let heartbeat_transactor_fields: Rc<RefCell<HashSet<String>>> = Default::default();
+    let heartbeat_transactor_fields = Rc::new(RefCell::new(
+        testbench_method_heartbeat_fields
+            .get(&testbench_type)
+            .cloned()
+            .unwrap_or_default(),
+    ));
     let existing_transactor_storage: HashMap<String, String> = prog.testbenches[tb_id.index()]
         .unbound_state_actors
         .iter()
@@ -5844,6 +6311,8 @@ fn lower_test(
         })
         .collect();
     let mut ctx = LowerCtx {
+        source_id,
+        diagnostics,
         dut_field: "dut".to_string(),
         tb_field: if synthetic {
             None
@@ -5858,10 +6327,17 @@ fn lower_test(
         record_ids: record_ids.clone(),
         records: prog.records.clone(),
         bus_bindings: bus_binding_decls,
-        bus_remaps: bus_bindings
+        bus_origins: bus_bindings
             .iter()
-            .filter(|b| !b.remap.is_empty())
-            .map(|b| (b.field.clone(), b.remap.clone()))
+            .map(|binding| {
+                (
+                    binding.field.clone(),
+                    ir::PortOrigin::BusBinding {
+                        binding: binding.id,
+                        field: binding.field.clone(),
+                    },
+                )
+            })
             .collect(),
         transactor_fields: transactor_fields.iter().cloned().collect(),
         target_transactor_fields: target_tlm_actors
@@ -5877,7 +6353,6 @@ fn lower_test(
         consts: consts.clone(),
         properties: properties.clone(),
         owner: Some(tb_id),
-        const_signed: const_signed.clone(),
         ambiguous_variants: ambiguous_variants.clone(),
         tb_scalar_fields: scalar_fields
             .iter()
@@ -5890,6 +6365,7 @@ fn lower_test(
         tb_record_fields: record_fields.clone(),
         regblock_callbacks: regblock_callbacks.clone(),
         tb_methods,
+        tb_method_functions,
         test_scope_lets: test_let_names,
         regblock_instance_types: regblock_instance_names(regblock_ids, addrmap_decls),
         regblock_bindings: regblock_bindings_map,
@@ -5905,12 +6381,39 @@ fn lower_test(
         randomize_problem_ids: randomize_problem_ids.clone(),
         tseqs: tseq_records.clone(),
         probes: probes.clone(),
+        partial_probe_names: HashSet::new(),
         extern_fns: extern_fns.clone(),
         // Populated just below (before run/check lowering) when the
         // native-lifecycle switch is on and the bound testbench declares
         // lifecycle phases; empty otherwise.
         tb_lifecycle_fns: HashMap::new(),
     };
+
+    if lowered_testbench_types.insert(testbench_type) {
+        let method_schemas = prog.testbench_types[testbench_type.index()].methods.clone();
+        for (method_index, method_schema) in method_schemas.into_iter().enumerate() {
+            let method = ctx.tb_methods.get(&method_schema.name).ok_or_else(|| {
+                LowerError::Invalid(format!(
+                    "testbench type `{}` is missing canonical method `{}`",
+                    prog.testbench_types[testbench_type.index()].name,
+                    method_schema.name
+                ))
+            })?;
+            let lowered = lower_testbench_method_body(
+                method,
+                method_schema.function,
+                testbench_type,
+                ir::TestbenchMethodId(method_index as u32),
+                &dut_type,
+                &ctx,
+                helpers,
+                side_tables,
+            )?;
+            prog.functions[method_schema.function.index()] = lowered;
+        }
+        testbench_method_heartbeat_fields
+            .insert(testbench_type, heartbeat_transactor_fields.borrow().clone());
+    }
 
     // Synthesized auto-sampler functions, one per covergroup field, in
     // declaration order. Sampling is schema-driven (the bin counters
@@ -5931,6 +6434,7 @@ fn lower_test(
             }],
             entry: BlockId(0),
             owner: Some(tb_id),
+            testbench_record_locals: Vec::new(),
             ret: None,
             implicit_returns: Vec::new(),
         });
@@ -5960,30 +6464,29 @@ fn lower_test(
             let Some(body) = shared_lifecycle_bodies.get(&(tbn.clone(), phase)) else {
                 continue;
             };
-            let fid = if let Some(existing) =
-                shared_lifecycle_fns.get(tbn).and_then(|m| m.get(&phase))
-            {
-                *existing
-            } else {
-                let fid = FunctionId(prog.functions.len() as u32);
-                let f = lower_tb_lifecycle_body(
-                    fid,
-                    format!("__tb_lifecycle_{tbn}_{phase:?}"),
-                    Some(tb_id),
-                    tb_id,
-                    phase,
-                    body,
-                    &ctx,
-                    helpers,
-                    side_tables,
-                )?;
-                prog.functions.push(f);
-                shared_lifecycle_fns
-                    .entry(tbn.clone())
-                    .or_default()
-                    .insert(phase, fid);
-                fid
-            };
+            let fid =
+                if let Some(existing) = shared_lifecycle_fns.get(tbn).and_then(|m| m.get(&phase)) {
+                    *existing
+                } else {
+                    let fid = FunctionId(prog.functions.len() as u32);
+                    let f = lower_tb_lifecycle_body(
+                        fid,
+                        format!("__tb_lifecycle_{tbn}_{phase:?}"),
+                        Some(tb_id),
+                        tb_id,
+                        phase,
+                        body,
+                        &ctx,
+                        helpers,
+                        side_tables,
+                    )?;
+                    prog.functions.push(f);
+                    shared_lifecycle_fns
+                        .entry(tbn.clone())
+                        .or_default()
+                        .insert(phase, fid);
+                    fid
+                };
             ctx.tb_lifecycle_fns.insert(phase, fid);
         }
     }
@@ -5997,7 +6500,11 @@ fn lower_test(
     let run_fn = lower_function(
         run_id,
         format!("run_{}", t.name.name),
-        FunctionKind::Run,
+        FunctionKind::TestBody {
+            test: test_id,
+            member: ir::TestCallableMember::Run,
+            name: t.name.name.clone(),
+        },
         Some(tb_id),
         &run_stmts,
         &ctx,
@@ -6013,7 +6520,11 @@ fn lower_test(
         let check_fn = lower_function(
             check_id,
             format!("check_{}", t.name.name),
-            FunctionKind::Check,
+            FunctionKind::TestBody {
+                test: test_id,
+                member: ir::TestCallableMember::Check,
+                name: t.name.name.clone(),
+            },
             Some(tb_id),
             &check_stmts,
             &ctx,
@@ -6041,12 +6552,20 @@ fn lower_test(
         );
         let cb_fn = lower_reg_cb_body(
             cb_id,
-            format!("{}_{binding}_{reg}_cb", t.name.name),
+            ir::TestHookMember::RegblockWrite {
+                binding: binding.clone(),
+                register: reg.clone(),
+            }
+            .function_name(&t.name.name),
             Some(tb_id),
             &h.body,
             &ctx,
             helpers,
             side_tables,
+            ir::TestHookMember::RegblockWrite {
+                binding: binding.clone(),
+                register: reg.clone(),
+            },
         )?;
         prog.functions.push(cb_fn);
         let tb = &mut prog.testbenches[tb_id.index()];
@@ -6078,7 +6597,7 @@ fn lower_test(
             .and_then(|tbn| components.get(tbn).copied())
             .expect("tb_periodic_asts is only populated for an impl-bound testbench");
         let mut periodic_services: Vec<ir::TbPeriodicServiceSchema> = Vec::new();
-        for h in &tb_periodic_asts {
+        for (service_index, h) in tb_periodic_asts.iter().enumerate() {
             // The FOURTH landing of the non-literal periodic period,
             // after the three bound-to transactor arms in
             // `transactors.rs`, and it behaves identically — which is
@@ -6119,14 +6638,30 @@ fn lower_test(
             let fid = FunctionId(prog.functions.len() as u32);
             let f = lower_tb_periodic_service_body(
                 fid,
-                format!("{}_tb_periodic_{}", t.name.name, fid.0),
+                ir::TestHookMember::TestbenchPeriodic {
+                    service: service_index as u32,
+                }
+                .function_name(&t.name.name),
                 Some(tb_id),
                 tb_decl,
                 h,
                 &ctx,
                 helpers,
                 side_tables,
+                ir::TestHookMember::TestbenchPeriodic {
+                    service: service_index as u32,
+                },
             )?;
+            side_tables
+                .borrow_mut()
+                .synchronous_callbacks
+                .push(SynchronousCallbackSite {
+                    function: fid,
+                    pending: false,
+                    kind: SynchronousCallbackKind::TestbenchPeriodic,
+                    source_id: ctx.source_id,
+                    span: h.span,
+                });
             prog.functions.push(f);
             periodic_services.push(ir::TbPeriodicServiceSchema {
                 period,
@@ -6150,18 +6685,34 @@ fn lower_test(
             .and_then(|tbn| components.get(tbn).copied())
             .expect("tb_cycle_asts is only populated for an impl-bound testbench");
         let mut cycle_services: Vec<ir::TbCycleServiceSchema> = Vec::new();
-        for h in &tb_cycle_asts {
+        for (service_index, h) in tb_cycle_asts.iter().enumerate() {
             let fid = FunctionId(prog.functions.len() as u32);
             let (f, trigger) = lower_tb_cycle_service_body(
                 fid,
-                format!("{}_tb_cycle_{}", t.name.name, fid.0),
+                ir::TestHookMember::TestbenchCycle {
+                    service: service_index as u32,
+                }
+                .function_name(&t.name.name),
                 Some(tb_id),
                 tb_decl,
                 h,
                 &ctx,
                 helpers,
                 side_tables,
+                ir::TestHookMember::TestbenchCycle {
+                    service: service_index as u32,
+                },
             )?;
+            side_tables
+                .borrow_mut()
+                .synchronous_callbacks
+                .push(SynchronousCallbackSite {
+                    function: fid,
+                    pending: false,
+                    kind: SynchronousCallbackKind::TestbenchCycle,
+                    source_id: ctx.source_id,
+                    span: h.span,
+                });
             prog.functions.push(f);
             cycle_services.push(ir::TbCycleServiceSchema {
                 trigger,
@@ -6205,6 +6756,7 @@ fn lower_test(
     }
 
     prog.tests.push(TestSchema {
+        id: test_id,
         name: t.name.name.clone(),
         testbench: tb_id,
         run: run_id,
@@ -6251,12 +6803,13 @@ fn phase_call_name<'a>(s: &AstStmt, phases: &HashMap<String, &'a Block>) -> Opti
 /// call another). `active` tracks the phase-expansion stack to reject a
 /// recursive cycle. A non-phase-call statement is pushed unchanged.
 fn expand_phase_calls<'a>(
-    s: &'a AstStmt,
+    sourced: SourcedStmt<'a>,
     phases: &HashMap<String, &'a Block>,
     active: &mut Vec<String>,
-    out: &mut Vec<&'a AstStmt>,
+    out: &mut Vec<SourcedStmt<'a>>,
     test_name: &str,
 ) -> Result<(), LowerError> {
+    let s = sourced.stmt;
     if let Some(name) = phase_call_name(s, phases) {
         if active.contains(&name) {
             return Err(LowerError::Invalid(format!(
@@ -6265,25 +6818,37 @@ fn expand_phase_calls<'a>(
         }
         active.push(name.clone());
         let body = phases[&name];
-        for inner in &body.stmts {
-            expand_phase_calls(inner, phases, active, out, test_name)?;
+        for (index, inner) in body.stmts.iter().enumerate() {
+            let source_id = body.stmt_source(index);
+            let source_id = if source_id.is_known() {
+                source_id
+            } else {
+                sourced.source_id
+            };
+            expand_phase_calls(
+                SourcedStmt::new(inner, source_id),
+                phases,
+                active,
+                out,
+                test_name,
+            )?;
         }
         active.pop();
         return Ok(());
     }
-    out.push(s);
+    out.push(sourced);
     Ok(())
 }
 
 /// Flatten a block's statements, optionally skipping the synthesized
 /// `_tb.dut = dut` wire (it is scaffolding-owned in the IR backend —
 /// the emitter wires the TB struct's DUT pointer before the body runs).
-fn collect_stmts<'a>(b: &'a Block, skip_tb_wire: bool, out: &mut Vec<&'a AstStmt>) {
-    for s in &b.stmts {
+fn collect_stmts<'a>(b: &'a Block, skip_tb_wire: bool, out: &mut Vec<SourcedStmt<'a>>) {
+    for (index, s) in b.stmts.iter().enumerate() {
         if skip_tb_wire && is_tb_dut_wire(s) {
             continue;
         }
-        out.push(s);
+        out.push(SourcedStmt::new(s, b.stmt_source(index)));
     }
 }
 
@@ -6835,8 +7400,7 @@ fn infer_promoted_scalar_type(
                     .then_some(ty);
             }
             extern_fns.get(&id.name).and_then(|(_, _, ty)| {
-                matches!(ty, IrType::UInt(_) | IrType::SInt(_) | IrType::Bool)
-                    .then_some(ty.clone())
+                matches!(ty, IrType::UInt(_) | IrType::SInt(_) | IrType::Bool).then_some(ty.clone())
             })
         }
         _ => None,
@@ -6947,29 +7511,6 @@ pub(crate) fn time_literal_to_ps(s: &str) -> Result<i64, String> {
     n.checked_mul(factor).ok_or_else(overflow)
 }
 
-/// Bit width of a probe's scalar type. Probes surface a single SV
-/// `logic`/`logic [W-1:0]` through the bind stub, so only scalar types
-/// are accepted: `uint<N>`/`sint<N>`/`bits<N>` (width = N), `bit`/`bool`
-/// (width = 1). Returns `None` for any aggregate / named type. Mirrors
-/// `crate::codegen::sv_stub::sv_type_decl`'s accepted set.
-fn probe_scalar_width(t: &TypeExpr) -> Option<u32> {
-    let TypeExpr::Builtin { name, args, .. } = t else {
-        return None;
-    };
-    use crate::ast::BuiltinTy;
-    match name {
-        BuiltinTy::Bit | BuiltinTy::Bool | BuiltinTy::BoolLower => Some(1),
-        BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits => match args.first()? {
-            crate::ast::TypeArg::Expr(e) => match &*e.kind {
-                ExprKind::Int(s) => s.replace('_', "").parse::<u32>().ok(),
-                _ => None,
-            },
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 // ── Function builder ─────────────────────────────────────────────────
 
 /// Per-test lowering context shared by all of the test's functions.
@@ -6980,6 +7521,8 @@ pub(crate) type ExternFnTable = HashMap<String, (Vec<String>, Vec<IrType>, IrTyp
 
 #[derive(Clone)]
 pub(crate) struct LowerCtx {
+    pub source_id: SourceId,
+    pub(crate) diagnostics: LowerDiagnosticRecorder,
     /// Test-scope DUT field name (`"dut"`).
     pub dut_field: String,
     /// `Some("_tb")` for impl-form tests (testbench-bound).
@@ -7014,16 +7557,10 @@ pub(crate) struct LowerCtx {
     /// `TransactorMethod` call edges out of pure-helper bodies (design
     /// seam rule).
     pub bus_bindings: HashMap<String, crate::ast::BusDecl>,
-    /// Per-binding `bind ... with { ch.sig: "port" }` signal remaps
-    /// (binding name → v1's `(channel, signal) → flat_port` table).
-    /// Consulted when lowering a `<binding>.<channel>.<signal>`
-    /// handshake access so the emitted flat name honors the override
-    /// instead of the `<binding>_<channel>_<signal>` convention. Empty
-    /// for bindings without a `with { ... }` clause and for every
-    /// non-test context (helper/method bodies, which carry the
-    /// placeholder bus prefix — those are remapped at bind time by
-    /// `fill_initiator_bus_prefix`).
-    pub bus_remaps: HashMap<String, Vec<((String, String), String)>>,
+    /// Semantic origin assigned to ports lowered through each bus name.
+    /// Test bodies carry concrete binding ids; reusable bound callable
+    /// bodies carry `BoundBus` until a renderer supplies their adapter.
+    pub bus_origins: HashMap<String, crate::ir::PortOrigin>,
     /// Transactor-typed testbench fields (`xact` → transactor id), for
     /// `xact.method(...)` call resolution and the `xact.dut = dut`
     /// bind. Disjoint from `bus_bindings` (collision rejected at
@@ -7067,7 +7604,7 @@ pub(crate) struct LowerCtx {
     /// v1's `enum_variants` rule). Substituted as literals at use
     /// sites; locals shadow (lookup order: local, then const — same
     /// effective shadowing as v1's C++ scoping).
-    pub consts: HashMap<String, u64>,
+    pub consts: HashMap<String, ConstVal>,
     /// File-scope `property NAME ... end property` declarations, name →
     /// body expression (v1's `properties` table). A bare-identifier
     /// `assert`/`assume`/`cover` operand that hits this map is a
@@ -7083,10 +7620,6 @@ pub(crate) struct LowerCtx {
     /// bodies by owner. `None` for file-level helper / tseq / transactor
     /// method contexts, which have no testbench.
     pub owner: Option<TestbenchId>,
-    /// Signedness of file-scope constants, retained alongside the
-    /// substituted bit patterns so TB-IR preserves signed operators at
-    /// use sites (`const NEG : sint<8> = -1; NEG >> 1`).
-    pub const_signed: HashMap<String, bool>,
     /// Enum-variant names declared by more than one `enum`, mapped to the
     /// owning enum names for the diagnostic. `consts` folds variants into
     /// one flat name-keyed table, so an ambiguous name would silently
@@ -7123,32 +7656,22 @@ pub(crate) struct LowerCtx {
     /// reference them; the bodies are lowered (and the schema patched)
     /// afterward at the matching reserved ids.
     pub regblock_callbacks: HashMap<String, Vec<(String, FunctionId)>>,
-    /// Testbench helper methods (`function`/`hookable` declared inside
-    /// the bound testbench), CFG-inlined at `_tb.<m>(...)` call sites
-    /// like impure helpers — v1 emits them as `[&]`-capturing lambdas
-    /// whose waits tick the same scheduler.
+    /// Testbench helper methods (`function`/`hookable` declared inside the
+    /// bound testbench) and their canonical callable identities.
     pub tb_methods: HashMap<String, HookableMethod>,
+    /// Canonical callable identity for each reusable testbench method.
+    /// Present together with `tb_methods` in testbench-bound contexts.
+    pub tb_method_functions: HashMap<String, FunctionId>,
     /// Test-scope let names (hoisted into the run function). Used for
     /// a precise rejection when the check phase references one — run
     /// and check are separate IR functions, so v1's shared-capture
     /// scoping is not representable.
     pub test_scope_lets: HashSet<String>,
-    /// Every `regblock` and `addrmap` DECLARATION name in the file.
-    ///
-    /// A `let` whose declared type names one of these is an
-    /// INSTANTIATION and requires `= bind <helper>`; without it there is
-    /// no bus for the registers to reach. v1 states that rule and
-    /// enforces it ("regblock instantiation requires `= bind <helper>`
-    /// (a transactor with write/read methods)"), refusing to emit at
-    /// all. TB-IR used to accept it silently, because a regblock's
-    /// mirror record shares its name and the let landed on the ordinary
-    /// record-local arm — the emitted testbench then served every
-    /// register access from the mirror and issued NO bus traffic, so
-    /// the test passed without ever touching the DUT. See divergence
-    /// 104.
-    ///
-    /// Populated in EVERY context, not just the test one — the hole is
-    /// reachable from a hookable method body and a `tseq` body too.
+    /// Every `regblock` and `addrmap` declaration name in the file. A `let`
+    /// whose type names one of these is an instance and requires
+    /// `= bind <helper>`; without a binding, register accesses cannot reach a
+    /// bus. The set is populated in every context because helper and `tseq`
+    /// bodies can declare the same instances.
     pub regblock_instance_types: HashSet<String>,
     /// Register-block bindings (`let regs : R = bind <helper>`) →
     /// per-binding access context (mirror record, helper field,
@@ -7202,11 +7725,11 @@ pub(crate) struct LowerCtx {
     /// `ConstraintSite`. Empty for keep-free transactions and for
     /// contexts that cannot host a `randomize` (pure helpers).
     pub record_keeps: HashMap<String, Vec<crate::ast::Expr>>,
-    /// Randomize-target span → typed constraint-problem id. The handle
+    /// Randomize-target source site → typed constraint-problem id. The handle
     /// (`ConstraintProblemId.0`) the constraint-IR layer assigned to the
     /// site, keyed exactly like v1's `runtime_randomize_problem_ids`.
     /// `None` at a site means no Z3-ready problem (lower/backend error).
-    pub randomize_problem_ids: HashMap<(u32, u32), u32>,
+    pub randomize_problem_ids: HashMap<SourceSite, u64>,
     /// `tseq` name → element type (`TseqElem::Record`/`TseqElem::Scalar`).
     /// A `let txns = Name(args)` whose callee is in this map lowers to a
     /// `CallTarget::Tseq` whose result types the local as the element's
@@ -7225,9 +7748,13 @@ pub(crate) struct LowerCtx {
     /// metadata). A `dut.<name>` access whose head is the DUT and whose
     /// segment is a probe name lowers to a `PortRef` with
     /// `access = Probe` (read-only) or `Force` (force-capable) instead of
-    /// the default `Port`. Empty for probe-less tests and every non-test
-    /// context (helpers, methods). See docs/probe-signals.md.
+    /// the default `Port`. Per-test contexts carry that test's declarations;
+    /// shared component and standalone-transactor methods carry the
+    /// suite-wide intersection. See docs/probe-signals.md.
     pub probes: HashMap<String, ProbeMeta>,
+    /// Probe names present in only some tests. Shared method contexts reject
+    /// these rather than letting them fall through as ordinary DUT ports.
+    pub partial_probe_names: HashSet<String>,
     /// `extern function name(...) -> ret` (spec §9) names. A call whose
     /// callee is in this set lowers to `CallTarget::ExternFn` and emits
     /// with the RAW symbol name (resolved at link via `--ref-src`); the
@@ -7249,6 +7776,15 @@ pub(crate) struct LowerCtx {
 }
 
 impl LowerCtx {
+    /// Run a declaration lowerer with its originating source ID without
+    /// cloning the immutable schema tables carried by this context.
+    fn with_source<T>(&mut self, source_id: SourceId, f: impl FnOnce(&Self) -> T) -> T {
+        let previous = std::mem::replace(&mut self.source_id, source_id);
+        let result = f(self);
+        self.source_id = previous;
+        result
+    }
+
     /// A dynamic list has no finite DUT-wire representation. Record values
     /// containing one are valid host-side state/randomize values, but cannot
     /// cross a TLM request/response packing boundary (including through a
@@ -7276,35 +7812,11 @@ impl LowerCtx {
         ))
     }
 
-    /// See `const_vals_from`. Built on demand rather than stored, and
-    /// only ever reached from a field default that is not a plain
-    /// literal — `fold_field_default` answers the common shapes without
-    /// consulting the table at all.
+    /// A cloned view for declaration helpers that fold defaults after the
+    /// shared lowering context has been constructed.
     pub(crate) fn const_vals(&self) -> HashMap<String, ConstVal> {
-        const_vals_from(&self.consts, &self.const_signed)
+        self.consts.clone()
     }
-}
-
-/// Recombine the two split constant tables (`consts` bit patterns +
-/// `const_signed` signedness) into the single map `fold_const` wants.
-/// The split exists because use-site substitution needs the two
-/// separately; constant FOLDING needs them together.
-pub(crate) fn const_vals_from(
-    consts: &HashMap<String, u64>,
-    const_signed: &HashMap<String, bool>,
-) -> HashMap<String, ConstVal> {
-    consts
-        .iter()
-        .map(|(k, &bits)| {
-            (
-                k.clone(),
-                ConstVal {
-                    bits,
-                    signed: const_signed.get(k).copied().unwrap_or(false),
-                },
-            )
-        })
-        .collect()
 }
 
 /// Fold an ADDRESS-like constant expression — an addrmap instance base
@@ -7372,13 +7884,26 @@ pub(crate) fn fold_addr_const(
 /// `width` is the declared probe type's bit width (for the `PortRef`).
 #[derive(Debug, Clone)]
 pub(crate) struct ProbeMeta {
+    pub id: ProbeId,
     pub force: bool,
-    pub width: Option<u32>,
+    pub ty: IrType,
 }
 
 pub(crate) struct LoopFrame {
     pub continue_to: BlockId,
     pub break_to: BlockId,
+}
+
+#[derive(Clone, Copy)]
+struct SourcedStmt<'a> {
+    stmt: &'a AstStmt,
+    source_id: SourceId,
+}
+
+impl<'a> SourcedStmt<'a> {
+    fn new(stmt: &'a AstStmt, source_id: SourceId) -> Self {
+        Self { stmt, source_id }
+    }
 }
 
 /// One in-flight helper inline (innermost last). While a frame is
@@ -7389,12 +7914,11 @@ pub(crate) struct LoopFrame {
 pub(crate) struct InlineFrame {
     /// Helper name, for recursion detection.
     pub(crate) name: String,
-    /// True for `_tb.<method>` frames. Unlike free helpers, testbench
-    /// methods capture testbench-owned host state.
-    pub(crate) is_testbench_method: bool,
-    /// Param names bound to the caller's DUT — `as_port_ref` resolves
-    /// `<alias>.<port>` exactly like `dut.<port>`.
-    pub(crate) dut_aliases: HashSet<String>,
+    /// Param names bound to a caller DUT receiver. The value is the canonical
+    /// receiver name in the enclosing callable, so nested inlining preserves
+    /// a module-typed testbench-method parameter instead of collapsing it to
+    /// the suite DUT field.
+    pub(crate) dut_aliases: HashMap<String, String>,
     pub(crate) ret_dest: LocalId,
     pub(crate) ret_cont: BlockId,
     /// `scopes.len()` at frame entry — lookup floor.
@@ -7410,6 +7934,7 @@ struct BlockInProgress {
 
 pub(crate) struct FuncBuilder<'a> {
     pub(crate) ctx: &'a LowerCtx,
+    pub(crate) current_source_id: SourceId,
     pub(crate) helpers: &'a helpers::HelperRegistry<'a>,
     locals: Vec<TypedLocal>,
     local_names: HashSet<String>,
@@ -7419,6 +7944,15 @@ pub(crate) struct FuncBuilder<'a> {
     pub(crate) loop_stack: Vec<LoopFrame>,
     temp_counter: u32,
     pub(crate) inline_frames: Vec<InlineFrame>,
+    /// Module-typed parameters of an out-of-line testbench method. They
+    /// resolve as aliases of the owning testbench's DUT handle.
+    pub(crate) standalone_dut_aliases: HashSet<String>,
+    /// True while lowering one canonical reusable testbench method.
+    pub(crate) in_testbench_method: bool,
+    /// Owning reusable testbench type while lowering a canonical method.
+    /// Bus/TLM references retain this identity instead of one implementation's
+    /// declaration-order binding index.
+    pub(crate) testbench_method_owner: Option<TestbenchTypeId>,
     /// Synthetic locals for transaction/struct-typed testbench fields.
     /// These are declared in every owning function so record-field IR can
     /// type-check, but codegen binds the names to shared test-scope C++
@@ -7478,6 +8012,8 @@ pub(crate) struct FuncBuilder<'a> {
     /// being lowered. Used to resolve bare sibling method calls like
     /// `idle()` inside `write()`.
     pub(crate) self_transactor: Option<String>,
+    /// Stable schema identity of that enclosing transactor.
+    pub(crate) self_transactor_id: Option<TransactorId>,
     /// Full sibling method signature table for the current transactor,
     /// including methods declared later in source order.
     /// Sibling methods visible inside a transactor method body:
@@ -7490,7 +8026,7 @@ pub(crate) struct FuncBuilder<'a> {
     /// for the bound-instance path, and it was dropped in both places
     /// for the same reason.
     /// Sibling methods callable by bare name inside a transactor body:
-    /// `(param_names, param_tys, ret_ty, active_only)`. The types are
+    /// `(param_names, param_tys, ret_ty, active_only, function)`. The types are
     /// carried for the same reason `TransactorMethodSchema::param_tys`
     /// is — a call site lowers under a snapshot, with no functions
     /// table, so without them it had nothing to type-check an argument
@@ -7502,6 +8038,7 @@ pub(crate) struct FuncBuilder<'a> {
             Vec<crate::ir::IrType>,
             Option<crate::ir::IrType>,
             bool,
+            FunctionId,
         ),
     >,
     /// True while lowering a transactor method declared under
@@ -7543,12 +8080,20 @@ pub(crate) struct FuncBuilder<'a> {
     /// the parameters it captured. `false` in every such nested builder,
     /// which is what closes that door.
     pub(crate) in_test_body: bool,
+    /// Stable owner used for statement-position callback-site allocation.
+    /// Present only while lowering one named test's run/check body.
+    pub(crate) test_hook_site_owner: Option<ir::TestHookSiteOwner>,
     /// Best-effort bit widths of locals with an explicit scalar type
     /// annotation (`let s64 : uint<64> = ...`). Consulted only by the
     /// width-method receiver inference (v1's `let_widths`); the
     /// declared `TypedLocal::ty` deliberately stays `Unknown` (see
     /// docs/tbir-mvp.md divergence 4).
     pub(crate) let_widths: HashMap<LocalId, u32>,
+    /// Default-constructed component locals and their root instance mode.
+    /// Membership distinguishes a component instance (`Some(None)` for a
+    /// modeless root) from a component value local initialized by copying
+    /// another instance (`None`).
+    pub(crate) component_local_modes: HashMap<LocalId, Option<ir::ComponentInstanceMode>>,
     /// `Some(component)` while lowering a `ComponentMethod` body: a bare
     /// field name that names a field of that component resolves self-
     /// relatively (`Expr::ComponentField { base: SelfField }`), and
@@ -7577,13 +8122,13 @@ pub(crate) struct FuncBuilder<'a> {
     pub(crate) recv_payloads: HashMap<LocalId, Vec<(String, LocalId)>>,
     /// Active while lowering a concurrent check body (`assert`/`assume`
     /// over a named property or temporal expression, or a `cover`
-    /// predicate): maps a temporal system-call's SOURCE SPAN to the latch
+    /// predicate): maps a temporal system-call's SOURCE SITE to the latch
     /// slot that reading resolves to. `lower_expr` consults it before
     /// dispatching on the expression kind, so `past(x)` inside a check
     /// body becomes `Expr::TemporalSlot` instead of the usual rejection.
     /// Empty everywhere else — the exact shape of v1's `prop_subs` hook,
-    /// which keys the same substitution by span during emission.
-    pub(crate) temporal_slots: HashMap<(u32, u32), (u32, ir::TemporalFn)>,
+    /// which keys the same substitution by source site during emission.
+    pub(crate) temporal_slots: HashMap<SourceSite, (u32, ir::TemporalFn)>,
 
     /// The `RecordSeq` accumulator local of the `tseq` body currently
     /// being lowered (`Some` only inside a `FunctionKind::Tseq` body). A
@@ -7615,24 +8160,43 @@ fn lower_function<'a>(
     name: String,
     kind: FunctionKind,
     owner: Option<TestbenchId>,
-    stmts: &[&AstStmt],
+    stmts: &[SourcedStmt<'_>],
     ctx: &'a LowerCtx,
     helpers: &'a helpers::HelperRegistry<'a>,
     side_tables: &'a RefCell<SideTables>,
 ) -> Result<TbFunction, LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
-    b.in_check = kind == FunctionKind::Check;
+    b.in_check = matches!(
+        kind,
+        FunctionKind::TestBody {
+            member: ir::TestCallableMember::Check,
+            ..
+        }
+    );
     // `lower_function` is only ever called for a test's own run / check
     // body, which is exactly where a once-per-simulation registration is
     // sound. See `FuncBuilder::in_test_body`.
     b.in_test_body = true;
+    b.test_hook_site_owner = match &kind {
+        FunctionKind::TestBody { member, name, .. } => Some(ir::TestHookSiteOwner {
+            test: name.clone(),
+            member: *member,
+        }),
+        _ => None,
+    };
     declare_tb_record_fields(&mut b, ctx);
     // Regblock mirror locals: declared + default-constructed (to their
     // reset values) at the head of the Run function, mirroring v1's
     // single `<Name>_Mirror regs;` declaration at the hoisted-let site.
     // Run-scoped — a check-phase regblock access fails the binding
     // lookup and is rejected precisely (like a test-scope let).
-    if kind == FunctionKind::Run {
+    if matches!(
+        kind,
+        FunctionKind::TestBody {
+            member: ir::TestCallableMember::Run,
+            ..
+        }
+    ) {
         for binding in &ctx.regblock_init_order {
             let rec = ctx.regblock_bindings[binding].record;
             let id = b.declare(binding);
@@ -7649,8 +8213,14 @@ fn lower_function<'a>(
             b.push(ir::Stmt::RecordInit(id, *rec));
         }
     }
-    for s in stmts {
-        b.lower_stmt(s)?;
+    for sourced in stmts {
+        let prior = b.current_source_id;
+        if sourced.source_id.is_known() {
+            b.current_source_id = sourced.source_id;
+        }
+        let result = b.lower_stmt(sourced.stmt);
+        b.current_source_id = prior;
+        result?;
     }
     if !b.is_terminated() {
         b.terminate(Terminator::Return);
@@ -7719,6 +8289,7 @@ pub(crate) fn lower_method_hook_body<'a>(
     ctx: &'a LowerCtx,
     helpers: &'a helpers::HelperRegistry<'a>,
     side_tables: &'a RefCell<SideTables>,
+    member: ir::TestHookMember,
 ) -> Result<TbFunction, LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     reserve_tb_record_names(&mut b, ctx);
@@ -7735,9 +8306,101 @@ pub(crate) fn lower_method_hook_body<'a>(
     if !b.is_terminated() {
         b.terminate(Terminator::Return);
     }
-    let mut f = b.finish(id, name, FunctionKind::TestHook, owner)?;
+    let mut f = b.finish(id, name, FunctionKind::TestHook { member }, owner)?;
     f.params = params.iter().chain(capture_params).cloned().collect();
     Ok(f)
+}
+
+fn lower_testbench_method_body<'a>(
+    method: &HookableMethod,
+    id: FunctionId,
+    testbench: TestbenchTypeId,
+    method_id: ir::TestbenchMethodId,
+    dut_type: &str,
+    ctx: &'a LowerCtx,
+    helpers: &'a helpers::HelperRegistry<'a>,
+    side_tables: &'a RefCell<SideTables>,
+) -> Result<TbFunction, LowerError> {
+    let mut builder = FuncBuilder::new(ctx, helpers, side_tables);
+    builder.in_testbench_method = true;
+    builder.testbench_method_owner = Some(testbench);
+    reserve_tb_record_names(&mut builder, ctx);
+    let mut params = Vec::with_capacity(method.params.len());
+    for param in &method.params {
+        let ty = components::testbench_method_param_ir_type(
+            &method.name.name,
+            &format!("parameter `{}`", param.name.name),
+            param.ty.as_ref(),
+            ctx,
+        )?;
+        let module_type = match (&param.ty, &ty) {
+            (Some(TypeExpr::Named { name, .. }), IrType::Unknown) => {
+                name.segments.last().map(|segment| segment.name.as_str())
+            }
+            _ => None,
+        };
+        let local = if let Some(module_type) = module_type {
+            if module_type != dut_type {
+                return Err(not_implemented(
+                    &format!(
+                        "testbench method parameter `{}` of module type `{module_type}`",
+                        param.name.name
+                    ),
+                    "only the owning testbench DUT type is a valid module parameter",
+                    V1Status::EmitsUncompilable,
+                ));
+            }
+            let local = LocalId(builder.locals.len() as u32);
+            builder.local_names.insert(param.name.name.clone());
+            builder.locals.push(TypedLocal {
+                name: param.name.name.clone(),
+                ty: ty.clone(),
+            });
+            builder
+                .standalone_dut_aliases
+                .insert(param.name.name.clone());
+            local
+        } else {
+            builder.declare(&param.name.name)
+        };
+        builder.set_local_type(local, ty.clone());
+        if let Some(source_ty) = &param.ty {
+            if let Some(width) = components::scalar_width(source_ty) {
+                builder.let_widths.insert(local, width);
+            }
+        }
+        params.push(TypedParam {
+            name: param.name.name.clone(),
+            ty,
+        });
+    }
+    declare_tb_record_fields(&mut builder, ctx);
+    if let Some(return_ty) = &method.return_ty {
+        let ret = builder.declare("__ret");
+        builder.set_local_type(
+            ret,
+            components::testbench_method_param_ir_type(
+                &method.name.name,
+                "return type",
+                Some(return_ty),
+                ctx,
+            )?,
+        );
+        builder.helper_ret = Some(ret);
+    }
+    builder.lower_block_stmts(&method.body)?;
+    let mut function = builder.finish(
+        id,
+        format!("tb_method_{}_{}", testbench.0, method.name.name),
+        FunctionKind::TestbenchMethod {
+            testbench,
+            method: method_id,
+            name: method.name.name.clone(),
+        },
+        None,
+    )?;
+    function.params = params;
+    Ok(function)
 }
 
 /// Lower one testbench-scoped `on <N> cycles ... end on` periodic-handler
@@ -7745,7 +8408,7 @@ pub(crate) fn lower_method_hook_body<'a>(
 /// The body is first rewritten (bare testbench field/method references →
 /// `_tb.<name>`) so it resolves through the ordinary TEST-scope `ctx`
 /// exactly like the bound test body — `_tb.<field>` host state, `dut`
-/// pokes/reads, and `_tb.<m>()` helper inlining. The firing cadence
+/// pokes/reads, and `_tb.<m>()` callable edges. The firing cadence
 /// (`period`) and the phase are recorded on the schema, not here; the
 /// registration closure the backend emits gates on `cycle_count`.
 #[allow(clippy::too_many_arguments)]
@@ -7758,6 +8421,7 @@ fn lower_tb_periodic_service_body<'a>(
     ctx: &'a LowerCtx,
     helpers: &'a helpers::HelperRegistry<'a>,
     side_tables: &'a RefCell<SideTables>,
+    member: ir::TestHookMember,
 ) -> Result<TbFunction, LowerError> {
     let mut body = h.body.clone();
     crate::codegen::cpp_tb::rewrite_testbench_scope_body(&mut body, tb, &HashSet::new());
@@ -7766,7 +8430,7 @@ fn lower_tb_periodic_service_body<'a>(
     if !b.is_terminated() {
         b.terminate(Terminator::Return);
     }
-    b.finish(id, name, FunctionKind::TestHook, owner)
+    b.finish(id, name, FunctionKind::TestHook { member }, owner)
 }
 
 /// Lower one testbench-scoped `on <bool-expr> ... end on` cycle-trigger
@@ -7790,20 +8454,23 @@ fn lower_tb_cycle_service_body<'a>(
     ctx: &'a LowerCtx,
     helpers: &'a helpers::HelperRegistry<'a>,
     side_tables: &'a RefCell<SideTables>,
+    member: ir::TestHookMember,
 ) -> Result<(TbFunction, ir::Expr), LowerError> {
     // Rewrite the trigger predicate the same way the body is rewritten:
     // wrap it in a throwaway one-statement block so the shared
     // `rewrite_testbench_scope_body` walker maps bare field refs to
     // `_tb.<field>` and leaves `dut.<sig>` / `_tb` alone.
     let mut trigger_expr = h.event.clone();
-    let mut trigger_wrapper = Block {
-        stmts: vec![crate::ast::Stmt {
+    let mut trigger_wrapper = Block::new(
+        vec![crate::ast::Stmt {
             kind: StmtKind::Expr(trigger_expr),
             span: h.event.span,
         }],
-        span: h.event.span,
-    };
+        h.event.span,
+        ctx.source_id,
+    );
     crate::codegen::cpp_tb::rewrite_testbench_scope_body(&mut trigger_wrapper, tb, &HashSet::new());
+    trigger_wrapper.stmt_sources.remove(0);
     let StmtKind::Expr(rewritten) = trigger_wrapper.stmts.remove(0).kind else {
         unreachable!("trigger wrapper holds exactly the Expr statement we inserted");
     };
@@ -7818,7 +8485,7 @@ fn lower_tb_cycle_service_body<'a>(
     if !b.is_terminated() {
         b.terminate(Terminator::Return);
     }
-    let f = b.finish(id, name, FunctionKind::TestHook, owner)?;
+    let f = b.finish(id, name, FunctionKind::TestHook { member }, owner)?;
     Ok((f, trigger))
 }
 
@@ -7840,6 +8507,7 @@ fn lower_reg_cb_body<'a>(
     ctx: &'a LowerCtx,
     helpers: &'a helpers::HelperRegistry<'a>,
     side_tables: &'a RefCell<SideTables>,
+    member: ir::TestHookMember,
 ) -> Result<TbFunction, LowerError> {
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     reserve_tb_record_names(&mut b, ctx);
@@ -7870,7 +8538,7 @@ fn lower_reg_cb_body<'a>(
     if !b.is_terminated() {
         b.terminate(Terminator::Return);
     }
-    let mut f = b.finish(id, name, FunctionKind::TestHook, owner)?;
+    let mut f = b.finish(id, name, FunctionKind::TestHook { member }, owner)?;
     f.params = vec![TypedParam {
         name: "data".to_string(),
         ty: IrType::UInt(None),
@@ -7894,7 +8562,9 @@ pub(crate) fn placeholder_function(id: FunctionId) -> TbFunction {
     TbFunction {
         id,
         name: format!("_pending_{}", id.0),
-        kind: FunctionKind::TestHook,
+        kind: FunctionKind::TestHook {
+            member: ir::TestHookMember::Pending,
+        },
         params: Vec::new(),
         locals: Vec::new(),
         blocks: vec![BasicBlock {
@@ -7903,6 +8573,7 @@ pub(crate) fn placeholder_function(id: FunctionId) -> TbFunction {
         }],
         entry: BlockId(0),
         owner: None,
+        testbench_record_locals: Vec::new(),
         ret: None,
         implicit_returns: Vec::new(),
     }
@@ -7938,9 +8609,14 @@ impl<'a> FuncBuilder<'a> {
     ) -> Self {
         FuncBuilder {
             ctx,
+            current_source_id: ctx.source_id,
             helpers,
             locals: Vec::new(),
-            local_names: HashSet::new(),
+            // Testbench component instances are emitted in the enclosing C++
+            // scope. Reserve their names so a lexically shadowing HARC local
+            // receives a distinct C++ spelling and an explicit `_tb.<name>`
+            // path can still address the captured instance.
+            local_names: ctx.component_fields.keys().cloned().collect(),
             scopes: vec![HashMap::new()],
             blocks: vec![BlockInProgress {
                 stmts: Vec::new(),
@@ -7950,6 +8626,9 @@ impl<'a> FuncBuilder<'a> {
             loop_stack: Vec::new(),
             temp_counter: 0,
             inline_frames: Vec::new(),
+            standalone_dut_aliases: HashSet::new(),
+            in_testbench_method: false,
+            testbench_method_owner: None,
             tb_record_locals: HashMap::new(),
             helper_ret: None,
             pure_helper_abi: false,
@@ -7959,6 +8638,7 @@ impl<'a> FuncBuilder<'a> {
             in_transactor_method: false,
             in_reevaluated_predicate: false,
             self_transactor: None,
+            self_transactor_id: None,
             self_transactor_methods: HashMap::new(),
             self_transactor_method_active_only: false,
             current_body_name: None,
@@ -7966,7 +8646,9 @@ impl<'a> FuncBuilder<'a> {
             inactive_target_state_fields: HashSet::new(),
             in_check: false,
             in_test_body: false,
+            test_hook_site_owner: None,
             let_widths: HashMap::new(),
+            component_local_modes: HashMap::new(),
             self_component: None,
             self_component_active_only: false,
             side_tables,
@@ -7977,6 +8659,14 @@ impl<'a> FuncBuilder<'a> {
             concurrent_target_ooo_lanes: false,
             next_tlm_fork_tag: HashMap::new(),
         }
+    }
+
+    pub(crate) fn source_site(&self, span: crate::lexer::Span) -> SourceSite {
+        SourceSite::new(self.current_source_id, span)
+    }
+
+    pub(crate) fn record_error_span(&self, span: crate::lexer::Span) {
+        self.ctx.diagnostics.record(self.current_source_id, span);
     }
 
     /// Reject an AST access rooted at state that does not exist in this
@@ -8078,12 +8768,27 @@ impl FuncBuilder<'_> {
     /// way v1's `[&]`-capturing lambdas do), or — inside an inline
     /// frame — a helper parameter bound to the DUT at the call site.
     pub(crate) fn is_dut_name(&self, name: &str) -> bool {
-        if let Some(f) = self.inline_frames.last() {
-            if f.dut_aliases.contains(name) {
-                return true;
+        self.resolved_dut_name(name).is_some()
+    }
+
+    /// Resolve a source DUT alias to the stable receiver name carried by the
+    /// enclosing callable. Inline-helper parameters retain their caller's
+    /// receiver; canonical testbench-method module parameters retain their
+    /// own declared name.
+    pub(crate) fn resolved_dut_name(&self, name: &str) -> Option<String> {
+        if let Some(frame) = self.inline_frames.last() {
+            if let Some(receiver) = frame.dut_aliases.get(name) {
+                return Some(receiver.clone());
             }
         }
-        name == self.ctx.dut_field
+        if self.standalone_dut_aliases.contains(name) {
+            return Some(name.to_string());
+        }
+        (name == self.ctx.dut_field).then(|| self.ctx.dut_field.clone())
+    }
+
+    pub(crate) fn in_testbench_method_scope(&self) -> bool {
+        self.in_testbench_method && self.inline_frames.is_empty()
     }
 
     /// Declare a new local for a source name. Shadowed / reused names
@@ -8209,25 +8914,19 @@ impl FuncBuilder<'_> {
         self.tb_record_locals.get(name).copied()
     }
 
-    pub(crate) fn in_testbench_method_frame(&self) -> bool {
-        self.inline_frames
-            .last()
-            .map_or(false, |f| f.is_testbench_method)
-    }
-
     /// Lookup shared transaction/struct-typed testbench fields only from
     /// contexts that model v1's testbench capture: the run/check/hook body
     /// itself, or an inlined `_tb.<method>` body. Free helpers remain
     /// fenced from caller/testbench locals.
     pub(crate) fn lookup_tb_record_field_in_capture_scope(&self, name: &str) -> Option<LocalId> {
-        let can_capture = self.inline_frames.is_empty() || self.in_testbench_method_frame();
+        let can_capture = self.inline_frames.is_empty();
         can_capture
             .then(|| self.lookup_tb_record_field(name))
             .flatten()
     }
 
     pub(crate) fn tb_scalar_field_in_capture_scope(&self, name: &str) -> Option<String> {
-        let can_capture = self.inline_frames.is_empty() || self.in_testbench_method_frame();
+        let can_capture = self.inline_frames.is_empty();
         (can_capture && self.ctx.tb_scalar_fields.contains_key(name)).then(|| name.to_string())
     }
 
@@ -8254,6 +8953,16 @@ impl FuncBuilder<'_> {
             IrType::Component(c) => Some(c),
             _ => None,
         }
+    }
+
+    /// The root mode of a default-constructed component local. The outer
+    /// `Option` distinguishes an instance local from a by-value component
+    /// parameter/copy; the inner option is the source's optional mode.
+    pub(crate) fn component_local_instance_mode(
+        &self,
+        l: LocalId,
+    ) -> Option<Option<ir::ComponentInstanceMode>> {
+        self.component_local_modes.get(&l).copied()
     }
 
     /// `Some(element type)` when the local is a transaction-sequence
@@ -8338,6 +9047,25 @@ impl FuncBuilder<'_> {
             .filter(|&i| reachable[i])
             .map(|i| remap[i])
             .collect();
+        let mut testbench_record_locals = self
+            .tb_record_locals
+            .into_iter()
+            .map(|(field, local)| {
+                let record = match self.locals[local.index()].ty {
+                    IrType::Record(record) => record,
+                    ref other => panic!(
+                        "testbench record local %{0} `{field}` has non-record type {other:?}",
+                        local.0
+                    ),
+                };
+                ir::TbRecordLocalBinding {
+                    local,
+                    field,
+                    record,
+                }
+            })
+            .collect::<Vec<_>>();
+        testbench_record_locals.sort_by_key(|binding| binding.local);
 
         Ok(TbFunction {
             id,
@@ -8348,6 +9076,7 @@ impl FuncBuilder<'_> {
             blocks: kept,
             entry: BlockId(0),
             owner,
+            testbench_record_locals,
             ret: self.helper_ret,
             implicit_returns,
         })
@@ -8386,6 +9115,7 @@ fn remap_terminator(t: &mut Terminator, remap: &[BlockId]) {
 /// emission supplies the receiver. Initiator bodies still share one function
 /// per type, so this is idempotent for the same instance but `Err(prev)` for a
 /// different one. The scan-then-fill split keeps the body un-mutated on error.
+#[allow(dead_code)]
 fn fill_transactor_state_instance(func: &mut TbFunction, instance: &str) -> Result<(), String> {
     if let Some(prev) = existing_state_instance(func) {
         if prev != instance {
@@ -8502,6 +9232,7 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 }
                 ir::Stmt::TransactorCall { call, .. }
                 | ir::Stmt::TransactorSelfCall { call, .. } => in_expr(call),
+                ir::Stmt::TestbenchCall { args, .. } => args.iter().find_map(in_expr),
                 ir::Stmt::ScoreboardOp { op, .. } => match op {
                     ir::ScoreboardOp::QueuePush { value, .. }
                     | ir::ScoreboardOp::ScalarWrite { value, .. } => in_expr(value),
@@ -8539,7 +9270,9 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                     in_expr(value)
                 }
                 ir::Stmt::ComponentQueuePop { .. }
+                | ir::Stmt::ComponentInit { .. }
                 | ir::Stmt::ComponentSubAssign { .. }
+                | ir::Stmt::ComponentAssign { .. }
                 | ir::Stmt::TbQueuePop { .. } => None,
                 // Fork/join descriptors carry their request payload exprs;
                 // a responder body never forks, but scan for completeness.
@@ -8653,6 +9386,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 }
             }
             ir::Expr::Literal { .. }
+            | ir::Expr::StringLiteral(_)
             | ir::Expr::WideLiteral(_)
             | ir::Expr::Local(_)
             | ir::Expr::CycleCount
@@ -8772,6 +9506,11 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 }
                 ir::Stmt::TransactorCall { call, .. }
                 | ir::Stmt::TransactorSelfCall { call, .. } => fill_expr(call, instance),
+                ir::Stmt::TestbenchCall { args, .. } => {
+                    for arg in args {
+                        fill_expr(arg, instance);
+                    }
+                }
                 ir::Stmt::ScoreboardOp { op, .. } => match op {
                     ir::ScoreboardOp::QueuePush { value, .. }
                     | ir::ScoreboardOp::ScalarWrite { value, .. } => fill_expr(value, instance),
@@ -8809,7 +9548,9 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 ir::Stmt::SeqPush { value, .. } => fill_expr(value, instance),
                 ir::Stmt::ComponentQueuePush { value, .. } => fill_expr(value, instance),
                 ir::Stmt::ComponentQueuePop { .. }
+                | ir::Stmt::ComponentInit { .. }
                 | ir::Stmt::ComponentSubAssign { .. }
+                | ir::Stmt::ComponentAssign { .. }
                 | ir::Stmt::TbQueuePop { .. } => {}
                 ir::Stmt::TlmFork(desc) => {
                     for a in &mut desc.args {
@@ -8892,18 +9633,15 @@ fn fill_visit_port(
             .find(|((rch, rsig), _)| rch == &p.port_path[1] && rsig == &p.port_path[2])
         {
             p.port_path = vec![port.clone()];
-            p.deferred_bus_binding = Some(crate::ir::DeferredBusBinding::Selected(
-                binding.to_string(),
-            ));
+            p.deferred_bus_binding =
+                Some(crate::ir::DeferredBusBinding::Selected(binding.to_string()));
             return;
         }
     }
     if p.port_path.first().is_some_and(|seg| seg == placeholder) {
         p.port_path[0] = binding.to_string();
     }
-    p.deferred_bus_binding = Some(crate::ir::DeferredBusBinding::Selected(
-        binding.to_string(),
-    ));
+    p.deferred_bus_binding = Some(crate::ir::DeferredBusBinding::Selected(binding.to_string()));
 }
 
 /// Recursively fill/check the placeholder bus prefix of every `PortRef`
@@ -8988,6 +9726,7 @@ fn fill_visit_expr(
             }
         }
         Expr::Literal { .. }
+        | Expr::StringLiteral(_)
         | Expr::WideLiteral(_)
         | Expr::Local(_)
         | Expr::CycleCount
@@ -9009,49 +9748,71 @@ fn fill_visit_expr(
     }
 }
 
-/// Fill the placeholder bus prefix in a single schema-resident expression
-/// (a monitor cycle-handler's synthesized `valid && ready` trigger, which
-/// lives on the schema rather than in a function body, so the body-walking
-/// `fill_initiator_bus_prefix` does not reach it). Same one-instance-per-
-/// type conflict gate.
-fn fill_initiator_bus_prefix_expr(
-    e: &mut crate::ir::Expr,
-    binding: &str,
-    remap: &[((String, String), String)],
-) -> Result<(), String> {
-    let placeholder = transactors::INITIATOR_BUS_PLACEHOLDER;
-    let mut conflict = None;
-    fill_visit_expr(e, placeholder, binding, remap, false, &mut conflict);
-    if let Some(prev) = conflict {
-        return Err(prev);
+#[allow(dead_code)]
+fn retarget_transactor_self_calls(
+    func: &mut TbFunction,
+    source: TransactorId,
+    target: TransactorId,
+    functions: &HashMap<FunctionId, FunctionId>,
+) {
+    let mut rewrite_call = |nested: &mut ir::Expr| {
+        if let ir::Expr::Call(
+            ir::CallTarget::TransactorSelfMethod {
+                transactor,
+                function,
+                ..
+            },
+            _,
+        ) = nested
+        {
+            if *transactor == source {
+                *transactor = target;
+                if let Some(mapped) = functions.get(function) {
+                    *function = *mapped;
+                }
+            }
+        }
+    };
+    let mut rewrite_expr = |expr: &mut ir::Expr| {
+        // `walk_expr_mut` visits descendants only, so rewrite the root call
+        // first. A `TransactorSelfCall` stores this root expression directly.
+        rewrite_call(expr);
+        ir::visit::walk_expr_mut(expr, &mut rewrite_call);
+    };
+    for block in &mut func.blocks {
+        for stmt in &mut block.stmts {
+            ir::visit::visit_stmt_exprs_mut(stmt, &mut rewrite_expr);
+        }
+        ir::visit::visit_terminator_exprs_mut(&mut block.terminator, &mut rewrite_expr);
     }
-    fill_visit_expr(e, placeholder, binding, remap, true, &mut conflict);
-    Ok(())
 }
 
 #[derive(Clone)]
 struct BoundInitiatorTemplate {
     schema: ir::TransactorSchema,
     functions: Vec<TbFunction>,
-    claimed: bool,
 }
 
-/// Clone one bound initiator schema and its method functions for a concrete
-/// test-scope instance. Bus ports are physical C++ identifiers, so leaving
-/// them on the source-type schema would make a second binding overwrite the
-/// first. The clone receives an instance-qualified internal name; source type
-/// lookup continues to resolve the untouched template schema.
+/// Clone one bound initiator schema and its method functions for an additional
+/// concrete binding in the same test. Bodies retain logical bus ports and a
+/// receiver-relative state placeholder; the emitted call site supplies both
+/// instance-specific resources.
 fn specialize_bound_initiator(
     prog: &mut TbProgram,
     template: &BoundInitiatorTemplate,
     instance: &str,
-    binding: &str,
-    remap: &[((String, String), String)],
 ) -> Result<TransactorId, LowerError> {
     let specialized_id = TransactorId(prog.transactors.len() as u32);
     let mut schema = template.schema.clone();
     schema.emission_name = Some(format!("{}__{instance}", schema.name));
     let emission_name = schema.emission_name().to_string();
+    let function_base = prog.functions.len() as u32;
+    let function_ids = schema
+        .methods
+        .iter()
+        .enumerate()
+        .map(|(index, method)| (method.function, FunctionId(function_base + index as u32)))
+        .collect::<HashMap<_, _>>();
 
     for method in &mut schema.methods {
         let mut func = template
@@ -9065,19 +9826,27 @@ fn specialize_bound_initiator(
                     template.schema.name, method.function.0
                 ))
             })?;
-        let function_id = FunctionId(prog.functions.len() as u32);
+        let function_id = function_ids[&method.function];
         func.id = function_id;
         func.name = format!("{emission_name}_{}", method.name);
+        let FunctionKind::TransactorBody {
+            transactor: source,
+            member,
+            name,
+        } = &func.kind
+        else {
+            return Err(LowerError::Invalid(format!(
+                "internal bound-initiator template `{}` has non-transactor fn{}",
+                template.schema.name, func.id.0
+            )));
+        };
+        let source = *source;
         func.kind = FunctionKind::TransactorBody {
             transactor: specialized_id,
+            member: *member,
+            name: name.clone(),
         };
-        if let Err(previous) = fill_initiator_bus_prefix(&mut func, binding, remap) {
-            return Err(LowerError::Invalid(format!(
-                "internal bound-initiator specialization for `{}` found an already-filled \
-                 bus binding `{previous}` while selecting `{binding}`",
-                schema.name
-            )));
-        }
+        retarget_transactor_self_calls(&mut func, source, specialized_id, &function_ids);
         prog.functions.push(func);
         method.function = function_id;
     }
@@ -9087,6 +9856,7 @@ fn specialize_bound_initiator(
     Ok(specialized_id)
 }
 
+#[allow(dead_code)]
 fn fill_initiator_bus_prefix(
     func: &mut TbFunction,
     binding: &str,
@@ -9197,6 +9967,11 @@ fn fill_initiator_bus_prefix(
                     Stmt::TransactorCall { call, .. } | Stmt::TransactorSelfCall { call, .. } => {
                         visit_expr(call, placeholder, binding, remap, rewrite, &mut conflict)
                     }
+                    Stmt::TestbenchCall { args, .. } => {
+                        for arg in args {
+                            visit_expr(arg, placeholder, binding, remap, rewrite, &mut conflict);
+                        }
+                    }
                     Stmt::ScoreboardOp { op, .. } => match op {
                         ir::ScoreboardOp::QueuePush { value, .. }
                         | ir::ScoreboardOp::ScalarWrite { value, .. } => {
@@ -9215,7 +9990,9 @@ fn fill_initiator_bus_prefix(
                         visit_expr(value, placeholder, binding, remap, rewrite, &mut conflict)
                     }
                     Stmt::ComponentQueuePop { .. }
+                    | Stmt::ComponentInit { .. }
                     | Stmt::ComponentSubAssign { .. }
+                    | Stmt::ComponentAssign { .. }
                     | Stmt::TransactorStateQueuePop { .. }
                     | Stmt::TbQueuePop { .. } => {}
                     Stmt::TlmFork(desc) => {

@@ -15,13 +15,13 @@ use super::*;
 mod implementation;
 
 pub(crate) use implementation::{
-    bound_transactor_is_component, connect_delivery_is_faithful,
-    connect_payload_matches_ir_type, dotted_path, endpoint_label, event_payloads_agree_in_shape,
-    field_scalar_width_ok, fixed_vec_elem_ir_type, fixed_vec_ir_type_with_records,
-    queue_fixed_vec_elem_ir_type,
-    fold_field_default, is_event_field, lower_component_bodies, lower_component_schema,
-    lower_event_payload, lower_queue_elem, resolve_connects, resolve_testbench_connects,
-    scalar_field_ir_type, scoreboard_is_component, transactor_has_mode_sensitive_analysis_surface,
+    bound_transactor_is_component, connect_delivery_is_faithful, connect_payload_matches_ir_type,
+    dotted_path, endpoint_label, event_payloads_agree_in_shape, field_scalar_width_ok,
+    fixed_vec_elem_ir_type, fixed_vec_ir_type_with_records, fold_field_default, is_event_field,
+    lower_component_bodies, lower_component_schema, lower_event_payload, lower_queue_elem,
+    queue_fixed_vec_elem_ir_type, resolve_connects, resolve_testbench_connects,
+    scalar_field_ir_type, scalar_width, scoreboard_is_component, testbench_method_param_ir_type,
+    testbench_method_schema_ir_type, transactor_has_mode_sensitive_analysis_surface,
     transactor_has_target_threads, transactor_is_always_on_dut_event_host,
     transactor_is_analysis_source, transactor_is_component, transactor_is_dut_poking_bfm,
     transactor_is_event_driven, transactor_is_function_library, transactor_is_passive_helper,

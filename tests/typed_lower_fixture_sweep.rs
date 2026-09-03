@@ -61,7 +61,7 @@ fn lower_problem_does_not_panic_on_any_fixture() {
                 txn,
                 None,
                 Span::default(),
-                ConstraintProblemId(total_txns as u32),
+                ConstraintProblemId(total_txns as u64),
             );
             match result {
                 Ok(problem) => {

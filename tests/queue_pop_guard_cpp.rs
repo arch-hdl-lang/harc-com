@@ -1,4 +1,4 @@
-//! Runtime gate for `harc_rt::HarcQueue<T>::pop()` on an empty queue.
+//! Runtime gate for guarded `harc_rt::HarcQueue<T>` value reads.
 //!
 //! `pop()` used to call `std::deque::front()` with no emptiness check
 //! (#644). `front()` on an empty deque is undefined behaviour, so a
@@ -9,7 +9,8 @@
 //! scoreboard / component-queue seam (`Stmt::ComponentQueuePop`) emits
 //! a bare `<recv>.<queue>.pop()`.
 //!
-//! The helper now has two paths, and this test pins both, because each
+//! Both `pop()` and the non-destructive `front()` have two paths, and this
+//! test pins them because each
 //! covers what the other cannot:
 //!
 //!   * With a reporter installed — what the generated `run_<Test>()`
@@ -59,9 +60,9 @@ fn cxx() -> Option<String> {
 }
 
 /// `argv[1]` selects the path under test:
-///   * `report` — reporter installed: the empty pop must call it once,
-///     return a zero-filled `T`, and NOT abort.
-///   * `abort`  — no reporter: the empty pop must abort.
+///   * `report` / `front-report` — reporter installed: the empty read must
+///     name its operation, return a zero-filled `T`, and NOT abort.
+///   * `abort` / `front-abort` — no reporter: the empty read must abort.
 ///   * anything else — the ordinary push/pop path, so a guard that
 ///     fired on a NON-empty queue fails here too.
 const PROBE: &str = r#"#include "harc_queue_rt.h"
@@ -79,6 +80,16 @@ int main(int argc, char** argv) {
         // Reported exactly once, poisoned with a deterministic zero,
         // and the queue is still coherent afterwards.
         std::printf("reported=%d v=%llu size=%zu\n", reported, v, q.size());
+        // The scope must uninstall on the way out, or a later read would
+        // call into a dead test context.
+        return 0;
+    }
+
+    if (std::strcmp(mode, "front-report") == 0) {
+        int reported = 0;
+        harc_rt::HarcQueueFatalScope scope([&]() { reported++; });
+        unsigned long long v = q.front();
+        std::printf("reported=%d v=%llu size=%zu\n", reported, v, q.size());
         // The scope must uninstall on the way out, or a later pop would
         // call into a dead test context.
         return 0;
@@ -92,23 +103,43 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (std::strcmp(mode, "nested") == 0) {
+        int outer = 0;
+        int inner = 0;
+        harc_rt::HarcQueueFatalScope outer_scope([&]() { outer++; });
+        {
+            harc_rt::HarcQueueFatalScope inner_scope([&]() { inner++; });
+            (void)q.pop();
+        }
+        (void)q.pop();
+        std::printf("outer=%d inner=%d\n", outer, inner);
+        return 0;
+    }
+
     if (std::strcmp(mode, "abort") == 0) {
         (void)q.pop();
         std::printf("UNREACHABLE\n");
         return 0;
     }
 
+    if (std::strcmp(mode, "front-abort") == 0) {
+        (void)q.front();
+        std::printf("UNREACHABLE\n");
+        return 0;
+    }
+
     q.push(7);
     q.push(9);
+    unsigned long long front = q.front();
     unsigned long long a = q.pop();
     unsigned long long b = q.pop();
-    std::printf("%llu %llu %d %zu\n", a, b, (int)q.empty(), q.size());
+    std::printf("%llu %llu %llu %d %zu\n", front, a, b, (int)q.empty(), q.size());
     return 0;
 }
 "#;
 
 #[test]
-fn empty_queue_pop_reports_fatal_and_aborts_only_without_a_reporter() {
+fn empty_queue_value_reads_report_fatal_and_abort_only_without_a_reporter() {
     // A silent skip would let the UB this test exists for ship on any
     // machine without a compiler, so an absent toolchain fails unless
     // the operator opts out explicitly (same contract as
@@ -166,8 +197,8 @@ fn empty_queue_pop_reports_fatal_and_aborts_only_without_a_reporter() {
         "non-empty pop path exited non-zero:\n{stderr}",
     );
     assert_eq!(
-        stdout, "7 9 1 0",
-        "push/pop no longer round-trips in FIFO order",
+        stdout, "7 7 9 1 0",
+        "front must not remove the value and push/pop must retain FIFO order",
     );
 
     // Reporter installed — the generated `run_<Test>()` shape. The
@@ -185,6 +216,16 @@ fn empty_queue_pop_reports_fatal_and_aborts_only_without_a_reporter() {
          value; stderr:\n{stderr}",
     );
 
+    let (status, stdout, stderr) = run("front-report");
+    assert!(
+        status.success(),
+        "empty front aborted even though a reporter was installed:\n{stderr}",
+    );
+    assert_eq!(
+        stdout, "reported=1 v=0 size=0",
+        "empty front must report exactly once, preserve the queue, and return a deterministic zero; stderr:\n{stderr}",
+    );
+
     // The scope uninstalls on the way out — otherwise a later pop would
     // call into a test context that no longer exists.
     let (status, stdout, _) = run("uninstalled");
@@ -192,6 +233,15 @@ fn empty_queue_pop_reports_fatal_and_aborts_only_without_a_reporter() {
     assert_eq!(
         stdout, "installed=0",
         "HarcQueueFatalScope left its reporter installed after destruction",
+    );
+
+    // A generated run can be nested under a caller-owned reporting scope.
+    // Leaving the inner scope must restore, rather than erase, that caller.
+    let (status, stdout, stderr) = run("nested");
+    assert!(status.success(), "nested reporter probe failed:\n{stderr}");
+    assert_eq!(
+        stdout, "outer=1 inner=1",
+        "the inner queue-fatal scope did not restore the previous reporter",
     );
 
     // No reporter — no test context to fail cleanly through, so this
@@ -217,6 +267,26 @@ fn empty_queue_pop_reports_fatal_and_aborts_only_without_a_reporter() {
             status.signal(),
             Some(SIGABRT),
             "empty pop did not abort(); status: {status:?}, stderr:\n{stderr}",
+        );
+    }
+
+    let (status, stdout, stderr) = run("front-abort");
+    assert!(
+        !stdout.contains("UNREACHABLE"),
+        "front() on an empty queue returned instead of aborting with no reporter installed; stdout:\n{stdout}",
+    );
+    assert!(!status.success(), "empty front exited 0; stderr:\n{stderr}");
+    assert!(
+        stderr.contains("HARC-ERROR: front() on an empty queue"),
+        "empty front did not name the operation; stderr:\n{stderr}",
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(SIGABRT),
+            "empty front did not abort(); status: {status:?}, stderr:\n{stderr}",
         );
     }
 

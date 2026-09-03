@@ -24,7 +24,7 @@ end function alloc_one
 
 function free_one(dut: TaskQueue, handle: uint<32>)
     dut.free_req_valid = 1
-    dut.free_req_handle = handle
+    dut.free_req_handle = handle.trunc<3>()
     wait 1 cycle
     dut.free_req_valid = 0
     dut.free_req_handle = 0
@@ -55,7 +55,7 @@ end function delete_head_one
 
 function read_data_one(dut: TaskQueue, handle: uint<32>) -> uint<32>
     dut.read_data_req_valid = 1
-    dut.read_data_req_handle = handle
+    dut.read_data_req_handle = handle.trunc<3>()
     wait 1 cycle
     let data = dut.read_data_resp_valid ? dut.read_data_resp_data : 57005
     dut.read_data_req_valid = 0
@@ -66,7 +66,7 @@ end function read_data_one
 
 function write_data_one(dut: TaskQueue, handle: uint<32>, data: uint<32>)
     dut.write_data_req_valid = 1
-    dut.write_data_req_handle = handle
+    dut.write_data_req_handle = handle.trunc<3>()
     dut.write_data_req_data = data
     wait 1 cycle
     dut.write_data_req_valid = 0

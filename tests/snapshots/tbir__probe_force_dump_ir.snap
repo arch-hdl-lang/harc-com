@@ -3,10 +3,49 @@ source: tests/tbir.rs
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
-  testbench tb0 ProbeForceTb { dut: CpuPipe }
-  test ProbeForceTest tb=tb0 run=fn0 check=-
+  probe p0 CpuPipe.alu_a : uint<32> at alu0.a shared
+  probe p1 CpuPipe.inject_rs1 : uint<32> at decode_rs1_val force shared
+  testbench tb0 ProbeForceTb { dut: CpuPipe } probe=p0 probe=p1 component helper=c0
+  test ProbeForceTest tb=tb0 run=fn3 check=-
+  component c0 ProbeForceHelper (agent)
+    method read_inject(0 args) -> ret = fn0
+    method force_inject(1 arg) = fn1
+    method release_inject(0 args) = fn2
 
-fn fn0 run_ProbeForceTest [kind=Run, owner=tb0]
+fn fn0 comp_method_0 [kind=ComponentMethod(c0)]
+  locals:
+    %0 __ret : uint<32>
+    %1 __t0 : uint<32>
+  ret = %__ret
+  entry = b0
+
+  b0:
+    DutRead(%__t0, dut.inject_rs1 (force))
+    Assign(%__ret, %__t0)
+    -> Return
+
+fn fn1 comp_method_1 [kind=ComponentMethod(c0)]
+  params:
+    value : uint<32>
+  locals:
+    %0 value : uint<32>
+  entry = b0
+
+  b0:
+    DutWrite(dut.inject_rs1 (force), %value)
+    -> Return
+
+fn fn2 comp_method_2 [kind=ComponentMethod(c0)]
+  entry = b0
+
+  b0:
+    ProbeRelease(dut.inject_rs1 (force))
+    -> Return
+
+fn fn3 run_ProbeForceTest [kind=Run, owner=tb0]
+  locals:
+    %0 __t0 : uint<32>
+    %1 __t1 : uint<32>
   entry = b0
 
   b0:
@@ -34,12 +73,16 @@ fn fn0 run_ProbeForceTest [kind=Run, owner=tb0]
 
   b4:
     AssertCheck { cond: (dut.alu_a (probe) == 100), on_fail: "natural alu_a: expected 100, got %lld", dut.alu_a (probe) }
-    DutWrite(dut.inject_rs1 (force), 3735928559)
+    ComponentCall(%__t0 = helper.c0::read_inject([]))
+    AssertCheck { cond: (%__t0 == 100), on_fail: "shared helper read: expected 100" }
+    ComponentCall(helper.c0::force_inject([3735928559]))
     -> WaitCycles(1, b5)
 
   b5:
     AssertCheck { cond: (dut.alu_a (probe) == 3735928559), on_fail: "forced alu_a: expected 0xDEADBEEF, got 0x%08llx", dut.alu_a (probe) }
-    ProbeRelease(dut.inject_rs1 (force))
+    ComponentCall(%__t1 = helper.c0::read_inject([]))
+    AssertCheck { cond: (%__t1 == 3735928559), on_fail: "shared helper force readback failed" }
+    ComponentCall(helper.c0::release_inject([]))
     DutWrite(dut.rs1_data, 42)
     DutWrite(dut.imem_data, 96)
     -> WaitCycles(1, b6)

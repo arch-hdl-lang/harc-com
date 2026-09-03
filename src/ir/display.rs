@@ -9,6 +9,19 @@ use std::fmt::{self, Display, Formatter, Write as _};
 impl Display for TbProgram {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         writeln!(f, "tb-ir program")?;
+        for probe in &self.probes {
+            writeln!(
+                f,
+                "  probe p{} {}.{} : {} at {}{}{}",
+                probe.id.0,
+                probe.dut_type,
+                probe.name,
+                probe_type_str(probe.ty),
+                probe.sv_path,
+                if probe.force { " force" } else { "" },
+                if probe.shared { " shared" } else { "" },
+            )?;
+        }
         for (i, tb) in self.testbenches.iter().enumerate() {
             write!(
                 f,
@@ -21,6 +34,9 @@ impl Display for TbProgram {
             )?;
             for (field, cov) in &tb.cov_fields {
                 write!(f, " cov {field}=cg{}", cov.0)?;
+            }
+            for probe in &tb.probes {
+                write!(f, " probe=p{}", probe.0)?;
             }
             for field in &tb.state_fields {
                 match field {
@@ -543,13 +559,14 @@ static EMPTY_CHECK_SCOPE: std::sync::LazyLock<TbFunction> =
     std::sync::LazyLock::new(|| TbFunction {
         id: crate::ir::FunctionId(u32::MAX),
         name: "<check>".to_string(),
-        kind: crate::ir::FunctionKind::Run,
+        kind: crate::ir::FunctionKind::Helper,
         owner: None,
         params: Vec::new(),
         locals: Vec::new(),
         blocks: Vec::new(),
         entry: crate::ir::BlockId(0),
         ret: None,
+        testbench_record_locals: Vec::new(),
         implicit_returns: Vec::new(),
     });
 
@@ -596,26 +613,28 @@ impl Display for TbFunction {
 
 fn kind_str(k: &FunctionKind) -> String {
     match k {
-        FunctionKind::Run => "Run".to_string(),
-        FunctionKind::Check => "Check".to_string(),
+        FunctionKind::TestBody { member, .. } => match member {
+            crate::ir::TestCallableMember::Run => "Run".to_string(),
+            crate::ir::TestCallableMember::Check => "Check".to_string(),
+        },
         FunctionKind::SamplerAuto { covgroup } => format!("SamplerAuto(cg{})", covgroup.0),
         FunctionKind::Helper => "Helper".to_string(),
-        FunctionKind::TransactorBody { transactor } => {
+        FunctionKind::TestbenchMethod { testbench, .. } => {
+            format!("TestbenchMethod(tbt{})", testbench.0)
+        }
+        FunctionKind::TransactorBody { transactor, .. } => {
             format!("TransactorBody(x{})", transactor.0)
         }
-        FunctionKind::ComponentMethod { component } => {
+        FunctionKind::ComponentMethod { component, .. } => {
             format!("ComponentMethod(c{})", component.0)
         }
         FunctionKind::Tseq { elem } => match elem {
             crate::ir::TseqElem::Record(r) => format!("Tseq(r{})", r.0),
             crate::ir::TseqElem::Scalar(t) => format!("Tseq({})", type_str(t)),
         },
-        FunctionKind::TestHook => "TestHook".to_string(),
+        FunctionKind::TestHook { member } => format!("TestHook({member:?})"),
         FunctionKind::TestbenchLifecycle { testbench, phase } => {
             format!("TestbenchLifecycle(tb{}, {})", testbench.0, phase.keyword())
-        }
-        FunctionKind::TestbenchMethod { testbench } => {
-            format!("TestbenchMethod(tb{})", testbench.0)
         }
     }
 }
@@ -639,6 +658,7 @@ fn type_str(t: &IrType) -> String {
             }
         },
         IrType::Bool => "bool".to_string(),
+        IrType::String => "String".to_string(),
         IrType::Record(r) => format!("record(r{})", r.0),
         IrType::RecordSeq(r) => format!("seq(r{})", r.0),
         IrType::Seq(t) => format!("seq({})", type_str(t)),
@@ -665,6 +685,16 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::ProbeRelease(p) => format!("ProbeRelease({})", port_str(Some(func), p)),
         Stmt::RecordInit(l, r) => format!("RecordInit({}, r{})", local_str(func, *l), r.0),
         Stmt::AggregateInit(l) => format!("AggregateInit({})", local_str(func, *l)),
+        Stmt::ComponentInit {
+            local,
+            component,
+            mode,
+        } => format!(
+            "ComponentInit({}, c{}, {:?})",
+            local_str(func, *local),
+            component.0,
+            mode
+        ),
         Stmt::RecordFieldWrite {
             local,
             field,
@@ -749,6 +779,33 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::TbQueuePop { field, dest } => {
             format!("TbQueuePop({} = _tb.{field}.pop())", local_str(func, *dest))
         }
+        Stmt::TestbenchCall {
+            function,
+            args,
+            dut_args,
+            dest,
+        } => {
+            let args = args
+                .iter()
+                .enumerate()
+                .map(|(index, arg)| {
+                    if dut_args.contains(&index) {
+                        "<dut>".to_string()
+                    } else {
+                        expr_str(func, arg)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            match dest {
+                Some(dest) => format!(
+                    "TestbenchCall({} = fn{}({args}))",
+                    local_str(func, *dest),
+                    function.0
+                ),
+                None => format!("TestbenchCall(fn{}({args}))", function.0),
+            }
+        }
         Stmt::TransactorStateWrite {
             instance,
             field,
@@ -812,7 +869,7 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         Stmt::PropertyCheck(p) => format!("PropertyCheck(p{})", p.0),
         Stmt::CoverCheck(c) => format!("CoverCheck(c{})", c.0),
         Stmt::CycleHandler(h) => format!("CycleHandler(h{})", h.0),
-        Stmt::EventSubscribe { event, handler } => {
+        Stmt::EventSubscribe { event, handler, .. } => {
             let event = match event {
                 crate::ir::EventChannelRef::Local(event) => local_str(func, *event),
                 crate::ir::EventChannelRef::Component { base, event, .. } => {
@@ -826,6 +883,7 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             side,
             handler,
             captures,
+            ..
         } => {
             let target = match target {
                 crate::ir::MethodHookTarget::Transactor { field, method, .. } => {
@@ -923,15 +981,13 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
                 .chain(subpath.iter().cloned())
                 .collect::<Vec<_>>()
                 .join(".");
-            format!(
-                "ComponentEmit({recv}.{event}, [{}])",
-                a.join(", ")
-            )
+            format!("ComponentEmit({recv}.{event}, [{}])", a.join(", "))
         }
         Stmt::ComponentCall {
             base,
             component,
             method,
+            function: _,
             args,
             dest,
         } => {
@@ -959,6 +1015,11 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
         ),
         Stmt::ComponentSubAssign { dst, field, src } => format!(
             "ComponentSubAssign({}.{field} = {})",
+            comp_base_str(dst),
+            comp_base_str(src)
+        ),
+        Stmt::ComponentAssign { dst, src } => format!(
+            "ComponentAssign({} = {})",
             comp_base_str(dst),
             comp_base_str(src)
         ),
@@ -1023,6 +1084,7 @@ fn sb_query_str(query: &crate::ir::ScoreboardQuery) -> String {
         ScoreboardQuery::Scalar { scalar } => scalar.clone(),
         ScoreboardQuery::QueueSize { queue } => format!("{queue}.size()"),
         ScoreboardQuery::QueueEmpty { queue } => format!("{queue}.empty()"),
+        ScoreboardQuery::QueueFront { queue, .. } => format!("{queue}.front()"),
     }
 }
 
@@ -1215,6 +1277,16 @@ fn port_str(func: Option<&TbFunction>, p: &PortRef) -> String {
     out
 }
 
+fn probe_type_str(ty: ProbeScalarType) -> String {
+    match ty {
+        ProbeScalarType::Bit => "bit".to_string(),
+        ProbeScalarType::Bool => "bool".to_string(),
+        ProbeScalarType::UInt(width) => format!("uint<{width}>"),
+        ProbeScalarType::SInt(width) => format!("sint<{width}>"),
+        ProbeScalarType::Bits(width) => format!("bits<{width}>"),
+    }
+}
+
 /// Render a period/max_idle clause expr (which lowered in the same
 /// builder as the component body `function`) using that function for any
 /// local-name resolution. Field reads render as `self.<field>`; literals
@@ -1230,6 +1302,7 @@ fn expr_str_for_component(
 pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
     match e {
         Expr::Literal { value, .. } => format!("{value}"),
+        Expr::StringLiteral(value) => format!("{value:?}"),
         Expr::CycleCount => "cycle_count".to_string(),
         Expr::ErrorCount => "errors".to_string(),
         Expr::WideLiteral(words) => {
@@ -1293,6 +1366,7 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         Expr::TbQueueQuery { field, query } => match query {
             crate::ir::ScoreboardQuery::QueueSize { .. } => format!("_tb.{field}.size()"),
             crate::ir::ScoreboardQuery::QueueEmpty { .. } => format!("_tb.{field}.empty()"),
+            crate::ir::ScoreboardQuery::QueueFront { .. } => format!("_tb.{field}.front()"),
             crate::ir::ScoreboardQuery::Scalar { .. } => format!("_tb.{field}"),
         },
         Expr::TransactorState { instance, field } => format!("{instance}.{field}"),
@@ -1314,6 +1388,7 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
             let q = match query {
                 crate::ir::ScoreboardQuery::QueueSize { .. } => "size",
                 crate::ir::ScoreboardQuery::QueueEmpty { .. } => "empty",
+                crate::ir::ScoreboardQuery::QueueFront { .. } => "front",
                 crate::ir::ScoreboardQuery::Scalar { .. } => "scalar",
             };
             format!("{instance}.{field}.{q}()")
@@ -1464,13 +1539,19 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
                 CallTarget::Helper { name, .. } => name.clone(),
                 CallTarget::Builtin(n) => format!("builtin:{n}"),
                 CallTarget::ExternFn { name, .. } => format!("extern:{name}"),
-                CallTarget::TransactorMethod { bus_field, method } => {
+                CallTarget::TransactorMethod {
+                    bus_field, method, ..
+                } => {
                     format!("{bus_field}.{method}")
                 }
-                CallTarget::TransactorSelfMethod { transactor, method } => {
-                    format!("self:{transactor}.{method}")
+                CallTarget::TransactorSelfMethod {
+                    transactor_name,
+                    method,
+                    ..
+                } => {
+                    format!("self:{transactor_name}.{method}")
                 }
-                CallTarget::Tseq(n) => format!("tseq:{n}"),
+                CallTarget::Tseq { name, .. } => format!("tseq:{name}"),
             };
             let a = args
                 .iter()
@@ -1535,13 +1616,19 @@ fn cover_expr_str(e: &Expr) -> String {
                 CallTarget::Helper { name, .. } => name.clone(),
                 CallTarget::ExternFn { name, .. } => format!("extern:{name}"),
                 CallTarget::Builtin(n) => format!("builtin:{n}"),
-                CallTarget::TransactorMethod { bus_field, method } => {
+                CallTarget::TransactorMethod {
+                    bus_field, method, ..
+                } => {
                     format!("{bus_field}.{method}")
                 }
-                CallTarget::TransactorSelfMethod { transactor, method } => {
-                    format!("self:{transactor}.{method}")
+                CallTarget::TransactorSelfMethod {
+                    transactor_name,
+                    method,
+                    ..
+                } => {
+                    format!("self:{transactor_name}.{method}")
                 }
-                CallTarget::Tseq(n) => format!("tseq:{n}"),
+                CallTarget::Tseq { name, .. } => format!("tseq:{name}"),
             };
             let a = args
                 .iter()

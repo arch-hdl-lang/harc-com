@@ -6,6 +6,475 @@
 use harc::codegen::{cpp_tb, merge, tbir};
 use harc::parser::parse_source;
 
+fn randomize_problem_ids(file: &harc::ast::SourceFile) -> Vec<u64> {
+    harc::solver::problem_table::build_typed_solver_problem_table(file)
+        .entries
+        .iter()
+        .filter_map(|entry| match (&entry.source, &entry.build) {
+            (
+                harc::solver::problem_table::TypedSolverProblemSource::RandomizeSite { .. },
+                harc::solver::problem_table::TypedSolverProblemBuild::Z3 { typed, .. },
+            ) => Some(typed.problem_id.0),
+            _ => None,
+        })
+        .collect()
+}
+
+fn component_solver_site_tags(cpp: &str) -> std::collections::BTreeSet<&str> {
+    cpp.match_indices("_solver_site_h")
+        .map(|(start, _)| {
+            let tail = &cpp[start..];
+            let end_marker = tail.find("_e").expect("site tag has an end-span marker") + 2;
+            let digit_count = tail[end_marker..]
+                .bytes()
+                .take_while(u8::is_ascii_digit)
+                .count();
+            &tail[..end_marker + digit_count]
+        })
+        .collect()
+}
+
+fn v1_enum_symbol(cpp: &str, source_name: &str) -> String {
+    let prefix = format!("harc_user_enum_{source_name}_");
+    cpp.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .find(|token| token.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no generated enum symbol for `{source_name}` in:\n{cpp}"))
+        .to_string()
+}
+
+#[test]
+fn dut_interface_catalog_preserves_direction_signedness_and_lane_shape() {
+    let dir =
+        std::env::temp_dir().join(format!("harc_dut_interface_catalog_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create interface-catalog test directory");
+    let sv = dir.join("CatalogTop.sv");
+    let arch = dir.join("CatalogTop.arch");
+    std::fs::write(
+        &sv,
+        r#"typedef logic signed [7:0] signed_byte_t;
+typedef int signed_int_t;
+typedef int unsigned unsigned_int_t;
+typedef signed_int_t signed_alias_t;
+module CatalogTop #(
+  parameter int WIDTH = 8,
+  parameter int LANES = 2,
+  parameter type T = signed_alias_t
+)(
+  input logic clk,
+  input logic rst,
+  input logic bool_in,
+  output logic signed [7:0] signed_out,
+  output signed_byte_t typedef_signed_out,
+  output unsigned int unsigned_prefix,
+  output int unsigned unsigned_suffix,
+  output signed_int_t typedef_int_out,
+  output signed_alias_t typedef_alias_out,
+  output T parameter_typedef_out,
+  input logic [WIDTH-1:0] parameterized_in,
+  input logic [LANES-1:0][WIDTH-1:0] packed_lanes,
+  output logic [15:0] unpacked_words [4]
+);
+endmodule
+module Unrelated;
+  typedef logic [3:0] signed_alias_t;
+endmodule
+module CompactTop #(parameter int WIDTH = 9, parameter type T = logic signed [WIDTH-1:0]) (output T compact_q, input logic [WIDTH-1:0] compact_in);
+endmodule
+"#,
+    )
+    .expect("write interface fixture");
+    std::fs::write(
+        &arch,
+        r#"module CatalogTop
+  port clk: in Clock<SysDomain>;
+  port rst: in Reset<Sync>;
+  port bool_in: in Bool;
+  port signed_out: out SInt<8>;
+  port typedef_signed_out: out SInt<8>;
+end module CatalogTop
+"#,
+    )
+    .expect("write native interface fixture");
+    let catalog = cpp_tb::dut_interface_catalog(
+        &[sv],
+        &[arch],
+        "CatalogTop",
+        &std::collections::HashMap::from([("packed_lanes".to_string(), 8)]),
+    )
+    .expect("resolve DUT interface")
+    .expect("catalog exists");
+    assert_eq!(catalog.dut_type(), "CatalogTop");
+    assert_eq!(
+        catalog.port("clk").unwrap().value_type(),
+        &harc::ir::IrType::UInt(Some(1))
+    );
+    assert_eq!(
+        catalog.port("rst").unwrap().value_type(),
+        &harc::ir::IrType::UInt(Some(1))
+    );
+    assert_eq!(
+        catalog.port("bool_in").unwrap().value_type(),
+        &harc::ir::IrType::Bool
+    );
+    let signed = catalog.port("signed_out").expect("signed output");
+    assert_eq!(signed.direction(), harc::ir::PortDirection::Out);
+    assert_eq!(signed.resolved_width(), Some(8));
+    assert_eq!(signed.value_type(), &harc::ir::IrType::SInt(Some(8)));
+    let typedef_signed = catalog
+        .port("typedef_signed_out")
+        .expect("signed typedef output");
+    assert_eq!(typedef_signed.resolved_width(), Some(8));
+    assert_eq!(
+        typedef_signed.value_type(),
+        &harc::ir::IrType::SInt(Some(8))
+    );
+    let packed = catalog.port("packed_lanes").expect("packed lanes");
+    assert_eq!(packed.resolved_width(), Some(16));
+    assert_eq!(packed.packed_lane_width(), Some(8));
+    let unpacked = catalog.port("unpacked_words").expect("unpacked words");
+    assert_eq!(unpacked.resolved_width(), Some(16));
+    assert_eq!(unpacked.unpacked_elements(), Some(4));
+    for name in ["unsigned_prefix", "unsigned_suffix"] {
+        assert_eq!(
+            catalog.port(name).unwrap().value_type(),
+            &harc::ir::IrType::UInt(Some(32))
+        );
+    }
+    for name in [
+        "typedef_int_out",
+        "typedef_alias_out",
+        "parameter_typedef_out",
+    ] {
+        assert_eq!(
+            catalog.port(name).unwrap().value_type(),
+            &harc::ir::IrType::SInt(Some(32))
+        );
+    }
+    let overridden = cpp_tb::dut_interface_catalog_with_parameter_overrides(
+        &[dir.join("CatalogTop.sv")],
+        &[dir.join("CatalogTop.arch")],
+        "CatalogTop",
+        &std::collections::HashMap::from([("packed_lanes".to_string(), 8)]),
+        &["WIDTH=13".to_string(), "LANES=3".to_string()],
+    )
+    .expect("resolve overridden DUT interface")
+    .expect("overridden catalog exists");
+    assert_eq!(
+        overridden
+            .port("parameterized_in")
+            .unwrap()
+            .resolved_width(),
+        Some(13)
+    );
+    assert_eq!(
+        overridden.port("packed_lanes").unwrap().resolved_width(),
+        Some(39)
+    );
+    assert_eq!(
+        overridden.port("packed_lanes").unwrap().packed_lane_width(),
+        Some(13)
+    );
+    let compact = cpp_tb::dut_interface_catalog(
+        &[dir.join("CatalogTop.sv")],
+        &[],
+        "CompactTop",
+        &std::collections::HashMap::new(),
+    )
+    .expect("resolve compact ANSI DUT interface")
+    .expect("compact ANSI catalog exists");
+    assert_eq!(
+        compact.port("compact_q").unwrap().value_type(),
+        &harc::ir::IrType::SInt(Some(9))
+    );
+    assert_eq!(
+        compact.port("compact_in").unwrap().resolved_width(),
+        Some(9)
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn dut_interface_catalog_resolves_imported_package_symbols_and_verilator_names() {
+    let dir = std::env::temp_dir().join(format!(
+        "harc_dut_interface_packages_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create package interface-catalog directory");
+    let package = dir.join("width_pkg.sv");
+    let top = dir.join("PackageTop.sv");
+    std::fs::write(
+        &package,
+        r#"package width_pkg;
+  localparam int WIDTH = 13;
+  typedef struct packed {
+    logic [WIDTH-1:0] data;
+    logic valid;
+  } payload_t;
+endpackage
+"#,
+    )
+    .expect("write package fixture");
+    std::fs::write(
+        &top,
+        r#"import width_pkg::*;
+module PackageTop(
+  input logic [WIDTH-1:0] payload,
+  input payload_t imported_payload,
+  input width_pkg::payload_t qualified_payload,
+  input logic TEST__ASYNC_DISABLE
+);
+endmodule
+"#,
+    )
+    .expect("write package-backed top fixture");
+
+    let catalog = cpp_tb::dut_interface_catalog(
+        &[package, top],
+        &[],
+        "PackageTop",
+        &std::collections::HashMap::new(),
+    )
+    .expect("resolve package-backed DUT interface")
+    .expect("package-backed catalog exists");
+    assert_eq!(catalog.port("payload").unwrap().resolved_width(), Some(13));
+    for name in ["imported_payload", "qualified_payload"] {
+        assert_eq!(catalog.port(name).unwrap().resolved_width(), Some(14));
+    }
+    assert_eq!(
+        catalog
+            .port_by_physical_name("TEST___05FASYNC_DISABLE")
+            .unwrap()
+            .name(),
+        "TEST__ASYNC_DISABLE"
+    );
+    let source = parse_source(
+        r#"test PhysicalPort
+    let dut : PackageTop
+    run
+        dut.TEST___05FASYNC_DISABLE = 0
+    end run
+end test PhysicalPort
+"#,
+    )
+    .expect("physical-port fixture parses");
+    let source = merge::merge_for_sim(vec![source], None).expect("physical-port fixture merges");
+    let program = harc::ir::lower::lower_program(&source).expect("physical-port fixture lowers");
+    harc::ir::verify::verify_program(&program).expect("physical-port fixture verifies");
+    harc::ir::passes::dut_access::analyze(&program, &catalog)
+        .expect("Verilator physical port spelling resolves through the DUT catalog");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn native_interface_catalog_covers_fifo_type_params_and_grouped_ram_ports() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fifo = cpp_tb::dut_interface_catalog(
+        &[],
+        &[root.join("tests/dut/sync_fifo.arch")],
+        "TxQueue",
+        &std::collections::HashMap::new(),
+    )
+    .expect("scan native FIFO interface")
+    .expect("FIFO catalog exists");
+    assert_eq!(fifo.port("clk").unwrap().resolved_width(), Some(1));
+    assert_eq!(fifo.port("rst").unwrap().resolved_width(), Some(1));
+    assert_eq!(
+        fifo.port("push_data").unwrap().value_type(),
+        &harc::ir::IrType::UInt(Some(8))
+    );
+    assert_eq!(
+        fifo.port("pop_data").unwrap().direction(),
+        harc::ir::PortDirection::Out
+    );
+
+    let ram = cpp_tb::dut_interface_catalog(
+        &[],
+        &[root.join("tests/dut/rom_lut.arch")],
+        "RomLut",
+        &std::collections::HashMap::new(),
+    )
+    .expect("scan native RAM interface")
+    .expect("RAM catalog exists");
+    assert_eq!(ram.port("rd_addr").unwrap().resolved_width(), Some(3));
+    assert_eq!(
+        ram.port("rd_en").unwrap().value_type(),
+        &harc::ir::IrType::Bool
+    );
+    assert_eq!(
+        ram.port("rd_data").unwrap().direction(),
+        harc::ir::PortDirection::Out
+    );
+
+    let arbiter = cpp_tb::dut_interface_catalog(
+        &[],
+        &[root.join("tests/dut/bus_arbiter.arch")],
+        "BusArbiter",
+        &std::collections::HashMap::new(),
+    )
+    .expect("scan native arbiter interface")
+    .expect("arbiter catalog exists");
+    for name in ["request_valid", "request_ready"] {
+        let port = arbiter.port(name).expect("flattened handshake signal");
+        assert_eq!(port.resolved_width(), Some(4));
+        assert_eq!(port.packed_lane_width(), Some(1));
+        assert_eq!(port.packed_lane_type(), Some(&harc::ir::IrType::Bool));
+    }
+    assert_eq!(
+        arbiter.port("request_valid").unwrap().direction(),
+        harc::ir::PortDirection::In
+    );
+    assert_eq!(
+        arbiter.port("request_ready").unwrap().direction(),
+        harc::ir::PortDirection::Out
+    );
+
+    let dir =
+        std::env::temp_dir().join(format!("harc_native_group_catalog_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create native group catalog directory");
+    let grouped = dir.join("Grouped.arch");
+    std::fs::write(
+        &grouped,
+        r#"module Grouped
+  param COUNT: const = 3;
+  ports[COUNT] req
+    valid: in Bool;
+    data: in SInt<8>;
+  end ports req
+end module Grouped
+"#,
+    )
+    .expect("write native grouped interface");
+    let grouped = cpp_tb::dut_interface_catalog(
+        &[],
+        &[grouped],
+        "Grouped",
+        &std::collections::HashMap::new(),
+    )
+    .expect("scan native grouped interface")
+    .expect("grouped catalog exists");
+    let valid = grouped.port("req_valid").expect("grouped valid");
+    assert_eq!(valid.resolved_width(), Some(3));
+    assert_eq!(valid.packed_lane_width(), Some(1));
+    assert_eq!(valid.packed_lane_type(), Some(&harc::ir::IrType::Bool));
+    let data = grouped.port("req_data").expect("grouped data");
+    assert_eq!(data.resolved_width(), Some(24));
+    assert_eq!(data.packed_lane_width(), Some(8));
+    assert_eq!(data.value_type(), &harc::ir::IrType::SInt(Some(24)));
+    assert_eq!(
+        data.packed_lane_type(),
+        Some(&harc::ir::IrType::SInt(Some(8)))
+    );
+    let overridden = cpp_tb::dut_interface_catalog_with_parameter_overrides(
+        &[],
+        &[dir.join("Grouped.arch")],
+        "Grouped",
+        &std::collections::HashMap::new(),
+        &["COUNT=5".to_string()],
+    )
+    .expect("scan overridden native grouped interface")
+    .expect("overridden grouped catalog exists");
+    assert_eq!(
+        overridden.port("req_valid").unwrap().resolved_width(),
+        Some(5)
+    );
+    assert_eq!(
+        overridden.port("req_data").unwrap().resolved_width(),
+        Some(40)
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn parameterized_ansi_packed_lanes_use_one_catalog_and_reject_wide_elements() {
+    let dir = std::env::temp_dir().join(format!(
+        "harc_wide_packed_lane_catalog_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create wide packed-lane test directory");
+    let harc_source = parse_source(
+        r#"test WideLane
+    let dut : LaneTop
+    clock clk = 10ns
+    run
+        dut.lanes[0] = 1
+    end run
+end test WideLane"#,
+    )
+    .expect("wide packed-lane HARC parses");
+    let merged = merge::merge_for_sim(vec![harc_source], None).expect("wide lane source merges");
+    let program = harc::ir::lower::lower_program(&merged).expect("wide lane source lowers");
+    harc::ir::verify::verify_program(&program).expect("wide lane IR verifies structurally");
+
+    for (name, sv) in [
+        (
+            "one_line",
+            "module LaneTop #(parameter int W=8) (input logic clk, input logic [1:0][W-1:0] lanes); endmodule\n",
+        ),
+        (
+            "multi_line",
+            "module LaneTop #(\n  parameter int W=8\n) (\n  input logic clk,\n  input logic [1:0][W-1:0] lanes\n);\nendmodule\n",
+        ),
+    ] {
+        let sv_path = dir.join(format!("{name}.sv"));
+        std::fs::write(&sv_path, sv).expect("write packed-lane SV fixture");
+        let narrow_catalog = cpp_tb::dut_interface_catalog_with_parameter_overrides(
+            std::slice::from_ref(&sv_path),
+            &[],
+            "LaneTop",
+            &std::collections::HashMap::new(),
+            &["W=8".to_string()],
+        )
+        .expect("scan narrow parameterized packed-lane catalog")
+        .expect("narrow packed-lane catalog exists");
+        let mut narrow_opts = cpp_tb::EmitOpts::default();
+        narrow_opts.dut_interface = Some(narrow_catalog);
+        for emitted in [
+            cpp_tb::emit_with_opts(&merged, narrow_opts.clone())
+                .expect("v1 emits the canonical narrow packed lane"),
+            harc::codegen::tbir::emit(&program, &merged, &narrow_opts)
+                .expect("TBIR emits the canonical narrow packed lane"),
+        ] {
+            assert!(
+                emitted.contains("harc_vec_lane_write<8>"),
+                "{name}: canonical lane shape was not used:\n{emitted}"
+            );
+            assert!(
+                !emitted.contains("dut->lanes[0]"),
+                "{name}: packed lane fell back to raw C++ indexing:\n{emitted}"
+            );
+        }
+        let catalog = cpp_tb::dut_interface_catalog_with_parameter_overrides(
+            &[sv_path],
+            &[],
+            "LaneTop",
+            &std::collections::HashMap::new(),
+            &["W=128".to_string()],
+        )
+        .expect("scan parameterized packed-lane catalog")
+        .expect("packed-lane catalog exists");
+        assert_eq!(catalog.port("lanes").unwrap().resolved_width(), Some(256));
+        assert_eq!(
+            catalog.port("lanes").unwrap().packed_lane_width(),
+            Some(128)
+        );
+        let mut opts = cpp_tb::EmitOpts::default();
+        opts.dut_interface = Some(catalog);
+        for error in [
+            cpp_tb::emit_with_opts(&merged, opts.clone())
+                .expect_err("v1 must reject a packed lane wider than its helper carrier"),
+            harc::codegen::tbir::emit(&program, &merged, &opts)
+                .expect_err("TBIR must reject the same packed lane"),
+        ] {
+            assert!(error.0.contains("64"), "{name}: {error}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn compile_and_run_runtime_cpp(name: &str, body: &str) {
     use std::fs;
     use std::process::Command;
@@ -69,10 +538,8 @@ fn arch_scalar_bit_select_uses_lane_helper_in_both_emitters() {
     let merged = merge::merge_for_sim(vec![parsed], Some("LazyMessageCallsFailTest"))
         .expect("merge selected test");
 
-    let scalar_widths = cpp_tb::dut_port_widths_from_files(
-        &[root.join("tests/dut/top_counter.arch")],
-        "Top",
-    );
+    let scalar_widths =
+        cpp_tb::dut_port_widths_from_files(&[root.join("tests/dut/top_counter.arch")], "Top");
     let mut opts = cpp_tb::EmitOpts::default();
     cpp_tb::add_arch_scalar_bit_lanes(&mut opts.vec_lane_widths, &scalar_widths);
 
@@ -121,7 +588,7 @@ end test TraceTest
     assert!(cpp.contains("trace.randomize(cycle_count, _trace_fields);"));
     assert!(cpp.contains("HARC_RT_LOG_PRINTF(log_ctx.sim_log, &trace, cycle_count, sev, fmt);"));
     assert!(cpp.contains(
-        "return harc_rt::log::harc_finish_sim_run(log_ctx, trace, cycle_count, errors);"
+        "return harc_rt::log::harc_finish_sim_run(log_ctx, trace, cycle_count, ctx.errors);"
     ));
     assert!(cpp_tb::TRACE_RT_HEADER.contains("vcd_time"));
     assert!(cpp_tb::TRACE_RT_HEADER.contains("clock_cycle"));
@@ -202,6 +669,9 @@ test RuntimeProblemTableTest
 end test RuntimeProblemTableTest
 "#;
     let parsed = parse_source(src).unwrap();
+    let [problem_id] = randomize_problem_ids(&parsed)[..] else {
+        panic!("expected one randomize problem")
+    };
     let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let cpp = cpp_tb::emit(&merged).expect("emit");
 
@@ -210,17 +680,18 @@ end test RuntimeProblemTableTest
         cpp.contains("HarcRuntimeProblemDescriptor _harc_runtime_random_problem_table_entries[]")
     );
     assert!(cpp.contains("HarcRuntimeProblemTable _harc_runtime_random_problem_table"));
-    assert!(cpp.contains("HarcRuntimeCallSite _harc_runtime_random_problem_table_call_sites[]"));
-    assert!(cpp.contains("_harc_runtime_random_problem_table_call_site_count = 2"));
-    assert!(cpp.contains("{1, \"randomize(Req)\""));
-    assert!(cpp.contains("{2, \"randomize(Req) with\""));
-    assert!(cpp.contains("{1, 1, 0}"));
-    assert!(cpp.contains("{2, 2, 0}"));
-    assert!(cpp.contains("HarcRandomizeCall _harc_runtime_random_problem_table_prepare_call"));
+    assert!(
+        cpp.contains("std::vector<harc_rt::random::HarcRuntimeCallSite> _harc_solver_call_sites{")
+    );
+    assert!(cpp.contains("{1ULL, \"randomize(Req)\""));
+    assert!(cpp.contains(&format!("{{{problem_id}ULL, \"randomize(Req) with\"")));
+    assert!(cpp.contains("{1ULL, 1ULL, 0}"));
+    assert!(cpp.contains(&format!("{{{problem_id}ULL, {problem_id}ULL, 0}}")));
+    assert!(cpp.contains("HarcRandomizeCall harc_prepare_randomize_call"));
     assert!(cpp.contains("harc_rt::random::harc_prepare_randomize_call("));
-    assert!(cpp.contains(
-        "auto _harc_rt_call = _harc_runtime_random_problem_table_prepare_call(2, harc_rng.state, harc_rng_next());"
-    ));
+    assert!(cpp.contains(&format!(
+        "auto _harc_rt_call = harc_prepare_randomize_call(ctx, {problem_id}ULL, ctx.rng.initial_seed, 0);"
+    )));
     assert!(cpp.contains("auto* _harc_rt_problem = _harc_rt_call.problem;"));
     assert!(cpp.contains("auto _harc_rt_seed = _harc_rt_call.seed;"));
     assert!(cpp
@@ -248,15 +719,19 @@ test RuntimeFastPathTest
 end test RuntimeFastPathTest
 "#;
     let parsed = parse_source(src).unwrap();
+    let [problem_id] = randomize_problem_ids(&parsed)[..] else {
+        panic!("expected one randomize problem")
+    };
     let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let cpp = cpp_tb::emit(&merged).expect("emit");
 
+    assert!(cpp.contains(&format!(
+        "auto _harc_rt_call = harc_prepare_randomize_call(ctx, {problem_id}ULL, ctx.rng.initial_seed, 0);"
+    )));
     assert!(cpp.contains(
-        "auto _harc_rt_call = _harc_runtime_random_problem_table_prepare_call(2, harc_rng.state, 0);"
+        "harc_solve_queued(t, _harc_rt_call.problem_id, _harc_rt_seed, [&](auto* _harc_target) { randomize_Empty(_harc_target, _harc_site_rng); });"
     ));
-    assert!(cpp.contains(
-        "harc_solve_queued(t, _harc_rt_call.problem_id, _harc_rt_seed, randomize_Empty);"
-    ));
+    assert!(cpp.contains("_harc_site_rng.state = _harc_rt_seed;"));
     assert!(cpp.contains("harc_rt::random::harc_handle_solve_status(_harc_rt_status);"));
     assert!(!cpp.contains("randomize_Empty(&t);"));
     assert!(
@@ -306,7 +781,7 @@ end test WaveTest
     assert!(cpp.contains("HARC_RT_LOG_WAVE_FILE(log_ctx.sim_log, _wave_path);"));
     assert!(cpp.contains("HARC_RT_DUMP_WAVE_TRACE(tfp, t);"));
     assert!(cpp.contains("_harc_trace_dump_next(\"clk\", (uint64_t)(cycle_count + 1));"));
-    assert!(cpp.contains("HARC_RT_WRITE_COVERAGE(Verilated::threadContextp()->coveragep());"));
+    assert!(cpp.contains("HARC_RT_WRITE_COVERAGE(ctx.verilated.coveragep());"));
     assert!(cpp.contains("HARC_RT_CLOSE_WAVE_TRACE(tfp);"));
 }
 
@@ -1179,9 +1654,9 @@ end test B
     assert!(shard.contents.contains("r.addr == 2"));
     assert!(shard.contents.contains("r.addr == 3"));
     assert!(!shard.contents.contains("suite__common_suffix"));
-    assert!(shard.contents.contains(
-        "static inline harc_rt::random::HarcRandomizeCall _harc_runtime_random_problem_table_prepare_call("
-    ));
+    assert!(shard
+        .contents
+        .contains("static inline harc_rt::random::HarcRandomizeCall harc_prepare_randomize_call("));
 }
 
 #[test]
@@ -1228,18 +1703,15 @@ end test T"#,
         cpp
     );
     assert!(
-        cpp.contains(
-            "(const char*)harc_rt::HarcHexBuf128(harc_rt::harc_read(dut->text_out), 32, false)"
-        ),
+        cpp.contains("auto _harc_interp_0 = harc_rt::harc_read(dut->text_out);")
+            && cpp.contains("(const char*)harc_rt::HarcHexBuf128(_harc_interp_0, 32, false)"),
         "expected HarcHexBuf128 lowering for `:032x`:\n{}",
         cpp
     );
 
     // Wide-hex uppercase — same shape, upper=true.
     assert!(
-        cpp.contains(
-            "(const char*)harc_rt::HarcHexBuf128(harc_rt::harc_read(dut->text_out), 32, true)"
-        ),
+        cpp.contains("(const char*)harc_rt::HarcHexBuf128(_harc_interp_0, 32, true)"),
         "expected HarcHexBuf128 lowering for `:032X`:\n{}",
         cpp
     );
@@ -1251,7 +1723,7 @@ end test T"#,
         cpp
     );
     assert!(
-        cpp.contains("harc_rt::harc_printf_ll(harc_rt::harc_read(dut->x))"),
+        cpp.contains("\"narrow=0x%08llx\", harc_rt::harc_printf_ll(_harc_interp_0)"),
         "expected narrow interpolation args to use harc_printf_ll:\n{}",
         cpp
     );
@@ -1573,22 +2045,28 @@ end test T"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
 
-    // Both consts emitted at file scope, before main().
+    // Both consts are emitted under collision-proof C++ names at file scope,
+    // before main().
     assert!(
-        cpp.contains("static constexpr uint64_t MSHR_SIZE = 32;"),
-        "expected `static constexpr uint64_t MSHR_SIZE = 32;` in:\n{}",
+        cpp.contains("static constexpr uint64_t harc_user_const_MSHR_SIZE_")
+            && cpp.contains(" = 32;"),
+        "expected a mangled file-scope MSHR_SIZE definition in:\n{}",
         cpp
     );
     assert!(
-        cpp.contains("static constexpr uint64_t HALF ="),
-        "expected `static constexpr uint64_t HALF` in:\n{}",
+        cpp.contains("static constexpr uint64_t harc_user_const_HALF_"),
+        "expected a mangled file-scope HALF definition in:\n{}",
         cpp
     );
 
     // Order matters — both should appear BEFORE `int main`.
     let main_pos = cpp.find("int main").expect("expected `int main` in output");
-    let mshr_pos = cpp.find("static constexpr uint64_t MSHR_SIZE").unwrap();
-    let half_pos = cpp.find("static constexpr uint64_t HALF").unwrap();
+    let mshr_pos = cpp
+        .find("static constexpr uint64_t harc_user_const_MSHR_SIZE_")
+        .unwrap();
+    let half_pos = cpp
+        .find("static constexpr uint64_t harc_user_const_HALF_")
+        .unwrap();
     assert!(
         mshr_pos < main_pos,
         "MSHR_SIZE should be emitted before main()"
@@ -3674,13 +4152,16 @@ test SeededSolverTest
 end test SeededSolverTest"#,
     )
     .unwrap();
+    let [problem_id] = randomize_problem_ids(&parsed)[..] else {
+        panic!("expected one randomize problem")
+    };
     let cpp = cpp_tb::emit(&parsed).expect("emit");
 
     assert!(
         cpp.contains("z3::params _p(_ctx);")
-            && cpp.contains(
-                "_harc_runtime_random_problem_table_prepare_call(2, harc_rng.state, harc_rng_next())"
-            )
+            && cpp.contains(&format!(
+                "harc_prepare_randomize_call(ctx, {problem_id}ULL, ctx.rng.initial_seed, 0)"
+            ))
             && cpp.contains("harc_rt::random::harc_solve_constrained(")
             && cpp.contains("harc_rt::random::harc_handle_solve_status(")
             && cpp.contains(
@@ -4152,23 +4633,30 @@ end test UniqueTest"#,
     assert!(
         cpp.contains("z3::solver _s(_ctx);")
             && cpp.contains(
-                "static harc_rt::random::HarcUniqueHistory<uint64_t> _solver_site_"
+                "for (auto _v : harc_rt::random::harc_unique_values(ctx.rng.unique.get<uint64_t>("
             )
-            && cpp.contains("_unique_test_tag;")
-            && cpp.contains("for (auto _v : harc_rt::random::harc_unique_values(_solver_site_")
-            && cpp.contains("_unique_test_tag)) _s.add")
+            && cpp.contains("ULL))) _s.add")
             && cpp.contains("// [unique within test] policy: no repeat until exhausted")
             && cpp.contains("harc_rt::random::harc_retry_without_unique_history(")
-            && cpp.contains("harc_rt::random::harc_unique_clear(_solver_site_")
-            && cpp.contains("harc_rt::random::harc_unique_remember(_solver_site_")
+            && cpp.contains(
+                "harc_rt::random::harc_unique_clear(ctx.rng.unique.get<uint64_t>("
+            )
+            && cpp.contains(
+                "harc_rt::random::harc_unique_remember(ctx.rng.unique.get<uint64_t>("
+            )
             && cpp.contains("_s.push();   // unique history constraints")
             && cpp.contains("_s.pop();   // drop exhausted unique-history scope")
             && !cpp.contains("if (_solver_site_")
-            && !cpp.contains("randomize_T(&t);"),
+            && !cpp.contains("randomize_T(&t);")
+            && !cpp.contains("thread_local")
+            && !cpp.contains("static harc_rt::random::HarcRng")
+            && !cpp.contains("static harc_rt::random::HarcUniqueHistory")
+            && !cpp.contains("static harc_rt::random::HarcAutoCovState")
+            && !cpp.contains("static harc_rt::random::HarcRuntimeCallSite"),
         "unique fields should route bare randomize through scoped recycling solver history; got:\n{cpp}",
     );
     let history_pos = cpp
-        .find("for (auto _v : harc_rt::random::harc_unique_values(_solver_site_")
+        .find("for (auto _v : harc_rt::random::harc_unique_values(ctx.rng.unique.get<uint64_t>(")
         .expect("unique history constraint");
     let preference_pos = cpp
         .find("_s.push();   // seeded candidate preferences")
@@ -4180,7 +4668,243 @@ end test UniqueTest"#,
 }
 
 #[test]
-fn constrained_unique_field_skips_unique_history_policy() {
+fn constrained_unique_field_keeps_its_scoped_history() {
+    let parsed = parse_source(
+        r#"transaction T
+    tag : uint<8> with [unique within tseq]
+end transaction T
+
+tseq Draw() -> TSeq<T>
+    let first : T
+    let second : T
+    randomize(first) with
+        first.tag >= 0
+    end randomize
+    randomize(second) with
+        second.tag >= 0
+    end randomize
+    yield first
+    yield second
+end tseq Draw
+
+test ConstrainedUniqueTest
+    let dut : DummyDut
+    run
+        let draws = Draw()
+    end run
+end test ConstrainedUniqueTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert_eq!(
+        cpp.matches(
+            "for (auto _v : harc_rt::random::harc_unique_values(_harc_unique_tseq.get<uint64_t>("
+        )
+        .count(),
+        2,
+        "both constrained sites must consult the invocation history:\n{cpp}"
+    );
+    assert_eq!(
+        cpp.matches("harc_rt::random::harc_unique_remember(_harc_unique_tseq.get<uint64_t>(")
+            .count(),
+        2,
+        "both constrained sites must update the invocation history:\n{cpp}"
+    );
+}
+
+#[test]
+fn bare_unique_is_per_call_and_allocates_no_persistent_history() {
+    let src = r#"transaction T
+    tag : uint<8> with [unique]
+end transaction T
+
+test BareUniqueTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test BareUniqueTest"#;
+    let cpp = v1_cpp(src);
+    assert!(cpp.contains("z3::solver _s(_ctx);"), "{cpp}");
+    assert!(!cpp.contains("harc_unique_values("), "{cpp}");
+    assert!(!cpp.contains("harc_unique_clear("), "{cpp}");
+    assert!(!cpp.contains("harc_unique_remember("), "{cpp}");
+    assert!(!cpp.contains(".rng.unique.get<"), "{cpp}");
+}
+
+#[test]
+fn bare_unique_list_is_distinct_only_within_the_current_call() {
+    let src = r#"transaction T
+    items : list<uint<8>> with [unique]
+    keep items.len() == 3
+end transaction T
+
+test BareUniqueListTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test BareUniqueListTest"#;
+    let cpp = v1_cpp(src);
+    assert!(
+        cpp.contains(
+            "_s.add(z3::ule(_z_items_len, _ctx.bv_val((uint64_t)1, 64)) || (_z_items_0 != _z_items_1));   // [unique] within this randomize call"
+        ),
+        "{cpp}"
+    );
+    assert!(
+        cpp.contains(
+            "_s.add(z3::ule(_z_items_len, _ctx.bv_val((uint64_t)2, 64)) || (_z_items_1 != _z_items_2));   // [unique] within this randomize call"
+        ),
+        "{cpp}"
+    );
+    assert!(!cpp.contains(".rng.unique.get<"), "{cpp}");
+}
+
+#[test]
+fn unique_within_test_shares_one_history_across_randomize_sites() {
+    let src = r#"transaction T
+    tag : uint<8> with [unique within test]
+end transaction T
+
+test SharedUniqueTest
+    let dut : DummyDut
+    run
+        let first : T
+        let second : T
+        randomize(first)
+        randomize(second)
+    end run
+end test SharedUniqueTest"#;
+    let cpp = v1_cpp(src);
+    let marker = "ctx.rng.unique.get<uint64_t>(";
+    let keys = cpp
+        .match_indices(marker)
+        .map(|(start, _)| {
+            let tail = &cpp[start + marker.len()..];
+            tail.split("ULL").next().expect("unique key")
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(keys.len(), 1, "both sites must share test history:\n{cpp}");
+}
+
+#[test]
+fn unique_within_tseq_is_owned_by_each_invocation() {
+    let src = r#"transaction T
+    tag : uint<8> with [unique within tseq]
+end transaction T
+
+tseq Draw() -> TSeq<T>
+    let t : T
+    randomize(t)
+    yield t
+end tseq Draw
+
+test TseqUniqueTest
+    let dut : DummyDut
+    run
+        let first = Draw()
+        let second = Draw()
+    end run
+end test TseqUniqueTest"#;
+    let parsed = parse_source(src).expect("parse");
+    let v1 = cpp_tb::emit(&parsed).expect("v1 emit");
+    let program = harc::ir::lower::lower_program(&parsed).expect("lower");
+    let tbir = harc::codegen::tbir::emit(&program, &parsed, &cpp_tb::EmitOpts::default())
+        .expect("TB-IR emit");
+    for (backend, cpp) in [("v1", v1), ("TB-IR", tbir)] {
+        assert!(
+            cpp.contains("harc_rt::random::HarcUniqueRegistry _harc_unique_tseq;"),
+            "{backend}: tseq invocation must own its history:\n{cpp}"
+        );
+        assert!(
+            cpp.contains("_harc_unique_tseq.get<uint64_t>("),
+            "{backend}: tseq randomize must use the invocation registry:\n{cpp}"
+        );
+        assert!(
+            !cpp.contains("ctx.rng.unique.get<uint64_t>("),
+            "{backend}: {cpp}"
+        );
+    }
+}
+
+#[test]
+fn unique_within_sequencer_is_owned_by_each_instance() {
+    let src = r#"transaction T
+    tag : uint<8> with [unique within sequencer]
+end transaction T
+
+sequencer Source
+    _harc_unique : uint<8> default 0
+    _harc_unique_1 : uint<8> default 0
+    hookable draw()
+        let t : T
+        randomize(t)
+    end draw
+end sequencer Source
+
+test SequencerUniqueTest
+    let dut : DummyDut
+    let first : Source
+    let second : Source
+    run
+        first.draw()
+        second.draw()
+    end run
+end test SequencerUniqueTest"#;
+    let parsed = parse_source(src).expect("parse");
+    let v1 = cpp_tb::emit(&parsed).expect("v1 emit");
+    let program = harc::ir::lower::lower_program(&parsed).expect("lower");
+    let tbir = harc::codegen::tbir::emit(&program, &parsed, &cpp_tb::EmitOpts::default())
+        .expect("TB-IR emit");
+    for (backend, cpp) in [("v1", v1), ("TB-IR", tbir)] {
+        assert!(
+            cpp.contains("uint64_t _harc_unique = 0;")
+                && cpp.contains("uint64_t _harc_unique_1 = 0;")
+                && cpp.contains("harc_rt::random::HarcUniqueRegistry _harc_unique_2;"),
+            "{backend}: each sequencer object must own a registry:\n{cpp}"
+        );
+        assert!(
+            cpp.contains("self._harc_unique_2.get<uint64_t>("),
+            "{backend}: sequencer randomize must use its receiver's registry:\n{cpp}"
+        );
+        assert!(
+            !cpp.contains("ctx.rng.unique.get<uint64_t>("),
+            "{backend}: {cpp}"
+        );
+    }
+}
+
+#[test]
+fn scoped_unique_rejects_the_wrong_lexical_owner_in_both_backends() {
+    for (scope, required_owner) in [("tseq", "tseq"), ("sequencer", "sequencer")] {
+        let src = format!(
+            r#"transaction T
+    tag : uint<8> with [unique within {scope}]
+end transaction T
+
+test InvalidUniqueScope
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test InvalidUniqueScope"#
+        );
+        let parsed = parse_source(&src).expect("parse");
+        let v1 = cpp_tb::emit(&parsed).expect_err("v1 rejects invalid unique scope");
+        assert!(v1.0.contains(required_owner), "v1: {v1}");
+        let program = harc::ir::lower::lower_program(&parsed).expect("lower");
+        let tbir = harc::codegen::tbir::emit(&program, &parsed, &cpp_tb::EmitOpts::default())
+            .expect_err("TB-IR rejects invalid unique scope");
+        assert!(tbir.0.contains(required_owner), "TB-IR: {tbir}");
+    }
+}
+
+#[test]
+fn constrained_unique_field_keeps_unique_history_policy() {
     let parsed = parse_source(
         r#"transaction T
     tag : uint<8> with [unique within test]
@@ -4200,14 +4924,14 @@ end test UniqueOverrideTest"#,
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
         cpp.contains("_s.add(_z_tag == _ctx.bv_val((uint64_t)7, 64));")
-            && !cpp.contains("[unique] policy: no repeat until exhausted")
-            && !cpp.contains("_solver_site_"),
-        "explicit constraints on a unique field should override the unique history policy; got:\n{cpp}",
+            && cpp.contains("// [unique within test] policy: no repeat until exhausted")
+            && cpp.contains("harc_rt::random::harc_unique_remember(ctx.rng.unique.get<uint64_t>("),
+        "explicit constraints narrow the unique domain without disabling its history; got:\n{cpp}",
     );
 }
 
 #[test]
-fn range_constrained_unique_field_uses_seeded_sampling_without_history() {
+fn range_constrained_unique_field_uses_seeded_sampling_and_history() {
     let parsed = parse_source(
         r#"transaction T
     tag : uint<8> with [unique within test]
@@ -4230,8 +4954,9 @@ end test UniqueConstrainedTest"#,
             && cpp.contains("harc_rt::random::harc_retry_without_preferences(")
             && cpp.contains("retry without seeded preferences")
             && !cpp.contains("static std::vector")
-            && !cpp.contains("[unique] policy: no repeat until exhausted"),
-        "constraints mentioning a unique field should suppress unique history while preserving seeded sampling; got:\n{cpp}",
+            && cpp.contains("// [unique within test] policy: no repeat until exhausted")
+            && cpp.contains("harc_rt::random::harc_unique_remember(ctx.rng.unique.get<uint64_t>("),
+        "constraints mentioning a unique field should preserve both scoped history and seeded sampling; got:\n{cpp}",
     );
 }
 
@@ -5541,8 +6266,8 @@ end test SharedRecordLoweringTest"#,
         "shared record lowering should emit equality for both structs and transactions; got:\n{cpp}"
     );
     assert!(
-        cpp.contains("static void randomize_Header(Header* t)")
-            && cpp.contains("randomize_Header(&t->hdr);"),
+        cpp.contains("static void randomize_Header(Header* t, harc_rt::random::HarcRng& harc_rng)")
+            && cpp.contains("randomize_Header(&t->hdr, harc_rng);"),
         "record randomization should be shared and recurse into nested record fields; got:\n{cpp}"
     );
 }
@@ -6321,8 +7046,9 @@ end impl TestbenchProbeDutTest"#,
         "expected read and force probe accessors to be preserved; got:\n{}",
         cpp,
     );
-    let (dut_ty, probes) =
-        cpp_tb::dut_probes(&parsed).expect("testbench-owned probes should emit a bind stub");
+    let (dut_ty, probes) = cpp_tb::dut_probes(&parsed)
+        .expect("probe catalog validates")
+        .expect("testbench-owned probes should emit a bind stub");
     assert_eq!(dut_ty, "CpuPipe");
     assert_eq!(probes.len(), 2);
     assert!(probes.iter().any(|p| p.name.name == "alu_a" && !p.force));
@@ -6348,8 +7074,9 @@ impl ProbeArrayTest for ProbeArrayTb
 end impl ProbeArrayTest"#,
     )
     .unwrap();
-    let (_, probes) =
-        cpp_tb::dut_probes(&parsed).expect("array selector probes should parse as DUT probes");
+    let (_, probes) = cpp_tb::dut_probes(&parsed)
+        .expect("probe catalog validates")
+        .expect("array selector probes should parse as DUT probes");
     assert!(probes
         .iter()
         .any(|p| p.name.name == "lane0" && p.path == "block.array_sig[0]"));
@@ -6360,6 +7087,530 @@ end impl ProbeArrayTest"#,
     let stub = harc::codegen::sv_stub::emit_stub("Top", &probes).unwrap();
     assert!(stub.contains("assign lane0 = Top.block.array_sig[0];"));
     assert!(stub.contains("assign gen_state = Top.gen_stage[2].u_stage.state_q;"));
+}
+
+#[test]
+fn probe_catalog_and_stub_preserve_scalar_kinds() {
+    let parsed = parse_source(
+        r#"test T
+    let dut : Top
+        probe bit_flag : bit at core.bit_flag
+        probe bool_flag : bool at core.bool_flag
+        probe unsigned_value : uint<8> at core.unsigned_value
+        probe signed_value : sint<8> at core.signed_value
+        probe raw_bits : bits<8> at core.raw_bits
+    end let dut
+    run
+        wait 1 cycle
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let catalog = harc::codegen::sv_stub::collect_suite_probes(&parsed).unwrap();
+    use harc::ir::ProbeScalarType;
+    assert_eq!(catalog.probe_types["bit_flag"], ProbeScalarType::Bit);
+    assert_eq!(catalog.probe_types["bool_flag"], ProbeScalarType::Bool);
+    assert_eq!(
+        catalog.probe_types["unsigned_value"],
+        ProbeScalarType::UInt(8)
+    );
+    assert_eq!(
+        catalog.probe_types["signed_value"],
+        ProbeScalarType::SInt(8)
+    );
+    assert_eq!(catalog.probe_types["raw_bits"], ProbeScalarType::Bits(8));
+
+    let stub = harc::codegen::sv_stub::emit_stub("Top", &catalog.probes).unwrap();
+    assert!(stub.contains("logic signed [7:0] signed_value"), "{stub}");
+    assert!(stub.contains("logic [7:0] unsigned_value"), "{stub}");
+    assert!(stub.contains("logic [7:0] raw_bits"), "{stub}");
+    assert!(stub.contains("logic bit_flag"), "{stub}");
+    assert!(stub.contains("logic bool_flag"), "{stub}");
+}
+
+#[test]
+fn suite_probe_catalog_deduplicates_identical_declarations() {
+    let parsed = parse_source(
+        r#"test A
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    run
+        wait 1 cycle
+    end run
+end test A
+
+test B
+    let dut : Top
+        probe force inject : UInt<32> at core.inject
+    end let dut
+    run
+        wait 1 cycle
+    end run
+end test B"#,
+    )
+    .unwrap();
+    let (dut, probes) = cpp_tb::dut_probes(&parsed)
+        .expect("identical suite declarations validate")
+        .expect("suite emits one bind stub");
+    assert_eq!(dut, "Top");
+    assert_eq!(probes.len(), 1);
+    assert_eq!(probes[0].name.name, "inject");
+
+    let catalog = harc::codegen::sv_stub::collect_suite_probes(&parsed).unwrap();
+    assert_eq!(catalog.shared_component_probes.len(), 1);
+}
+
+#[test]
+fn suite_probe_catalog_keeps_test_local_union_out_of_shared_components() {
+    let parsed = parse_source(
+        r#"test A
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    run
+        wait 1 cycle
+    end run
+end test A
+
+test B
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test B"#,
+    )
+    .unwrap();
+    let catalog = harc::codegen::sv_stub::collect_suite_probes(&parsed).unwrap();
+    assert_eq!(
+        catalog.probes.len(),
+        1,
+        "the suite bind stub uses the union"
+    );
+    assert!(
+        catalog.shared_component_probes.is_empty(),
+        "a declaration missing from one test cannot authorize shared code"
+    );
+    assert!(catalog.partial_component_probe_names.contains("inject"));
+}
+
+#[test]
+fn suite_probe_catalog_rejects_conflicting_declarations() {
+    for (label, second) in [
+        ("path", "probe force inject : uint<32> at other.inject"),
+        ("type", "probe force inject : uint<16> at core.inject"),
+        ("force", "probe inject : uint<32> at core.inject"),
+    ] {
+        let src = format!(
+            r#"test A
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    run
+        wait 1 cycle
+    end run
+end test A
+
+test B
+    let dut : Top
+        {second}
+    end let dut
+    run
+        wait 1 cycle
+    end run
+end test B"#
+        );
+        let parsed = parse_source(&src).unwrap();
+        let err = cpp_tb::dut_probes(&parsed).expect_err("conflict must fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("conflicting declarations"), "{label}: {msg}");
+        assert!(msg.contains("inject"), "{label}: {msg}");
+    }
+}
+
+#[test]
+fn suite_probe_conflict_retains_both_source_sites() {
+    let first = harc::parser::parse_source_named(
+        "first_probe.harc",
+        r#"test A
+    let dut : Top
+        probe inject : sint<8> at core.inject
+    end let dut
+    run
+        wait 1 cycle
+    end run
+end test A"#,
+    )
+    .unwrap();
+    let second = harc::parser::parse_source_named(
+        "second_probe.harc",
+        r#"test B
+    let dut : Top
+        probe inject : uint<8> at core.inject
+    end let dut
+    run
+        wait 1 cycle
+    end run
+end test B"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(vec![second, first], None).unwrap();
+    let err = harc::codegen::sv_stub::collect_suite_probes(&merged)
+        .expect_err("conflicting scalar kind must fail");
+    let related = err
+        .related_site()
+        .expect("first declaration source is retained");
+    assert_eq!(
+        &*merged.source_for_id(related.source_id).unwrap().name,
+        "first_probe.harc"
+    );
+    assert_eq!(
+        &*merged.source_for_id(err.source_id()).unwrap().name,
+        "second_probe.harc"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("first_probe.harc:3:"), "{msg}");
+    assert!(msg.contains("second_probe.harc:3:"), "{msg}");
+    assert!(msg.contains("sint<8>") && msg.contains("uint<8>"), "{msg}");
+}
+
+#[test]
+fn suite_probe_catalog_rejects_generated_names_and_force_path_aliases() {
+    for (label, declarations, expected) in [
+        (
+            "generated name",
+            "probe force inject : uint<32> at core.inject\n        probe inject_drv : uint<32> at core.other",
+            "generated bind-stub signal",
+        ),
+        (
+            "force path alias",
+            "probe force inject_a : uint<32> at core.inject\n        probe force inject_b : uint<32> at core.inject",
+            "competing force controllers",
+        ),
+        (
+            "force path overlap",
+            "probe force state : uint<32> at core.state\n        probe force state_bit : uint<1> at core.state[0]",
+            "overlapping SV paths",
+        ),
+    ] {
+        let src = format!(
+            r#"test T
+    let dut : Top
+        {declarations}
+    end let dut
+    run
+        wait 1 cycle
+    end run
+end test T"#
+        );
+        let parsed = parse_source(&src).unwrap();
+        let err = cpp_tb::dut_probes(&parsed).expect_err("unsafe probe aliases must fail");
+        assert!(err.to_string().contains(expected), "{label}: {err}");
+    }
+}
+
+#[test]
+fn v1_common_split_uses_the_validated_probe_catalog_for_shared_methods() {
+    let parsed = parse_source(
+        r#"agent ProbeUser
+    function read_probe() -> uint<32>
+        return dut.inject
+    end function read_probe
+    function force_probe(value: uint<32>)
+        dut.inject = value
+    end function force_probe
+    function release_probe()
+        release dut.inject
+    end function release_probe
+end agent ProbeUser
+
+test A
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    let user : ProbeUser
+    run
+        let before : uint<32> = user.read_probe()
+        user.force_probe(before + 1)
+        user.release_probe()
+    end run
+end test A
+
+test B
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    let user : ProbeUser
+    run
+        wait 1 cycle
+    end run
+end test B"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    let emitted = cpp_tb::emit_common_split(&merged, cpp_tb::EmitOpts::default(), "suite__", &[])
+        .expect("v1 common-object emission accepts the shared probe contract");
+    let all_cpp = emitted
+        .files
+        .iter()
+        .map(|file| file.contents.as_str())
+        .collect::<String>();
+    let accessor = "Top__DOT__harc_probes__DOT__inject";
+    assert!(all_cpp.contains(accessor), "{all_cpp}");
+    assert!(all_cpp.contains(&format!("{accessor}_drv")), "{all_cpp}");
+    assert!(all_cpp.contains(&format!("{accessor}_en")), "{all_cpp}");
+}
+
+#[test]
+fn v1_common_split_rejects_partial_probes_in_shared_methods() {
+    for (label, method) in [
+        (
+            "read",
+            "function use_probe() -> uint<32>\n        return dut.inject\n    end function use_probe",
+        ),
+        (
+            "write",
+            "function use_probe()\n        dut.inject = 1\n    end function use_probe",
+        ),
+        (
+            "release",
+            "function use_probe()\n        release dut.inject\n    end function use_probe",
+        ),
+    ] {
+        let parsed = parse_source(&format!(
+            r#"agent ProbeUser
+    {method}
+end agent ProbeUser
+
+test A
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    let user : ProbeUser
+    run
+        wait 1 cycle
+    end run
+end test A
+
+test B
+    let dut : Top
+    let user : ProbeUser
+    run
+        wait 1 cycle
+    end run
+end test B"#
+        ))
+        .unwrap();
+        let err = cpp_tb::emit_common_split(
+            &parsed,
+            cpp_tb::EmitOpts::default(),
+            "suite__",
+            &[],
+        )
+        .expect_err("v1 common shared methods must not inherit another test's probe");
+        let msg = err.to_string();
+        assert!(msg.contains("shared DUT access `dut.inject`"), "{label}: {msg}");
+    }
+}
+
+#[test]
+fn v1_shared_probe_recognition_uses_the_component_dut_receiver_name() {
+    for (kind, mode) in [("agent", ""), ("transactor", " active")] {
+        let component = if kind == "transactor" {
+            r#"transactor ProbeUser
+    chip : Top
+    when active
+        function read_probe() -> uint<32>
+            return chip.inject
+        end function read_probe
+        function force_probe(value: uint<32>)
+            chip.inject = value
+        end function force_probe
+        function release_probe()
+            release chip.inject
+        end function release_probe
+    end when
+end transactor ProbeUser"#
+        } else {
+            r#"agent ProbeUser
+    chip : Top
+    function read_probe() -> uint<32>
+        return chip.inject
+    end function read_probe
+    function force_probe(value: uint<32>)
+        chip.inject = value
+    end function force_probe
+    function release_probe()
+        release chip.inject
+    end function release_probe
+end agent ProbeUser"#
+        };
+        let parsed = parse_source(&format!(
+            r#"{component}
+
+test A
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    let user : ProbeUser{mode}
+    run
+        user.chip = dut
+        let before : uint<32> = user.read_probe()
+        user.force_probe(before + 1)
+        user.release_probe()
+    end run
+end test A
+
+test B
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    let user : ProbeUser{mode}
+    run
+        user.chip = dut
+        wait 1 cycle
+    end run
+end test B"#,
+        ))
+        .unwrap_or_else(|error| panic!("{kind} source parses: {error:?}"));
+        let common =
+            cpp_tb::emit_common_split(&parsed, cpp_tb::EmitOpts::default(), "suite__", &[])
+                .unwrap_or_else(|error| panic!("{kind} common emission succeeds: {error}"))
+                .files
+                .into_iter()
+                .map(|file| file.contents)
+                .collect::<String>();
+        let legacy = cpp_tb::emit(&parsed)
+            .unwrap_or_else(|error| panic!("{kind} legacy emission succeeds: {error}"));
+        let accessor = "Top__DOT__harc_probes__DOT__inject";
+        for (layout, all_cpp) in [("common", common), ("legacy", legacy)] {
+            assert!(
+                all_cpp.contains(&format!("dut->rootp->{accessor}")),
+                "{kind}/{layout}: {all_cpp}"
+            );
+            assert!(
+                all_cpp.contains(&format!("dut->rootp->{accessor}_drv")),
+                "{kind}/{layout}: {all_cpp}"
+            );
+            assert!(
+                all_cpp.contains(&format!("dut->rootp->{accessor}_en")),
+                "{kind}/{layout}: {all_cpp}"
+            );
+        }
+    }
+}
+
+#[test]
+fn v1_probe_recognition_respects_param_and_local_shadowing() {
+    let parsed = parse_source(
+        r#"struct Snapshot
+    inject : uint<32>
+end struct Snapshot
+
+agent ProbeUser
+    function from_param(dut: Snapshot) -> uint<32>
+        return dut.inject
+    end function from_param
+    function from_local() -> uint<32>
+        let dut : Snapshot
+        dut.inject = 9
+        return dut.inject
+    end function from_local
+end agent ProbeUser
+
+test A
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    let user : ProbeUser
+    run
+        let snapshot : Snapshot
+        let a : uint<32> = user.from_param(snapshot)
+        let b : uint<32> = user.from_local()
+        assert a == b
+    end run
+end test A
+
+test B
+    let dut : Top
+        probe force inject : uint<32> at core.inject
+    end let dut
+    let user : ProbeUser
+    run
+        wait 1 cycle
+    end run
+end test B"#,
+    )
+    .expect("source parses");
+
+    for (label, emitted) in [
+        ("legacy", cpp_tb::emit(&parsed).map(|cpp| vec![cpp])),
+        (
+            "common",
+            cpp_tb::emit_common_split(&parsed, cpp_tb::EmitOpts::default(), "suite__", &[])
+                .map(|output| output.files.into_iter().map(|file| file.contents).collect()),
+        ),
+    ] {
+        let all_cpp = emitted
+            .unwrap_or_else(|error| panic!("{label} emission succeeds: {error}"))
+            .join("\n");
+        assert!(all_cpp.contains("return dut.inject;"), "{label}: {all_cpp}");
+        assert!(all_cpp.contains("dut.inject = 9;"), "{label}: {all_cpp}");
+        assert!(
+            !all_cpp.contains("rootp->Top__DOT__harc_probes__DOT__inject"),
+            "{label}: shadowed host values must not become probes: {all_cpp}"
+        );
+    }
+}
+
+#[test]
+fn v1_self_contained_shards_use_the_full_suite_probe_contract() {
+    let parsed = parse_source(
+        r#"agent ProbeUser
+    function read_probe() -> uint<32>
+        return dut.inject
+    end function read_probe
+end agent ProbeUser
+
+test A
+    let dut : Top
+        probe inject : uint<32> at core.inject
+    end let dut
+    let user : ProbeUser
+    run
+        let value : uint<32> = user.read_probe()
+    end run
+end test A
+
+test B
+    let dut : Top
+    let user : ProbeUser
+    run
+        wait 1 cycle
+    end run
+end test B"#,
+    )
+    .expect("source parses");
+
+    let one = cpp_tb::emit_split_tests_with_file_prefix(
+        &parsed,
+        cpp_tb::EmitOpts::default(),
+        "suite__",
+        1,
+    )
+    .expect_err("group size one must reject the partial shared probe")
+    .to_string();
+    let bundled = cpp_tb::emit_split_tests_with_file_prefix(
+        &parsed,
+        cpp_tb::EmitOpts::default(),
+        "suite__",
+        2,
+    )
+    .expect_err("bundled emission must reject the same partial shared probe")
+    .to_string();
+    let expected = "shared DUT access `dut.inject` names a probe that is not declared identically by every test in the suite";
+    assert!(one.lines().all(|line| line == expected), "{one}");
+    assert!(bundled.lines().all(|line| line == expected), "{bundled}");
 }
 
 /// Classic `test T { ... }` form keeps building in this PR — the
@@ -6477,8 +7728,14 @@ end test T"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("target TLM thread should lower");
     let capture_pos = cpp
-        .find("uint64_t addr = (uint64_t)harc_rt::harc_read(dut->b_read_addr);")
+        .find("uint64_t addr = static_cast<uint64_t>(harc_rt::harc_trunc_u128")
         .expect("target responder should capture request args");
+    assert!(
+        cpp[capture_pos..].starts_with(
+            "uint64_t addr = static_cast<uint64_t>(harc_rt::harc_trunc_u128(static_cast<_harc_u128>(harc_rt::harc_read(dut->b_read_addr)), 8));"
+        ),
+        "target responder must capture the exact declared uint<8> request type:\n{cpp}"
+    );
     let edge_wait_pos = capture_pos
         + cpp[capture_pos..]
             .find("co_await harc_rt::wait_cycles(_slot, 1);")
@@ -8655,7 +9912,10 @@ end test T
         .iter()
         .filter(|i| matches!(i, harc::ast::Item::Extend(_)))
         .count();
-    assert_eq!(extends_before, 1, "source should declare one top-level extend");
+    assert_eq!(
+        extends_before, 1,
+        "source should declare one top-level extend"
+    );
 
     let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
     let extends_after: Vec<_> = merged
@@ -9330,6 +10590,345 @@ end test T"#,
     );
 }
 
+#[test]
+fn derived_signed_and_boolean_constants_reach_both_constraint_paths() {
+    let src = r#"const BASE : uint<8> = 2
+const LIMIT : uint<8> = BASE + 3
+const NEG : sint<8> = -1
+const ENABLE : bool = LIMIT == 5
+
+transaction Txn
+    u : uint<8>
+    s : sint<8>
+    keep u <= LIMIT
+    keep s >= NEG
+    keep ENABLE
+end transaction Txn
+
+test T
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t)
+        log(info, "${t.u}")
+    end run
+end test T"#;
+
+    for (backend, cpp) in [
+        ("v1", v1_cpp(src)),
+        (
+            "tbir",
+            tbir_constraint_snippets(src).expect("typed constants lower through TB-IR"),
+        ),
+    ] {
+        assert!(
+            cpp.contains("_ctx.bv_val((uint64_t)5, 64)"),
+            "{backend}: derived uint constant must fold to 5:\n{cpp}"
+        );
+        assert!(
+            cpp.contains("_ctx.bv_val((uint64_t)-1, 64)"),
+            "{backend}: unary-negative signed constant must retain -1:\n{cpp}"
+        );
+        assert!(
+            cpp.contains("_s.add(_ctx.bool_val(true));"),
+            "{backend}: typed bool constant must emit as a Z3 Bool:\n{cpp}"
+        );
+    }
+}
+
+#[test]
+fn equal_randomize_offsets_in_different_files_keep_distinct_problem_state() {
+    let defs = harc::parser::parse_source_named(
+        "defs.harc",
+        r#"transaction Txn
+    value : uint<8>
+end transaction Txn
+"#,
+    )
+    .expect("definitions parse");
+    let alpha = harc::parser::parse_source_named(
+        "alpha.harc",
+        r#"test Alpha
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t) with
+            t.value != 0
+        end randomize
+    end run
+end test Alpha
+"#,
+    )
+    .expect("alpha parses");
+    let bravo = harc::parser::parse_source_named(
+        "bravo.harc",
+        r#"test Bravo
+    let dut : Top
+    run
+        let t : Txn
+        randomize(t) with
+            t.value != 0
+        end randomize
+    end run
+end test Bravo
+"#,
+    )
+    .expect("bravo parses");
+    let merged = merge::merge_for_sim(vec![defs, alpha, bravo], None).expect("merge");
+    let table = harc::solver::problem_table::build_typed_solver_problem_table(&merged);
+    let sites: Vec<_> = table
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let harc::solver::problem_table::TypedSolverProblemSource::RandomizeSite {
+                source_id,
+                span,
+                ..
+            } = entry.source
+            else {
+                return None;
+            };
+            let problem_id = match &entry.build {
+                harc::solver::problem_table::TypedSolverProblemBuild::Z3 { typed, .. } => {
+                    typed.problem_id.0
+                }
+                other => panic!("randomize site must be Z3-ready: {other:?}"),
+            };
+            Some((source_id, span, problem_id))
+        })
+        .collect();
+    assert_eq!(sites.len(), 2);
+    assert_eq!(
+        sites[0].1, sites[1].1,
+        "fixture must use equal byte offsets"
+    );
+    assert_ne!(
+        sites[0].0, sites[1].0,
+        "source identity must remain distinct"
+    );
+    assert_ne!(sites[0].2, sites[1].2, "problem ids must remain distinct");
+
+    let cpp = cpp_tb::emit(&merged).expect("v1 emits both test cases");
+    let prog = harc::ir::lower::lower_program(&merged).expect("TB-IR lowers both test cases");
+    assert_eq!(prog.constraint_sites.len(), 2);
+    assert_ne!(
+        prog.constraint_sites[0].source_id,
+        prog.constraint_sites[1].source_id
+    );
+    let tbir_snippets = cpp_tb::emit_randomize_snippets(
+        &merged,
+        &cpp_tb::EmitOpts::default(),
+        &prog.constraint_sites,
+        0,
+    )
+    .expect("TB-IR randomize snippets emit")
+    .join("\n");
+    for (_, _, problem_id) in sites {
+        assert!(
+            cpp.contains(&format!("_solver_site_{problem_id}")),
+            "v1 randomize problem {problem_id} must own distinct generated state:\n{cpp}"
+        );
+        assert!(
+            tbir_snippets.contains(&format!("_solver_site_{problem_id}")),
+            "TB-IR randomize problem {problem_id} must retain its own generated state:\n{tbir_snippets}"
+        );
+    }
+}
+
+#[test]
+fn component_randomize_sites_at_equal_offsets_keep_distinct_runtime_cells() {
+    let alpha = harc::parser::parse_source_named(
+        "alpha.harc",
+        r#"agent Alpha
+    hookable draw()
+        let ctx : TxA
+        randomize(ctx)
+    end draw
+end agent Alpha
+
+transaction TxA
+    value : uint<8> with [unique within test]
+end transaction TxA
+"#,
+    )
+    .expect("alpha parses");
+    let bravo = harc::parser::parse_source_named(
+        "bravo.harc",
+        r#"agent Bravo
+    hookable draw()
+        let ctx : TxB
+        randomize(ctx)
+    end draw
+end agent Bravo
+
+transaction TxB
+    value : uint<130> with [unique within test]
+end transaction TxB
+"#,
+    )
+    .expect("bravo parses");
+    let test = harc::parser::parse_source_named(
+        "test.harc",
+        r#"test EqualOffsetComponents
+    let dut : Top
+    let alpha : Alpha
+    let bravo : Bravo
+    run
+        alpha.draw()
+        bravo.draw()
+    end run
+end test EqualOffsetComponents
+"#,
+    )
+    .expect("test parses");
+    let merged = merge::merge_for_sim(vec![alpha, bravo, test], None).expect("merge");
+    let program = harc::ir::lower::lower_program(&merged).expect("lower");
+    harc::ir::verify::verify_program(&program).expect("verify");
+    assert_eq!(program.constraint_sites.len(), 2);
+    assert_eq!(
+        program.constraint_sites[0].target.span, program.constraint_sites[1].target.span,
+        "fixture must keep the component randomize targets at equal offsets"
+    );
+    assert_ne!(
+        program.constraint_sites[0].source_id,
+        program.constraint_sites[1].source_id
+    );
+    assert!(program
+        .constraint_sites
+        .iter()
+        .all(|site| site.problem_id.is_none()));
+
+    let opts = cpp_tb::EmitOpts::default();
+    let v1 = cpp_tb::emit(&merged).expect("v1 emits distinct component sites");
+    let v1_tags = component_solver_site_tags(&v1);
+    assert_eq!(v1_tags.len(), 2, "{v1}");
+    let tbir = harc::codegen::tbir::emit(&program, &merged, &opts)
+        .expect("self-contained TB-IR emits distinct component sites");
+    let tbir_tags = component_solver_site_tags(&tbir);
+    assert_eq!(tbir_tags.len(), 2, "{tbir}");
+    assert_eq!(v1_tags, tbir_tags);
+}
+
+#[test]
+fn component_randomize_site_tags_ignore_source_id_allocation_order() {
+    const ALPHA: &str = r#"agent Alpha
+    hookable draw()
+        let ctx : TxA
+        randomize(ctx)
+    end draw
+end agent Alpha
+
+transaction TxA
+    value : uint<8> with [unique within test]
+end transaction TxA
+"#;
+    const BRAVO: &str = r#"agent Bravo
+    hookable draw()
+        let ctx : TxB
+        randomize(ctx)
+    end draw
+end agent Bravo
+
+transaction TxB
+    value : uint<130> with [unique within test]
+end transaction TxB
+"#;
+    const TEST: &str = r#"test EqualOffsetComponents
+    let dut : Top
+    let alpha : Alpha
+    let bravo : Bravo
+    run
+        alpha.draw()
+        bravo.draw()
+    end run
+end test EqualOffsetComponents
+"#;
+
+    let render = |reverse_parse_order: bool| {
+        let (alpha, bravo) = if reverse_parse_order {
+            let bravo = harc::parser::parse_source_named("bravo.harc", BRAVO).expect("bravo");
+            let alpha = harc::parser::parse_source_named("alpha.harc", ALPHA).expect("alpha");
+            (alpha, bravo)
+        } else {
+            let alpha = harc::parser::parse_source_named("alpha.harc", ALPHA).expect("alpha");
+            let bravo = harc::parser::parse_source_named("bravo.harc", BRAVO).expect("bravo");
+            (alpha, bravo)
+        };
+        let test = harc::parser::parse_source_named("test.harc", TEST).expect("test");
+        let merged = merge::merge_for_sim(vec![alpha, bravo, test], None).expect("merge");
+        cpp_tb::emit(&merged).expect("emit")
+    };
+
+    let forward = render(false);
+    let reverse = render(true);
+    assert_eq!(component_solver_site_tags(&forward).len(), 2, "{forward}");
+    assert_eq!(
+        component_solver_site_tags(&forward),
+        component_solver_site_tags(&reverse)
+    );
+    assert_eq!(forward, reverse);
+}
+
+#[test]
+fn component_randomize_site_tags_disambiguate_duplicate_source_names() {
+    const ALPHA: &str = r#"agent Alpha
+    hookable draw()
+        let ctx : TxA
+        randomize(ctx)
+    end draw
+end agent Alpha
+
+transaction TxA
+    value : uint<8> with [unique within test]
+end transaction TxA
+"#;
+    const BRAVO: &str = r#"agent Bravo
+    hookable draw()
+        let ctx : TxB
+        randomize(ctx)
+    end draw
+end agent Bravo
+
+transaction TxB
+    value : uint<130> with [unique within test]
+end transaction TxB
+"#;
+    const TEST: &str = r#"test EqualOffsetComponents
+    let dut : Top
+    let alpha : Alpha
+    let bravo : Bravo
+    run
+        alpha.draw()
+        bravo.draw()
+    end run
+end test EqualOffsetComponents
+"#;
+
+    let render = |reverse_parse_order: bool| {
+        let (alpha, bravo) = if reverse_parse_order {
+            let bravo = parse_source(BRAVO).expect("bravo");
+            let alpha = parse_source(ALPHA).expect("alpha");
+            (alpha, bravo)
+        } else {
+            let alpha = parse_source(ALPHA).expect("alpha");
+            let bravo = parse_source(BRAVO).expect("bravo");
+            (alpha, bravo)
+        };
+        assert_eq!(alpha.sources[0].name.as_ref(), "<input>");
+        assert_eq!(bravo.sources[0].name.as_ref(), "<input>");
+        let test = parse_source(TEST).expect("test");
+        let merged = merge::merge_for_sim(vec![alpha, bravo, test], None).expect("merge");
+        cpp_tb::emit(&merged).expect("emit")
+    };
+
+    let forward = render(false);
+    let reverse = render(true);
+    let forward_tags = component_solver_site_tags(&forward);
+    assert_eq!(forward_tags.len(), 2, "{forward}");
+    assert_eq!(forward_tags, component_solver_site_tags(&reverse));
+    assert_eq!(forward, reverse);
+}
+
 /// An enum is a value type, not a DUT module. `local_value_c_type` used
 /// to short-circuit only on records, so `let c : Color = BLUE` fell
 /// through to the "Named type means Verilator handle" rule and declared
@@ -9356,15 +10955,18 @@ end test T"#,
         !cpp.contains("VColor"),
         "an enum-typed local must not become a Verilator DUT handle; got:\n{cpp}"
     );
+    let red = v1_enum_symbol(&cpp, "RED");
+    let green = v1_enum_symbol(&cpp, "GREEN");
+    let blue = v1_enum_symbol(&cpp, "BLUE");
     assert!(
-        cpp.contains("int64_t c = BLUE;"),
+        cpp.contains(&format!("int64_t c = {blue};")),
         "an enum-typed local takes the same integer type an enum-typed \
          record field does; got:\n{cpp}"
     );
     assert!(
-        cpp.contains("static constexpr int64_t RED = 0;")
-            && cpp.contains("static constexpr int64_t GREEN = 1;")
-            && cpp.contains("static constexpr int64_t BLUE = 2;"),
+        cpp.contains(&format!("static constexpr int64_t {red} = 0;"))
+            && cpp.contains(&format!("static constexpr int64_t {green} = 1;"))
+            && cpp.contains(&format!("static constexpr int64_t {blue} = 2;")),
         "enum variants need file-scope definitions to be usable outside a \
          `keep`; got:\n{cpp}"
     );
@@ -9388,13 +10990,15 @@ test T
 end test T"#,
     );
     assert!(
-        cpp.contains("static constexpr uint64_t GREEN = 42;")
-            && !cpp.contains("static constexpr int64_t GREEN ="),
+        cpp.contains("static constexpr uint64_t harc_user_const_GREEN_")
+            && cpp.contains(" = 42;")
+            && !cpp.contains("static constexpr int64_t harc_user_enum_GREEN_"),
         "a `const` outranks a same-named variant, and only one definition \
          may be emitted; got:\n{cpp}"
     );
+    let red = v1_enum_symbol(&cpp, "RED");
     assert!(
-        cpp.contains("static constexpr int64_t RED = 0;"),
+        cpp.contains(&format!("static constexpr int64_t {red} = 0;")),
         "the other variants of that enum are unaffected; got:\n{cpp}"
     );
 }
@@ -9427,8 +11031,9 @@ end test T"#;
         !cpp.contains("constexpr int64_t Pkt ="),
         "a variant colliding with a record name must not be defined; got:\n{cpp}"
     );
+    let other = v1_enum_symbol(&cpp, "OTHER");
     assert!(
-        cpp.contains("static constexpr int64_t OTHER = 1;"),
+        cpp.contains(&format!("static constexpr int64_t {other} = 1;")),
         "the enum's other variants are still defined; got:\n{cpp}"
     );
 
@@ -9507,10 +11112,13 @@ end test T"#,
     // the initializer emits above `BLUE` and v1 fails to compile, exactly
     // as the spec says a forward reference must.
     let konst = cpp
-        .find("static constexpr uint64_t LIMIT = BLUE;")
+        .find("static constexpr uint64_t harc_user_const_LIMIT_")
         .unwrap_or_else(|| panic!("no LIMIT definition; got:\n{cpp}"));
     let variant = cpp
-        .find("static constexpr int64_t BLUE = 2;")
+        .find(&format!(
+            "static constexpr int64_t {} = 2;",
+            v1_enum_symbol(&cpp, "BLUE")
+        ))
         .unwrap_or_else(|| panic!("no BLUE definition; got:\n{cpp}"));
     assert!(
         konst < variant,
@@ -9536,13 +11144,15 @@ test T
     end run
 end test T"#,
     );
+    let a = v1_enum_symbol(&cpp, "A");
     assert_eq!(
-        cpp.matches("static constexpr int64_t A = ").count(),
+        cpp.matches(&format!("static constexpr int64_t {a} = "))
+            .count(),
         1,
         "a name repeated inside one enum must be defined once; got:\n{cpp}"
     );
     assert!(
-        cpp.contains("static constexpr int64_t A = 0;"),
+        cpp.contains(&format!("static constexpr int64_t {a} = 0;")),
         "the first occurrence fixes the index, matching `enum_variants`; got:\n{cpp}"
     );
 }
@@ -9567,8 +11177,9 @@ end test T"#,
         !cpp.contains("constexpr int64_t main"),
         "a variant named `main` must not be defined at file scope; got:\n{cpp}"
     );
+    let other = v1_enum_symbol(&cpp, "OTHER");
     assert!(
-        cpp.contains("static constexpr int64_t OTHER = 1;"),
+        cpp.contains(&format!("static constexpr int64_t {other} = 1;")),
         "the enum's other variants are unaffected; got:\n{cpp}"
     );
 }
@@ -11288,4 +12899,245 @@ end test GoodInstantiationTest"#,
         !cpp.contains("VTxn*") && !cpp.contains("VHelper*"),
         "no HARC-declared type may lower to a Verilator handle; got:\n{cpp}"
     );
+}
+
+fn independent_fnv1a_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+#[test]
+fn v1_common_split_artifact_bytes_are_stable() {
+    let parsed = parse_source(
+        r#"function add_one(x: uint<8>) -> uint<8>
+    return x + 1
+end function add_one
+
+test StableA
+    let dut : StableTop
+    run
+        dut.a = add_one(2)
+        wait 1 cycle
+        assert dut.sum == 3
+    end run
+end test StableA
+
+test StableB
+    let dut : StableTop
+    run
+        dut.a = add_one(8)
+        wait 1 cycle
+        assert dut.sum == 9
+    end run
+end test StableB"#,
+    )
+    .expect("parse stable v1 common fixture");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge stable fixture");
+    let output = cpp_tb::emit_common_split(
+        &merged,
+        cpp_tb::EmitOpts::default(),
+        "stable__",
+        &[
+            "top=StableTop".to_string(),
+            "mt=false".to_string(),
+            "coverage=false".to_string(),
+            "waves=".to_string(),
+        ],
+    )
+    .expect("emit stable v1 common fixture");
+
+    let actual: Vec<(String, String)> = output
+        .files
+        .iter()
+        .map(|file| {
+            (
+                file.filename.clone(),
+                independent_fnv1a_hex(file.contents.as_bytes()),
+            )
+        })
+        .collect();
+    let expected = vec![
+        (
+            "stable__suite_api.hpp".to_string(),
+            "9e236ee78638d3e4".to_string(),
+        ),
+        (
+            "stable__runtime.cpp".to_string(),
+            "40904d3cb1390ab8".to_string(),
+        ),
+        (
+            "stable__test_StableA.cpp".to_string(),
+            "a907b3b09e3ee62b".to_string(),
+        ),
+        (
+            "stable__test_StableB.cpp".to_string(),
+            "8894ec6118367e01".to_string(),
+        ),
+        (
+            "stable__registry.cpp".to_string(),
+            "44eb9beb079f8772".to_string(),
+        ),
+    ];
+    assert_eq!(actual, expected);
+    assert_eq!(output.interface_abi, "45a28e74abb2f038");
+    assert_eq!(output.build_profile, "f11cada50936fa42");
+    assert_eq!(
+        output
+            .artifact_plan
+            .render_manifest(&output.interface_abi, &output.build_profile)
+            .expect("render stable manifest"),
+        "{\"schema_version\":1,\"interface_abi\":\"45a28e74abb2f038\",\"build_profile\":\"f11cada50936fa42\",\"tests\":[\"StableA\",\"StableB\"],\"artifacts\":[\"stable__suite_api.hpp\",\"stable__runtime.cpp\",\"stable__test_StableA.cpp\",\"stable__test_StableB.cpp\",\"stable__registry.cpp\",\"harc_thread_rt.h\",\"harc_random_rt.h\",\"harc_queue_rt.h\",\"harc_trace_rt.h\",\"harc_log_rt.h\",\"harc_z3_rt.h\"]}\n"
+    );
+}
+
+#[test]
+fn v1_common_test_constraint_edit_preserves_interface_and_unrelated_capsule() {
+    let render = |alpha_constraint: u8| {
+        let parsed = parse_source(&format!(
+            r#"transaction Req
+    addr : uint<8>
+end transaction Req
+
+test Alpha
+    let dut : StableTop
+    run
+        let req : Req
+        randomize(req) with
+            req.addr != {alpha_constraint}
+        end randomize
+    end run
+end test Alpha
+
+test Bravo
+    let dut : StableTop
+    run
+        let req : Req
+        randomize(req) with
+            req.addr != 99
+        end randomize
+    end run
+end test Bravo"#
+        ))
+        .expect("parse v1-common constraint incrementality fixture");
+        let merged = merge::merge_for_sim(vec![parsed], None)
+            .expect("merge v1-common constraint incrementality fixture");
+        cpp_tb::emit_common_split(
+            &merged,
+            cpp_tb::EmitOpts::default(),
+            "constraint_incr__",
+            &[],
+        )
+        .expect("emit v1-common constraint incrementality fixture")
+    };
+
+    let before = render(7);
+    let after = render(8);
+    fn contents<'a>(output: &'a cpp_tb::CommonSplitOutput, name: &str) -> &'a str {
+        output
+            .files
+            .iter()
+            .find(|file| file.filename == name)
+            .unwrap_or_else(|| panic!("missing generated artifact {name}"))
+            .contents
+            .as_str()
+    }
+
+    assert_eq!(before.interface_abi, after.interface_abi);
+    assert_eq!(
+        contents(&before, "constraint_incr__suite_api.hpp"),
+        contents(&after, "constraint_incr__suite_api.hpp")
+    );
+    assert_eq!(
+        contents(&before, "constraint_incr__test_Bravo.cpp"),
+        contents(&after, "constraint_incr__test_Bravo.cpp")
+    );
+    assert_eq!(
+        contents(&before, "constraint_incr__registry.cpp"),
+        contents(&after, "constraint_incr__registry.cpp")
+    );
+    assert_ne!(
+        contents(&before, "constraint_incr__test_Alpha.cpp"),
+        contents(&after, "constraint_incr__test_Alpha.cpp")
+    );
+    assert_ne!(
+        contents(&before, "constraint_incr__runtime.cpp"),
+        contents(&after, "constraint_incr__runtime.cpp")
+    );
+    let interface = contents(&before, "constraint_incr__suite_api.hpp");
+    assert!(!interface.contains("_harc_runtime_random_problem_table"));
+    assert!(!interface.contains("_solver_site_"));
+    assert!(contents(&before, "constraint_incr__test_Alpha.cpp").contains("_harc_randomize_state"));
+}
+
+#[test]
+fn v1_common_context_alias_is_capsule_local() {
+    let render_bravo = |alpha_local: &str| {
+        let parsed = parse_source(&format!(
+            r#"test Alpha
+    let dut : StableTop
+    run
+{alpha_local}        wait 1 cycle
+    end run
+end test Alpha
+
+test Bravo
+    let dut : StableTop
+    run
+        wait 1 cycle
+    end run
+end test Bravo"#
+        ))
+        .expect("parse context-alias fixture");
+        let merged = merge::merge_for_sim(vec![parsed], None).expect("merge context-alias fixture");
+        let output =
+            cpp_tb::emit_common_split(&merged, cpp_tb::EmitOpts::default(), "stable_ctx__", &[])
+                .expect("emit context-alias fixture");
+        output
+            .files
+            .iter()
+            .find(|file| file.filename == "stable_ctx__test_Bravo.cpp")
+            .expect("Bravo capsule")
+            .contents
+            .clone()
+    };
+
+    let before = render_bravo("");
+    let after = render_bravo(
+        "        let ctx : uint<8> = 1\n        let _harc_randomize_context : uint<8> = 2\n",
+    );
+    assert_eq!(before, after);
+}
+
+#[test]
+fn v1_common_split_accepts_the_legacy_empty_prefix() {
+    let parsed = parse_source(
+        r#"test EmptyPrefix
+    let dut : EmptyPrefixTop
+    run
+        wait 1 cycle
+    end run
+end test EmptyPrefix"#,
+    )
+    .expect("parse empty-prefix fixture");
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge empty-prefix fixture");
+    let output = cpp_tb::emit_common_split(&merged, cpp_tb::EmitOpts::default(), "", &[])
+        .expect("the public v1 common API accepts an empty prefix");
+    assert_eq!(
+        output
+            .files
+            .iter()
+            .map(|file| file.filename.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "suite_api.hpp",
+            "runtime.cpp",
+            "test_EmptyPrefix.cpp",
+            "registry.cpp",
+        ]
+    );
+    assert_eq!(output.artifact_plan.manifest_filename(), "artifacts.json");
 }

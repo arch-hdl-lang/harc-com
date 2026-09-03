@@ -4,6 +4,7 @@
 //! `formal` (BTOR2 / SMT-LIB2 export, phase 4), and a real Phase 1a native
 //! runtime that lowers `tseq` to coroutines instead of straight-line C++.
 
+pub mod common_artifacts;
 pub mod cpp_tb;
 pub mod merge;
 pub mod sv_stub;

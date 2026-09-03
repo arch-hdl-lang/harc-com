@@ -76,8 +76,7 @@ fn both_backends_preserve_wide_record_bits_in_flat_and_structured_conversion() {
         let cpp = dir.join("probe.cpp");
         let bin = dir.join("probe");
         let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/harc_thread_rt.h");
-        let random_runtime =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/harc_random_rt.h");
+        let random_runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/harc_random_rt.h");
         std::fs::write(
             &cpp,
             format!(

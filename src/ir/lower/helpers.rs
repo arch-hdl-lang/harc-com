@@ -12,7 +12,7 @@
 //!   plus anything outside the pure scalar subset. These are
 //!   **CFG-inlined at each call site**: params become fresh caller
 //!   locals assigned from the lowered arguments (DUT-typed params
-//!   become aliases of the caller's DUT field), the body lowers into
+//!   retain the caller's exact typed DUT receiver), the body lowers into
 //!   the caller's blocks, and `return e` becomes
 //!   `Assign(dest, e); Jump(continuation)`.
 //!
@@ -33,11 +33,14 @@
 
 use super::{
     exprs::width_cast_kind, not_implemented, unsupported, FuncBuilder, InlineFrame, LowerCtx,
-    LowerError, SideTables, V1Status,
+    LowerDiagnosticRecorder, LowerError, SideTables, V1Status,
 };
 use crate::ast::{
     Block, BuiltinTy, CallArg, Expr as AstExpr, ExprKind, FunctionDecl, Item, SourceFile,
     Stmt as AstStmt, StmtKind, TypeArg, TypeExpr,
+};
+use crate::ir::scalar::{
+    contextual_value_bits, scalar_value_evidence, signed_value_bits, ScalarValueEvidence,
 };
 use crate::ir::{
     CallTarget, Expr, FunctionId, FunctionKind, IrType, RecordId, Stmt, TbFunction, Terminator,
@@ -49,6 +52,7 @@ use std::collections::{HashMap, HashSet};
 pub(crate) struct HelperEntry<'a> {
     pub decl: &'a FunctionDecl,
     pub pure: bool,
+    pub function: Option<FunctionId>,
 }
 
 #[derive(Default)]
@@ -59,10 +63,32 @@ pub(crate) struct HelperRegistry<'a> {
 impl<'a> HelperRegistry<'a> {
     /// Collect every file-level `function`, categorize pure vs impure,
     /// and reject recursion (direct or mutual).
-    pub(crate) fn build(file: &'a SourceFile) -> Result<Self, LowerError> {
+    pub(crate) fn build(
+        file: &'a SourceFile,
+        diagnostics: &LowerDiagnosticRecorder,
+    ) -> Result<Self, LowerError> {
         let mut decls: Vec<&'a FunctionDecl> = Vec::new();
-        for it in &file.items {
+        for (item_index, it) in file.items.iter().enumerate() {
             if let Item::Function(f) = it {
+                if let Some((param, span)) = f.params.iter().find_map(|param| {
+                    nested_string_type_span(param.ty.as_ref()).map(|span| (param, span))
+                }) {
+                    diagnostics.record(file.item_source(item_index), span);
+                    return Err(unsupported(
+                        &format!(
+                            "function `{}` parameter `{}` whose type contains `String`",
+                            f.name.name, param.name.name
+                        ),
+                        "String containers and aggregates are not supported; use exact top-level `String` for a callable parameter",
+                    ));
+                }
+                if let Some(span) = nested_string_type_span(f.return_ty.as_ref()) {
+                    diagnostics.record(file.item_source(item_index), span);
+                    return Err(unsupported(
+                        &format!("function `{}` return type containing `String`", f.name.name),
+                        "String containers and aggregates are not supported; use exact top-level `String` for a callable return",
+                    ));
+                }
                 decls.push(f);
             }
         }
@@ -115,7 +141,27 @@ impl<'a> HelperRegistry<'a> {
         let mut by_name = HashMap::new();
         for d in decls {
             let pure = !impure.contains(d.name.name.as_str());
-            by_name.insert(d.name.name.clone(), HelperEntry { decl: d, pure });
+            by_name.insert(
+                d.name.name.clone(),
+                HelperEntry {
+                    decl: d,
+                    pure,
+                    function: None,
+                },
+            );
+        }
+        let mut next_function = 0u32;
+        for item in &file.items {
+            let Item::Function(decl) = item else {
+                continue;
+            };
+            let Some(entry) = by_name.get_mut(&decl.name.name) else {
+                continue;
+            };
+            if entry.pure && std::ptr::eq(entry.decl, decl) {
+                entry.function = Some(FunctionId(next_function));
+                next_function += 1;
+            }
         }
         Ok(HelperRegistry { by_name })
     }
@@ -126,6 +172,20 @@ impl<'a> HelperRegistry<'a> {
 
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.by_name.contains_key(name)
+    }
+
+    /// Whether a value-position call to `name` is CFG-inlined and therefore
+    /// emits statements before yielding its result. Pure helpers stay as an
+    /// `Expr::Call`; impure helpers materialize an ordered value prelude.
+    pub(crate) fn emits_value_prelude(&self, name: &str) -> bool {
+        self.by_name.get(name).is_some_and(|entry| !entry.pure)
+    }
+
+    pub(crate) fn pure_count(&self) -> usize {
+        self.by_name
+            .values()
+            .filter(|entry| entry.function.is_some())
+            .count()
     }
 }
 
@@ -142,6 +202,13 @@ pub(crate) fn lower_pure_helper<'a>(
     b.pure_helper_abi = true;
     let mut params = Vec::with_capacity(decl.params.len());
     for p in &decl.params {
+        if is_string_tseq_type(p.ty.as_ref()) {
+            b.record_error_span(p.span);
+            return Err(LowerError::Invalid(format!(
+                "helper `{}` parameter `{}` cannot use `TSeq<String>`; String sequences are not supported",
+                decl.name.name, p.name.name
+            )));
+        }
         let ty = pure_helper_signature_type(
             &decl.name.name,
             &format!("parameter `{}`", p.name.name),
@@ -258,15 +325,24 @@ impl FuncBuilder<'_> {
             .collect();
 
         if entry.pure {
+            let arg_effects: Vec<bool> = arg_exprs
+                .iter()
+                .map(|expr| self.expr_has_effectful_value_prelude(expr))
+                .collect();
             let mut lowered = Vec::with_capacity(arg_exprs.len());
-            for (p, e) in decl.params.iter().zip(arg_exprs) {
+            for (index, (p, e)) in decl
+                .params
+                .iter()
+                .zip(arg_exprs.iter().copied())
+                .enumerate()
+            {
                 let param_ty = pure_helper_signature_type(
                     name,
                     &format!("parameter `{}`", p.name.name),
                     p.ty.as_ref(),
                     &self.ctx.record_ids,
                 )?;
-                let v = if matches!(param_ty, IrType::FixedVec { .. }) {
+                let mut v = if matches!(param_ty, IrType::FixedVec { .. }) {
                     let value = self.whole_vec_value_rhs(e)?.ok_or_else(|| {
                         LowerError::Invalid(format!(
                             "parameter `{}` of helper `{name}` requires a matching whole-vector value",
@@ -295,7 +371,16 @@ impl FuncBuilder<'_> {
                         V1Status::EmitsUncompilable,
                     ));
                 }
-                self.check_param_slot(&v, p, &format!("helper `{name}`"))?;
+                let hint = match self.check_param_slot(&v, p, &format!("helper `{name}`")) {
+                    Ok(hint) => hint,
+                    Err(error) => {
+                        self.record_error_span(e.span);
+                        return Err(error);
+                    }
+                };
+                if arg_effects[index + 1..].iter().any(|effect| *effect) {
+                    v = self.materialize_ordered_value_as(v, hint);
+                }
                 lowered.push(v);
             }
             let ret = pure_helper_signature_type(
@@ -306,6 +391,11 @@ impl FuncBuilder<'_> {
             )?;
             return Ok(Expr::Call(
                 CallTarget::Helper {
+                    function: entry.function.ok_or_else(|| {
+                        LowerError::Invalid(format!(
+                            "pure helper `{name}` is missing its canonical function identity"
+                        ))
+                    })?,
                     name: name.to_string(),
                     ret,
                 },
@@ -339,13 +429,17 @@ impl FuncBuilder<'_> {
         // Evaluate arguments in the caller's scope, before the helper's
         // params shadow anything.
         enum Bound {
-            Dut,
+            Dut(String),
             Val(Expr),
         }
+        let arg_effects: Vec<bool> = arg_exprs
+            .iter()
+            .map(|expr| self.expr_has_effectful_value_prelude(expr))
+            .collect();
         let mut bound = Vec::with_capacity(arg_exprs.len());
-        for (p, e) in decl.params.iter().zip(&arg_exprs) {
-            if is_dut_ident(self, e) {
-                bound.push(Bound::Dut);
+        for (index, (p, e)) in decl.params.iter().zip(&arg_exprs).enumerate() {
+            if let Some(receiver) = dut_ident_receiver(self, e) {
+                bound.push(Bound::Dut(receiver));
             } else if matches!(p.ty, Some(TypeExpr::Named { .. }))
                 && !matches!(ir_type_of_param(p.ty.as_ref(), self.ctx), IrType::Record(_))
             {
@@ -373,7 +467,7 @@ impl FuncBuilder<'_> {
                     p.ty.as_ref(),
                     &self.ctx.record_ids,
                 )?;
-                let v = if matches!(param_ty, IrType::FixedVec { .. }) {
+                let mut v = if matches!(param_ty, IrType::FixedVec { .. }) {
                     let value = self.whole_vec_value_rhs(e)?.ok_or_else(|| {
                         LowerError::Invalid(format!(
                             "parameter `{}` of helper `{name}` requires a matching whole-vector value",
@@ -398,7 +492,16 @@ impl FuncBuilder<'_> {
                 // verification after lowering" — a program error
                 // answered through the compiler-bug channel, the third
                 // place in this sweep that has happened.
-                self.check_param_slot(&v, p, &format!("helper `{name}`"))?;
+                let hint = match self.check_param_slot(&v, p, &format!("helper `{name}`")) {
+                    Ok(hint) => hint,
+                    Err(error) => {
+                        self.record_error_span(e.span);
+                        return Err(error);
+                    }
+                };
+                if arg_effects[index + 1..].iter().any(|effect| *effect) {
+                    v = self.materialize_ordered_value_as(v, hint);
+                }
                 bound.push(Bound::Val(v));
             }
         }
@@ -419,15 +522,14 @@ impl FuncBuilder<'_> {
         self.push_return_default(dest, &ret_ty);
         let cont = self.new_block();
 
-        let mut dut_aliases = HashSet::new();
+        let mut dut_aliases = HashMap::new();
         for (p, b) in decl.params.iter().zip(&bound) {
-            if matches!(b, Bound::Dut) {
-                dut_aliases.insert(p.name.name.clone());
+            if let Bound::Dut(receiver) = b {
+                dut_aliases.insert(p.name.name.clone(), receiver.clone());
             }
         }
         self.inline_frames.push(InlineFrame {
             name: name.to_string(),
-            is_testbench_method: false,
             dut_aliases,
             ret_dest: dest,
             ret_cont: cont,
@@ -472,72 +574,179 @@ impl FuncBuilder<'_> {
         v: &Expr,
         p: &crate::ast::Param,
         owner: &str,
-    ) -> Result<(), LowerError> {
+    ) -> Result<Option<IrType>, LowerError> {
+        if is_string_tseq_type(p.ty.as_ref()) {
+            return Err(LowerError::Invalid(format!(
+                "parameter `{}` of {owner} cannot use `TSeq<String>`; String sequences are not supported",
+                p.name.name
+            )));
+        }
         let want = slot_ir_type(p.ty.as_ref(), &self.ctx.record_ids);
-        let what = format!("parameter `{}` of {owner}", p.name.name);
-        self.check_slot_ir(v, &want, &what)?;
-        if matches!(want, IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_)) {
-            if let Some(actual @ (IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_))) =
-                self.expr_type(v)
+        let slot = format!("parameter `{}` of {owner}", p.name.name);
+        self.check_callable_argument(v, &want, &slot)
+    }
+
+    /// Check a source value against one callable parameter before argument
+    /// ordering can replace the expression with a temporary. The returned
+    /// type is a contextual type for such a temporary: it preserves a real
+    /// mask/literal bound instead of re-inferring the wider input leaf.
+    pub(crate) fn check_callable_argument(
+        &self,
+        value: &Expr,
+        expected: &IrType,
+        what: &str,
+    ) -> Result<Option<IrType>, LowerError> {
+        self.check_slot_ir(value, expected, what)?;
+        if matches!(expected, IrType::FixedVec { .. } | IrType::RecordSeq(_)) {
+            if let Some(actual @ (IrType::FixedVec { .. } | IrType::RecordSeq(_))) =
+                self.expr_type(value)
             {
-                if actual != want {
+                if &actual != expected {
                     return Err(LowerError::Invalid(format!(
-                        "{what} expects {want:?}, got {actual:?}"
+                        "{what} expects {expected:?}, got {actual:?}"
                     )));
                 }
             }
         }
-        Ok(())
+        let Some(evidence) = self.scalar_value_evidence(value) else {
+            return Ok(None);
+        };
+        if matches!(
+            expected,
+            IrType::Unknown | IrType::UInt(None) | IrType::SInt(None)
+        ) {
+            return Ok(None);
+        }
+
+        if matches!(expected, IrType::Bool) {
+            return match evidence {
+                ScalarValueEvidence::Bool => Ok(Some(IrType::Bool)),
+                ScalarValueEvidence::Integer {
+                    signed: None,
+                    exact: Some(0) | Some(1),
+                    ..
+                } => Ok(Some(IrType::Bool)),
+                _ => Err(LowerError::Invalid(format!(
+                    "{what} has type Bool, but the argument is not a boolean or a literal 0/1"
+                ))),
+            };
+        }
+
+        let (dest_width, dest_signed) = match expected {
+            IrType::UInt(Some(width)) => (*width, false),
+            IrType::SInt(Some(width)) => (*width, true),
+            _ => return Ok(None),
+        };
+        let ScalarValueEvidence::Integer {
+            width,
+            signed,
+            exact,
+            ..
+        } = evidence
+        else {
+            return Ok(Some(expected.clone()));
+        };
+
+        if let Some(src_signed) = signed {
+            if dest_signed != src_signed {
+                let src_width = width.unwrap_or(64);
+                let (article, from, to) = if src_signed {
+                    ("a", "signed", "unsigned")
+                } else {
+                    ("an", "unsigned", "signed")
+                };
+                return Err(LowerError::Invalid(format!(
+                    "assignment of {article} {from} {src_width}-bit value to {what}, declared \
+                     {to} {dest_width} bits. Signedness must match — relabel the value \
+                     explicitly with `as {}<{dest_width}>`.",
+                    if dest_signed { "sint" } else { "uint" }
+                )));
+            }
+        } else if exact.is_some_and(|value| value < 0) && !dest_signed {
+            let src_width = exact.map(signed_value_bits).unwrap_or(64);
+            return Err(LowerError::Invalid(format!(
+                "assignment of a signed {src_width}-bit value to {what}, declared unsigned \
+                 {dest_width} bits. Signedness must match — relabel the value explicitly with \
+                 `as uint<{dest_width}>`."
+            )));
+        }
+
+        let src_width = match (signed, exact) {
+            (None, Some(value)) => contextual_value_bits(value, dest_signed),
+            _ => width,
+        };
+        if let Some(src_width) = src_width {
+            if src_width > dest_width {
+                return Err(LowerError::Invalid(format!(
+                    "assignment of a {src_width}-bit value to {what}, declared {dest_width} bits, \
+                     narrows. Widths must not shrink implicitly — use `.trunc<{dest_width}>()` to \
+                     narrow explicitly, or widen the parameter declaration to {src_width} bits."
+                )));
+            }
+        }
+        Ok(Some(expected.clone()))
+    }
+
+    fn scalar_value_evidence(&self, value: &Expr) -> Option<ScalarValueEvidence> {
+        scalar_value_evidence(value, &|value| self.host_state_scalar_type(value))
+    }
+
+    pub(crate) fn lower_checked_ordered_args(
+        &mut self,
+        exprs: &[&AstExpr],
+        expected: &[IrType],
+        slots: &[String],
+        ports_allowed: bool,
+    ) -> Result<Vec<Expr>, LowerError> {
+        debug_assert_eq!(exprs.len(), expected.len());
+        debug_assert_eq!(exprs.len(), slots.len());
+        let effects: Vec<bool> = exprs
+            .iter()
+            .map(|expr| self.expr_has_effectful_value_prelude(expr))
+            .collect();
+        let mut lowered = Vec::with_capacity(exprs.len());
+        for (index, expr) in exprs.iter().enumerate() {
+            let mut value = if ports_allowed {
+                self.lower_expr(expr)?
+            } else {
+                self.lower_expr_no_ports(expr)?
+            };
+            let hint = match self.check_callable_argument(&value, &expected[index], &slots[index]) {
+                Ok(hint) => hint,
+                Err(error) => {
+                    self.record_error_span(expr.span);
+                    return Err(error);
+                }
+            };
+            if effects[index + 1..].iter().any(|effect| *effect) {
+                value = self.materialize_ordered_value_as(value, hint);
+            }
+            lowered.push(value);
+        }
+        Ok(lowered)
     }
 
     /// Lower a call to an `extern function name(...) -> ret` (spec §9).
-    /// Mirrors v1: arguments lower as plain scalar values and the call
-    /// stays an `Expr::Call(CallTarget::ExternFn, ...)`, emitted with the
-    /// RAW symbol name so it binds to the user's `extern "C"` definition
-    /// linked via `--ref-src`. An extern fn is PURE — it never
-    /// CFG-inlines and (unlike an impure helper) never takes a DUT
-    /// handle, so arguments lower without port access.
-    ///
-    /// Not "scalar", which this comment used to say and which the loop
-    /// below used to enforce: `c_type_for` renders `TSeq<T>` as
-    /// `const std::vector<T>&`, and a sequence argument compiles under
-    /// both backends. Purity is the property the lowering depends on;
-    /// scalar-ness was an assumption sitting next to it.
+    /// The call remains an `Expr::Call(CallTarget::ExternFn, ...)` whose
+    /// raw symbol binds to the user's `extern "C"` definition supplied by
+    /// `--ref-src`. Extern functions cannot access DUT ports, so their
+    /// arguments lower without port access; supported container arguments
+    /// remain valid ABI values.
     pub(crate) fn lower_extern_fn_call(
         &mut self,
         name: &str,
         args: &[CallArg],
     ) -> Result<Expr, LowerError> {
-        // Same measurement as the helper arm above:
-        // `ref_add(b = 222, a = 111)` emits `ref_add(222, 111)` under
-        // v1, and the in-order form emits the positional one unchanged.
-        // One lookup, not two, and no `None` path on either: the sole
-        // caller (`exprs.rs`) dispatches here only when the name is in
-        // `extern_fns`. The previous shape had three separate
-        // expressions of that impossible `None` — an `if let` that
-        // silently skipped the named-argument check, an
-        // `unwrap_or_default`, and a `contains_key` guard — and the
-        // commit that removed two of them said in its own message that
-        // the lookup always hits.
+        // `exprs.rs` dispatches here only after resolving the name in
+        // `extern_fns`, so the signature lookup is an invariant.
         let (pnames, ptys, ret) = self.ctx.extern_fns[name].clone();
         super::reject_misplaced_named_args(
             args,
             &pnames,
             &format!("extern fn call `{name}(...)`"),
         )?;
-        // Arity, before the slot loop — the same order
-        // `check_component_call_args` uses, and for the reason its doc
-        // records: without it the `zip`/`get` silently stops at the
-        // shorter side. Measured with a compiling control (`f(1)` on a
-        // one-parameter fn): `f(1, 2)` gives "too many arguments to
-        // function `uint64_t f(uint64_t)`" and `g(1)` on a two-parameter
-        // fn "too few arguments", from both backends.
-        //
-        // This also retires a `None` arm that checked a surplus argument
-        // against a fabricated scalar slot — `f(1, b)` reported that
-        // "an argument of extern fn `f` takes a non-record value",
-        // describing parameter #2 of a one-parameter function. A slot
-        // that does not exist has no type to disagree with.
+        // Check arity before pairing arguments with declared slots. A surplus
+        // argument has no parameter type against which it can be checked.
         if args.len() != pnames.len() {
             return Err(LowerError::Invalid(format!(
                 "extern fn `{name}` takes {} argument(s), call passes {}",
@@ -545,41 +754,21 @@ impl FuncBuilder<'_> {
                 args.len()
             )));
         }
-        let mut lowered = Vec::with_capacity(args.len());
-        for (i, a) in args.iter().enumerate() {
-            match a {
-                CallArg::Expr(e) | CallArg::Named { value: e, .. } => {
-                    let v = self.lower_expr_no_ports(e)?;
-                    // Arity is checked above and `pnames`/`ptys` come
-                    // from the same `d.params`, so both indexes are
-                    // total. The `None` labels these used to carry
-                    // described a parameter that does not exist — the
-                    // very diagnostic the arity check exists to replace.
-                    let slot = format!("parameter `{}` of extern fn `{name}`", pnames[i]);
-                    // Against the DECLARED type, not against "scalar".
-                    // A comment here twice asserted that every extern-fn
-                    // parameter is a scalar — citing this module's own
-                    // header — and the loop hard-coded the slot to match.
-                    // `TSeq<T>` is the counterexample: `cpp_tb`'s
-                    // `c_type_for` renders it `const std::vector<T>&`,
-                    // and `extern function ref_sum(xs: TSeq<Beat>)`
-                    // called with a sequence compiles under v1 and under
-                    // tbir at the merge base. Hard-coding the slot made
-                    // the DEFAULT backend reject it — the exact class of
-                    // false `Invalid` this family exists to remove,
-                    // reintroduced by the check meant to prevent it.
-                    //
-                    // The record case never reaches here: it is refused
-                    // at the declaration, where both backends already
-                    // break.
-                    self.check_slot_ir(&v, &ptys[i], &slot)?;
-                    lowered.push(v)
-                }
-            }
-        }
+        let arg_exprs: Vec<&crate::ast::Expr> = args
+            .iter()
+            .map(|a| match a {
+                CallArg::Expr(e) | CallArg::Named { value: e, .. } => e,
+            })
+            .collect();
+        let slots: Vec<String> = pnames
+            .iter()
+            .map(|pname| format!("parameter `{pname}` of extern fn `{name}`"))
+            .collect();
+        let lowered = self.lower_checked_ordered_args(&arg_exprs, &ptys, &slots, false)?;
         Ok(Expr::Call(
             CallTarget::ExternFn {
                 name: name.to_string(),
+                params: ptys,
                 ret,
             },
             lowered,
@@ -601,25 +790,24 @@ impl FuncBuilder<'_> {
             .then(|| name.name.clone())
     }
 
-    /// CFG-inline a testbench helper method call (`_tb.reset()`,
-    /// `_tb.bump(5)`). Same shape as the impure-helper inline: params
-    /// become fresh caller locals, the body lowers into the caller's
-    /// blocks under an `InlineFrame` (so the body sees only its own
-    /// scopes — plus the DUT, which a testbench method touches through
-    /// the shared `dut` field, resolved by `is_dut_name` exactly as in
-    /// the test body). v1 emits these as `[&]`-capturing lambdas whose
-    /// `wait`s tick the same scheduler, so the inlined CFG's cycle
-    /// behavior is identical.
+    /// Lower a call to the canonical callable for a testbench method.
+    /// Arguments are evaluated in source order and the current DUT handle is
+    /// represented explicitly for module-typed parameters.
     pub(crate) fn lower_tb_method_call(
         &mut self,
         name: &str,
         args: &[CallArg],
     ) -> Result<Expr, LowerError> {
+        let Some(&function) = self.ctx.tb_method_functions.get(name) else {
+            return Err(LowerError::Invalid(format!(
+                "testbench method `{name}` has no canonical callable"
+            )));
+        };
         let decl = self
             .ctx
             .tb_methods
             .get(name)
-            .expect("caller checked tb_methods membership");
+            .expect("canonical testbench method has an AST declaration");
         if args.len() != decl.params.len() {
             return Err(LowerError::Invalid(format!(
                 "testbench method `{name}` takes {} argument(s), call passes {}",
@@ -633,160 +821,126 @@ impl FuncBuilder<'_> {
                 "log/fail messages evaluate lazily; hoist the call into a `let` first",
             ));
         }
-        let frame_name = format!("_tb.{name}");
-        if self.inline_frames.iter().any(|f| f.name == frame_name) {
-            // Testbench methods are always inlined (they capture the
-            // shared `_tb` host state), so a cycle cannot terminate.
-            // v1 emits them as `auto` lambdas, which cannot name
-            // themselves in their own initializer — no v1 escape hatch.
-            return Err(not_implemented(
-                "recursive testbench methods",
-                format!("`{name}` is already being inlined"),
-                V1Status::EmitsUncompilable,
-            ));
-        }
-
-        // Same measurement as the helper and extern-fn arms:
-        // `hlp(b = 222, a = 111)` emits `Tb_hlp(_tb, 222, 111)` under
-        // v1 — silently swapped — while the in-order form emits the
-        // positional one unchanged.
-        let declared: Vec<String> = decl.params.iter().map(|p| p.name.name.clone()).collect();
+        let declared = decl
+            .params
+            .iter()
+            .map(|param| param.name.name.clone())
+            .collect::<Vec<_>>();
         super::reject_misplaced_named_args(
             args,
             &declared,
-            &format!("testbench method call `{name}(...)`"),
+            &format!("testbench method call `{name}(...)"),
         )?;
-        let arg_exprs: Vec<&crate::ast::Expr> = args
+        let arg_exprs = args
             .iter()
-            .map(|a| match a {
-                CallArg::Expr(e) | CallArg::Named { value: e, .. } => e,
+            .map(|arg| match arg {
+                CallArg::Expr(expr) | CallArg::Named { value: expr, .. } => expr,
             })
-            .collect();
-        enum Bound {
-            Dut,
-            Val(Expr),
-        }
-        let mut bound = Vec::with_capacity(arg_exprs.len());
-        for (p, e) in decl.params.iter().zip(&arg_exprs) {
-            if is_dut_ident(self, e) {
-                bound.push(Bound::Dut);
-            } else if matches!(p.ty, Some(TypeExpr::Named { .. }))
-                && !matches!(ir_type_of_param(p.ty.as_ref(), self.ctx), IrType::Record(_))
-            {
-                // The testbench-method sibling of the helper arm
-                // above, measured on its own rather than inferred from
-                // it: v1 emits `Tb_peek(_tb, _tb.m)` against
-                // `[&](Tb& self, VTop* d)` and g++ gives "no match for
-                // call to `<lambda(Tb&, VTop*)>` (Tb&, Model&)".
-                return Err(not_implemented(
-                    &format!(
-                        "testbench method parameter `{}` of module type with a non-DUT argument",
-                        p.name.name
-                    ),
-                    "v1 types the emitted lambda on the module and passes the argument \
-                     through, so g++ rejects the call",
-                    V1Status::EmitsUncompilable,
-                ));
-            } else {
-                let param_ty = testbench_method_signature_type(
-                    name,
-                    &format!("parameter `{}`", p.name.name),
-                    p.ty.as_ref(),
-                    &self.ctx.record_ids,
-                )?;
-                let v = if matches!(param_ty, IrType::FixedVec { .. }) {
-                    let value = self.whole_vec_value_rhs(e)?.ok_or_else(|| {
-                        LowerError::Invalid(format!(
-                            "parameter `{}` of testbench method `{name}` requires a whole fixed-vector value",
-                            p.name.name
-                        ))
-                    })?;
-                    if self.ir_whole_vec_type(&value).as_ref() != Some(&param_ty) {
-                        return Err(LowerError::Invalid(format!(
-                            "parameter `{}` of testbench method `{name}` expects {param_ty:?}, got {:?}",
-                            p.name.name,
-                            self.ir_whole_vec_type(&value).unwrap_or(IrType::Unknown)
-                        )));
-                    }
-                    value
-                } else {
-                    self.lower_expr_no_ports(e)?
-                };
-                // The testbench-method spelling of the slot rule.
-                // `ir_type_of_param` is already in hand two lines up, so
-                // this needed no new type table — the note that deferred
-                // it said otherwise and was wrong. Measured: `tf(1)`
-                // into a `t: Beat` parameter lowered and emitted, and
-                // both backends answer "no match for call to"; `tf(o)`
-                // on a DIFFERENT record reached the VERIFIER's
-                // `TypeMismatch` and surfaced as "internal error: TB-IR
-                // failed verification after lowering" — a program error
-                // answered through the compiler-bug channel.
-                self.check_param_slot(&v, p, &format!("testbench method `{name}`"))?;
-                bound.push(Bound::Val(v));
-            }
-        }
-
-        let dest = self.fresh_temp();
-        let mut ret_ty = IrType::Unknown;
-        if decl.return_ty.is_some() {
-            ret_ty = testbench_method_signature_type(
+            .collect::<Vec<_>>();
+        let arg_effects = arg_exprs
+            .iter()
+            .map(|expr| self.expr_has_effectful_value_prelude(expr))
+            .collect::<Vec<_>>();
+        let mut lowered = Vec::with_capacity(arg_exprs.len());
+        let mut dut_args = Vec::new();
+        for (index, (param, expr)) in decl.params.iter().zip(&arg_exprs).enumerate() {
+            let param_ty = testbench_method_signature_type(
                 name,
-                "return type",
-                decl.return_ty.as_ref(),
+                &format!("parameter `{}`", param.name.name),
+                param.ty.as_ref(),
                 &self.ctx.record_ids,
             )?;
-            self.set_local_type(dest, ret_ty.clone());
-        }
-        self.push_return_default(dest, &ret_ty);
-        let cont = self.new_block();
-
-        let mut dut_aliases = HashSet::new();
-        for (p, b) in decl.params.iter().zip(&bound) {
-            if matches!(b, Bound::Dut) {
-                dut_aliases.insert(p.name.name.clone());
+            let module_param = matches!(param.ty, Some(TypeExpr::Named { .. }))
+                && matches!(param_ty, IrType::Unknown);
+            if module_param {
+                let Some(receiver) = dut_ident_receiver(self, expr) else {
+                    self.record_error_span(expr.span);
+                    return Err(not_implemented(
+                        &format!(
+                            "testbench method parameter `{}` of module type with a non-DUT argument",
+                            param.name.name
+                        ),
+                        "only the owning testbench DUT handle can enter a module parameter",
+                        V1Status::EmitsUncompilable,
+                    ));
+                };
+                dut_args.push(index);
+                let receiver_local = self
+                    .standalone_dut_aliases
+                    .contains(&receiver)
+                    .then(|| {
+                        self.locals
+                            .iter()
+                            .position(|local| local.name == receiver)
+                            .map(|local| Expr::Local(crate::ir::LocalId(local as u32)))
+                    })
+                    .flatten();
+                lowered.push(receiver_local.unwrap_or(Expr::Literal {
+                    value: 0,
+                    ty: IrType::Unknown,
+                }));
+                continue;
             }
+            let mut value = if matches!(param_ty, IrType::FixedVec { .. }) {
+                let value = self.whole_vec_value_rhs(expr)?.ok_or_else(|| {
+                    LowerError::Invalid(format!(
+                        "parameter `{}` of testbench method `{name}` requires a whole fixed-vector value",
+                        param.name.name
+                    ))
+                })?;
+                if self.ir_whole_vec_type(&value).as_ref() != Some(&param_ty) {
+                    return Err(LowerError::Invalid(format!(
+                        "parameter `{}` of testbench method `{name}` expects {param_ty:?}, got {:?}",
+                        param.name.name,
+                        self.ir_whole_vec_type(&value).unwrap_or(IrType::Unknown)
+                    )));
+                }
+                value
+            } else {
+                self.lower_expr_no_ports(expr)?
+            };
+            let hint =
+                match self.check_param_slot(&value, param, &format!("testbench method `{name}`")) {
+                    Ok(hint) => hint,
+                    Err(error) => {
+                        self.record_error_span(expr.span);
+                        return Err(error);
+                    }
+                };
+            if arg_effects[index + 1..].iter().any(|effect| *effect) {
+                value = self.materialize_ordered_value_as(value, hint);
+            }
+            lowered.push(value);
         }
-        self.inline_frames.push(InlineFrame {
-            name: frame_name,
-            is_testbench_method: true,
-            dut_aliases,
-            ret_dest: dest,
-            ret_cont: cont,
-            scope_floor: self.scope_depth(),
-            loop_floor: self.loop_stack.len(),
+        let dest = if let Some(return_ty) = decl.return_ty.as_ref() {
+            let local = self.fresh_temp();
+            self.set_local_type(
+                local,
+                testbench_method_signature_type(
+                    name,
+                    "return type",
+                    Some(return_ty),
+                    &self.ctx.record_ids,
+                )?,
+            );
+            Some(local)
+        } else {
+            None
+        };
+        self.push(Stmt::TestbenchCall {
+            function,
+            args: lowered,
+            dut_args,
+            dest,
         });
-        self.push_scope();
-        for (p, b) in decl.params.iter().zip(bound) {
-            if let Bound::Val(e) = b {
-                let id = self.declare(&p.name.name);
-                self.set_local_type(
-                    id,
-                    testbench_method_signature_type(
-                        name,
-                        &format!("parameter `{}`", p.name.name),
-                        p.ty.as_ref(),
-                        &self.ctx.record_ids,
-                    )?,
-                );
-                self.push(Stmt::Assign(id, e));
-            }
-        }
-
-        let body = decl.body.clone();
-        self.lower_block_stmts(&body)?;
-        if !self.is_terminated() {
-            self.terminate(Terminator::Jump(cont));
-        }
-
-        self.pop_scope();
-        self.inline_frames.pop();
-        self.start_block(cont);
-        Ok(Expr::Local(dest))
+        Ok(dest.map(Expr::Local).unwrap_or(Expr::Literal {
+            value: 0,
+            ty: IrType::Unknown,
+        }))
     }
 
-    /// `return` lowering for helper contexts. Returns `false` when not
-    /// in a helper context (caller handles run/check semantics).
+    /// Lower a `return` inside a helper body. Returns false outside a helper
+    /// context so the enclosing statement lowering can handle phase returns.
     pub(crate) fn lower_helper_return(
         &mut self,
         value: Option<&AstExpr>,
@@ -798,22 +952,29 @@ impl FuncBuilder<'_> {
                 if let Some(port) = self.as_port_ref(e)? {
                     if matches!(
                         expected,
-                        IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_)
+                        IrType::Record(_)
+                            | IrType::RecordSeq(_)
+                            | IrType::Seq(_)
+                            | IrType::FixedVec { .. }
+                            | IrType::String
+                            | IrType::Component(_)
                     ) {
+                        self.record_error_span(e.span);
                         return Err(LowerError::Invalid(format!(
-                            "testbench/helper method return expects {expected:?}, got a scalar DUT port"
+                            "helper return expects {expected:?}, but a DUT port is a scalar value"
                         )));
+                    }
+                    if let Err(error) =
+                        self.check_slot_ir(&Expr::Port(port.clone()), &expected, "helper return")
+                    {
+                        self.record_error_span(e.span);
+                        return Err(error);
                     }
                     self.push(Stmt::DutRead(dest, port));
                 } else {
                     let ir = if let IrType::FixedVec { elem, len } = &expected {
-                        let shape = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
-                            .map(|class| (*len, class));
-                        match shape {
-                            Some(shape) => self.whole_vec_copy_rhs(shape, e)?,
-                            None => None,
-                        }
-                        .ok_or_else(|| {
+                        self.whole_vec_copy_rhs((*len, (**elem).clone()), e)?
+                            .ok_or_else(|| {
                             LowerError::Invalid(
                                 "fixed-vector testbench method return requires a matching whole-vector value"
                                     .to_string(),
@@ -830,6 +991,10 @@ impl FuncBuilder<'_> {
                             )));
                         }
                     }
+                    if let Err(error) = self.check_slot_ir(&ir, &expected, "helper return") {
+                        self.record_error_span(e.span);
+                        return Err(error);
+                    }
                     self.push(Stmt::Assign(dest, ir));
                 }
             }
@@ -840,18 +1005,13 @@ impl FuncBuilder<'_> {
             if let Some(e) = value {
                 let expected = self.local_type(ret).clone();
                 let ir = if let IrType::FixedVec { elem, len } = &expected {
-                    let shape = crate::codegen::cpp_tb::ir_vec_elem_class(elem)
-                        .map(|class| (*len, class));
-                    let value = match shape {
-                        Some(shape) => self.whole_vec_copy_rhs(shape, e)?,
-                        None => None,
-                    };
-                    value.ok_or_else(|| {
-                        LowerError::Invalid(
-                            "fixed-vector method return requires a matching whole-vector value"
-                                .to_string(),
-                        )
-                    })?
+                    self.whole_vec_copy_rhs((*len, (**elem).clone()), e)?
+                        .ok_or_else(|| {
+                            LowerError::Invalid(
+                                "fixed-vector method return requires a matching whole-vector value"
+                                    .to_string(),
+                            )
+                        })?
                 } else {
                     self.lower_expr_no_ports(e)?
                 };
@@ -877,7 +1037,10 @@ impl FuncBuilder<'_> {
                             V1Status::EmitsUncompilable,
                         ));
                     }
-                    self.check_slot_ir(&ir, &expected, "pure-helper return")?;
+                }
+                if let Err(error) = self.check_slot_ir(&ir, &expected, "helper return") {
+                    self.record_error_span(e.span);
+                    return Err(error);
                 }
                 self.push(Stmt::Assign(ret, ir));
             }
@@ -893,6 +1056,7 @@ impl FuncBuilder<'_> {
             IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_) => {
                 self.push(Stmt::AggregateInit(dest))
             }
+            IrType::String => self.push(Stmt::Assign(dest, Expr::StringLiteral(String::new()))),
             _ => self.push(Stmt::Assign(
                 dest,
                 Expr::Literal {
@@ -904,11 +1068,11 @@ impl FuncBuilder<'_> {
     }
 }
 
-fn is_dut_ident(b: &FuncBuilder<'_>, e: &AstExpr) -> bool {
+fn dut_ident_receiver(b: &FuncBuilder<'_>, e: &AstExpr) -> Option<String> {
     match &*e.kind {
-        ExprKind::Ident(id) => b.is_dut_name(&id.name),
-        ExprKind::Paren(inner) => is_dut_ident(b, inner),
-        _ => false,
+        ExprKind::Ident(id) if b.lookup(&id.name).is_none() => b.resolved_dut_name(&id.name),
+        ExprKind::Paren(inner) => dut_ident_receiver(b, inner),
+        _ => None,
     }
 }
 
@@ -927,6 +1091,7 @@ pub(crate) fn ir_type_of(ty: Option<&TypeExpr>) -> IrType {
         BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => IrType::UInt(width()),
         BuiltinTy::SInt | BuiltinTy::SIntCap => IrType::SInt(width()),
         BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => IrType::Bool,
+        BuiltinTy::String => IrType::String,
         _ => IrType::Unknown,
     }
 }
@@ -968,8 +1133,7 @@ pub(crate) fn tseq_ir_type(
         if let ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) = ir_type_of(Some(inner)) {
             return Some(IrType::Seq(Box::new(ty)));
         }
-        if let Some(ty @ IrType::FixedVec { .. }) =
-            super::components::fixed_vec_elem_ir_type(inner)
+        if let Some(ty @ IrType::FixedVec { .. }) = super::components::fixed_vec_elem_ir_type(inner)
         {
             return Some(IrType::Seq(Box::new(ty)));
         }
@@ -982,17 +1146,76 @@ pub(crate) fn tseq_ir_type(
 /// callable signatures must reject that sentinel instead of emitting it as a
 /// scalar value.
 pub(crate) fn callable_tseq_ir_type(
-    construct: String,
+    construct: impl FnOnce() -> String,
     ty: Option<&TypeExpr>,
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<Option<IrType>, LowerError> {
     match tseq_ir_type(ty, record_ids) {
         Some(IrType::Unknown) => Err(unsupported(
-            &construct,
+            &construct(),
             "callable TSeq values support records, scalars, and scalar-leaf fixed vectors",
         )),
         other => Ok(other),
     }
+}
+
+pub(crate) fn is_string_tseq_type(ty: Option<&TypeExpr>) -> bool {
+    let Some(TypeExpr::Builtin {
+        name: BuiltinTy::TSeq,
+        args,
+        ..
+    }) = ty
+    else {
+        return false;
+    };
+    match args.first() {
+        Some(TypeArg::Type(TypeExpr::Builtin {
+            name: BuiltinTy::String,
+            ..
+        })) => true,
+        Some(TypeArg::Expr(expr)) => {
+            matches!(&*expr.kind, ExprKind::Ident(ident) if ident.name == "String")
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn type_contains_string(ty: &TypeExpr) -> bool {
+    let args = match ty {
+        TypeExpr::Builtin {
+            name: BuiltinTy::String,
+            ..
+        } => return true,
+        TypeExpr::Builtin { args, .. } | TypeExpr::Named { generics: args, .. } => args,
+    };
+    args.iter().any(|arg| match arg {
+        TypeArg::Type(ty) => type_contains_string(ty),
+        TypeArg::Expr(expr) | TypeArg::Named { value: expr, .. } => {
+            matches!(&*expr.kind, ExprKind::Ident(ident) if ident.name == "String")
+        }
+    })
+}
+
+pub(crate) fn is_exact_string_type(ty: Option<&TypeExpr>) -> bool {
+    matches!(
+        ty,
+        Some(TypeExpr::Builtin {
+            name: BuiltinTy::String,
+            args,
+            ..
+        }) if args.is_empty()
+    )
+}
+
+pub(crate) fn is_nested_string_type(ty: Option<&TypeExpr>) -> bool {
+    ty.is_some_and(type_contains_string) && !is_exact_string_type(ty)
+}
+
+pub(crate) fn nested_string_type_span(ty: Option<&TypeExpr>) -> Option<crate::lexer::Span> {
+    let ty = ty.filter(|ty| type_contains_string(ty) && !is_exact_string_type(Some(ty)))?;
+    Some(match ty {
+        TypeExpr::Named { span, .. } | TypeExpr::Builtin { span, .. } => *span,
+    })
 }
 
 /// The declared type of a SLOT, for the argument checks — as opposed to
@@ -1019,9 +1242,9 @@ pub(crate) fn slot_ir_type(
     if let Some(seq) = tseq_ir_type(ty, record_ids) {
         return seq;
     }
-    if let Some(fixed) = ty.and_then(|ty| {
-        super::components::fixed_vec_ir_type_with_records(ty, record_ids)
-    }) {
+    if let Some(fixed) =
+        ty.and_then(|ty| super::components::fixed_vec_ir_type_with_records(ty, record_ids))
+    {
         return fixed;
     }
     if let Some(TypeExpr::Builtin { name, .. }) = ty {
@@ -1044,15 +1267,15 @@ fn pure_helper_signature_type(
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<IrType, LowerError> {
     if let Some(seq) = callable_tseq_ir_type(
-        format!("{what} of helper `{helper}` has an unsupported TSeq element type"),
+        || format!("{what} of helper `{helper}` has an unsupported TSeq element type"),
         ty,
         record_ids,
     )? {
         return Ok(seq);
     }
-    if let Some(fixed @ IrType::FixedVec { .. }) = ty.and_then(|ty| {
-        super::components::fixed_vec_ir_type_with_records(ty, record_ids)
-    }) {
+    if let Some(fixed @ IrType::FixedVec { .. }) =
+        ty.and_then(|ty| super::components::fixed_vec_ir_type_with_records(ty, record_ids))
+    {
         return Ok(fixed);
     }
     Ok(ir_type_of_with_records(ty, record_ids))
@@ -1083,15 +1306,15 @@ fn inlined_helper_signature_type(
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<IrType, LowerError> {
     if let Some(seq) = callable_tseq_ir_type(
-        format!("{what} of helper `{helper}` has an unsupported TSeq element type"),
+        || format!("{what} of helper `{helper}` has an unsupported TSeq element type"),
         ty,
         record_ids,
     )? {
         return Ok(seq);
     }
-    if let Some(fixed @ IrType::FixedVec { .. }) = ty.and_then(|ty| {
-        super::components::fixed_vec_ir_type_with_records(ty, record_ids)
-    }) {
+    if let Some(fixed @ IrType::FixedVec { .. }) =
+        ty.and_then(|ty| super::components::fixed_vec_ir_type_with_records(ty, record_ids))
+    {
         return Ok(fixed);
     }
     Ok(ir_type_of_with_records(ty, record_ids))
@@ -1104,21 +1327,20 @@ fn testbench_method_signature_type(
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<IrType, LowerError> {
     if let Some(seq) = callable_tseq_ir_type(
-        format!(
-            "{what} of testbench method `{method}` has an unsupported TSeq element type"
-        ),
+        || format!("{what} of testbench method `{method}` has an unsupported TSeq element type"),
         ty,
         record_ids,
     )? {
         return Ok(seq);
     }
-    if let Some(fixed @ IrType::FixedVec { .. }) = ty.and_then(|ty| {
-        super::components::fixed_vec_ir_type_with_records(ty, record_ids)
-    }) {
+    if let Some(fixed @ IrType::FixedVec { .. }) =
+        ty.and_then(|ty| super::components::fixed_vec_ir_type_with_records(ty, record_ids))
+    {
         return Ok(fixed);
     }
     Ok(ir_type_of_with_records(ty, record_ids))
 }
+
 // ── Conservative purity / call-graph scan ───────────────────────────
 
 struct Scan {
@@ -1203,7 +1425,7 @@ fn scan_stmt(st: &AstStmt, s: &mut Scan) {
 
 fn scan_expr(e: &AstExpr, s: &mut Scan) {
     match &*e.kind {
-        ExprKind::Int(_) | ExprKind::Bool(_) => {}
+        ExprKind::Int(_) | ExprKind::String(_) | ExprKind::Bool(_) => {}
         ExprKind::Ident(id) => {
             // Lexically captured DUT reference (v1 lambdas capture
             // `dut` by reference; the inlined form resolves it via the

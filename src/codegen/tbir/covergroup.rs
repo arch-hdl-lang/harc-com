@@ -9,10 +9,10 @@
 //! match v1 exactly for the trace-equivalence gate.
 
 use crate::codegen::cpp_tb::EmitError;
+use crate::ir::passes::dut_access::DutAccessPlan;
 use crate::ir::{
     BinOp, CallTarget, CovBinBound, CovBinValue, CoverPointSchema, CovgroupSchema, Expr,
-    FunctionId, IrType, PortRef, TbProgram, TransactorMethodSchema, TransactorSchema, UnOp,
-    WidthCastKind,
+    FunctionId, IrType, PortRef, TbProgram, UnOp, WidthCastKind,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -144,8 +144,10 @@ fn cross_bin_labels(cross: &DeclaredCross<'_>) -> Vec<(usize, String)> {
 /// inclusive `_v >= lo && _v <= hi` (open bounds drop their side; a
 /// fully open range is `true`), members `||`-joined.
 struct CoverWidths<'a> {
+    prog: &'a TbProgram,
     lanes: &'a HashMap<String, u32>,
     ports: &'a HashMap<String, u32>,
+    dut_access: Option<&'a DutAccessPlan>,
     /// Late-resolved hook argument and record-field types, keyed as `arg`
     /// and `arg.field`. Clock-triggered covergroups pass an empty map.
     hook_types: &'a HashMap<String, IrType>,
@@ -168,9 +170,12 @@ fn cover_expr_width(e: &Expr, widths: &CoverWidths<'_>) -> Option<u32> {
             .checked_mul(32)
             .and_then(|width| u32::try_from(width).ok()),
         Expr::Port(port) => match &port.lane {
-            Some(_) => cover_lane_width(widths.lanes, port),
-            None => port
-                .width
+            Some(_) => cover_lane_width(widths, port),
+            None => widths
+                .dut_access
+                .and_then(|plan| plan.resolve(port).ok())
+                .map(|access| access.width_for(port))
+                .or(port.width)
                 .or_else(|| widths.ports.get(&port.port_path.join("_")).copied())
                 .filter(|width| *width != u32::MAX),
         },
@@ -221,6 +226,12 @@ fn cover_expr_width(e: &Expr, widths: &CoverWidths<'_>) -> Option<u32> {
 fn cover_expr_signed(e: &Expr, widths: &CoverWidths<'_>) -> bool {
     match e {
         Expr::Literal { ty, .. } => matches!(ty, IrType::SInt(_)),
+        Expr::Port(port) => widths
+            .dut_access
+            .and_then(|plan| plan.resolve(port).ok())
+            .and_then(|access| access.value_type_for(port))
+            .or_else(|| port.value_type.clone())
+            .is_some_and(|ty| matches!(ty, IrType::SInt(_))),
         Expr::Unary(UnOp::Not, _) => false,
         // See `expr_is_signed` (tbir/expr.rs): `BitNotHost`'s signedness
         // follows its operand, not an unconditional signed — so a shift or
@@ -261,10 +272,26 @@ fn cover_expr_signed(e: &Expr, widths: &CoverWidths<'_>) -> bool {
 
 fn has_unresolved_arch_width(e: &Expr, widths: &CoverWidths<'_>) -> bool {
     match e {
-        Expr::Port(port) if port.lane.is_none() && port.width.is_none() => widths
-            .ports
-            .get(&port.port_path.join("_"))
-            .is_some_and(|width| *width == u32::MAX),
+        Expr::Port(port) => {
+            let own = port.lane.is_none()
+                && port.width.is_none()
+                && widths
+                    .ports
+                    .get(&port.port_path.join("_"))
+                    .is_some_and(|width| *width == u32::MAX);
+            let mut nested = false;
+            crate::ir::visit::visit_port_lane_expr(port, &mut |index| {
+                nested |= has_unresolved_arch_width(index, widths)
+            });
+            own || nested
+        }
+        Expr::PortSnapshotLane { port, index, .. } => {
+            let mut nested = has_unresolved_arch_width(index, widths);
+            crate::ir::visit::visit_port_lane_expr(port, &mut |lane| {
+                nested |= has_unresolved_arch_width(lane, widths)
+            });
+            nested
+        }
         Expr::Unary(_, inner) => has_unresolved_arch_width(inner, widths),
         // Truncation, direction-agnostic resize (including `as uint<N>`),
         // and a fixed slice establish a concrete low-bit result without
@@ -585,7 +612,7 @@ fn cover_expr_cpp(e: &Expr, widths: &CoverWidths<'_>) -> Result<String, EmitErro
         Expr::Literal { value, .. } => format!("{value}"),
         Expr::WideLiteral(words) => super::expr::wide_literal_cpp(words),
         Expr::Port(p) => {
-            let sig = cover_port_signal(p);
+            let sig = cover_port_signal(widths, p)?;
             match &p.lane {
                 None => format!("harc_rt::harc_read({sig})"),
                 Some(lane) => {
@@ -595,7 +622,7 @@ fn cover_expr_cpp(e: &Expr, widths: &CoverWidths<'_>) -> Result<String, EmitErro
                             cover_bounded_index_cpp(index, widths, u64::MAX)?
                         }
                     };
-                    match cover_lane_width(widths.lanes, p) {
+                    match cover_lane_width(widths, p) {
                         Some(w) => {
                             format!("harc_rt::harc_vec_lane_read<{w}>({sig}, (std::size_t)({idx}))")
                         }
@@ -666,7 +693,32 @@ fn cover_expr_cpp(e: &Expr, widths: &CoverWidths<'_>) -> Result<String, EmitErro
                 // exact C++ carrier context for wide values (`HarcWide<N>`),
                 // so rejecting the argument here would discard information
                 // the call already has.
-                CallTarget::Helper { name, .. } => super::expr::helper_cpp_name(name),
+                CallTarget::Helper { function, name, .. } => {
+                    let helper = widths
+                        .prog
+                        .functions
+                        .get(function.index())
+                        .filter(|candidate| {
+                            candidate.id == *function
+                                && candidate.kind == crate::ir::FunctionKind::Helper
+                                && candidate.name == *name
+                        })
+                        .ok_or_else(|| {
+                            EmitError(format!(
+                                "tbir: covergroup call references missing or stale helper fn{} `{name}`",
+                                function.0
+                            ))
+                        })?;
+                    if helper.params.len() != args.len() {
+                        return Err(EmitError(format!(
+                            "tbir: covergroup helper fn{} `{name}` expects {} argument(s), got {}",
+                            function.0,
+                            helper.params.len(),
+                            args.len()
+                        )));
+                    }
+                    super::expr::helper_cpp_name(name)
+                }
                 CallTarget::ExternFn { name, .. } => {
                     // FFI arguments do not yet carry parameter metadata in
                     // CallTarget, so retain the conservative wide gate.
@@ -697,12 +749,35 @@ fn cover_expr_cpp(e: &Expr, widths: &CoverWidths<'_>) -> Result<String, EmitErro
     })
 }
 
-fn cover_port_signal(p: &PortRef) -> String {
-    format!("dut->{}", p.port_path.join("_"))
+fn cover_port_signal(widths: &CoverWidths<'_>, port: &PortRef) -> Result<String, EmitError> {
+    if let Some(plan) = widths.dut_access {
+        let access = plan
+            .resolve(port)
+            .map_err(|error| EmitError(format!("tbir: {error}")))?;
+        if matches!(
+            access.access(),
+            crate::ir::PortAccess::Probe | crate::ir::PortAccess::Force
+        ) {
+            let probe = plan
+                .probe_for_port(port)
+                .map_err(|error| EmitError(format!("tbir: {error}")))?;
+            return Ok(format!(
+                "dut->rootp->{}",
+                crate::codegen::sv_stub::mangled_accessor(plan.dut_type(), probe.name())
+            ));
+        }
+        let separator = if access.aggregate() { "." } else { "_" };
+        return Ok(format!("dut->{}", access.path().join(separator)));
+    }
+    Ok(format!("dut->{}", port.port_path.join("_")))
 }
 
-fn cover_lane_width(lanes: &HashMap<String, u32>, p: &PortRef) -> Option<u32> {
-    lanes.get(&p.port_path.join("_")).copied()
+fn cover_lane_width(widths: &CoverWidths<'_>, port: &PortRef) -> Option<u32> {
+    widths
+        .dut_access
+        .and_then(|plan| plan.resolve(port).ok())
+        .and_then(|access| access.packed_lane_width())
+        .or_else(|| widths.lanes.get(&port.port_path.join("_")).copied())
 }
 
 fn cover_bin_op_cpp(op: BinOp) -> &'static str {
@@ -857,8 +932,7 @@ fn bin_membership(values: &[CovBinValue], widths: &CoverWidths<'_>) -> Result<St
     Ok(format!("({})", parts.join(" || ")))
 }
 
-/// `struct <Name> { ... bin counters ... void report() const { ... } };`
-pub(super) fn covgroup_struct(out: &mut String, schema: &CovgroupSchema) {
+fn covgroup_state_members(out: &mut String, schema: &CovgroupSchema) {
     let crosses = auto_cross_pairs(schema);
     let declared = declared_crosses(schema);
     writeln!(out, "struct {} {{", schema.name).ok();
@@ -890,34 +964,72 @@ pub(super) fn covgroup_struct(out: &mut String, schema: &CovgroupSchema) {
         .ok();
     }
     writeln!(out).ok();
+}
+
+/// `struct <Name> { ... bin counters ... void report() const { ... } };`
+pub(super) fn covgroup_struct(out: &mut String, schema: &CovgroupSchema) {
+    covgroup_state_members(out, schema);
+    writeln!(
+        out,
+        "{INDENT}void report(harc_rt::log::HarcLogContext& log_ctx) const {{"
+    )
+    .ok();
+    emit_covgroup_report_body(out, schema, 2);
+    writeln!(out, "{INDENT}}}").ok();
+    writeln!(out, "}};").ok();
+    writeln!(out).ok();
+}
+
+pub(super) fn common_covgroup_declaration(out: &mut String, schema: &CovgroupSchema) {
+    covgroup_state_members(out, schema);
+    writeln!(
+        out,
+        "{INDENT}void report(harc_rt::log::HarcLogContext& log_ctx) const;"
+    )
+    .ok();
+    writeln!(out, "}};").ok();
+    writeln!(out).ok();
+}
+
+pub(super) fn common_covgroup_definition(out: &mut String, schema: &CovgroupSchema) {
+    writeln!(
+        out,
+        "void {}::report(harc_rt::log::HarcLogContext& log_ctx) const {{",
+        schema.name
+    )
+    .ok();
+    emit_covgroup_report_body(out, schema, 1);
+    writeln!(out, "}}").ok();
+    writeln!(out).ok();
+}
+
+fn emit_covgroup_report_body(out: &mut String, schema: &CovgroupSchema, depth: usize) {
+    let crosses = auto_cross_pairs(schema);
+    let declared = declared_crosses(schema);
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
 
     // report() — same ARCH-format coverage dump as v1 (stdout).
     let total_bins: usize = schema.points.iter().map(|p| p.bins.len()).sum();
-    writeln!(out, "{INDENT}void report() const {{").ok();
     writeln!(
         out,
-        "{INDENT}{INDENT}uint64_t _total = {total_bins}; uint64_t _hit = 0;"
+        "{pad}uint64_t _total = {total_bins}; uint64_t _hit = 0;"
     )
     .ok();
     for p in &schema.points {
         for b in &p.bins {
-            writeln!(
-                out,
-                "{INDENT}{INDENT}if ({}.{} > 0) _hit++;",
-                p.name, b.name
-            )
-            .ok();
+            writeln!(out, "{pad}if ({}.{} > 0) _hit++;", p.name, b.name).ok();
         }
     }
     writeln!(
         out,
-        "{INDENT}{INDENT}harc_rt::log::harc_print_covergroup_summary(\"{}\", _hit, _total);",
+        "{pad}harc_rt::log::harc_print_covergroup_summary(\"{}\", _hit, _total);",
         schema.name
     )
     .ok();
     writeln!(
         out,
-        "{INDENT}{INDENT}harc_rt::log::harc_cov_json_summary(\"{}\", _hit, _total);",
+        "{pad}harc_rt::log::harc_cov_json_summary(log_ctx.coverage_json, \"{}\", _hit, _total);",
         schema.name
     )
     .ok();
@@ -925,13 +1037,13 @@ pub(super) fn covgroup_struct(out: &mut String, schema: &CovgroupSchema) {
         for b in &p.bins {
             writeln!(
                 out,
-                "{INDENT}{INDENT}harc_rt::log::harc_print_covergroup_bin(\"{0}\", \"{1}\", {0}.{1});",
+                "{pad}harc_rt::log::harc_print_covergroup_bin(\"{0}\", \"{1}\", {0}.{1});",
                 p.name, b.name
             )
             .ok();
             writeln!(
                 out,
-                "{INDENT}{INDENT}harc_rt::log::harc_cov_json_bin(\"{}\", \"{}\", \"{}\", {}.{});",
+                "{pad}harc_rt::log::harc_cov_json_bin(log_ctx.coverage_json, \"{}\", \"{}\", \"{}\", {}.{});",
                 schema.name, p.name, b.name, p.name, b.name
             )
             .ok();
@@ -939,60 +1051,56 @@ pub(super) fn covgroup_struct(out: &mut String, schema: &CovgroupSchema) {
     }
     // Declared crosses report before the auto-crosses — v1 ordering.
     for cross in &declared {
-        let pad2 = INDENT.repeat(2);
-        let pad3 = INDENT.repeat(3);
-        writeln!(out, "{pad2}{{").ok();
-        writeln!(out, "{pad3}uint64_t _cross_hit = 0;").ok();
-        writeln!(out, "{pad3}uint64_t _cross_missing = 0;").ok();
+        writeln!(out, "{pad}{{").ok();
+        writeln!(out, "{pad1}uint64_t _cross_hit = 0;").ok();
+        writeln!(out, "{pad1}uint64_t _cross_missing = 0;").ok();
         writeln!(
             out,
-            "{pad3}for (size_t _i = 0; _i < {}; ++_i) if ({}[_i] > 0) _cross_hit++;",
+            "{pad1}for (size_t _i = 0; _i < {}; ++_i) if ({}[_i] > 0) _cross_hit++;",
             cross.total_bins, cross.storage
         )
         .ok();
         writeln!(
             out,
-            "{pad3}harc_rt::log::harc_print_covergroup_cross_summary(\"{}\", \"cross\", \"{}\", _cross_hit, {});",
+            "{pad1}harc_rt::log::harc_print_covergroup_cross_summary(\"{}\", \"cross\", \"{}\", _cross_hit, {});",
             schema.name, cross.label, cross.total_bins
         )
         .ok();
         writeln!(
             out,
-            "{pad3}harc_rt::log::harc_cov_json_cross_summary(\"{}\", \"cross\", \"{}\", _cross_hit, {});",
+            "{pad1}harc_rt::log::harc_cov_json_cross_summary(log_ctx.coverage_json, \"{}\", \"cross\", \"{}\", _cross_hit, {});",
             schema.name, cross.label, cross.total_bins
         )
         .ok();
         for (idx, label) in cross_bin_labels(cross) {
             writeln!(
                 out,
-                "{pad3}harc_rt::log::harc_cov_json_cross_bin(\"{}\", \"cross\", \"{}\", \"{}\", {}[{idx}]);",
+                "{pad1}harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, \"{}\", \"cross\", \"{}\", \"{}\", {}[{idx}]);",
                 schema.name, cross.label, label, cross.storage
             )
             .ok();
             writeln!(
                 out,
-                "{pad3}if ({}[{idx}] == 0) {{ if (_cross_missing < {CROSS_MISSING_DETAIL_LIMIT}) harc_rt::log::harc_print_covergroup_missing_bin(\"{label}\"); _cross_missing++; }}",
+                "{pad1}if ({}[{idx}] == 0) {{ if (_cross_missing < {CROSS_MISSING_DETAIL_LIMIT}) harc_rt::log::harc_print_covergroup_missing_bin(\"{label}\"); _cross_missing++; }}",
                 cross.storage
             )
             .ok();
         }
         writeln!(
             out,
-            "{pad3}harc_rt::log::harc_print_covergroup_more_missing(_cross_missing, {CROSS_MISSING_DETAIL_LIMIT}, \"cross\");"
+            "{pad1}harc_rt::log::harc_print_covergroup_more_missing(_cross_missing, {CROSS_MISSING_DETAIL_LIMIT}, \"cross\");"
         )
         .ok();
-        writeln!(out, "{pad2}}}").ok();
+        writeln!(out, "{pad}}}").ok();
     }
     for &(ai, bi) in &crosses {
         let (a, b) = (&schema.points[ai], &schema.points[bi]);
-        let pad2 = INDENT.repeat(2);
-        let pad3 = INDENT.repeat(3);
-        writeln!(out, "{pad2}{{").ok();
-        writeln!(out, "{pad3}uint64_t _cross_hit = 0;").ok();
-        writeln!(out, "{pad3}uint64_t _cross_missing = 0;").ok();
+        writeln!(out, "{pad}{{").ok();
+        writeln!(out, "{pad1}uint64_t _cross_hit = 0;").ok();
+        writeln!(out, "{pad1}uint64_t _cross_missing = 0;").ok();
         writeln!(
             out,
-            "{pad3}for (size_t _i = 0; _i < {}; ++_i) for (size_t _j = 0; _j < {}; ++_j) if (_auto_cross_{}__{}[_i][_j] > 0) _cross_hit++;",
+            "{pad1}for (size_t _i = 0; _i < {}; ++_i) for (size_t _j = 0; _j < {}; ++_j) if (_auto_cross_{}__{}[_i][_j] > 0) _cross_hit++;",
             a.bins.len(),
             b.bins.len(),
             a.name,
@@ -1001,7 +1109,7 @@ pub(super) fn covgroup_struct(out: &mut String, schema: &CovgroupSchema) {
         .ok();
         writeln!(
             out,
-            "{pad3}harc_rt::log::harc_print_covergroup_cross_summary(\"{}\", \"auto_cross\", \"{} x {}\", _cross_hit, {});",
+            "{pad1}harc_rt::log::harc_print_covergroup_cross_summary(\"{}\", \"auto_cross\", \"{} x {}\", _cross_hit, {});",
             schema.name,
             a.name,
             b.name,
@@ -1010,7 +1118,7 @@ pub(super) fn covgroup_struct(out: &mut String, schema: &CovgroupSchema) {
         .ok();
         writeln!(
             out,
-            "{pad3}harc_rt::log::harc_cov_json_cross_summary(\"{}\", \"auto_cross\", \"{} x {}\", _cross_hit, {});",
+            "{pad1}harc_rt::log::harc_cov_json_cross_summary(log_ctx.coverage_json, \"{}\", \"auto_cross\", \"{} x {}\", _cross_hit, {});",
             schema.name,
             a.name,
             b.name,
@@ -1021,13 +1129,13 @@ pub(super) fn covgroup_struct(out: &mut String, schema: &CovgroupSchema) {
             for (j, bb) in b.bins.iter().enumerate() {
                 writeln!(
                     out,
-                    "{pad3}harc_rt::log::harc_cov_json_cross_bin(\"{}\", \"auto_cross\", \"{} x {}\", \"{}.{} x {}.{}\", _auto_cross_{}__{}[{}][{}]);",
+                    "{pad1}harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, \"{}\", \"auto_cross\", \"{} x {}\", \"{}.{} x {}.{}\", _auto_cross_{}__{}[{}][{}]);",
                     schema.name, a.name, b.name, a.name, ab.name, b.name, bb.name, a.name, b.name, i, j
                 )
                 .ok();
                 writeln!(
                     out,
-                    "{pad3}if (_auto_cross_{}__{}[{}][{}] == 0) {{ if (_cross_missing < {CROSS_MISSING_DETAIL_LIMIT}) harc_rt::log::harc_print_covergroup_missing_bin(\"{}.{} x {}.{}\"); _cross_missing++; }}",
+                    "{pad1}if (_auto_cross_{}__{}[{}][{}] == 0) {{ if (_cross_missing < {CROSS_MISSING_DETAIL_LIMIT}) harc_rt::log::harc_print_covergroup_missing_bin(\"{}.{} x {}.{}\"); _cross_missing++; }}",
                     a.name, b.name, i, j, a.name, ab.name, b.name, bb.name
                 )
                 .ok();
@@ -1035,14 +1143,11 @@ pub(super) fn covgroup_struct(out: &mut String, schema: &CovgroupSchema) {
         }
         writeln!(
             out,
-            "{pad3}harc_rt::log::harc_print_covergroup_more_missing(_cross_missing, {CROSS_MISSING_DETAIL_LIMIT}, \"auto-cross\");"
+            "{pad1}harc_rt::log::harc_print_covergroup_more_missing(_cross_missing, {CROSS_MISSING_DETAIL_LIMIT}, \"auto-cross\");"
         )
         .ok();
-        writeln!(out, "{pad2}}}").ok();
+        writeln!(out, "{pad}}}").ok();
     }
-    writeln!(out, "{INDENT}}}").ok();
-    writeln!(out, "}};").ok();
-    writeln!(out).ok();
 }
 
 /// `_checkers.push_back([&]() { ...sample... });` at depth 1 — same
@@ -1051,10 +1156,12 @@ pub(super) fn covgroup_struct(out: &mut String, schema: &CovgroupSchema) {
 /// the covergroup instance (`_tb.cov`).
 pub(super) fn sampler_registration(
     out: &mut String,
+    prog: &TbProgram,
     schema: &CovgroupSchema,
     instance: &str,
     lanes: &HashMap<String, u32>,
     ports: &HashMap<String, u32>,
+    dut_access: Option<&DutAccessPlan>,
 ) -> Result<(), EmitError> {
     writeln!(out, "{INDENT}_checkers.push_back([&]() {{").ok();
     let hook_types = HashMap::new();
@@ -1063,8 +1170,10 @@ pub(super) fn sampler_registration(
         schema,
         instance,
         &CoverWidths {
+            prog,
             lanes,
             ports,
+            dut_access,
             hook_types: &hook_types,
         },
         2,
@@ -1105,7 +1214,12 @@ fn sample_body(
     for p in &schema.points {
         writeln!(out, "{pad2}{{").ok();
         let target = cover_expr_cpp(&p.target, widths)?;
-        writeln!(out, "{pad3}uint64_t _v = (uint64_t)({});", target).ok();
+        let sample_type = if cover_expr_signed(&p.target, widths) {
+            "int64_t"
+        } else {
+            "uint64_t"
+        };
+        writeln!(out, "{pad3}{sample_type} _v = ({sample_type})({target});").ok();
         for (bin_idx, b) in p.bins.iter().enumerate() {
             let membership = bin_membership(&b.values, widths)?;
             if !any_cross {
@@ -1187,55 +1301,6 @@ fn sample_body(
     Ok(())
 }
 
-/// Emit the `<Type>_<method>_pre` and `<Type>_<method>_post` hook-vector
-/// declarations for one transactor method that has covergroup
-/// subscribers. Mirrors v1's `emit_hook_vectors`: a
-/// `std::vector<std::function<void(args)>>` per side, holding the sample
-/// closures. The method body fans these out at its pre/post boundary
-/// (`emit_method`). Param C-types match the method-lambda param shape.
-pub(super) fn hook_vector_decls(
-    out: &mut String,
-    prog: &TbProgram,
-    owner_name: &str,
-    method_name: &str,
-    function: FunctionId,
-    n_params: usize,
-    pad: &str,
-) -> Result<(), EmitError> {
-    let arg_csv = method_param_ctypes(prog, function, n_params).join(", ");
-    writeln!(
-        out,
-        "{pad}std::vector<std::function<void({arg_csv})>> {}_{}_pre;",
-        owner_name, method_name
-    )
-    .ok();
-    writeln!(
-        out,
-        "{pad}std::vector<std::function<void({arg_csv})>> {}_{}_post;",
-        owner_name, method_name
-    )
-    .ok();
-    Ok(())
-}
-
-pub(super) fn transactor_hook_vector_decls(
-    out: &mut String,
-    prog: &TbProgram,
-    schema: &TransactorSchema,
-    m: &TransactorMethodSchema,
-    pad: &str,
-) -> Result<(), EmitError> {
-    hook_vector_decls(
-        out,
-        prog,
-        schema.emission_name(),
-        &m.name,
-        m.function,
-        m.param_names.len(),
-        pad,
-    )
-}
-
 /// Push one hook-triggered covergroup's sample closure onto the resolved
 /// method's `<Type>_<method>_<side>` hook vector — the trigger-specific
 /// analogue of `sampler_registration`. The closure takes the method's
@@ -1247,18 +1312,14 @@ pub(super) fn hook_sampler_registration(
     out: &mut String,
     prog: &TbProgram,
     schema: &CovgroupSchema,
-    vector_base: String,
+    vector: String,
     function: FunctionId,
     n_params: usize,
-    side: crate::ast::HookSide,
     instance: &str,
     lanes: &HashMap<String, u32>,
     ports: &HashMap<String, u32>,
+    dut_access: Option<&DutAccessPlan>,
 ) -> Result<(), EmitError> {
-    let side_str = match side {
-        crate::ast::HookSide::Pre => "pre",
-        crate::ast::HookSide::Post => "post",
-    };
     // Param decls for the closure signature: `<cty> <name>` per method
     // param, matching the hook-vector element type. Names come from the
     // method's lowered locals (param slots are the leading locals).
@@ -1271,7 +1332,7 @@ pub(super) fn hook_sampler_registration(
         .collect();
     writeln!(
         out,
-        "{INDENT}{vector_base}_{side_str}.push_back([&]({}) {{",
+        "{INDENT}{vector}.push_back([&]({}) {{",
         arg_decls.join(", ")
     )
     .ok();
@@ -1289,23 +1350,16 @@ pub(super) fn hook_sampler_registration(
         schema,
         instance,
         &CoverWidths {
+            prog,
             lanes,
             ports,
+            dut_access,
             hook_types: &hook_types,
         },
         2,
     )?;
     writeln!(out, "{INDENT}}});").ok();
     Ok(())
-}
-
-/// C-type list for a method's params (the hook-vector signature),
-/// matching `emit_method`'s lambda param shape exactly.
-fn method_param_ctypes(prog: &TbProgram, function: FunctionId, n_params: usize) -> Vec<String> {
-    let func = prog.function(function);
-    (0..n_params)
-        .map(|i| param_cty(prog, &func.locals[i].ty))
-        .collect()
 }
 
 /// One param's C-type, mirroring `emit_method`'s mapping (record by

@@ -9,10 +9,9 @@
 //! call edge is deliberately never inlined at the IR level — the
 //! sequence→transactor boundary is the placement cut every split
 //! backend needs (design doc §CallTarget). The verifier pins the edge
-//! to the one position backends expand: the ENTIRE right-hand side of
-//! a `Stmt::Assign` in a `Run`/`Check` function, with a `bus_field`/
-//! `method` pair that resolves against the owning testbench's
-//! `bus_bindings` at the declared arity. Anywhere else — nested in an
+//! to the one position backends expand: the entire right-hand side of a
+//! `Stmt::Assign`, with a typed target plus method identity that resolves at
+//! the declared arity. Anywhere else — nested in an
 //! expression, in a format arg or wait predicate, or inside a
 //! `Helper`/`SamplerAuto` body (pure helpers must stay suspension-
 //! free and placement-neutral) — is a lowering bug. The edge is also
@@ -39,7 +38,16 @@
 //!   synthesis dropped its body.
 
 use super::*;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+
+fn probe_paths_overlap(a: &str, b: &str) -> bool {
+    fn is_path_prefix(prefix: &str, path: &str) -> bool {
+        path.strip_prefix(prefix).is_some_and(|suffix| {
+            suffix.is_empty() || suffix.starts_with('.') || suffix.starts_with('[')
+        })
+    }
+    is_path_prefix(a, b) || is_path_prefix(b, a)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyError {
@@ -135,6 +143,20 @@ pub enum VerifyError {
         func: FunctionId,
         block: BlockId,
         context: &'static str,
+    },
+    /// Probe capabilities are part of the self-contained IR contract.
+    BadProbeAccess {
+        func: FunctionId,
+        block: BlockId,
+        operation: &'static str,
+        access: PortAccess,
+    },
+    /// A probe-bearing `PortRef` must resolve through the program catalog and
+    /// exactly match its name, type, width, capability, and owner scope.
+    BadProbeRef {
+        func: FunctionId,
+        block: BlockId,
+        detail: String,
     },
     /// Transactor-call seam rule (module docs). A
     /// `CallTarget::TransactorMethod` edge must resolve in exactly one
@@ -277,6 +299,21 @@ impl std::fmt::Display for VerifyError {
                 "fn{}: b{} contains a DUT port read in a disallowed position ({context})",
                 func.0, block.0
             ),
+            VerifyError::BadProbeAccess {
+                func,
+                block,
+                operation,
+                access,
+            } => write!(
+                f,
+                "fn{}: b{} uses {:?} access for {operation}",
+                func.0, block.0, access
+            ),
+            VerifyError::BadProbeRef {
+                func,
+                block,
+                detail,
+            } => write!(f, "fn{}: b{} has invalid probe reference: {detail}", func.0, block.0),
             VerifyError::BadTransactorCall {
                 func,
                 block,
@@ -311,66 +348,33 @@ impl std::fmt::Display for VerifyError {
 /// operands, where a nested reading would need slot-of-slot accounting
 /// the model deliberately does not carry.
 fn check_temporal_slots(e: &Expr, n_slots: usize, what: &str, errs: &mut Vec<VerifyError>) {
-    match e {
-        Expr::TemporalSlot { slot, .. } => {
-            if (*slot as usize) >= n_slots {
-                errs.push(VerifyError::BadProgramRef {
-                    what: if n_slots == 0 {
-                        format!("{what} nests a temporal reading inside a latch operand")
-                    } else {
-                        format!(
-                            "{what} references temporal slot {slot} but declares only \
-                             {n_slots} latch(es)"
-                        )
-                    },
-                });
-            }
+    crate::ir::visit::walk_expr(e, &mut |expr| {
+        let Expr::TemporalSlot { slot, .. } = expr else {
+            return;
+        };
+        if (*slot as usize) >= n_slots {
+            errs.push(VerifyError::BadProgramRef {
+                what: if n_slots == 0 {
+                    format!("{what} nests a temporal reading inside a latch operand")
+                } else {
+                    format!(
+                        "{what} references temporal slot {slot} but declares only \
+                         {n_slots} latch(es)"
+                    )
+                },
+            });
         }
-        Expr::Binary(_, a, b) => {
-            check_temporal_slots(a, n_slots, what, errs);
-            check_temporal_slots(b, n_slots, what, errs);
-        }
-        Expr::Unary(_, a) => check_temporal_slots(a, n_slots, what, errs),
-        Expr::BitSlice { target, .. } => check_temporal_slots(target, n_slots, what, errs),
-        Expr::BitSliceDyn { target, hi, lo } => {
-            check_temporal_slots(target, n_slots, what, errs);
-            check_temporal_slots(hi, n_slots, what, errs);
-            check_temporal_slots(lo, n_slots, what, errs);
-        }
-        Expr::Ternary(c, t, f) => {
-            check_temporal_slots(c, n_slots, what, errs);
-            check_temporal_slots(t, n_slots, what, errs);
-            check_temporal_slots(f, n_slots, what, errs);
-        }
-        Expr::WidthCast { inner, .. } => check_temporal_slots(inner, n_slots, what, errs),
-        Expr::ComponentIdle { n, .. } | Expr::TransactorIdle { n, .. } => {
-            check_temporal_slots(n, n_slots, what, errs)
-        }
-        Expr::SeqIndex { index, .. } => check_temporal_slots(index, n_slots, what, errs),
-        Expr::Call(_, args) => {
-            for a in args {
-                check_temporal_slots(a, n_slots, what, errs);
-            }
-        }
-        Expr::RecordField {
-            mid_indices, index, ..
-        } => {
-            for (_, idx) in mid_indices {
-                check_temporal_slots(idx, n_slots, what, errs);
-            }
-            if let Some(idx) = index {
-                check_temporal_slots(idx, n_slots, what, errs);
-            }
-        }
-        _ => {}
-    }
+    });
 }
 
 fn cover_expr_type_hint(expr: &Expr) -> Option<IrType> {
     match expr {
         Expr::Literal { ty, .. } => Some(ty.clone()),
         Expr::WideLiteral(words) => Some(IrType::UInt(Some(wide_literal_bits(words)))),
-        Expr::Port(port) => Some(IrType::UInt(port.width)),
+        Expr::Port(port) => port
+            .value_type
+            .clone()
+            .or_else(|| Some(IrType::UInt(port.width))),
         Expr::Unary(crate::ir::UnOp::Not, _) => Some(IrType::Bool),
         Expr::Unary(crate::ir::UnOp::BitNotHost, _) => Some(IrType::SInt(None)),
         Expr::Unary(_, inner) => cover_expr_type_hint(inner),
@@ -426,6 +430,7 @@ fn helper_abi_type_valid(ty: &IrType, record_count: usize) -> bool {
         IrType::RecordSeq(record) => record.index() < record_count,
         IrType::Seq(elem) => sequence_elem_valid(elem),
         IrType::FixedVec { elem, .. } => helper_fixed_vec_elem_valid(elem, record_count),
+        IrType::String => true,
         other => cover_scalar_type(other),
     }
 }
@@ -449,9 +454,13 @@ fn helper_fixed_vec_elem_valid(ty: &IrType, record_count: usize) -> bool {
 }
 
 fn cover_call_compatible(expected: &IrType, actual: &IrType) -> bool {
-    if matches!(expected, IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_))
-        || matches!(actual, IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_))
-    {
+    if matches!(
+        expected,
+        IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_)
+    ) || matches!(
+        actual,
+        IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_)
+    ) {
         return expected == actual;
     }
     cover_scalar_type(expected)
@@ -488,9 +497,7 @@ fn check_cover_expr(
             }
         }
         Expr::Port(port) => {
-            if let Some(LaneIndex::Var(index)) = &port.lane {
-                recurse(index, errs);
-            }
+            crate::ir::visit::visit_port_lane_expr(port, &mut |index| recurse(index, errs));
         }
         Expr::Binary(_, lhs, rhs) => {
             recurse(lhs, errs);
@@ -542,13 +549,27 @@ fn check_cover_expr(
             index: Some(index), ..
         } => recurse(index, errs),
         Expr::CovHookArg { .. } | Expr::CovHookParam { index: None, .. } => {}
-        Expr::Call(CallTarget::Helper { name, ret }, args) => {
-            let helper = prog
-                .functions
-                .iter()
-                .find(|f| f.kind == FunctionKind::Helper && f.name == *name);
+        Expr::Call(
+            CallTarget::Helper {
+                function,
+                name,
+                ret,
+            },
+            args,
+        ) => {
+            let helper = prog.functions.get(function.index()).filter(|candidate| {
+                candidate.id == *function
+                    && candidate.kind == FunctionKind::Helper
+                    && candidate.name == *name
+            });
             let Some(helper) = helper else {
-                bad(format!("references missing helper `{name}`"), errs);
+                bad(
+                    format!(
+                        "references missing or stale helper fn{} `{name}`",
+                        function.0
+                    ),
+                    errs,
+                );
                 for arg in args {
                     recurse(arg, errs);
                 }
@@ -635,6 +656,28 @@ fn fixed_vec_elem_valid(ty: &IrType) -> bool {
         }
         IrType::FixedVec { elem, .. } => fixed_vec_elem_valid(elem),
         _ => false,
+    }
+}
+
+fn ir_type_contains_string(ty: &IrType) -> bool {
+    match ty {
+        IrType::String => true,
+        IrType::Seq(elem) | IrType::FixedVec { elem, .. } => ir_type_contains_string(elem),
+        _ => false,
+    }
+}
+
+fn ir_type_is_nested_string(ty: &IrType) -> bool {
+    !matches!(ty, IrType::String) && ir_type_contains_string(ty)
+}
+
+fn queue_elem_contains_string(elem: &QueueElem) -> bool {
+    match elem {
+        QueueElem::Scalar { ty } => ir_type_contains_string(ty),
+        QueueElem::FixedVec { elem, .. } | QueueElem::List { elem } => {
+            ir_type_contains_string(elem)
+        }
+        QueueElem::Record(_) => false,
     }
 }
 
@@ -769,6 +812,329 @@ fn verify_scoreboard_scalar_schema(
 
 pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     let mut errs = Vec::new();
+    let mut probe_names = std::collections::HashSet::new();
+    let mut generated_probe_symbols = std::collections::HashMap::new();
+    let mut force_probe_paths: Vec<(&str, &str)> = Vec::new();
+    for (index, probe) in prog.probes.iter().enumerate() {
+        if probe.id.index() != index {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "probe table slot p{index} carries mismatched id p{}",
+                    probe.id.0
+                ),
+            });
+        }
+        if probe.name.is_empty() || !probe_names.insert(probe.name.as_str()) {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "probe p{index} has an empty or duplicate name `{}`",
+                    probe.name
+                ),
+            });
+        }
+        if probe.sv_path.trim().is_empty() || probe.ty.width() == 0 {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "probe p{index} `{}` has invalid path/type metadata ({:?} at `{}`)",
+                    probe.name, probe.ty, probe.sv_path
+                ),
+            });
+        }
+        let mut symbols = vec![probe.name.clone()];
+        if probe.force {
+            symbols.push(format!("{}_drv", probe.name));
+            symbols.push(format!("{}_en", probe.name));
+        }
+        for symbol in symbols {
+            if let Some(owner) = generated_probe_symbols.insert(symbol.clone(), probe.name.as_str())
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "probe p{index} `{}` collides with generated signal `{symbol}` owned by `{owner}`",
+                        probe.name
+                    ),
+                });
+            }
+        }
+        if probe.force {
+            for (path, owner) in &force_probe_paths {
+                if probe_paths_overlap(path, &probe.sv_path) {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "force probes `{owner}` and `{}` have overlapping paths `{path}` and `{}`",
+                            probe.name, probe.sv_path
+                        ),
+                    });
+                }
+            }
+            force_probe_paths.push((&probe.sv_path, &probe.name));
+        }
+    }
+    for (tb_index, tb) in prog.testbenches.iter().enumerate() {
+        match prog.testbench_types.get(tb.type_id.index()) {
+            Some(schema) if schema.name == tb.name => {
+                for (field, component) in &schema.component_fields {
+                    if !tb
+                        .component_fields
+                        .iter()
+                        .any(|binding| binding.field == *field && binding.component == *component)
+                    {
+                        errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "testbench tb{tb_index} `{}` is missing declared component field `{field}` c{} from type tbt{}",
+                                tb.name, component.0, tb.type_id.0
+                            ),
+                        });
+                    }
+                }
+            }
+            Some(schema) => errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "testbench tb{tb_index} `{}` references type tbt{} named `{}`",
+                    tb.name, tb.type_id.0, schema.name
+                ),
+            }),
+            None => errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "testbench tb{tb_index} `{}` references missing type tbt{}",
+                    tb.name, tb.type_id.0
+                ),
+            }),
+        }
+        let mut seen = HashSet::new();
+        for probe_id in &tb.probes {
+            if !seen.insert(*probe_id) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "testbench tb{tb_index} `{}` repeats probe capability p{}",
+                        tb.name, probe_id.0
+                    ),
+                });
+                continue;
+            }
+            match prog.probes.get(probe_id.index()) {
+                Some(probe) if probe.dut_type == tb.dut_type => {}
+                Some(probe) => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "testbench tb{tb_index} `{}` targets DUT `{}` but probe p{} targets `{}`",
+                        tb.name, tb.dut_type, probe_id.0, probe.dut_type
+                    ),
+                }),
+                None => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "testbench tb{tb_index} `{}` references missing probe p{}",
+                        tb.name, probe_id.0
+                    ),
+                }),
+            }
+        }
+    }
+    let mut test_callable_claims = vec![0usize; prog.functions.len()];
+    for (test_index, test) in prog.tests.iter().enumerate() {
+        let test_id = TestId(test_index as u32);
+        if test.id != test_id {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "test table slot t{test_index} `{}` carries mismatched id t{}",
+                    test.name, test.id.0
+                ),
+            });
+        }
+        if prog.testbenches.get(test.testbench.index()).is_none() {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "test t{test_index} `{}` references missing testbench tb{}",
+                    test.name, test.testbench.0
+                ),
+            });
+        }
+        for (member, function_id) in [
+            (TestCallableMember::Run, Some(test.run)),
+            (TestCallableMember::Check, test.check),
+        ] {
+            let Some(function_id) = function_id else {
+                continue;
+            };
+            if let Some(claims) = test_callable_claims.get_mut(function_id.index()) {
+                *claims += 1;
+            }
+            let Some(function) = prog.functions.get(function_id.index()) else {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "test t{test_index} `{}` {:?} slot references missing fn{}",
+                        test.name, member, function_id.0
+                    ),
+                });
+                continue;
+            };
+            let prefix = match member {
+                TestCallableMember::Run => "run",
+                TestCallableMember::Check => "check",
+            };
+            let expected_kind = FunctionKind::TestBody {
+                test: test_id,
+                member,
+                name: test.name.clone(),
+            };
+            if function.id != function_id
+                || function.name != format!("{prefix}_{}", test.name)
+                || function.kind != expected_kind
+                || function.owner != Some(test.testbench)
+                || !function.params.is_empty()
+                || function.ret.is_some()
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "test t{test_index} `{}` {:?} slot fn{} has inconsistent callable identity {:?}",
+                        test.name, member, function_id.0, function.kind
+                    ),
+                });
+            }
+        }
+    }
+    for function in &prog.functions {
+        if matches!(function.kind, FunctionKind::TestBody { .. })
+            && test_callable_claims.get(function.id.index()).copied() != Some(1)
+        {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "test body fn{} `{}` must have exactly one test schema owner",
+                    function.id.0, function.name
+                ),
+            });
+        }
+    }
+    let mut testbench_type_names = HashSet::new();
+    let mut testbench_method_claims = vec![0usize; prog.functions.len()];
+    for (type_index, schema) in prog.testbench_types.iter().enumerate() {
+        if !testbench_type_names.insert(schema.name.as_str()) {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "testbench type tbt{type_index} repeats canonical name `{}`",
+                    schema.name
+                ),
+            });
+        }
+        let mut method_names = HashSet::new();
+        for (method_index, method) in schema.methods.iter().enumerate() {
+            if !method_names.insert(method.name.as_str()) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "testbench type tbt{type_index} `{}` repeats method `{}`",
+                        schema.name, method.name
+                    ),
+                });
+            }
+            if let Some(claims) = testbench_method_claims.get_mut(method.function.index()) {
+                *claims += 1;
+            }
+            let Some(function) = prog.functions.get(method.function.index()) else {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "testbench type tbt{type_index} method `{}` references missing fn{}",
+                        method.name, method.function.0
+                    ),
+                });
+                continue;
+            };
+            if function.id != method.function
+                || function.name != format!("tb_method_{}_{}", type_index, method.name)
+                || function.kind
+                    != (FunctionKind::TestbenchMethod {
+                        testbench: TestbenchTypeId(type_index as u32),
+                        method: crate::ir::TestbenchMethodId(method_index as u32),
+                        name: method.name.clone(),
+                    })
+                || function.owner.is_some()
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "testbench type tbt{type_index} method `{}` has inconsistent callable fn{} metadata",
+                        method.name, method.function.0
+                    ),
+                });
+            }
+            if method.param_names.len() != method.param_tys.len()
+                || method.param_tys.len() != method.module_param_types.len()
+                || method.param_tys.len() != function.params.len()
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "testbench type tbt{type_index} method `{}` has inconsistent parameter metadata",
+                        method.name
+                    ),
+                });
+            }
+            for (index, ((name, ty), parameter)) in method
+                .param_names
+                .iter()
+                .zip(method.param_tys.iter())
+                .zip(function.params.iter())
+                .enumerate()
+            {
+                if name != &parameter.name || ty != &parameter.ty {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "testbench type tbt{type_index} method `{}` parameter {index} does not match fn{}",
+                            method.name, method.function.0
+                        ),
+                    });
+                }
+                if method
+                    .module_param_types
+                    .get(index)
+                    .is_some_and(Option::is_some)
+                    && *ty != IrType::Unknown
+                {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "testbench type tbt{type_index} method `{}` module parameter {index} must use the Unknown IR carrier",
+                            method.name
+                        ),
+                    });
+                }
+            }
+            let function_ret = function
+                .ret
+                .and_then(|ret| function.locals.get(ret.index()))
+                .map(|local| &local.ty);
+            if function_ret != method.ret_ty.as_ref() {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "testbench type tbt{type_index} method `{}` return metadata does not match fn{}",
+                        method.name, method.function.0
+                    ),
+                });
+            }
+        }
+    }
+    for function in &prog.functions {
+        if matches!(function.kind, FunctionKind::TestbenchMethod { .. })
+            && testbench_method_claims.get(function.id.index()).copied() != Some(1)
+        {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "testbench method fn{} `{}` must have exactly one canonical owner",
+                    function.id.0, function.name
+                ),
+            });
+        }
+    }
+    for probe in &prog.probes {
+        let present_everywhere = !prog.testbenches.is_empty()
+            && prog
+                .testbenches
+                .iter()
+                .all(|tb| tb.probes.contains(&probe.id));
+        if probe.shared != present_everywhere {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "probe p{} `{}` shared={} but testbench capability intersection is {}",
+                    probe.id.0, probe.name, probe.shared, present_everywhere
+                ),
+            });
+        }
+    }
     for (ri, record) in prog.records.iter().enumerate() {
         let mut names = std::collections::HashSet::new();
         for field in &record.fields {
@@ -780,6 +1146,14 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                         record.name, field.name
                     ),
                 });
+            }
+            if ir_type_contains_string(&field.ty) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "{what} has unsupported persistent String storage; String values are limited to locals and callable boundaries"
+                    ),
+                });
+                continue;
             }
             match &field.ty {
                 IrType::Seq(elem) => {
@@ -947,53 +1321,130 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     // and that a nested mode override names a transactor child.
     for (ci, component) in prog.components.iter().enumerate() {
         let mut component_functions = std::collections::HashSet::new();
-        let mut check_component_function = |what: &str, function: FunctionId| {
-            if !component_functions.insert(function) {
-                errs.push(VerifyError::BadProgramRef {
-                    what: format!(
-                        "component c{ci} `{}` uses fn{} for more than one {what}",
-                        component.name, function.0
-                    ),
-                });
-            }
-            match prog.functions.get(function.index()) {
-                Some(f)
-                    if f.kind
-                        == (FunctionKind::ComponentMethod {
-                            component: ComponentId(ci as u32),
-                        }) => {}
-                Some(f) => errs.push(VerifyError::BadProgramRef {
-                    what: format!(
-                        "component c{ci} `{}` {what} points at fn{} with kind {:?}",
-                        component.name, function.0, f.kind
-                    ),
-                }),
-                None => errs.push(VerifyError::BadProgramRef {
-                    what: format!(
-                        "component c{ci} `{}` {what} references missing fn{}",
-                        component.name, function.0
-                    ),
-                }),
-            }
-        };
+        let mut check_component_function =
+            |what: &str,
+             function: FunctionId,
+             member: crate::ir::ComponentCallableId,
+             method_name: Option<&str>| {
+                if !component_functions.insert(function) {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "component c{ci} `{}` uses fn{} for more than one {what}",
+                            component.name, function.0
+                        ),
+                    });
+                }
+                match prog.functions.get(function.index()) {
+                    Some(f)
+                        if f.kind
+                            == (FunctionKind::ComponentMethod {
+                                component: ComponentId(ci as u32),
+                                member,
+                                method_name: method_name.map(str::to_string),
+                            }) => {}
+                    Some(f) => errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "component c{ci} `{}` {what} points at fn{} with kind {:?}",
+                            component.name, function.0, f.kind
+                        ),
+                    }),
+                    None => errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "component c{ci} `{}` {what} references missing fn{}",
+                            component.name, function.0
+                        ),
+                    }),
+                }
+            };
+        let mut member = 0u32;
         for method in &component.methods {
-            check_component_function("method", method.function);
+            check_component_function(
+                "method",
+                method.function,
+                crate::ir::ComponentCallableId(member),
+                Some(&method.name),
+            );
+            member += 1;
         }
         for handler in &component.on_handlers {
-            check_component_function("on handler", handler.function);
+            check_component_function(
+                "on handler",
+                handler.function,
+                crate::ir::ComponentCallableId(member),
+                None,
+            );
+            member += 1;
         }
         for handler in &component.periodic_handlers {
-            check_component_function("periodic handler", handler.function);
+            check_component_function(
+                "periodic handler",
+                handler.function,
+                crate::ir::ComponentCallableId(member),
+                None,
+            );
+            member += 1;
         }
         for handler in &component.cycle_handlers {
-            check_component_function("cycle handler", handler.function);
+            check_component_function(
+                "cycle handler",
+                handler.function,
+                crate::ir::ComponentCallableId(member),
+                None,
+            );
+            member += 1;
         }
         if let Some(handler) = &component.watchdog {
-            check_component_function("watchdog", handler.function);
+            check_component_function(
+                "watchdog",
+                handler.function,
+                crate::ir::ComponentCallableId(member),
+                None,
+            );
         }
         drop(check_component_function);
         for method in &component.methods {
-            for (param, ty) in method.param_tys.iter().enumerate() {
+            let Some(function) = prog.functions.get(method.function.index()) else {
+                continue;
+            };
+            if method.param_names.len() != method.param_tys.len()
+                || method.param_tys.len() != function.params.len()
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "component c{ci} method `{}` has inconsistent parameter metadata",
+                        method.name
+                    ),
+                });
+            }
+            for (index, ((name, ty), parameter)) in method
+                .param_names
+                .iter()
+                .zip(method.param_tys.iter())
+                .zip(function.params.iter())
+                .enumerate()
+            {
+                if name != &parameter.name || ty != &parameter.ty {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "component c{ci} method `{}` parameter {index} does not match fn{}",
+                            method.name, method.function.0
+                        ),
+                    });
+                }
+            }
+            let function_ret = function
+                .ret
+                .and_then(|ret| function.locals.get(ret.index()))
+                .map(|local| &local.ty);
+            if method.has_ret != method.ret_ty.is_some() || function_ret != method.ret_ty.as_ref() {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "component c{ci} method `{}` return metadata does not match fn{}",
+                        method.name, method.function.0
+                    ),
+                });
+            }
+            for (index, ty) in method.param_tys.iter().enumerate() {
                 let invalid_aggregate = match ty {
                     IrType::RecordSeq(record) => record.index() >= prog.records.len(),
                     IrType::FixedVec { .. } => {
@@ -1005,8 +1456,16 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 if invalid_aggregate {
                     errs.push(VerifyError::BadProgramRef {
                         what: format!(
-                            "component c{ci} `{}` method `{}` parameter {param} has invalid aggregate schema {ty:?}",
+                            "component c{ci} `{}` method `{}` parameter {index} has invalid aggregate schema {ty:?}",
                             component.name, method.name
+                        ),
+                    });
+                }
+                if ir_type_is_nested_string(ty) {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "component c{ci} method `{}` param {index} cannot use a type containing String: {ty:?}",
+                            method.name
                         ),
                     });
                 }
@@ -1061,6 +1520,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                             | IrType::UInt(_)
                             | IrType::SInt(_)
                             | IrType::Bool
+                            | IrType::String
                     )
                 );
                 if materialized_return && method.ret_ty != function_ret {
@@ -1105,6 +1565,14 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                         });
                     }
                 }
+            }
+            if method.ret_ty.as_ref().is_some_and(ir_type_is_nested_string) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "component c{ci} method `{}` return cannot use a type containing String: {:?}",
+                        method.name, method.ret_ty
+                    ),
+                });
             }
         }
         for handler in &component.on_handlers {
@@ -1165,9 +1633,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             }
         }
         for edge in &component.connects {
-            if let Err(detail) =
-                verify_component_connect(prog, ComponentId(ci as u32), edge)
-            {
+            if let Err(detail) = verify_component_connect(prog, ComponentId(ci as u32), edge) {
                 errs.push(VerifyError::BadProgramRef {
                     what: format!(
                         "component c{ci} `{}` has invalid connect metadata: {detail}",
@@ -1177,8 +1643,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             }
         }
         for handler in &component.cycle_handlers {
-            if handler.monitor_channel.is_some()
-                && matches!(handler.phase, HandlerPhase::PostEval)
+            if handler.monitor_channel.is_some() && matches!(handler.phase, HandlerPhase::PostEval)
             {
                 errs.push(VerifyError::BadProgramRef {
                     what: format!(
@@ -1220,6 +1685,24 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                         ),
                     });
                 }
+            }
+            let contains_string = match &field.kind {
+                ComponentFieldKind::Scalar { ty, .. } => ir_type_contains_string(ty),
+                ComponentFieldKind::FixedVec(vec) => ir_type_contains_string(&vec.elem),
+                ComponentFieldKind::Queue { elem } => queue_elem_contains_string(elem),
+                ComponentFieldKind::Record { .. }
+                | ComponentFieldKind::Event { .. }
+                | ComponentFieldKind::Sub { .. }
+                | ComponentFieldKind::Dut { .. }
+                | ComponentFieldKind::ScoreboardSub { .. } => false,
+            };
+            if contains_string {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "component c{ci} field `{}` has unsupported persistent String storage, including nested String containers",
+                        field.name
+                    ),
+                });
             }
             if let ComponentFieldKind::Queue { elem } = &field.kind {
                 verify_queue_elem_schema(
@@ -1289,12 +1772,22 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 });
             }
             match &field.kind {
-                ScoreboardFieldKind::Queue { elem } => verify_queue_elem_schema(
-                    elem,
-                    prog.records.len(),
-                    format!("scoreboard sb{si} field `{}`", field.name),
-                    &mut errs,
-                ),
+                ScoreboardFieldKind::Queue { elem } => {
+                    if queue_elem_contains_string(elem) {
+                        errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "scoreboard sb{si} field `{}` has unsupported nested String storage",
+                                field.name
+                            ),
+                        });
+                    }
+                    verify_queue_elem_schema(
+                        elem,
+                        prog.records.len(),
+                        format!("scoreboard sb{si} field `{}`", field.name),
+                        &mut errs,
+                    );
+                }
                 ScoreboardFieldKind::Scalar { ty, default } => verify_scoreboard_scalar_schema(
                     ty,
                     default,
@@ -1312,6 +1805,14 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     }
                 }
                 ScoreboardFieldKind::List { elem, vec_len } => {
+                    if ir_type_contains_string(elem) {
+                        errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "scoreboard sb{si} field `{}` has unsupported nested String storage",
+                                field.name
+                            ),
+                        });
+                    }
                     // Signed and unsigned share the element width ceiling
                     // (harc#657) — the same lift as scalar fields, so a
                     // `list<sint<128>>` that lowering now accepts is not
@@ -1409,13 +1910,39 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     for (xi, x) in prog.transactors.iter().enumerate() {
         for field in &x.state_fields {
             match &field.kind {
-                StateFieldKind::Queue { elem } => verify_queue_elem_schema(
-                    elem,
-                    prog.records.len(),
-                    format!("transactor x{xi} state field `{}`", field.name),
-                    &mut errs,
-                ),
+                StateFieldKind::Scalar { ty, .. } if ir_type_contains_string(ty) => {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "transactor x{xi} state field `{}` has unsupported persistent String storage, including nested String containers",
+                            field.name
+                        ),
+                    });
+                }
+                StateFieldKind::Queue { elem } => {
+                    if queue_elem_contains_string(elem) {
+                        errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "transactor x{xi} state field `{}` has unsupported nested String storage",
+                                field.name
+                            ),
+                        });
+                    }
+                    verify_queue_elem_schema(
+                        elem,
+                        prog.records.len(),
+                        format!("transactor x{xi} state field `{}`", field.name),
+                        &mut errs,
+                    );
+                }
                 StateFieldKind::FixedVec { ty } => {
+                    if ir_type_contains_string(ty) {
+                        errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "transactor x{xi} state field `{}` has unsupported nested String storage",
+                                field.name
+                            ),
+                        });
+                    }
                     let valid = matches!(
                         ty,
                         IrType::FixedVec { elem, .. }
@@ -1433,47 +1960,92 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 _ => {}
             }
         }
-        for method in &x.methods {
-            let Some(function) = prog.functions.get(method.function.index()) else {
-                continue;
-            };
-            let function_param_tys = function
-                .params
-                .iter()
-                .map(|param| param.ty.clone())
-                .collect::<Vec<_>>();
-            let function_param_local_tys = function
-                .locals
-                .iter()
-                .take(function.params.len())
-                .map(|local| local.ty.clone())
-                .collect::<Vec<_>>();
-            if method.param_names.len() != method.param_tys.len()
-                || method.param_tys != function_param_tys
-                || method.param_tys != function_param_local_tys
-            {
-                errs.push(VerifyError::BadProgramRef {
-                    what: format!(
-                        "transactor x{xi} method `{}` parameter schema {:?} disagrees with fn{} params {:?} / locals {:?}",
-                        method.name,
-                        method.param_tys,
-                        method.function.0,
-                        function_param_tys,
-                        function_param_local_tys
-                    ),
-                });
-            }
-            for ty in &method.param_tys {
+        for (member, method) in x.methods.iter().enumerate() {
+            for (index, ty) in method.param_tys.iter().enumerate() {
                 if matches!(ty, IrType::FixedVec { .. })
                     && !component_fixed_vec_elem_valid(ty, prog.records.len())
                 {
                     errs.push(VerifyError::BadProgramRef {
                         what: format!(
-                            "transactor x{xi} method `{}` has invalid fixed-vector parameter type {ty:?}",
+                            "transactor x{xi} method `{}` parameter {index} has invalid fixed-vector schema {ty:?}",
                             method.name
                         ),
                     });
                 }
+                if ir_type_is_nested_string(ty) {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "transactor x{xi} method `{}` param {} cannot use a type containing String: {ty:?}",
+                            method.name, index
+                        ),
+                    });
+                }
+            }
+            if method.ret_ty.as_ref().is_some_and(ir_type_is_nested_string) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "transactor x{xi} method `{}` return cannot use a type containing String: {:?}",
+                        method.name, method.ret_ty
+                    ),
+                });
+            }
+            let Some(function) = prog.functions.get(method.function.index()) else {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "transactor x{xi} method `{}` references missing fn{}",
+                        method.name, method.function.0
+                    ),
+                });
+                continue;
+            };
+            if function.id != method.function
+                || function.name != format!("{}_{}", x.emission_name(), method.name)
+                || function.kind
+                    != (FunctionKind::TransactorBody {
+                        transactor: TransactorId(xi as u32),
+                        member: crate::ir::TransactorCallableId(member as u32),
+                        name: method.name.clone(),
+                    })
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "transactor x{xi} method `{}` points at fn{} with inconsistent callable identity {:?}",
+                        method.name, method.function.0, function.kind
+                    ),
+                });
+            }
+            let function_param_names = function
+                .params
+                .iter()
+                .map(|param| param.name.as_str())
+                .collect::<Vec<_>>();
+            let schema_param_names = method
+                .param_names
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let function_param_tys = function
+                .params
+                .iter()
+                .map(|param| &param.ty)
+                .collect::<Vec<_>>();
+            let schema_param_tys = method.param_tys.iter().collect::<Vec<_>>();
+            let function_param_local_tys = function
+                .locals
+                .iter()
+                .take(function.params.len())
+                .map(|local| &local.ty)
+                .collect::<Vec<_>>();
+            if function_param_names != schema_param_names
+                || function_param_tys != schema_param_tys
+                || function_param_local_tys != schema_param_tys
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "transactor x{xi} method `{}` parameter schema disagrees with fn{}",
+                        method.name, method.function.0
+                    ),
+                });
             }
             let function_ret = function
                 .ret
@@ -1498,10 +2070,61 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 }
             }
         }
-        for method in &x.target_methods {
+        for (target_member, method) in x.target_methods.iter().enumerate() {
             let Some(function) = prog.functions.get(method.function.index()) else {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "transactor x{xi} target method `{}` references missing fn{}",
+                        method.name, method.function.0
+                    ),
+                });
                 continue;
             };
+            let member = x.methods.len() + target_member;
+            if function.id != method.function
+                || function.name != format!("{}_target_{}", x.emission_name(), method.name)
+                || function.kind
+                    != (FunctionKind::TransactorBody {
+                        transactor: TransactorId(xi as u32),
+                        member: crate::ir::TransactorCallableId(member as u32),
+                        name: method.name.clone(),
+                    })
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "transactor x{xi} target method `{}` points at fn{} with inconsistent callable identity {:?}",
+                        method.name, method.function.0, function.kind
+                    ),
+                });
+            }
+            let function_param_names = function
+                .params
+                .iter()
+                .map(|param| param.name.as_str())
+                .collect::<Vec<_>>();
+            let schema_param_names = method.args.iter().map(String::as_str).collect::<Vec<_>>();
+            let function_param_tys = function
+                .params
+                .iter()
+                .map(|param| &param.ty)
+                .collect::<Vec<_>>();
+            let schema_param_tys = method.param_tys.iter().collect::<Vec<_>>();
+            let function_ret = function
+                .ret
+                .and_then(|ret| function.locals.get(ret.index()))
+                .map(|local| local.ty.clone());
+            if function_param_names != schema_param_names
+                || function_param_tys != schema_param_tys
+                || method.has_ret != method.ret_ty.is_some()
+                || method.ret_ty != function_ret
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "transactor x{xi} target method `{}` ABI schema disagrees with fn{}",
+                        method.name, method.function.0
+                    ),
+                });
+            }
             let ret_record = function
                 .ret
                 .and_then(|ret| function.locals.get(ret.index()))
@@ -1529,40 +2152,87 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 }
             }
         }
-        for (name, function) in x
-            .methods
-            .iter()
-            .map(|m| (m.name.as_str(), m.function))
-            .chain(
-                x.target_methods
-                    .iter()
-                    .map(|m| (m.name.as_str(), m.function)),
-            )
-        {
-            match prog.functions.get(function.index()) {
-                Some(f)
-                    if f.kind
-                        == (FunctionKind::TransactorBody {
-                            transactor: TransactorId(xi as u32),
-                        }) => {}
-                Some(f) => errs.push(VerifyError::BadProgramRef {
-                    what: format!(
-                        "transactor x{xi} method `{}` points at fn{} with kind {:?}",
-                        name, function.0, f.kind
-                    ),
-                }),
-                None => errs.push(VerifyError::BadProgramRef {
-                    what: format!(
-                        "transactor x{xi} method `{}` references missing fn{}",
-                        name, function.0
-                    ),
-                }),
-            }
-        }
     }
     for (ti, tb) in prog.testbenches.iter().enumerate() {
         let mut component_binding_names = std::collections::HashSet::new();
         let mut transactor_binding_names = std::collections::HashSet::new();
+        for (binding_index, binding) in tb.bus_bindings.iter().enumerate() {
+            if binding.id.index() != binding_index {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} bus binding `{}` carries bb{} at table index {binding_index}",
+                        binding.field, binding.id.0
+                    ),
+                });
+            }
+            let mut method_names = std::collections::HashSet::new();
+            for method in &binding.methods {
+                if !method_names.insert(method.name.as_str()) {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "tb{ti} bus binding `{}` repeats TLM method `{}`",
+                            binding.field, method.name
+                        ),
+                    });
+                }
+                if method.args.len() != method.arg_types.len() {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "tb{ti} bus binding `{}` method `{}` has {} argument names but {} argument types",
+                            binding.field,
+                            method.name,
+                            method.args.len(),
+                            method.arg_types.len()
+                        ),
+                    });
+                }
+                if method.has_ret != method.ret_type.is_some() {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "tb{ti} bus binding `{}` method `{}` has inconsistent return metadata",
+                            binding.field, method.name
+                        ),
+                    });
+                }
+                if matches!(
+                    method.mode,
+                    crate::ir::TlmMethodMode::OutOfOrder { tags: 0 }
+                ) {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "tb{ti} bus binding `{}` method `{}` has zero out-of-order tag slots",
+                            binding.field, method.name
+                        ),
+                    });
+                }
+                let mut arg_names = std::collections::HashSet::new();
+                for arg in &method.args {
+                    if arg.is_empty() || !arg_names.insert(arg.as_str()) {
+                        errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "tb{ti} bus binding `{}` method `{}` has an empty or duplicate argument `{arg}`",
+                                binding.field, method.name
+                            ),
+                        });
+                    }
+                }
+            }
+            let mut remap_keys = std::collections::HashSet::new();
+            for ((channel, signal), physical) in &binding.remap {
+                if channel.is_empty()
+                    || signal.is_empty()
+                    || physical.is_empty()
+                    || !remap_keys.insert((channel.as_str(), signal.as_str()))
+                {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "tb{ti} bus binding `{}` has an invalid or duplicate remap `{channel}.{signal}` -> `{physical}`",
+                            binding.field
+                        ),
+                    });
+                }
+            }
+        }
         let state_scalars: Vec<_> = tb
             .state_fields
             .iter()
@@ -1589,8 +2259,26 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
         let mut state_names = std::collections::HashSet::new();
         for field in &tb.state_fields {
             let name = match field {
-                TbStateFieldSchema::Scalar(field) => &field.name,
+                TbStateFieldSchema::Scalar(field) => {
+                    if ir_type_contains_string(&field.ty) {
+                        errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "tb{ti} scalar field `{}` has unsupported persistent String storage, including nested String containers",
+                                field.name
+                            ),
+                        });
+                    }
+                    &field.name
+                }
                 TbStateFieldSchema::Queue(field) => {
+                    if queue_elem_contains_string(&field.elem) {
+                        errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "tb{ti} queue field `{}` has unsupported nested String storage",
+                                field.name
+                            ),
+                        });
+                    }
                     verify_queue_elem_schema(
                         &field.elem,
                         prog.records.len(),
@@ -1639,7 +2327,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 }
                 match prog.functions.get(callback.index()) {
                     Some(func)
-                        if func.kind == FunctionKind::TestHook
+                        if matches!(func.kind, FunctionKind::TestHook { .. })
                             && func.owner == Some(TestbenchId(ti as u32))
                             && func.params.len() == 1
                             && func.params[0].ty == IrType::UInt(None)
@@ -1768,6 +2456,83 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 }),
             }
         }
+        let mut bound_bus_fields = std::collections::HashSet::new();
+        for adapter in &tb.bound_bus_instances {
+            if !bound_bus_fields.insert(&adapter.field) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} declares bound-bus adapter `{}` more than once",
+                        adapter.field
+                    ),
+                });
+            }
+            let Some(binding) = tb.bus_binding(adapter.binding) else {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} bound-bus adapter `{}` references missing bb{}",
+                        adapter.field, adapter.binding.0
+                    ),
+                });
+                continue;
+            };
+            let bound_bus = match adapter.owner {
+                BoundBusOwner::Transactor(transactor) => tb
+                    .transactor_fields
+                    .iter()
+                    .find(|(field, owner)| field == &adapter.field && *owner == transactor)
+                    .and_then(|_| prog.transactors.get(transactor.index()))
+                    .and_then(|schema| schema.bound_bus.as_deref()),
+                BoundBusOwner::Component(component) => tb
+                    .component_fields
+                    .iter()
+                    .find(|field| field.field == adapter.field && field.component == component)
+                    .and_then(|_| prog.components.get(component.index()))
+                    .and_then(|schema| schema.bound_bus.as_deref()),
+            };
+            if bound_bus != Some(binding.bus.as_str()) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} bound-bus adapter `{}` owner {:?} does not bind bus `{}`",
+                        adapter.field, adapter.owner, binding.bus
+                    ),
+                });
+            }
+        }
+        for (field, transactor) in &tb.transactor_fields {
+            if prog
+                .transactors
+                .get(transactor.index())
+                .is_some_and(|schema| schema.bound_bus.is_some())
+                && !tb.bound_bus_instances.iter().any(|adapter| {
+                    adapter.field == *field
+                        && adapter.owner == BoundBusOwner::Transactor(*transactor)
+                })
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} bound transactor field `{field}` has no typed bus adapter"
+                    ),
+                });
+            }
+        }
+        for field in &tb.component_fields {
+            if prog
+                .components
+                .get(field.component.index())
+                .is_some_and(|schema| schema.bound_bus.is_some())
+                && !tb.bound_bus_instances.iter().any(|adapter| {
+                    adapter.field == field.field
+                        && adapter.owner == BoundBusOwner::Component(field.component)
+                })
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} bound component field `{}` has no typed bus adapter",
+                        field.field
+                    ),
+                });
+            }
+        }
         let mut target_names = std::collections::HashSet::new();
         for actor in &tb.target_tlm_actors {
             if transactor_binding_names.contains(&actor.instance)
@@ -1889,6 +2654,30 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 });
             }
         }
+        for (si, service) in tb.periodic_services.iter().enumerate() {
+            let expected = crate::ir::TestHookMember::TestbenchPeriodic { service: si as u32 };
+            match prog.functions.get(service.function.index()) {
+                Some(func)
+                    if matches!(&func.kind, FunctionKind::TestHook { member } if member == &expected)
+                        && func.owner == Some(TestbenchId(ti as u32))
+                        && func.params.is_empty() => {}
+                Some(func) => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} periodic service {si} body fn{} is {:?}, owner {:?}, with {} param(s)",
+                        func.id.0,
+                        func.kind,
+                        func.owner,
+                        func.params.len()
+                    ),
+                }),
+                None => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "tb{ti} periodic service {si} references missing fn{}",
+                        service.function.0
+                    ),
+                }),
+            }
+        }
         // Testbench cycle-service predicates are standalone expressions,
         // not part of the handler body's CFG. Walk them explicitly with
         // the handler function's owner/type context so every expression
@@ -1904,8 +2693,12 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 });
                 continue;
             };
-            if func.kind != FunctionKind::TestHook
-                || func.owner != Some(TestbenchId(ti as u32))
+            if !matches!(
+                &func.kind,
+                FunctionKind::TestHook {
+                    member: crate::ir::TestHookMember::TestbenchCycle { service }
+                } if *service == si as u32
+            ) || func.owner != Some(TestbenchId(ti as u32))
                 || !func.params.is_empty()
             {
                 errs.push(VerifyError::BadProgramRef {
@@ -1930,6 +2723,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             checker.check_truth_expr(&service.trigger, true, "testbench cycle-service trigger");
         }
     }
+    verify_test_hook_claims(prog, &mut errs);
     for (i, func) in prog.functions.iter().enumerate() {
         if func.id.index() != i {
             errs.push(VerifyError::BadProgramRef {
@@ -1953,6 +2747,174 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
         Ok(())
     } else {
         Err(errs)
+    }
+}
+
+fn verify_test_hook_claims(prog: &TbProgram, errs: &mut Vec<VerifyError>) {
+    use crate::ir::{TestHookMember, TestHookSiteId};
+    let mut claims: BTreeMap<FunctionId, Vec<TestHookMember>> = BTreeMap::new();
+    let mut statement_sites: BTreeMap<TestHookSiteId, String> = BTreeMap::new();
+    let mut next_statement_site: BTreeMap<crate::ir::TestHookSiteOwner, u32> = BTreeMap::new();
+    let mut claim = |function: FunctionId,
+                     member: TestHookMember,
+                     description: String,
+                     expected_owner: Option<&crate::ir::TestHookSiteOwner>| {
+        if let Some(site) = match &member {
+            TestHookMember::EventSubscription(site)
+            | TestHookMember::MethodSubscription(site)
+            | TestHookMember::StatementCycle(site) => Some(site),
+            _ => None,
+        } {
+            if expected_owner != Some(&site.owner) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "{description} site {:?} does not belong to its test body",
+                        site
+                    ),
+                });
+            }
+            if expected_owner.is_some() {
+                let expected = next_statement_site.entry(site.owner.clone()).or_default();
+                if site.ordinal != *expected {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "{description} site {} is out of source order: expected {}_hs{}",
+                            site.symbol(),
+                            site.owner.member.symbol(),
+                            *expected
+                        ),
+                    });
+                }
+                *expected += 1;
+            }
+            if let Some(previous) = statement_sites.insert(site.clone(), description.clone()) {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "test-hook site {} is claimed by both {previous} and {description}",
+                        site.symbol()
+                    ),
+                });
+            }
+        }
+        claims.entry(function).or_default().push(member);
+    };
+
+    for function in &prog.functions {
+        let expected_site_owner = match &function.kind {
+            FunctionKind::TestBody { member, name, .. } => Some(crate::ir::TestHookSiteOwner {
+                test: name.clone(),
+                member: *member,
+            }),
+            _ => None,
+        };
+        for block in &function.blocks {
+            for stmt in &block.stmts {
+                match stmt {
+                    Stmt::EventSubscribe { site, handler, .. } => claim(
+                        *handler,
+                        TestHookMember::EventSubscription(site.clone()),
+                        format!("fn{} event subscription", function.id.0),
+                        expected_site_owner.as_ref(),
+                    ),
+                    Stmt::MethodHookSubscribe { site, handler, .. } => claim(
+                        *handler,
+                        TestHookMember::MethodSubscription(site.clone()),
+                        format!("fn{} method subscription", function.id.0),
+                        expected_site_owner.as_ref(),
+                    ),
+                    Stmt::CycleHandler(handler) => {
+                        if let Some(schema) = prog.cycle_handlers.get(handler.index()) {
+                            claim(
+                                schema.function,
+                                TestHookMember::StatementCycle(schema.site.clone()),
+                                format!("cycle handler h{}", handler.0),
+                                expected_site_owner.as_ref(),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for (testbench_index, testbench) in prog.testbenches.iter().enumerate() {
+        for binding in &testbench.regblock_bindings {
+            for (register, callback) in &binding.callbacks {
+                claim(
+                    *callback,
+                    TestHookMember::RegblockWrite {
+                        binding: binding.field.clone(),
+                        register: register.clone(),
+                    },
+                    format!(
+                        "tb{testbench_index} regblock callback {}.{register}",
+                        binding.field
+                    ),
+                    None,
+                );
+            }
+        }
+        for (service, schema) in testbench.periodic_services.iter().enumerate() {
+            claim(
+                schema.function,
+                TestHookMember::TestbenchPeriodic {
+                    service: service as u32,
+                },
+                format!("tb{testbench_index} periodic service {service}"),
+                None,
+            );
+        }
+        for (service, schema) in testbench.cycle_services.iter().enumerate() {
+            claim(
+                schema.function,
+                TestHookMember::TestbenchCycle {
+                    service: service as u32,
+                },
+                format!("tb{testbench_index} cycle service {service}"),
+                None,
+            );
+        }
+    }
+    drop(claim);
+
+    for function in &prog.functions {
+        let FunctionKind::TestHook { member } = &function.kind else {
+            continue;
+        };
+        let owned = claims.remove(&function.id).unwrap_or_default();
+        let expected_name = match member {
+            TestHookMember::EventSubscription(_)
+            | TestHookMember::MethodSubscription(_)
+            | TestHookMember::StatementCycle(_) => Some(member.function_name("")),
+            _ => function.owner.and_then(|owner| {
+                let mut tests = prog.tests.iter().filter(|test| test.testbench == owner);
+                let first = tests.next()?;
+                tests
+                    .next()
+                    .is_none()
+                    .then(|| member.function_name(&first.name))
+            }),
+        };
+        if member == &TestHookMember::Pending
+            || owned.len() != 1
+            || owned.first() != Some(member)
+            || expected_name.as_deref() != Some(function.name.as_str())
+        {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "test-hook fn{} `{}` identity {:?} has owner claims {:?} and expected name {:?}",
+                    function.id.0, function.name, member, owned, expected_name
+                ),
+            });
+        }
+    }
+    for (function, owned) in claims {
+        errs.push(VerifyError::BadProgramRef {
+            what: format!(
+                "test-hook owner claim(s) {:?} reference non-TestHook fn{}",
+                owned, function.0
+            ),
+        });
     }
 }
 
@@ -2175,6 +3137,21 @@ fn resolve_testbench_component_path(
 /// transactor/responder body (by function id) or a test-scope instance name.
 /// This mirrors the backend's state-receiver resolution so verification can
 /// enforce the queue element type before emission indexes the same schema.
+fn function_testbench_schema<'a>(
+    prog: &'a TbProgram,
+    func: &TbFunction,
+) -> Option<&'a crate::ir::TestbenchSchema> {
+    if let Some(owner) = func.owner {
+        return prog.testbenches.get(owner.index());
+    }
+    let FunctionKind::TestbenchMethod { testbench, .. } = func.kind else {
+        return None;
+    };
+    prog.testbenches
+        .iter()
+        .find(|schema| schema.type_id == testbench)
+}
+
 fn resolve_transactor_state_queue_elem(
     prog: &TbProgram,
     func: &TbFunction,
@@ -2201,13 +3178,8 @@ fn resolve_transactor_state_queue_elem(
                 func.id.0
             ));
         }
-        let owner = func
-            .owner
+        let tb = function_testbench_schema(prog, func)
             .ok_or_else(|| format!("target-state instance `{instance}` has no owning testbench"))?;
-        let tb = prog
-            .testbenches
-            .get(owner.index())
-            .ok_or_else(|| format!("references missing testbench tb{}", owner.0))?;
         let transactor = tb
             .transactor_fields
             .iter()
@@ -2227,8 +3199,8 @@ fn resolve_transactor_state_queue_elem(
             })
             .ok_or_else(|| {
                 format!(
-                    "target-state instance `{instance}` does not resolve on tb{}",
-                    owner.0
+                    "target-state instance `{instance}` does not resolve on testbench `{}`",
+                    tb.name
                 )
             })?;
         prog.transactors.get(transactor.index()).ok_or_else(|| {
@@ -2266,7 +3238,7 @@ fn resolve_component_queue_elem(
 ) -> Result<QueueElem, String> {
     let component = match base {
         ComponentBase::SelfField => match func.kind {
-            FunctionKind::ComponentMethod { component } => component,
+            FunctionKind::ComponentMethod { component, .. } => component,
             _ => {
                 return Err(format!(
                     "self-relative component queue `{queue}` appears outside a component method"
@@ -2274,14 +3246,36 @@ fn resolve_component_queue_elem(
             }
         },
         ComponentBase::Path(path) => {
-            let owner = func
-                .owner
-                .ok_or_else(|| "component queue path has no owning testbench".to_string())?;
-            let tb = prog
-                .testbenches
-                .get(owner.index())
-                .ok_or_else(|| format!("references missing testbench tb{}", owner.0))?;
-            resolve_testbench_component_path(prog, tb, path)?
+            if path.first().map(String::as_str) == Some("self") {
+                let FunctionKind::ComponentMethod { component, .. } = func.kind else {
+                    return Err(
+                        "self-rooted component queue path appears outside a component method"
+                            .to_string(),
+                    );
+                };
+                let mut component = component;
+                for segment in path.iter().skip(1) {
+                    let schema = prog
+                        .components
+                        .get(component.index())
+                        .ok_or_else(|| format!("references missing component c{}", component.0))?;
+                    component = match schema.field(segment).map(|field| &field.kind) {
+                        Some(ComponentFieldKind::Sub {
+                            component: nested, ..
+                        }) => *nested,
+                        _ => {
+                            return Err(format!(
+                                "self component queue path segment `{segment}` is not a sub-component"
+                            ));
+                        }
+                    };
+                }
+                component
+            } else {
+                let tb = function_testbench_schema(prog, func)
+                    .ok_or_else(|| "component queue path has no owning testbench".to_string())?;
+                resolve_testbench_component_path(prog, tb, path)?
+            }
         }
         ComponentBase::Local(local) => {
             return Err(format!(
@@ -2358,9 +3352,7 @@ fn event_payload_accepts_value_type(payload: &EventPayload, ty: &IrType) -> bool
         (_, IrType::Unknown) => true,
         (EventPayload::Scalar { .. }, IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) => true,
         (EventPayload::Record(source), IrType::Record(sink)) => *source == *sink,
-        (EventPayload::FixedVec { .. }, IrType::FixedVec { .. }) => {
-            payload.value_ir_type() == *ty
-        }
+        (EventPayload::FixedVec { .. }, IrType::FixedVec { .. }) => payload.value_ir_type() == *ty,
         _ => false,
     }
 }
@@ -2376,7 +3368,9 @@ fn verify_event_payload_ref(prog: &TbProgram, payload: &EventPayload) -> Result<
         }
         EventPayload::FixedVec { elem, .. } => {
             if !component_fixed_vec_elem_valid(&elem, prog.records.len()) {
-                return Err(format!("has invalid fixed-vector element metadata {elem:?}"));
+                return Err(format!(
+                    "has invalid fixed-vector element metadata {elem:?}"
+                ));
             }
         }
         _ => {}
@@ -2413,7 +3407,10 @@ fn verify_component_event_ref(
         resolve_component_path_mode(&prog.components, binding.component, binding.mode, tail)
             .map_err(|err| err.to_string())?
     } else if root == "self" {
-        let FunctionKind::ComponentMethod { component: owner } = func.kind else {
+        let FunctionKind::ComponentMethod {
+            component: owner, ..
+        } = func.kind
+        else {
             return Err("self-rooted component event outside a component method".to_string());
         };
         resolve_component_path_mode(&prog.components, owner, None, tail)
@@ -2599,6 +3596,100 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
         return Err(errs); // nothing else is meaningful
     }
 
+    for (index, param) in func.params.iter().enumerate() {
+        if ir_type_is_nested_string(&param.ty) {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} `{}` param {} cannot use a type containing String: {:?}",
+                    fid.0, func.name, index, param.ty
+                ),
+            });
+        }
+    }
+    for (index, local) in func.locals.iter().enumerate() {
+        if ir_type_is_nested_string(&local.ty) {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} `{}` local %{} cannot use a type containing String: {:?}",
+                    fid.0, func.name, index, local.ty
+                ),
+            });
+        }
+    }
+    let record_binding_owners = match func.kind {
+        FunctionKind::TestbenchMethod { testbench, .. } => prog
+            .testbenches
+            .iter()
+            .filter(|schema| schema.type_id == testbench)
+            .collect::<Vec<_>>(),
+        _ => func
+            .owner
+            .and_then(|owner| prog.testbenches.get(owner.index()))
+            .into_iter()
+            .collect::<Vec<_>>(),
+    };
+    let mut record_binding_locals = HashSet::new();
+    let mut record_binding_fields = HashSet::new();
+    for binding in &func.testbench_record_locals {
+        if !record_binding_locals.insert(binding.local)
+            || !record_binding_fields.insert(binding.field.as_str())
+        {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} `{}` repeats testbench record binding `%{} -> {}`",
+                    fid.0, func.name, binding.local.0, binding.field
+                ),
+            });
+            continue;
+        }
+        match func.locals.get(binding.local.index()) {
+            Some(local) if local.ty == IrType::Record(binding.record) => {}
+            Some(local) => errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} `{}` testbench record binding `%{} -> {}` has local type {:?}, expected Record(r{})",
+                    fid.0, func.name, binding.local.0, binding.field, local.ty, binding.record.0
+                ),
+            }),
+            None => errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} `{}` testbench record binding `%{} -> {}` references a missing local",
+                    fid.0, func.name, binding.local.0, binding.field
+                ),
+            }),
+        }
+        if record_binding_owners.is_empty()
+            || record_binding_owners.iter().any(|owner| {
+                !owner
+                    .record_fields
+                    .iter()
+                    .any(|(field, record)| field == &binding.field && *record == binding.record)
+            })
+        {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} `{}` testbench record binding `%{} -> {}` does not match every owning testbench schema",
+                    fid.0, func.name, binding.local.0, binding.field
+                ),
+            });
+        }
+    }
+    for (local_index, local) in func.locals.iter().enumerate() {
+        let is_testbench_record = record_binding_owners.iter().any(|owner| {
+            owner
+                .record_fields
+                .iter()
+                .any(|(field, record)| field == &local.name && local.ty == IrType::Record(*record))
+        });
+        if is_testbench_record && !record_binding_locals.contains(&LocalId(local_index as u32)) {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} `{}` local %{} `{}` aliases a testbench record field without typed provenance",
+                    fid.0, func.name, local_index, local.name
+                ),
+            });
+        }
+    }
+
     // Pure helpers emit as file-scope C++ functions whose params and return
     // use the scalar, fixed-vector, or TSeq helper ABI. Internal record locals
     // are permitted, but a pass must not drift a parameter's mirrored local
@@ -2685,6 +3776,46 @@ pub fn verify_function(prog: &TbProgram, func: &TbFunction) -> Result<(), Vec<Ve
                     fid.0, func.name
                 ),
             }),
+        }
+    }
+
+    if matches!(func.kind, FunctionKind::Tseq { .. }) {
+        if func.params.len() > func.locals.len() {
+            errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} tseq `{}` has {} params but only {} locals",
+                    fid.0,
+                    func.name,
+                    func.params.len(),
+                    func.locals.len()
+                ),
+            });
+        }
+        for (index, param) in func.params.iter().enumerate() {
+            match func.locals.get(index) {
+                Some(local) if local.ty != param.ty => errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "fn{} tseq `{}` param {} metadata {:?} does not match mirrored local {:?}",
+                        fid.0, func.name, index, param.ty, local.ty
+                    ),
+                }),
+                None => continue,
+                _ => {}
+            }
+            let unsupported = |ty: &IrType| ir_type_contains_string(ty);
+            if unsupported(&param.ty)
+                || func
+                    .locals
+                    .get(index)
+                    .is_some_and(|local| unsupported(&local.ty))
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "fn{} tseq `{}` param {} cannot use String",
+                        fid.0, func.name, index
+                    ),
+                });
+            }
         }
     }
 
@@ -2801,9 +3932,25 @@ struct Checker<'a> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum CollectionElementShape {
+    Value(ValueAbiClass),
+    FixedVec(usize, Box<CollectionElementShape>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum WholeCollectionShape {
-    FixedVec(usize, String),
-    DynamicSeq(String),
+    FixedVec(usize, CollectionElementShape),
+    DynamicSeq(ValueAbiClass),
+}
+
+fn collection_element_shape(ty: &IrType) -> Option<CollectionElementShape> {
+    match ty {
+        IrType::FixedVec { elem, len } => Some(CollectionElementShape::FixedVec(
+            *len,
+            Box::new(collection_element_shape(elem)?),
+        )),
+        _ => value_abi_class(ty).map(CollectionElementShape::Value),
+    }
 }
 
 impl Checker<'_> {
@@ -2814,14 +3961,17 @@ impl Checker<'_> {
         self.transactor_predicate_expr_ok = previous;
     }
 
+    fn owner_testbench(&self) -> Option<&crate::ir::TestbenchSchema> {
+        function_testbench_schema(self.prog, self.func)
+    }
+
     fn check_truth_expr(&mut self, expr: &Expr, ports_ok: bool, context: &'static str) {
         self.check_expr(expr, ports_ok, context);
         let ty = self.aggregate_assignment_expr_type(expr);
         if matches!(
             ty,
-            Some(IrType::Record(_) | IrType::Seq(_) | IrType::FixedVec { .. })
-        )
-            || self.contains_invalid_record_composition(expr)
+            Some(IrType::String | IrType::Record(_) | IrType::Seq(_) | IrType::FixedVec { .. })
+        ) || self.contains_invalid_record_composition(expr)
         {
             self.errs.push(VerifyError::BadProgramRef {
                 what: format!(
@@ -2836,12 +3986,27 @@ impl Checker<'_> {
         self.check_expr(expr, ports_ok, context);
         if matches!(
             self.aggregate_assignment_expr_type(expr),
-            Some(IrType::Record(_) | IrType::Seq(_) | IrType::FixedVec { .. })
+            Some(IrType::String | IrType::Record(_) | IrType::Seq(_) | IrType::FixedVec { .. })
         ) || self.contains_invalid_record_composition(expr)
         {
             self.errs.push(VerifyError::BadProgramRef {
                 what: format!(
                     "fn{} b{} {context} is not a scalar value",
+                    self.fid.0, self.bid.0
+                ),
+            });
+        }
+    }
+
+    fn check_non_string_expr(&mut self, expr: &Expr, ports_ok: bool, context: &'static str) {
+        self.check_expr(expr, ports_ok, context);
+        if matches!(
+            self.aggregate_assignment_expr_type(expr),
+            Some(IrType::String)
+        ) {
+            self.errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} b{} {context} is String-valued",
                     self.fid.0, self.bid.0
                 ),
             });
@@ -2954,7 +4119,7 @@ impl Checker<'_> {
     fn component_base_id(&self, base: &ComponentBase) -> Result<ComponentId, String> {
         match base {
             ComponentBase::SelfField => match self.func.kind {
-                FunctionKind::ComponentMethod { component } => self
+                FunctionKind::ComponentMethod { component, .. } => self
                     .prog
                     .components
                     .get(component.index())
@@ -2969,10 +4134,7 @@ impl Checker<'_> {
                 // Match lowering's namespace order: a real testbench
                 // component field named `self` wins over the synthetic
                 // method-relative root of the same spelling.
-                let owner_tb = self
-                    .func
-                    .owner
-                    .and_then(|owner| self.prog.testbenches.get(owner.index()));
+                let owner_tb = self.owner_testbench();
                 if let Some(tb) = owner_tb.filter(|tb| {
                     tb.component_fields
                         .iter()
@@ -2980,7 +4142,7 @@ impl Checker<'_> {
                 }) {
                     resolve_testbench_component_path(self.prog, tb, path)
                 } else if root == "self" {
-                    let FunctionKind::ComponentMethod { component } = self.func.kind else {
+                    let FunctionKind::ComponentMethod { component, .. } = self.func.kind else {
                         return Err(
                             "self-rooted component path outside a component method".to_string()
                         );
@@ -3010,15 +4172,9 @@ impl Checker<'_> {
                         .map(|_| cid)
                         .ok_or_else(|| format!("component c{} does not resolve", cid.0))
                 } else {
-                    let owner = self
-                        .func
-                        .owner
-                        .ok_or_else(|| "component path has no owning testbench".to_string())?;
                     let tb = self
-                        .prog
-                        .testbenches
-                        .get(owner.index())
-                        .ok_or_else(|| format!("owner tb{} does not resolve", owner.0))?;
+                        .owner_testbench()
+                        .ok_or_else(|| "component path has no owning testbench".to_string())?;
                     resolve_testbench_component_path(self.prog, tb, path)
                 }
             }
@@ -3026,6 +4182,322 @@ impl Checker<'_> {
                 "component field uses local base %{}; only method calls may use local component values",
                 local.0
             )),
+        }
+    }
+
+    fn self_component_function_is_active(&self, component: ComponentId) -> bool {
+        let Some(schema) = self.prog.components.get(component.index()) else {
+            return false;
+        };
+        schema
+            .methods
+            .iter()
+            .any(|m| m.function == self.fid && matches!(m.activation, Activation::ActiveOnly))
+            || schema
+                .on_handlers
+                .iter()
+                .any(|h| h.function == self.fid && matches!(h.activation, Activation::ActiveOnly))
+            || schema
+                .periodic_handlers
+                .iter()
+                .any(|h| h.function == self.fid && matches!(h.activation, Activation::ActiveOnly))
+            || schema
+                .cycle_handlers
+                .iter()
+                .any(|h| h.function == self.fid && matches!(h.activation, Activation::ActiveOnly))
+            || schema.watchdog.as_ref().is_some_and(|w| {
+                w.function == self.fid && matches!(w.activation, Activation::ActiveOnly)
+            })
+    }
+
+    fn component_value_path_id(&self, path: &[String]) -> Result<ComponentId, String> {
+        let (root, tail) = path
+            .split_first()
+            .ok_or_else(|| "empty component value path".to_string())?;
+        let owner_tb = self.owner_testbench();
+        if let Some(binding) = owner_tb.and_then(|tb| {
+            tb.component_fields
+                .iter()
+                .find(|binding| binding.field == *root)
+        }) {
+            if tail.is_empty() {
+                return self
+                    .prog
+                    .components
+                    .get(binding.component.index())
+                    .map(|_| binding.component)
+                    .ok_or_else(|| format!("component c{} does not resolve", binding.component.0));
+            }
+            let (field, receiver) = tail
+                .split_last()
+                .expect("a non-empty component value tail has a field");
+            let resolved = resolve_component_path_mode(
+                &self.prog.components,
+                binding.component,
+                binding.mode,
+                receiver,
+            )
+            .map_err(|error| error.to_string())?;
+            let owner = self
+                .prog
+                .components
+                .get(resolved.component.index())
+                .ok_or_else(|| format!("component c{} does not resolve", resolved.component.0))?;
+            let schema = owner
+                .field(field)
+                .ok_or_else(|| format!("component `{}` has no field `{field}`", owner.name))?;
+            let ComponentFieldKind::Sub { component, .. } = schema.kind else {
+                return Err(format!(
+                    "component value path `{}` does not end in a sub-component",
+                    path.join(".")
+                ));
+            };
+            if !component_mode_includes_activation(resolved.effective_mode, schema.activation) {
+                return Err(format!(
+                    "component value path `{}` is disabled by its instance mode",
+                    path.join(".")
+                ));
+            }
+            return self
+                .prog
+                .components
+                .get(component.index())
+                .map(|_| component)
+                .ok_or_else(|| format!("component c{} does not resolve", component.0));
+        }
+
+        if root != "self" {
+            return Err(format!("root `{root}` is not a testbench component field"));
+        }
+        let FunctionKind::ComponentMethod { component, .. } = self.func.kind else {
+            return Err("self-rooted component value outside a component method".to_string());
+        };
+        if tail.is_empty() {
+            return self
+                .prog
+                .components
+                .get(component.index())
+                .map(|_| component)
+                .ok_or_else(|| format!("component c{} does not resolve", component.0));
+        }
+
+        let (field, receiver) = tail
+            .split_last()
+            .expect("a non-empty self component value tail has a field");
+        if receiver.is_empty() {
+            let owner = self
+                .prog
+                .components
+                .get(component.index())
+                .ok_or_else(|| format!("component c{} does not resolve", component.0))?;
+            let schema = owner
+                .field(field)
+                .ok_or_else(|| format!("component `{}` has no field `{field}`", owner.name))?;
+            let ComponentFieldKind::Sub {
+                component: copied, ..
+            } = schema.kind
+            else {
+                return Err(format!(
+                    "component value path `{}` does not end in a sub-component",
+                    path.join(".")
+                ));
+            };
+            if matches!(schema.activation, Activation::ActiveOnly)
+                && !self.self_component_function_is_active(component)
+            {
+                return Err(format!(
+                    "component value path `{}` is active-only in an always-on component body",
+                    path.join(".")
+                ));
+            }
+            return self
+                .prog
+                .components
+                .get(copied.index())
+                .map(|_| copied)
+                .ok_or_else(|| format!("component c{} does not resolve", copied.0));
+        }
+
+        let self_schema = self
+            .prog
+            .components
+            .get(component.index())
+            .ok_or_else(|| format!("component c{} does not resolve", component.0))?;
+        let first = &receiver[0];
+        let first_schema = self_schema
+            .field(first)
+            .ok_or_else(|| format!("component `{}` has no field `{first}`", self_schema.name))?;
+        let ComponentFieldKind::Sub {
+            component: head,
+            mode,
+        } = first_schema.kind
+        else {
+            return Err(format!(
+                "self path segment `{first}` is not a sub-component"
+            ));
+        };
+        if matches!(first_schema.activation, Activation::ActiveOnly)
+            && !self.self_component_function_is_active(component)
+        {
+            return Err(format!(
+                "self path segment `{first}` is active-only in an always-on component body"
+            ));
+        }
+        let resolved =
+            resolve_component_path_mode(&self.prog.components, head, mode, &receiver[1..])
+                .map_err(|error| error.to_string())?;
+        let owner = self
+            .prog
+            .components
+            .get(resolved.component.index())
+            .ok_or_else(|| format!("component c{} does not resolve", resolved.component.0))?;
+        let schema = owner
+            .field(field)
+            .ok_or_else(|| format!("component `{}` has no field `{field}`", owner.name))?;
+        let ComponentFieldKind::Sub {
+            component: copied, ..
+        } = schema.kind
+        else {
+            return Err(format!(
+                "component value path `{}` does not end in a sub-component",
+                path.join(".")
+            ));
+        };
+        if !component_mode_includes_activation(resolved.effective_mode, schema.activation) {
+            return Err(format!(
+                "component value path `{}` is disabled by its instance mode",
+                path.join(".")
+            ));
+        }
+        self.prog
+            .components
+            .get(copied.index())
+            .map(|_| copied)
+            .ok_or_else(|| format!("component c{} does not resolve", copied.0))
+    }
+
+    fn component_value_base_id(&self, base: &ComponentBase) -> Result<ComponentId, String> {
+        match base {
+            ComponentBase::Local(local) => match self.func.locals.get(local.index()) {
+                Some(crate::ir::TypedLocal {
+                    ty: IrType::Component(component),
+                    ..
+                }) if self.prog.components.get(component.index()).is_some() => Ok(*component),
+                Some(crate::ir::TypedLocal {
+                    ty: IrType::Component(component),
+                    ..
+                }) => Err(format!(
+                    "component local %{} references missing component c{}",
+                    local.0, component.0
+                )),
+                Some(local_schema) => Err(format!(
+                    "local %{} is {:?}, not a component value",
+                    local.0, local_schema.ty
+                )),
+                None => Err(format!("component local %{} does not resolve", local.0)),
+            },
+            ComponentBase::Path(path) => self.component_value_path_id(path),
+            ComponentBase::SelfField => self.component_base_id(base),
+        }
+    }
+
+    fn component_local_initializer(
+        &self,
+        local: LocalId,
+    ) -> Result<Option<(ComponentId, Option<ComponentInstanceMode>)>, String> {
+        let mut found = None;
+        for stmt in self.func.blocks.iter().flat_map(|block| &block.stmts) {
+            let Stmt::ComponentInit {
+                local: initialized,
+                component,
+                mode,
+            } = stmt
+            else {
+                continue;
+            };
+            if *initialized != local {
+                continue;
+            }
+            let value = (*component, *mode);
+            if found.is_some() {
+                return Err(format!(
+                    "component local %{} has more than one ComponentInit statement",
+                    local.0
+                ));
+            }
+            found = Some(value);
+        }
+        Ok(found)
+    }
+
+    fn component_subfield_id(
+        &self,
+        base: &ComponentBase,
+        field: &str,
+    ) -> Result<ComponentId, String> {
+        if field.is_empty() {
+            return Err("empty sub-component field".to_string());
+        }
+        match base {
+            ComponentBase::Path(path) => {
+                let mut full = path.clone();
+                full.extend(field.split('.').map(str::to_string));
+                self.component_value_path_id(&full)
+            }
+            ComponentBase::SelfField => {
+                let mut full = vec!["self".to_string()];
+                full.extend(field.split('.').map(str::to_string));
+                self.component_value_path_id(&full)
+            }
+            ComponentBase::Local(local) => {
+                let component = self.component_value_base_id(base)?;
+                let inherited = self
+                    .component_local_initializer(*local)?
+                    .and_then(|(_, mode)| mode);
+                let segments: Vec<&str> = field.split('.').collect();
+                let (field, receiver) = segments
+                    .split_last()
+                    .expect("non-empty local component subfield path");
+                let receiver: Vec<String> =
+                    receiver.iter().map(|segment| (*segment).into()).collect();
+                let resolved = resolve_component_path_mode(
+                    &self.prog.components,
+                    component,
+                    inherited,
+                    &receiver,
+                )
+                .map_err(|error| error.to_string())?;
+                let owner = self
+                    .prog
+                    .components
+                    .get(resolved.component.index())
+                    .ok_or_else(|| {
+                        format!("component c{} does not resolve", resolved.component.0)
+                    })?;
+                let schema = owner
+                    .field(field)
+                    .ok_or_else(|| format!("component `{}` has no field `{field}`", owner.name))?;
+                let ComponentFieldKind::Sub {
+                    component: copied, ..
+                } = schema.kind
+                else {
+                    return Err(format!(
+                        "field `{field}` of component `{}` is not a sub-component",
+                        owner.name
+                    ));
+                };
+                if !component_mode_includes_activation(resolved.effective_mode, schema.activation) {
+                    return Err(format!(
+                        "component local %{} sub-component field `{}` is disabled by its instance mode",
+                        local.0, field
+                    ));
+                }
+                self.prog
+                    .components
+                    .get(copied.index())
+                    .map(|_| copied)
+                    .ok_or_else(|| format!("component c{} does not resolve", copied.0))
+            }
         }
     }
 
@@ -3120,8 +4592,9 @@ impl Checker<'_> {
                     Some(IrType::Component(component)) => *component,
                     _ => return Err(format!("local %{} is not component-typed", local.0)),
                 };
-                let resolved = resolve_component_path_mode(&self.prog.components, root, None, subpath)
-                    .map_err(|err| err.to_string())?;
+                let resolved =
+                    resolve_component_path_mode(&self.prog.components, root, None, subpath)
+                        .map_err(|err| err.to_string())?;
                 (resolved.component, resolved.effective_mode)
             }
             _ => (self.component_base_id(base)?, None),
@@ -3187,10 +4660,7 @@ impl Checker<'_> {
             // an explicit passive descendant mode is statically decisive.
             ComponentBase::Local(_)
                 if matches!(field.activation, Activation::ActiveOnly)
-                    && matches!(
-                        local_effective_mode,
-                        Some(ComponentInstanceMode::Passive)
-                    ) =>
+                    && matches!(local_effective_mode, Some(ComponentInstanceMode::Passive)) =>
             {
                 return Err(format!(
                     "active-only component event `{event}` is disabled by a passive \
@@ -3210,7 +4680,7 @@ impl Checker<'_> {
         &self,
         base: &ComponentBase,
         field: &str,
-    ) -> Result<Option<(usize, String)>, String> {
+    ) -> Result<Option<(usize, CollectionElementShape)>, String> {
         let cid = self.component_base_id(base)?;
         let component = self
             .prog
@@ -3239,7 +4709,7 @@ impl Checker<'_> {
                         "fixed-vector component field `{field}` has a subfield"
                     ));
                 }
-                crate::codegen::cpp_tb::ir_vec_elem_class(&vec.elem)
+                collection_element_shape(&vec.elem)
                     .map(|elem| Some((vec.len, elem)))
                     .ok_or_else(|| {
                         format!(
@@ -3265,7 +4735,7 @@ impl Checker<'_> {
                     let last = index + 1 == rest.len();
                     if last {
                         return match member.vec_len {
-                            Some(len) => crate::codegen::cpp_tb::ir_vec_elem_class(&member.ty)
+                            Some(len) => collection_element_shape(&member.ty)
                                 .map(|elem| Some((len, elem)))
                                 .ok_or_else(|| {
                                     format!(
@@ -3399,7 +4869,7 @@ impl Checker<'_> {
         mut record: RecordId,
         segments: &[&str],
         mid_indices: &[usize],
-    ) -> Result<Option<(usize, String)>, String> {
+    ) -> Result<Option<(usize, CollectionElementShape)>, String> {
         if segments.is_empty() {
             return Ok(None);
         }
@@ -3434,7 +4904,7 @@ impl Checker<'_> {
                     }
                 }
                 return match len {
-                    Some(len) => crate::codegen::cpp_tb::ir_vec_elem_class(&ty)
+                    Some(len) => collection_element_shape(&ty)
                         .map(|elem| Some((len, elem)))
                         .ok_or_else(|| {
                             format!("record vector field `{segment}` has an invalid element type")
@@ -3462,7 +4932,7 @@ impl Checker<'_> {
         path: &[String],
         mid_indices: &[(usize, Expr)],
         index: Option<&Expr>,
-    ) -> Result<Option<(usize, String)>, String> {
+    ) -> Result<Option<(usize, CollectionElementShape)>, String> {
         let record = match self.func.locals.get(local.index()).map(|local| &local.ty) {
             Some(IrType::Record(record)) => *record,
             _ => return Err(format!("local %{} is not record-typed", local.0)),
@@ -3581,7 +5051,7 @@ impl Checker<'_> {
         field: &str,
     ) -> Result<&StateFieldSchema, String> {
         let body_transactor = match self.func.kind {
-            FunctionKind::TransactorBody { transactor } => Some(transactor),
+            FunctionKind::TransactorBody { transactor, .. } => Some(transactor),
             _ => None,
         };
         let transactor = if let Some(transactor) =
@@ -3597,15 +5067,9 @@ impl Checker<'_> {
                 "placeholder transactor-state instance outside a transactor body".to_string(),
             );
         } else {
-            let owner = self
-                .func
-                .owner
-                .ok_or_else(|| "transactor-state access has no owning testbench".to_string())?;
             let tb = self
-                .prog
-                .testbenches
-                .get(owner.index())
-                .ok_or_else(|| format!("owner tb{} does not resolve", owner.0))?;
+                .owner_testbench()
+                .ok_or_else(|| "transactor-state access has no owning testbench".to_string())?;
             tb.target_tlm_actors
                 .iter()
                 .find(|actor| actor.instance == instance)
@@ -3721,7 +5185,7 @@ impl Checker<'_> {
                 _ => Some(IrType::Unknown),
             },
             Expr::ComponentValue { base } => self
-                .component_base_id(base)
+                .component_value_base_id(base)
                 .ok()
                 .map(IrType::Component)
                 .or(Some(IrType::Unknown)),
@@ -3910,7 +5374,7 @@ impl Checker<'_> {
         path: &[String],
         mid_indices: &[(usize, Expr)],
         index: Option<&Expr>,
-    ) -> Result<Option<(usize, String)>, String> {
+    ) -> Result<Option<(usize, CollectionElementShape)>, String> {
         if path.is_empty() {
             if mid_indices.iter().any(|(position, _)| *position != 0) {
                 return Err(format!(
@@ -3956,8 +5420,9 @@ impl Checker<'_> {
                 selected = elem;
             }
             return Ok(match selected {
-                IrType::FixedVec { elem, len } => crate::codegen::cpp_tb::ir_vec_elem_class(elem)
-                    .map(|class| (*len, class)),
+                IrType::FixedVec { elem, len } => {
+                    collection_element_shape(elem).map(|class| (*len, class))
+                }
                 _ => None,
             });
         }
@@ -4080,7 +5545,10 @@ impl Checker<'_> {
         self.record_path_leaf_type(record, &segments, &positions)
     }
 
-    fn expr_whole_vec_shape(&self, expr: &Expr) -> Result<Option<(usize, String)>, String> {
+    fn expr_whole_vec_shape(
+        &self,
+        expr: &Expr,
+    ) -> Result<Option<(usize, CollectionElementShape)>, String> {
         match expr {
             Expr::ComponentField { base, field } => self.component_field_vec_shape(base, field),
             Expr::RecordField {
@@ -4161,23 +5629,22 @@ impl Checker<'_> {
 
     fn whole_collection_shape(
         &self,
-        vec_shape: Result<Option<(usize, String)>, String>,
+        vec_shape: Result<Option<(usize, CollectionElementShape)>, String>,
         ty: Option<IrType>,
     ) -> Result<Option<WholeCollectionShape>, String> {
-        match vec_shape? {
-            Some((len, elem)) => Ok(Some(WholeCollectionShape::FixedVec(len, elem))),
-            None => match ty {
-                Some(IrType::FixedVec { elem, len }) => {
-                    crate::codegen::cpp_tb::ir_vec_elem_class(&elem)
-                        .map(|class| WholeCollectionShape::FixedVec(len, class))
-                        .map(Some)
-                        .ok_or_else(|| "fixed vector has an invalid element type".to_string())
-                }
-                Some(IrType::Seq(elem)) => crate::codegen::cpp_tb::ir_vec_elem_class(&elem)
-                    .map(WholeCollectionShape::DynamicSeq)
-                    .map(Some)
-                    .ok_or_else(|| "dynamic list has an invalid element type".to_string()),
-                _ => Ok(None),
+        let vec_shape = vec_shape?;
+        match ty {
+            Some(IrType::FixedVec { elem, len }) => collection_element_shape(&elem)
+                .map(|shape| WholeCollectionShape::FixedVec(len, shape))
+                .map(Some)
+                .ok_or_else(|| "fixed vector has an invalid element type".to_string()),
+            Some(IrType::Seq(elem)) => value_abi_class(&elem)
+                .map(WholeCollectionShape::DynamicSeq)
+                .map(Some)
+                .ok_or_else(|| "dynamic list has an invalid element type".to_string()),
+            _ => match vec_shape {
+                Some((len, elem)) => Ok(Some(WholeCollectionShape::FixedVec(len, elem))),
+                None => Ok(None),
             },
         }
     }
@@ -4221,7 +5688,7 @@ impl Checker<'_> {
 
     fn check_whole_vec_write_value(
         &mut self,
-        dst_shape: Result<Option<(usize, String)>, String>,
+        dst_shape: Result<Option<(usize, CollectionElementShape)>, String>,
         dst_ty: Option<IrType>,
         value: &Expr,
         context: &'static str,
@@ -4262,30 +5729,39 @@ impl Checker<'_> {
                     // entire Assign RHS of a Run/Check function. Args
                     // are checked individually (no ports, no nesting);
                     // `check_expr` rejects the target everywhere else.
-                    if let Expr::Call(CallTarget::TransactorMethod { bus_field, method }, args) = e
+                    if let Expr::Call(
+                        CallTarget::TransactorMethod {
+                            bus_field,
+                            method,
+                            target,
+                        },
+                        args,
+                    ) = e
                     {
-                        self.check_bus_call_edge(Some(*l), bus_field, method, args);
+                        self.check_bus_call_edge(Some(*l), bus_field, method, target, args, None);
                         continue;
                     }
-                    if let Expr::Call(CallTarget::Tseq(name), args) = e {
-                        self.check_tseq_call(*l, name, args);
+                    if let Expr::Call(CallTarget::Tseq { function, name }, args) = e {
+                        self.check_tseq_call(*l, *function, name, args);
                         continue;
                     }
-                    let fixed_vec_dest = self
-                        .func
-                        .locals
-                        .get(l.index())
-                        .and_then(|local| match &local.ty {
-                            IrType::FixedVec { elem, len } => {
-                                crate::codegen::cpp_tb::ir_vec_elem_class(elem)
-                                    .map(|class| (*len, class))
-                            }
-                            _ => None,
-                        });
+                    let fixed_vec_dest =
+                        self.func
+                            .locals
+                            .get(l.index())
+                            .and_then(|local| match &local.ty {
+                                IrType::FixedVec { elem, len } => {
+                                    collection_element_shape(elem).map(|class| (*len, class))
+                                }
+                                _ => None,
+                            });
                     if let Some(shape) = fixed_vec_dest {
                         self.check_whole_vec_write_value(
                             Ok(Some(shape)),
-                            self.func.locals.get(l.index()).map(|local| local.ty.clone()),
+                            self.func
+                                .locals
+                                .get(l.index())
+                                .map(|local| local.ty.clone()),
                             e,
                             "Assign value",
                         );
@@ -4296,9 +5772,10 @@ impl Checker<'_> {
                     if self.func.locals.get(l.index()).is_some() {
                         let expected = &self.func.local(*l).ty;
                         if let Some(actual) = expr_type(self.prog, self.func, e) {
-                            if *expected != IrType::Unknown
-                                && actual != IrType::Unknown
-                                && !assign_compatible(expected, &actual)
+                            if !string_value_compatible(expected, &actual)
+                                || (*expected != IrType::Unknown
+                                    && actual != IrType::Unknown
+                                    && !assign_compatible(expected, &actual))
                             {
                                 self.errs.push(VerifyError::TypeMismatch {
                                     func: self.fid,
@@ -4318,14 +5795,17 @@ impl Checker<'_> {
                         let aggregate_actual = self.aggregate_assignment_expr_type(e);
                         let aggregate_incompatible = self.contains_invalid_record_composition(e)
                             || match expected {
-                                IrType::Record(_) => {
+                                IrType::Record(_) | IrType::Component(_) => {
                                     aggregate_actual.as_ref().is_some_and(|actual| {
                                         *actual != IrType::Unknown
                                             && !aggregate_assignment_compatible(expected, actual)
                                     })
                                 }
                                 IrType::UInt(_) | IrType::SInt(_) | IrType::Bool => {
-                                    matches!(&aggregate_actual, Some(IrType::Record(_)))
+                                    matches!(
+                                        &aggregate_actual,
+                                        Some(IrType::Record(_) | IrType::Component(_))
+                                    )
                                 }
                                 _ => false,
                             };
@@ -4340,10 +5820,42 @@ impl Checker<'_> {
                         }
                     }
                 }
-                Stmt::DutWrite(_, e) => self.check_expr(e, true, "DutWrite value"),
-                Stmt::DutRead(l, _) => {
+                Stmt::DutWrite(port, e) => {
+                    self.check_port_ref(port, "DutWrite");
+                    crate::ir::visit::visit_port_lane_expr(port, &mut |index| {
+                        self.check_non_string_expr(index, true, "DutWrite lane index")
+                    });
+                    if port.access == PortAccess::Probe {
+                        self.errs.push(VerifyError::BadProbeAccess {
+                            func: self.fid,
+                            block: self.bid,
+                            operation: "DutWrite",
+                            access: port.access,
+                        });
+                    }
+                    self.check_non_string_expr(e, true, "DutWrite value");
+                }
+                Stmt::DutRead(l, port) => {
                     self.check_local(*l);
-                    if let Some(expected) = self.func.locals.get(l.index()).map(|local| &local.ty)
+                    crate::ir::visit::visit_port_lane_expr(port, &mut |index| {
+                        self.check_non_string_expr(index, true, "DutRead lane index")
+                    });
+                    if let Some(probe) = self.check_port_ref(port, "DutRead") {
+                        if let Some(local) = self.func.locals.get(l.index()) {
+                            let actual = probe.ty.ir_type();
+                            if local.ty == IrType::Unknown || !assign_compatible(&local.ty, &actual)
+                            {
+                                self.errs.push(VerifyError::TypeMismatch {
+                                    func: self.fid,
+                                    block: self.bid,
+                                    local: *l,
+                                    expected: local.ty.clone(),
+                                    actual,
+                                });
+                            }
+                        }
+                    } else if let Some(expected) =
+                        self.func.locals.get(l.index()).map(|local| &local.ty)
                     {
                         if matches!(
                             expected,
@@ -4364,9 +5876,20 @@ impl Checker<'_> {
                         }
                     }
                 }
-                // `release dut.<probe>` carries no value and no local;
-                // the PortRef's access class is validated at lowering.
-                Stmt::ProbeRelease(_) => {}
+                Stmt::ProbeRelease(port) => {
+                    self.check_port_ref(port, "ProbeRelease");
+                    crate::ir::visit::visit_port_lane_expr(port, &mut |index| {
+                        self.check_non_string_expr(index, true, "ProbeRelease lane index")
+                    });
+                    if port.access != PortAccess::Force {
+                        self.errs.push(VerifyError::BadProbeAccess {
+                            func: self.fid,
+                            block: self.bid,
+                            operation: "ProbeRelease",
+                            access: port.access,
+                        });
+                    }
+                }
                 Stmt::RecordInit(l, r) => {
                     self.check_local(*l);
                     if r.index() >= self.prog.records.len()
@@ -4393,9 +5916,7 @@ impl Checker<'_> {
                             IrType::FixedVec { .. } => {
                                 !helper_abi_type_valid(&tl.ty, self.prog.records.len())
                             }
-                            IrType::RecordSeq(record) => {
-                                record.index() >= self.prog.records.len()
-                            }
+                            IrType::RecordSeq(record) => record.index() >= self.prog.records.len(),
                             IrType::Seq(_) => {
                                 !helper_abi_type_valid(&tl.ty, self.prog.records.len())
                             }
@@ -4405,6 +5926,62 @@ impl Checker<'_> {
                         self.errs.push(VerifyError::BadProgramRef {
                             what: format!(
                                 "fn{} b{} AggregateInit target is not a valid aggregate",
+                                self.fid.0, self.bid.0
+                            ),
+                        });
+                    }
+                }
+                Stmt::ComponentInit {
+                    local,
+                    component,
+                    mode,
+                } => {
+                    self.check_local(*local);
+                    let local_matches = self
+                        .func
+                        .locals
+                        .get(local.index())
+                        .is_some_and(|entry| entry.ty == IrType::Component(*component));
+                    if !local_matches || self.prog.components.get(component.index()).is_none() {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} ComponentInit local %{} does not have component type c{}",
+                                self.fid.0, self.bid.0, local.0, component.0
+                            ),
+                        });
+                    } else {
+                        let binding = ComponentFieldBinding {
+                            field: self.func.local(*local).name.clone(),
+                            component: *component,
+                            connects: Vec::new(),
+                            mode: *mode,
+                        };
+                        if let Err(detail) = validate_component_binding_modes(
+                            &self.prog.components,
+                            std::slice::from_ref(&binding),
+                        ) {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} ComponentInit has invalid instance modes: {detail}",
+                                    self.fid.0, self.bid.0
+                                ),
+                            });
+                        }
+                        if let Some(detail) =
+                            component_local_runtime_requirement(&self.prog.components, *component)
+                        {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} ComponentInit requires unsupported {detail}",
+                                    self.fid.0, self.bid.0
+                                ),
+                            });
+                        }
+                    }
+                    if let Err(detail) = self.component_local_initializer(*local) {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} ComponentInit: {detail}",
                                 self.fid.0, self.bid.0
                             ),
                         });
@@ -4422,10 +5999,10 @@ impl Checker<'_> {
                     let mid_positions: Vec<usize> = mid_indices.iter().map(|(p, _)| *p).collect();
                     self.check_record_field(*local, field, path, &mid_positions);
                     for (_, idx) in mid_indices {
-                        self.check_expr(idx, false, "RecordFieldWrite mid index");
+                        self.check_non_string_expr(idx, false, "RecordFieldWrite mid index");
                     }
                     if let Some(idx) = index {
-                        self.check_expr(idx, false, "RecordFieldWrite index");
+                        self.check_non_string_expr(idx, false, "RecordFieldWrite index");
                     }
                     let dst_shape = self.record_field_vec_shape(
                         *local,
@@ -4472,16 +6049,12 @@ impl Checker<'_> {
                                     | IrType::Event(_)
                             )
                         );
-                    let refs_valid = self
-                        .prog
-                        .regblocks
-                        .get(regblock.index())
-                        .is_some_and(|rb| {
-                            self.func
-                                .locals
-                                .get(local.index())
-                                .is_some_and(|l| l.ty == IrType::Record(rb.record))
-                        });
+                    let refs_valid = self.prog.regblocks.get(regblock.index()).is_some_and(|rb| {
+                        self.func
+                            .locals
+                            .get(local.index())
+                            .is_some_and(|l| l.ty == IrType::Record(rb.record))
+                    });
                     if !dest_valid || !addr_valid || !refs_valid {
                         self.errs.push(VerifyError::BadProgramRef {
                             what: format!(
@@ -4501,23 +6074,19 @@ impl Checker<'_> {
                     self.check_local(*local);
                     self.check_expr(addr, false, "RecordWrite address");
                     self.check_expr(value, false, "RecordWrite value");
-                    let refs_valid = self
-                        .prog
-                        .regblocks
-                        .get(regblock.index())
-                        .is_some_and(|rb| {
-                            self.func.locals.get(local.index()).is_some_and(|l| {
-                                l.name == *binding && l.ty == IrType::Record(rb.record)
-                            })
-                        });
+                    let refs_valid = self.prog.regblocks.get(regblock.index()).is_some_and(|rb| {
+                        self.func.locals.get(local.index()).is_some_and(|l| {
+                            l.name == *binding && l.ty == IrType::Record(rb.record)
+                        })
+                    });
                     let binding_valid = self
                         .func
                         .owner
                         .and_then(|owner| self.prog.testbenches.get(owner.index()))
                         .is_some_and(|tb| {
-                            tb.regblock_bindings.iter().any(|b| {
-                                b.field == *binding && b.regblock == *regblock
-                            })
+                            tb.regblock_bindings
+                                .iter()
+                                .any(|b| b.field == *binding && b.regblock == *regblock)
                         });
                     if !refs_valid
                         || !binding_valid
@@ -4534,13 +6103,45 @@ impl Checker<'_> {
                 }
                 Stmt::RecordWriteCb {
                     local,
+                    binding,
                     field,
                     value,
+                    callback,
                     ..
                 } => {
                     self.check_local(*local);
                     self.check_record_field(*local, field, &[], &[]);
                     self.check_expr(value, false, "RecordWriteCb value");
+                    if let Some(callback) = callback {
+                        match self.prog.functions.get(callback.index()) {
+                            Some(function)
+                                if matches!(
+                                    &function.kind,
+                                    FunctionKind::TestHook {
+                                        member: crate::ir::TestHookMember::RegblockWrite {
+                                            binding: owner_binding,
+                                            register,
+                                        }
+                                    } if owner_binding == binding && register == field
+                                ) && function.owner == self.func.owner => {}
+                            Some(function) => self.errs.push(VerifyError::BadConcurrentCheck {
+                                func: self.fid,
+                                block: self.bid,
+                                detail: format!(
+                                    "RecordWriteCb callback fn{} has mismatched identity {:?}",
+                                    function.id.0, function.kind
+                                ),
+                            }),
+                            None => self.errs.push(VerifyError::BadConcurrentCheck {
+                                func: self.fid,
+                                block: self.bid,
+                                detail: format!(
+                                    "RecordWriteCb callback references missing fn{}",
+                                    callback.0
+                                ),
+                            }),
+                        }
+                    }
                 }
                 Stmt::TbFieldWrite { field, value } => {
                     self.check_tb_field(field);
@@ -4608,9 +6209,7 @@ impl Checker<'_> {
                         Ok(state) => {
                             let expected = match &state.kind {
                                 StateFieldKind::Scalar { ty, .. } => Some(ty.clone()),
-                                StateFieldKind::Record { record } => {
-                                    Some(IrType::Record(*record))
-                                }
+                                StateFieldKind::Record { record } => Some(IrType::Record(*record)),
                                 StateFieldKind::FixedVec { ty } => Some(ty.clone()),
                                 StateFieldKind::Queue { .. } => None,
                             };
@@ -4692,10 +6291,18 @@ impl Checker<'_> {
                     value,
                 } => {
                     for (_, idx) in mid_indices {
-                        self.check_expr(idx, false, "TransactorStateRecordFieldWrite mid index");
+                        self.check_non_string_expr(
+                            idx,
+                            false,
+                            "TransactorStateRecordFieldWrite mid index",
+                        );
                     }
                     if let Some(idx) = index {
-                        self.check_expr(idx, false, "TransactorStateRecordFieldWrite index");
+                        self.check_non_string_expr(
+                            idx,
+                            false,
+                            "TransactorStateRecordFieldWrite index",
+                        );
                     }
                     let dst_shape = self.transactor_state_field_vec_shape(
                         instance,
@@ -4805,7 +6412,11 @@ impl Checker<'_> {
                 // `TestHook` whose parameter matches the event payload. Both
                 // local and component channels are re-resolved so a later IR
                 // pass cannot leave stale metadata for emission to trust.
-                Stmt::EventSubscribe { event, handler } => {
+                Stmt::EventSubscribe {
+                    site,
+                    event,
+                    handler,
+                } => {
                     let payload = match event {
                         crate::ir::EventChannelRef::Local(event) => {
                             self.check_local(*event);
@@ -4857,7 +6468,14 @@ impl Checker<'_> {
                         }
                     };
                     match self.prog.functions.get(handler.index()) {
-                        Some(f) if f.kind == FunctionKind::TestHook && f.params.len() == 1 => {
+                        Some(f)
+                            if matches!(
+                                &f.kind,
+                                FunctionKind::TestHook {
+                                    member: crate::ir::TestHookMember::EventSubscription(member)
+                                } if member == site
+                            ) && f.params.len() == 1 =>
+                        {
                             if f.locals.first().map(|local| &local.ty)
                                 != f.params.first().map(|param| &param.ty)
                             {
@@ -4912,6 +6530,7 @@ impl Checker<'_> {
                     }
                 }
                 Stmt::MethodHookSubscribe {
+                    site,
                     target,
                     handler,
                     captures,
@@ -4932,7 +6551,14 @@ impl Checker<'_> {
                         }
                     };
                     match self.prog.functions.get(handler.index()) {
-                        Some(f) if f.kind == FunctionKind::TestHook => {
+                        Some(f)
+                            if matches!(
+                                &f.kind,
+                                FunctionKind::TestHook {
+                                    member: crate::ir::TestHookMember::MethodSubscription(member)
+                                } if member == site
+                            ) =>
+                        {
                             let actual: Vec<IrType> =
                                 f.params.iter().map(|param| param.ty.clone()).collect();
                             let locals: Vec<IrType> = f
@@ -5073,7 +6699,12 @@ impl Checker<'_> {
                         }
                         match self.prog.functions.get(schema.function.index()) {
                                 Some(f)
-                                    if f.kind == FunctionKind::TestHook && f.params.is_empty() => {}
+                                    if matches!(
+                                        &f.kind,
+                                        FunctionKind::TestHook {
+                                            member: crate::ir::TestHookMember::StatementCycle(site)
+                                        } if *site == schema.site
+                                    ) && f.params.is_empty() => {}
                                 Some(f) => self.errs.push(VerifyError::BadConcurrentCheck {
                                     func: self.fid,
                                     block: self.bid,
@@ -5191,11 +6822,10 @@ impl Checker<'_> {
                     // surfaces them through the `Err` arm of the call
                     // below.
                     let dst_shape = self.component_field_vec_shape(base, field);
-                    // `dst_ty` feeds #661's whole-collection shape
-                    // (a scalar record list is a collection the raw vec
-                    // shape cannot see). Computed before the call so
-                    // the scalar-type check below can still ask whether
-                    // this destination is a plain, non-collection slot.
+                    // `dst_ty` lets whole-collection checking recognize a
+                    // dynamic record list that raw fixed-vector shape
+                    // metadata cannot see. Keep it for the scalar check
+                    // below as well.
                     let dst_ty = self.component_field_type(base, field);
                     let non_vec_dest = matches!(dst_shape, Ok(None));
                     self.check_whole_vec_write_value(
@@ -5204,38 +6834,16 @@ impl Checker<'_> {
                         value,
                         "ComponentFieldWrite value",
                     );
-                    // What none of that covered: the destination's
-                    // TYPE. A `uint<129>` written into a `uint<65>`
-                    // field passed the verifier untouched, and both
-                    // sides are `_harc_u128` in C++, so nothing
-                    // downstream objected either. Lowering rejects it
-                    // now (harc#642/#656); this is the IR-level
-                    // backstop, so a future lowering path that skips
-                    // that check cannot emit the truncation silently.
-                    //
-                    // Gated on a NON-VEC destination:
-                    // `component_field_type` answers a fixed vector
-                    // with its ELEMENT type, and a whole-`Vec` copy is
-                    // not an element assignment. The collection shapes
-                    // are the call above's business.
-                    //
-                    // Deliberately bounded to a destination past 64
-                    // bits, even though the LOWERING check now judges
-                    // <=64-bit fields too (harc#658). A verifier is a
-                    // backstop, not a second opinion, and judging <=64
-                    // here faithfully would require re-deriving whether
-                    // the RHS width is DECLARED or MANUFACTURED from a
-                    // widthless leaf (`seen + <const>`) — the exact
-                    // distinction `check_owner_scalar_field_write`'s
-                    // `rhs_width_manufactured` draws in lowering.
-                    // Duplicating that here, on the verifier's separate
-                    // expr typers, is how the two drift; getting it
-                    // wrong turns a program lowering accepts into
-                    // `internal error: failed verification after
-                    // lowering`. So the backstop stays at >64 — the
-                    // silent same-carrier truncation class (#642/#656)
-                    // it was built for — and lowering is authoritative
-                    // for the <=64 rule.
+                    // Collection shape checking above does not validate a
+                    // scalar destination's type. For non-`Vec` fields wider
+                    // than 64 bits, both widths are explicit enough for an
+                    // IR-level backstop against same-carrier truncation.
+                    // `component_field_type` reports a fixed vector's
+                    // element type, so whole-vector writes must stay in the
+                    // collection path. At 64 bits or below, compatibility
+                    // remains lowering's responsibility because the IR type
+                    // does not retain whether an expression width was
+                    // declared or manufactured from a widthless leaf.
                     let wide_dest = matches!(
                         dst_ty,
                         Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w))) if w > 64
@@ -5266,7 +6874,7 @@ impl Checker<'_> {
                     inner_index,
                     value,
                 } => {
-                    self.check_expr(index, false, "ComponentVecElementWrite index");
+                    self.check_non_string_expr(index, false, "ComponentVecElementWrite index");
                     match self.component_indexed_field_type(base, field, *index_pos) {
                         Ok((expected, len)) => {
                             if matches!(index, Expr::Literal { value, .. } if *value as usize >= len)
@@ -5280,7 +6888,7 @@ impl Checker<'_> {
                             // the value is checked against its scalar
                             // inner element.
                             if let Some(inner) = inner_index {
-                                self.check_expr(
+                                self.check_non_string_expr(
                                     inner,
                                     false,
                                     "ComponentVecElementWrite inner index",
@@ -5412,12 +7020,157 @@ impl Checker<'_> {
                     }
                 }
                 Stmt::ComponentCall {
+                    base,
                     component,
                     method,
+                    function,
                     args,
                     dest,
-                    ..
                 } => {
+                    match self.component_value_base_id(base) {
+                        Ok(actual) if actual == *component => {
+                            let schema = &self.prog.components[component.index()];
+                            match schema.method(method) {
+                                Some(method_schema) => {
+                                    if method_schema.function != *function {
+                                        self.errs.push(VerifyError::BadProgramRef {
+                                            what: format!(
+                                                "fn{} b{} component method `{}.{method}` resolves to fn{} but the call carries fn{}",
+                                                self.fid.0,
+                                                self.bid.0,
+                                                schema.name,
+                                                method_schema.function.0,
+                                                function.0
+                                            ),
+                                        });
+                                    }
+                                    if let ComponentBase::Local(local) = base {
+                                        match self.component_local_initializer(*local) {
+                                            Ok(Some((initialized, mode))) => {
+                                                if initialized != *component {
+                                                    self.errs.push(VerifyError::BadProgramRef {
+                                                        what: format!(
+                                                            "fn{} b{} ComponentCall local %{} initializes c{} but calls c{}",
+                                                            self.fid.0,
+                                                            self.bid.0,
+                                                            local.0,
+                                                            initialized.0,
+                                                            component.0
+                                                        ),
+                                                    });
+                                                }
+                                                if !component_mode_includes_activation(
+                                                    mode,
+                                                    method_schema.activation,
+                                                ) {
+                                                    self.errs.push(VerifyError::BadProgramRef {
+                                                        what: format!(
+                                                            "fn{} b{} ComponentCall active-only method `{method}` is disabled by local %{} mode {:?}",
+                                                            self.fid.0,
+                                                            self.bid.0,
+                                                            local.0,
+                                                            mode
+                                                        ),
+                                                    });
+                                                }
+                                            }
+                                            Ok(None) => {}
+                                            Err(detail) => {
+                                                self.errs.push(VerifyError::BadProgramRef {
+                                                    what: format!(
+                                                        "fn{} b{} ComponentCall: {detail}",
+                                                        self.fid.0, self.bid.0
+                                                    ),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    if method_schema.param_tys.len() != args.len() {
+                                        self.errs.push(VerifyError::BadProgramRef {
+                                            what: format!(
+                                                "fn{} b{} component method `{}.{method}` expects {} argument(s), call carries {}",
+                                                self.fid.0,
+                                                self.bid.0,
+                                                schema.name,
+                                                method_schema.param_tys.len(),
+                                                args.len()
+                                            ),
+                                        });
+                                    }
+                                    for (index, (arg, expected)) in args
+                                        .iter()
+                                        .zip(method_schema.param_tys.iter())
+                                        .enumerate()
+                                    {
+                                        if let Some(actual) =
+                                            self.aggregate_assignment_expr_type(arg)
+                                        {
+                                            if !call_argument_type_compatible(expected, &actual) {
+                                                self.errs.push(VerifyError::BadProgramRef {
+                                                    what: format!(
+                                                        "fn{} b{} component method `{}.{method}` argument {} has type {:?}, expected {:?}",
+                                                        self.fid.0,
+                                                        self.bid.0,
+                                                        schema.name,
+                                                        index + 1,
+                                                        actual,
+                                                        expected
+                                                    ),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    match (method_schema.ret_ty.as_ref(), dest) {
+                                        (Some(expected), Some(local)) => {
+                                            if let Some(actual) =
+                                                self.func.locals.get(local.index()).map(|l| &l.ty)
+                                            {
+                                                if !string_value_compatible(actual, expected) {
+                                                    self.errs.push(VerifyError::BadProgramRef {
+                                                        what: format!(
+                                                            "fn{} b{} component method `{}.{method}` returns {:?}, destination is {:?}",
+                                                            self.fid.0,
+                                                            self.bid.0,
+                                                            schema.name,
+                                                            expected,
+                                                            actual
+                                                        ),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        (None, Some(_)) => {
+                                            self.errs.push(VerifyError::BadProgramRef {
+                                                what: format!(
+                                                    "fn{} b{} void component method `{}.{method}` has a destination",
+                                                    self.fid.0, self.bid.0, schema.name
+                                                ),
+                                            });
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                None => self.errs.push(VerifyError::BadProgramRef {
+                                    what: format!(
+                                        "fn{} b{} ComponentCall references missing method `{method}` on c{}",
+                                        self.fid.0, self.bid.0, component.0
+                                    ),
+                                }),
+                            }
+                        }
+                        Ok(actual) => self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} ComponentCall base resolves to c{}, not stored c{}",
+                                self.fid.0, self.bid.0, actual.0, component.0
+                            ),
+                        }),
+                        Err(detail) => self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} ComponentCall base does not resolve: {detail}",
+                                self.fid.0, self.bid.0
+                            ),
+                        }),
+                    }
                     for a in args {
                         self.check_expr(a, false, "ComponentCall arg");
                     }
@@ -5491,8 +7244,264 @@ impl Checker<'_> {
                         self.check_local(*d);
                     }
                 }
+                Stmt::TestbenchCall {
+                    function,
+                    args,
+                    dut_args,
+                    dest,
+                } => {
+                    let target = self
+                        .prog
+                        .functions
+                        .get(function.index())
+                        .filter(|candidate| candidate.id == *function);
+                    let Some(target) = target else {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} TestbenchCall references missing fn{}",
+                                self.fid.0, self.bid.0, function.0
+                            ),
+                        });
+                        for arg in args {
+                            self.check_expr(arg, false, "TestbenchCall arg");
+                        }
+                        if let Some(dest) = dest {
+                            self.check_local(*dest);
+                        }
+                        continue;
+                    };
+                    let FunctionKind::TestbenchMethod { testbench, .. } = target.kind else {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} TestbenchCall targets fn{} with kind {:?}",
+                                self.fid.0, self.bid.0, function.0, target.kind
+                            ),
+                        });
+                        for arg in args {
+                            self.check_expr(arg, false, "TestbenchCall arg");
+                        }
+                        if let Some(dest) = dest {
+                            self.check_local(*dest);
+                        }
+                        continue;
+                    };
+                    let caller_testbench = match self.func.kind {
+                        FunctionKind::TestbenchMethod { testbench, .. } => Some(testbench),
+                        _ => self
+                            .func
+                            .owner
+                            .and_then(|owner| self.prog.testbenches.get(owner.index()))
+                            .map(|schema| schema.type_id),
+                    };
+                    if caller_testbench != Some(testbench) {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} TestbenchCall crosses testbench types: caller {:?}, target tbt{}",
+                                self.fid.0, self.bid.0, caller_testbench, testbench.0
+                            ),
+                        });
+                    }
+                    let method_schema =
+                        self.prog
+                            .testbench_types
+                            .get(testbench.index())
+                            .and_then(|schema| {
+                                schema
+                                    .methods
+                                    .iter()
+                                    .find(|method| method.function == *function)
+                            });
+                    let Some(method_schema) = method_schema else {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} TestbenchCall target fn{} has no testbench-method owner entry",
+                                self.fid.0, self.bid.0, function.0
+                            ),
+                        });
+                        for arg in args {
+                            self.check_expr(arg, false, "TestbenchCall arg");
+                        }
+                        if let Some(dest) = dest {
+                            self.check_local(*dest);
+                        }
+                        continue;
+                    };
+                    if method_schema.module_param_types.len() != target.params.len() {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} testbench method fn{} has {} module-parameter slots for {} params",
+                                self.fid.0,
+                                self.bid.0,
+                                function.0,
+                                method_schema.module_param_types.len(),
+                                target.params.len()
+                            ),
+                        });
+                    }
+                    if dut_args.windows(2).any(|pair| pair[0] >= pair[1])
+                        || dut_args.iter().any(|index| *index >= args.len())
+                    {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} TestbenchCall fn{} has malformed DUT argument indices {:?}",
+                                self.fid.0, self.bid.0, function.0, dut_args
+                            ),
+                        });
+                    }
+                    if target.params.len() != args.len() {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} testbench method fn{} expects {} argument(s), call carries {}",
+                                self.fid.0,
+                                self.bid.0,
+                                function.0,
+                                target.params.len(),
+                                args.len()
+                            ),
+                        });
+                    }
+                    for (index, (arg, expected)) in
+                        args.iter().zip(target.params.iter()).enumerate()
+                    {
+                        let expects_dut = method_schema
+                            .module_param_types
+                            .get(index)
+                            .is_some_and(Option::is_some);
+                        let carries_dut = dut_args.contains(&index);
+                        if expects_dut != carries_dut {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} testbench method fn{} argument {} DUT/value kind does not match its parameter",
+                                    self.fid.0,
+                                    self.bid.0,
+                                    function.0,
+                                    index + 1
+                                ),
+                            });
+                        }
+                        if carries_dut {
+                            let current_dut = matches!(
+                                arg,
+                                Expr::Literal {
+                                    value: 0,
+                                    ty: IrType::Unknown
+                                }
+                            );
+                            let module_parameter = match (&self.func.kind, arg) {
+                                (
+                                    FunctionKind::TestbenchMethod {
+                                        testbench: caller_type,
+                                        method: caller_method,
+                                        ..
+                                    },
+                                    Expr::Local(local),
+                                ) => self
+                                    .prog
+                                    .testbench_types
+                                    .get(caller_type.index())
+                                    .and_then(|schema| schema.methods.get(caller_method.index()))
+                                    .is_some_and(|method| {
+                                        local.index() < self.func.params.len()
+                                            && method
+                                                .module_param_types
+                                                .get(local.index())
+                                                .is_some_and(Option::is_some)
+                                    }),
+                                _ => false,
+                            };
+                            if !current_dut && !module_parameter {
+                                self.errs.push(VerifyError::BadProgramRef {
+                                    what: format!(
+                                        "fn{} b{} testbench method fn{} DUT argument {} has a non-canonical payload",
+                                        self.fid.0,
+                                        self.bid.0,
+                                        function.0,
+                                        index + 1
+                                    ),
+                                });
+                            }
+                            continue;
+                        }
+                        let fixed_vec = matches!(expected.ty, IrType::FixedVec { .. });
+                        self.check_expr_inner(arg, false, "TestbenchCall arg", fixed_vec);
+                        let actual = if fixed_vec {
+                            self.expr_whole_vec_type(arg).ok().flatten()
+                        } else {
+                            self.aggregate_assignment_expr_type(arg)
+                        };
+                        if let Some(actual) = actual {
+                            if !call_argument_type_compatible(&expected.ty, &actual) {
+                                self.errs.push(VerifyError::BadProgramRef {
+                                    what: format!(
+                                        "fn{} b{} testbench method fn{} argument {} has type {:?}, expected {:?}",
+                                        self.fid.0,
+                                        self.bid.0,
+                                        function.0,
+                                        index + 1,
+                                        actual,
+                                        expected.ty
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    for arg in &args[target.params.len().min(args.len())..] {
+                        self.check_expr(arg, false, "TestbenchCall arg");
+                    }
+                    match (target.ret, dest) {
+                        (Some(ret), Some(dest)) => {
+                            self.check_local(*dest);
+                            if let (Some(expected), Some(actual)) = (
+                                target.locals.get(ret.index()).map(|local| &local.ty),
+                                self.func.locals.get(dest.index()).map(|local| &local.ty),
+                            ) {
+                                if !aggregate_assignment_compatible(actual, expected) {
+                                    self.errs.push(VerifyError::BadProgramRef {
+                                        what: format!(
+                                            "fn{} b{} testbench method fn{} returns {:?}, destination is {:?}",
+                                            self.fid.0,
+                                            self.bid.0,
+                                            function.0,
+                                            expected,
+                                            actual
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        (None, Some(dest)) => {
+                            self.check_local(*dest);
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} void testbench method fn{} has a destination",
+                                    self.fid.0, self.bid.0, function.0
+                                ),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
                 Stmt::SeqPush { seq, value } => {
                     self.check_local(*seq);
+                    let string_accumulator = self
+                        .func
+                        .locals
+                        .get(seq.index())
+                        .is_some_and(|local| {
+                            matches!(&local.ty, IrType::Seq(elem) if matches!(elem.as_ref(), IrType::String))
+                        });
+                    let string_value = matches!(
+                        self.aggregate_assignment_expr_type(value),
+                        Some(IrType::String)
+                    );
+                    if string_accumulator || string_value {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} SeqPush cannot use a String element",
+                                self.fid.0, self.bid.0
+                            ),
+                        });
+                    }
                     let expected = match self.func.locals.get(seq.index()).map(|l| &l.ty) {
                         Some(IrType::RecordSeq(record)) => Some(IrType::Record(*record)),
                         Some(IrType::Seq(elem)) => Some((**elem).clone()),
@@ -5529,9 +7538,9 @@ impl Checker<'_> {
                                 actual.as_ref() == Some(&expected)
                                     && !self.contains_invalid_record_composition(value)
                             }
-                            _ => actual
-                                .as_ref()
-                                .is_some_and(|actual| assign_compatible(&expected, actual)),
+                            _ => actual.as_ref().is_some_and(|actual| {
+                                call_argument_type_compatible(&expected, actual)
+                            }),
                         };
                         if !compatible {
                             self.errs.push(VerifyError::BadProgramRef {
@@ -5591,10 +7600,71 @@ impl Checker<'_> {
                         }),
                     }
                 }
-                // Whole sub-component value copy — receiver/source resolved
-                // at lowering against the component schema; nothing to
-                // verify structurally (no local/port dependency).
-                Stmt::ComponentSubAssign { .. } => {}
+                Stmt::ComponentSubAssign { dst, field, src } => {
+                    let destination = self.component_subfield_id(dst, field);
+                    let source = self.component_value_base_id(src);
+                    match (destination, source) {
+                        (Ok(destination), Ok(source)) if destination == source => {}
+                        (Ok(destination), Ok(source)) => {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} ComponentSubAssign copies component c{} into c{}",
+                                    self.fid.0, self.bid.0, source.0, destination.0
+                                ),
+                            });
+                        }
+                        (Err(detail), _) => self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} ComponentSubAssign destination does not resolve: {detail}",
+                                self.fid.0, self.bid.0
+                            ),
+                        }),
+                        (_, Err(detail)) => self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} ComponentSubAssign source does not resolve: {detail}",
+                                self.fid.0, self.bid.0
+                            ),
+                        }),
+                    }
+                }
+                Stmt::ComponentAssign { dst, src } => {
+                    let destination =
+                        match dst {
+                            ComponentBase::Path(path) if path.len() == 1 => {
+                                self.component_value_base_id(dst)
+                            }
+                            ComponentBase::Path(path) => Err(format!(
+                                "destination `{}` is not a direct testbench component field",
+                                path.join(".")
+                            )),
+                            _ => Err("destination must be a direct testbench component field"
+                                .to_string()),
+                        };
+                    let source = self.component_value_base_id(src);
+                    match (destination, source) {
+                        (Ok(destination), Ok(source)) if destination == source => {}
+                        (Ok(destination), Ok(source)) => {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} ComponentAssign copies component c{} into c{}",
+                                    self.fid.0, self.bid.0, source.0, destination.0
+                                ),
+                            });
+                        }
+                        (Err(detail), _) => self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} ComponentAssign destination does not resolve: {detail}",
+                                self.fid.0, self.bid.0
+                            ),
+                        }),
+                        (_, Err(detail)) => self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} ComponentAssign source does not resolve: {detail}",
+                                self.fid.0, self.bid.0
+                            ),
+                        }),
+                    }
+                }
                 Stmt::TlmFork(desc) => {
                     if let Some(d) = desc.dest {
                         self.check_local(d);
@@ -5603,22 +7673,40 @@ impl Checker<'_> {
                     // as a blocking Assign-RHS edge (Run/Check only, binding
                     // resolves on the owner tb, method exists, arg arity +
                     // purity). The args are no-inline-port.
-                    self.check_bus_call_edge(desc.dest, &desc.bus_field, &desc.method, &desc.args);
+                    self.check_bus_call_edge(
+                        desc.dest,
+                        &desc.bus_field,
+                        &desc.method,
+                        &desc.target,
+                        &desc.args,
+                        Some(desc.tag),
+                    );
                 }
                 Stmt::TlmJoinAll(pending) => {
                     for p in pending {
                         if let Some(d) = p.dest {
                             self.check_local(d);
                         }
-                        self.check_bus_call_edge(p.dest, &p.bus_field, &p.method, &p.args);
+                        self.check_bus_call_edge(
+                            p.dest,
+                            &p.bus_field,
+                            &p.method,
+                            &p.target,
+                            &p.args,
+                            Some(p.tag),
+                        );
                     }
                 }
             }
         }
         match &b.terminator {
             Terminator::Branch(c, _, _) => self.check_truth_expr(c, false, "Branch cond"),
-            Terminator::WaitCycles(e, _, _) => self.check_expr(e, false, "WaitCycles count"),
-            Terminator::WaitCyclesSync(e, _) => self.check_expr(e, false, "WaitCycles count"),
+            Terminator::WaitCycles(e, _, _) => {
+                self.check_non_string_expr(e, false, "WaitCycles count")
+            }
+            Terminator::WaitCyclesSync(e, _) => {
+                self.check_non_string_expr(e, false, "WaitCycles count")
+            }
             Terminator::WaitTimePs(..) => {}
             Terminator::WaitUntil { preds, .. } => {
                 for p in preds {
@@ -5629,7 +7717,7 @@ impl Checker<'_> {
                 for p in preds {
                     self.check_wait_truth_expr(&p.expr, "WaitUntilTimeout pred");
                 }
-                self.check_expr(cycles, false, "WaitUntilTimeout cycles");
+                self.check_non_string_expr(cycles, false, "WaitUntilTimeout cycles");
             }
             Terminator::Randomize {
                 target,
@@ -5740,17 +7828,227 @@ impl Checker<'_> {
         }
     }
 
+    fn check_port_ref(&mut self, port: &PortRef, operation: &'static str) -> Option<ProbeSchema> {
+        if matches!(port.access, PortAccess::Port) {
+            if port.probe.is_some() {
+                self.errs.push(VerifyError::BadProbeRef {
+                    func: self.fid,
+                    block: self.bid,
+                    detail: format!(
+                        "{operation} marks ordinary DUT port `{}` with a probe id",
+                        port.port_path.join(".")
+                    ),
+                });
+            }
+            if port.origin == PortOrigin::Dut && port.port_path.len() == 1 {
+                let name = &port.port_path[0];
+                let shadows_declared_probe = match self.func.owner {
+                    Some(owner) => self.prog.testbenches.get(owner.index()).is_some_and(|tb| {
+                        tb.probes.iter().any(|probe| {
+                            self.prog
+                                .probes
+                                .get(probe.index())
+                                .is_some_and(|schema| schema.id == *probe && schema.name == *name)
+                        })
+                    }),
+                    None => self
+                        .prog
+                        .probes
+                        .iter()
+                        .any(|probe| probe.shared && probe.name == *name),
+                };
+                if shadows_declared_probe {
+                    self.errs.push(VerifyError::BadProbeRef {
+                        func: self.fid,
+                        block: self.bid,
+                        detail: format!(
+                            "{operation} marks declared probe `{name}` as an ordinary DUT port"
+                        ),
+                    });
+                }
+            }
+            match &port.origin {
+                PortOrigin::Dut => {}
+                PortOrigin::BusBinding { binding, field } => {
+                    let resolved = self.owner_testbench().and_then(|tb| {
+                        if matches!(self.func.kind, FunctionKind::TestbenchMethod { .. }) {
+                            tb.bus_bindings
+                                .iter()
+                                .find(|candidate| candidate.field == *field)
+                        } else {
+                            tb.bus_binding(*binding)
+                                .filter(|candidate| candidate.field == *field)
+                        }
+                    });
+                    if resolved.is_none() {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} {operation} references bus binding bb{} outside its owning testbench",
+                                self.fid.0, self.bid.0, binding.0
+                            ),
+                        });
+                    }
+                }
+                PortOrigin::BoundBus => {
+                    let valid = match self.func.kind {
+                        FunctionKind::TransactorBody { transactor, .. } => self
+                            .prog
+                            .transactors
+                            .get(transactor.index())
+                            .is_some_and(|schema| schema.bound_bus.is_some()),
+                        FunctionKind::ComponentMethod { component, .. } => self
+                            .prog
+                            .components
+                            .get(component.index())
+                            .is_some_and(|schema| schema.bound_bus.is_some()),
+                        _ => false,
+                    };
+                    if !valid {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} {operation} carries a bound-bus port without a bound callable owner",
+                                self.fid.0, self.bid.0
+                            ),
+                        });
+                    }
+                }
+            }
+            return None;
+        }
+
+        if port.origin != PortOrigin::Dut {
+            self.errs.push(VerifyError::BadProbeRef {
+                func: self.fid,
+                block: self.bid,
+                detail: format!(
+                    "{operation} marks a probe with bus-relative origin {:?}",
+                    port.origin
+                ),
+            });
+        }
+
+        let Some(probe_id) = port.probe else {
+            self.errs.push(VerifyError::BadProbeRef {
+                func: self.fid,
+                block: self.bid,
+                detail: format!(
+                    "{operation} names `{}` as {:?} without a probe id",
+                    port.port_path.join("."),
+                    port.access
+                ),
+            });
+            return None;
+        };
+        let Some(schema) = self.prog.probes.get(probe_id.index()).cloned() else {
+            self.errs.push(VerifyError::BadProbeRef {
+                func: self.fid,
+                block: self.bid,
+                detail: format!("{operation} references missing probe p{}", probe_id.0),
+            });
+            return None;
+        };
+
+        let expected_access = if schema.force {
+            PortAccess::Force
+        } else {
+            PortAccess::Probe
+        };
+        let expected_type = schema.ty.ir_type();
+        let mut mismatches = Vec::new();
+        if schema.id != probe_id {
+            mismatches.push(format!(
+                "catalog slot p{} carries id p{}",
+                probe_id.0, schema.id.0
+            ));
+        }
+        if port.port_path.len() != 1 || port.port_path[0] != schema.name {
+            mismatches.push(format!(
+                "path `{}` does not match catalog name `{}`",
+                port.port_path.join("."),
+                schema.name
+            ));
+        }
+        if !port.aggregate_path || port.lane.is_some() {
+            mismatches.push("probe paths must be one unindexed aggregate segment".to_string());
+        }
+        if port.access != expected_access {
+            mismatches.push(format!(
+                "access {:?} does not match catalog capability {:?}",
+                port.access, expected_access
+            ));
+        }
+        if port.width != Some(schema.ty.width()) {
+            mismatches.push(format!(
+                "width {:?} does not match catalog width {}",
+                port.width,
+                schema.ty.width()
+            ));
+        }
+        if port.value_type.as_ref() != Some(&expected_type) {
+            mismatches.push(format!(
+                "type {:?} does not match catalog type {:?}",
+                port.value_type, expected_type
+            ));
+        }
+        match self.func.owner {
+            Some(owner) => match self.prog.testbenches.get(owner.index()) {
+                Some(tb) => {
+                    if port.testbench_field != tb.dut_field {
+                        mismatches.push(format!(
+                            "receiver `{}` does not match testbench DUT field `{}`",
+                            port.testbench_field, tb.dut_field
+                        ));
+                    }
+                    if schema.dut_type != tb.dut_type {
+                        mismatches.push(format!(
+                            "catalog DUT `{}` does not match testbench DUT `{}`",
+                            schema.dut_type, tb.dut_type
+                        ));
+                    }
+                    if !tb.probes.contains(&probe_id) {
+                        mismatches.push(format!(
+                            "testbench `{}` does not declare probe p{} `{}`",
+                            tb.name, probe_id.0, schema.name
+                        ));
+                    }
+                }
+                None => mismatches.push(format!("owner tb{} does not resolve", owner.0)),
+            },
+            None if !schema.shared => mismatches.push(format!(
+                "ownerless shared function uses non-shared probe p{} `{}`",
+                probe_id.0, schema.name
+            )),
+            None => {
+                if port.testbench_field != "dut" {
+                    mismatches.push(format!(
+                        "shared probe receiver `{}` is not the canonical `dut` field",
+                        port.testbench_field
+                    ));
+                }
+            }
+        }
+        if !mismatches.is_empty() {
+            self.errs.push(VerifyError::BadProbeRef {
+                func: self.fid,
+                block: self.bid,
+                detail: format!(
+                    "{operation} probe p{} `{}`: {}",
+                    probe_id.0,
+                    schema.name,
+                    mismatches.join("; ")
+                ),
+            });
+        }
+        Some(schema)
+    }
+
     /// The owning testbench must declare scalar field `field`.
     fn check_tb_field(&mut self, field: &str) {
-        let ok = self
-            .func
-            .owner
-            .and_then(|tb| self.prog.testbenches.get(tb.index()))
-            .is_some_and(|tb| {
-                tb.state_fields.iter().any(|state| {
-                    matches!(state, TbStateFieldSchema::Scalar(scalar) if scalar.name == field)
-                })
-            });
+        let ok = self.owner_testbench().is_some_and(|tb| {
+            tb.state_fields.iter().any(
+                |state| matches!(state, TbStateFieldSchema::Scalar(scalar) if scalar.name == field),
+            )
+        });
         if !ok {
             self.errs.push(VerifyError::BadTbField {
                 func: self.fid,
@@ -5765,17 +8063,14 @@ impl Checker<'_> {
     /// `FixedVec`, so this is how the fixed-vector element checks recover
     /// the receiver's shape. `None` when no scalar field by that name.
     fn tb_scalar_field_ty(&self, field: &str) -> Option<IrType> {
-        self.func
-            .owner
-            .and_then(|tb| self.prog.testbenches.get(tb.index()))
-            .and_then(|tb| {
-                tb.state_fields.iter().find_map(|state| match state {
-                    TbStateFieldSchema::Scalar(scalar) if scalar.name == field => {
-                        Some(scalar.ty.clone())
-                    }
-                    _ => None,
-                })
+        self.owner_testbench().and_then(|tb| {
+            tb.state_fields.iter().find_map(|state| match state {
+                TbStateFieldSchema::Scalar(scalar) if scalar.name == field => {
+                    Some(scalar.ty.clone())
+                }
+                _ => None,
             })
+        })
     }
 
     /// Bounds- and structure-check a fixed-vector element write whose
@@ -5826,16 +8121,14 @@ impl Checker<'_> {
         context: &'static str,
         what: &'static str,
     ) {
-        self.check_expr(index, ports_ok, context);
+        self.check_non_string_expr(index, ports_ok, context);
         if let Some(inner) = inner_index {
-            self.check_expr(inner, ports_ok, context);
+            self.check_non_string_expr(inner, ports_ok, context);
         }
         let Some(IrType::FixedVec { elem, len }) = vec_ty else {
             return;
         };
-        if len == 0
-            || matches!(index, Expr::Literal { value, .. } if *value as usize >= len)
-        {
+        if len == 0 || matches!(index, Expr::Literal { value, .. } if *value as usize >= len) {
             self.errs.push(VerifyError::BadProgramRef {
                 what: format!(
                     "fn{} b{} {what}: index out of bounds for fixed vector of length {len}",
@@ -5878,15 +8171,12 @@ impl Checker<'_> {
     }
 
     fn tb_queue_elem(&self, field: &str) -> Option<&QueueElem> {
-        self.func
-            .owner
-            .and_then(|tb| self.prog.testbenches.get(tb.index()))
-            .and_then(|tb| {
-                tb.state_fields.iter().find_map(|state| match state {
-                    TbStateFieldSchema::Queue(queue) if queue.name == field => Some(&queue.elem),
-                    _ => None,
-                })
+        self.owner_testbench().and_then(|tb| {
+            tb.state_fields.iter().find_map(|state| match state {
+                TbStateFieldSchema::Queue(queue) if queue.name == field => Some(&queue.elem),
+                _ => None,
             })
+        })
     }
 
     /// The scoreboard id must resolve and `field` must be a
@@ -5915,15 +8205,11 @@ impl Checker<'_> {
             }
             return;
         }
-        let bound = self
-            .func
-            .owner
-            .and_then(|tb| self.prog.testbenches.get(tb.index()))
-            .is_some_and(|tb| {
-                tb.scoreboard_fields
-                    .iter()
-                    .any(|(f, id)| f == field && *id == sb)
-            });
+        let bound = self.owner_testbench().is_some_and(|tb| {
+            tb.scoreboard_fields
+                .iter()
+                .any(|(f, id)| f == field && *id == sb)
+        });
         if !bound {
             self.errs.push(VerifyError::BadScoreboard {
                 func: self.fid,
@@ -5957,22 +8243,18 @@ impl Checker<'_> {
         }
         // Match lowering's namespace order: a real testbench component field
         // named `self` wins over the synthetic component-method root.
-        let owner_component = self
-            .func
-            .owner
-            .and_then(|owner| self.prog.testbenches.get(owner.index()))
-            .and_then(|owner| {
-                owner
-                    .component_fields
-                    .iter()
-                    .find(|binding| binding.field == *root)
-                    .map(|binding| binding.component)
-            });
+        let owner_component = self.owner_testbench().and_then(|owner| {
+            owner
+                .component_fields
+                .iter()
+                .find(|binding| binding.field == *root)
+                .map(|binding| binding.component)
+        });
         let mut component = if let Some(component) = owner_component {
             component
         } else if root == "self" {
             match self.func.kind {
-                FunctionKind::ComponentMethod { component } => component,
+                FunctionKind::ComponentMethod { component, .. } => component,
                 _ => {
                     return Err(
                         "self-rooted nested scoreboard outside a component method".to_string()
@@ -6111,20 +8393,11 @@ impl Checker<'_> {
     /// testbench so an IR-mutating pass cannot invent a field, mismatch its
     /// schema, or leave codegen indexing a dangling transactor id.
     fn check_transactor_idle(&mut self, field: &str, transactor: TransactorId, storage: &str) {
-        let Some(owner) = self.func.owner else {
+        let Some(tb) = self.owner_testbench().cloned() else {
             self.errs.push(VerifyError::BadProgramRef {
                 what: format!(
                     "fn{} b{} transactor heartbeat `{field}` has no owning testbench",
                     self.fid.0, self.bid.0
-                ),
-            });
-            return;
-        };
-        let Some(tb) = self.prog.testbenches.get(owner.index()) else {
-            self.errs.push(VerifyError::BadProgramRef {
-                what: format!(
-                    "fn{} b{} transactor heartbeat owner tb{} does not resolve",
-                    self.fid.0, self.bid.0, owner.0
                 ),
             });
             return;
@@ -6288,21 +8561,24 @@ impl Checker<'_> {
             block: bid,
             detail,
         };
-        let Expr::Call(CallTarget::TransactorMethod { bus_field, method }, args) = call else {
+        let Expr::Call(
+            CallTarget::TransactorMethod {
+                bus_field,
+                method,
+                target,
+            },
+            args,
+        ) = call
+        else {
             self.errs.push(bad(
                 "payload is not a TransactorMethod call edge".to_string()
             ));
             return;
         };
-        let Some(owner) = self.func.owner else {
+        let Some(tb) = self.owner_testbench().cloned() else {
             self.errs.push(bad(format!(
                 "`{bus_field}.{method}` called from a function with no owner testbench"
             )));
-            return;
-        };
-        let Some(tb) = self.prog.testbenches.get(owner.index()) else {
-            self.errs
-                .push(bad(format!("owner tb{} does not resolve", owner.0)));
             return;
         };
         let Some((_, xid)) = tb.transactor_fields.iter().find(|(f, _)| f == bus_field) else {
@@ -6320,6 +8596,22 @@ impl Checker<'_> {
             }
             return;
         };
+        let crate::ir::TransactorMethodTarget::Callable {
+            transactor,
+            function,
+        } = target
+        else {
+            self.errs.push(bad(format!(
+                "`{bus_field}.{method}` rides Stmt::TransactorCall without a typed callable target"
+            )));
+            return;
+        };
+        if transactor != xid {
+            self.errs.push(bad(format!(
+                "`{bus_field}.{method}` carries transactor x{} but the receiver has type x{}",
+                transactor.0, xid.0
+            )));
+        }
         let Some(schema) = self.prog.transactors.get(xid.index()) else {
             self.errs
                 .push(bad(format!("transactor x{} does not resolve", xid.0)));
@@ -6332,11 +8624,25 @@ impl Checker<'_> {
             )));
             return;
         };
+        if resolved.function != *function {
+            self.errs.push(bad(format!(
+                "transactor method `{}.{method}` resolves to fn{} but the call carries fn{}",
+                schema.name, resolved.function.0, function.0
+            )));
+        }
         if resolved.active_only && tb.passive_transactor_fields.contains(bus_field) {
             self.errs.push(bad(format!(
                 "transactor method `{}.{method}` is active-only but field `{bus_field}` is \
                  passive",
                 schema.name
+            )));
+        }
+        if resolved.param_tys.len() != args.len() {
+            self.errs.push(bad(format!(
+                "transactor method `{}.{method}` parameter type count {} disagrees with {} call argument(s)",
+                schema.name,
+                resolved.param_tys.len(),
+                args.len()
             )));
         }
         if args.len() != resolved.param_names.len() {
@@ -6359,10 +8665,12 @@ impl Checker<'_> {
                 let actual = if matches!(expected, IrType::FixedVec { .. }) {
                     self.expr_whole_vec_type(arg).ok().flatten()
                 } else {
-                    expr_type(self.prog, self.func, arg)
+                    self.aggregate_assignment_expr_type(arg)
                 };
                 match actual {
-                    Some(actual) if assign_compatible(expected, &actual) => {}
+                    Some(actual)
+                        if assign_compatible(expected, &actual)
+                            && call_argument_type_compatible(expected, &actual) => {}
                     Some(actual) => self.errs.push(bad(format!(
                         "transactor method `{}.{method}` parameter {} expects {expected:?}, got {actual:?}",
                         schema.name,
@@ -6388,8 +8696,7 @@ impl Checker<'_> {
             self.errs.push(bad(format!(
                 "transactor method `{}.{method}` must return a scalar truth value in a wait \
                  predicate, got {:?}",
-                schema.name,
-                resolved.ret_ty
+                schema.name, resolved.ret_ty
             )));
         }
         if let Some(dest) = dest {
@@ -6451,7 +8758,7 @@ impl Checker<'_> {
         whole_vec_ok: bool,
     ) {
         match e {
-            Expr::Literal { .. } | Expr::WideLiteral(_) => {}
+            Expr::Literal { .. } | Expr::StringLiteral(_) | Expr::WideLiteral(_) => {}
             // The global cycle counter — a framework value, no
             // local/port dependency to verify.
             Expr::CycleCount | Expr::ErrorCount => {}
@@ -6480,6 +8787,8 @@ impl Checker<'_> {
                     ScoreboardQuery::QueueSize { queue }
                     | ScoreboardQuery::QueueEmpty { queue }
                         if queue == field => {}
+                    ScoreboardQuery::QueueFront { queue, elem }
+                        if queue == field && self.tb_queue_elem(field) == Some(elem) => {}
                     _ => self.errs.push(VerifyError::BadProgramRef {
                         what: format!(
                             "fn{} b{} has malformed query metadata for testbench queue `{field}`",
@@ -6509,10 +8818,10 @@ impl Checker<'_> {
                 index,
             } => {
                 for (_, idx) in mid_indices {
-                    self.check_expr(idx, ports_ok, context);
+                    self.check_non_string_expr(idx, ports_ok, "record path index");
                 }
                 if let Some(idx) = index {
-                    self.check_expr(idx, ports_ok, context);
+                    self.check_non_string_expr(idx, ports_ok, "record field index");
                 }
                 let vec_shape = self.transactor_state_field_vec_shape(
                     instance,
@@ -6532,8 +8841,38 @@ impl Checker<'_> {
                 Err(detail) => self.report_bad_whole_vec_use(detail),
                 }
             }
-            Expr::TransactorStateQueueQuery { .. } => {}
-            Expr::Port(_) => {
+            Expr::TransactorStateQueueQuery {
+                instance,
+                field,
+                query,
+            } => match resolve_transactor_state_queue_elem(
+                self.prog,
+                self.func,
+                instance,
+                field,
+            ) {
+                Ok(actual) => match query {
+                    ScoreboardQuery::QueueSize { queue }
+                    | ScoreboardQuery::QueueEmpty { queue }
+                        if queue == field => {}
+                    ScoreboardQuery::QueueFront { queue, elem }
+                        if queue == field && elem == &actual => {}
+                    _ => self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} has malformed query metadata for target-state queue `{instance}.{field}`",
+                            self.fid.0, self.bid.0
+                        ),
+                    }),
+                },
+                Err(detail) => self.errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "fn{} b{} has invalid target-state queue query: {detail}",
+                        self.fid.0, self.bid.0
+                    ),
+                }),
+            },
+            Expr::Port(port) => {
+                self.check_port_ref(port, "Expr::Port");
                 if !ports_ok {
                     self.errs.push(VerifyError::PortInDisallowedPosition {
                         func: self.fid,
@@ -6541,8 +8880,21 @@ impl Checker<'_> {
                         context,
                     });
                 }
+                crate::ir::visit::visit_port_lane_expr(port, &mut |index| {
+                    self.check_non_string_expr(index, ports_ok, "DUT lane index")
+                });
             }
             Expr::Binary(op, a, b) => {
+                if matches!(self.aggregate_assignment_expr_type(a), Some(IrType::String))
+                    || matches!(self.aggregate_assignment_expr_type(b), Some(IrType::String))
+                {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} binary operator {op:?} is not defined for String values",
+                            self.fid.0, self.bid.0
+                        ),
+                    });
+                }
                 let lhs_shape = self.expr_whole_collection_shape(a);
                 let rhs_shape = self.expr_whole_collection_shape(b);
                 match (lhs_shape, rhs_shape) {
@@ -6570,18 +8922,31 @@ impl Checker<'_> {
                     }
                 }
             }
-            Expr::Unary(_, a) => self.check_expr(a, ports_ok, context),
-            Expr::BitSlice { target, .. } => self.check_expr(target, ports_ok, context),
+            Expr::Unary(op, a) => {
+                if matches!(self.aggregate_assignment_expr_type(a), Some(IrType::String)) {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} unary operator {op:?} is not defined for String values",
+                            self.fid.0, self.bid.0
+                        ),
+                    });
+                }
+                self.check_expr(a, ports_ok, context);
+            }
+            Expr::BitSlice { target, .. } => {
+                self.check_non_string_expr(target, ports_ok, "bit-slice target")
+            }
             Expr::BitSliceDyn { target, hi, lo } => {
-                self.check_expr(target, ports_ok, context);
-                self.check_expr(hi, ports_ok, context);
-                self.check_expr(lo, ports_ok, context);
+                self.check_non_string_expr(target, ports_ok, "bit-slice target");
+                self.check_non_string_expr(hi, ports_ok, "bit-slice upper bound");
+                self.check_non_string_expr(lo, ports_ok, "bit-slice lower bound");
             }
             Expr::PortSnapshotLane {
                 snapshot,
                 port,
                 index,
             } => {
+                self.check_port_ref(port, "Expr::PortSnapshotLane");
                 if context != "Assign value" {
                     self.errs.push(VerifyError::BadProgramRef {
                         what: format!(
@@ -6624,11 +8989,14 @@ impl Checker<'_> {
                 }
                 let same_port = |defined: &crate::ir::PortRef| {
                     defined.testbench_field == port.testbench_field
+                        && defined.origin == port.origin
                         && defined.port_path == port.port_path
                         && defined.aggregate_path == port.aggregate_path
                         && defined.direction == port.direction
                         && defined.width == port.width
+                        && defined.value_type == port.value_type
                         && defined.access == port.access
+                        && defined.probe == port.probe
                         && defined.lane.is_none()
                 };
                 if definition_count != 1 || !defined_port.is_some_and(same_port) {
@@ -6639,9 +9007,29 @@ impl Checker<'_> {
                         ),
                     });
                 }
-                self.check_expr(index, ports_ok, context);
+                self.check_non_string_expr(index, ports_ok, "sampled DUT lane index");
             }
             Expr::Ternary(c, t, e2) => {
+                if matches!(self.aggregate_assignment_expr_type(c), Some(IrType::String)) {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} ternary condition is String-valued",
+                            self.fid.0, self.bid.0
+                        ),
+                    });
+                }
+                let then_ty = self.aggregate_assignment_expr_type(t);
+                let else_ty = self.aggregate_assignment_expr_type(e2);
+                if matches!(then_ty, Some(IrType::String))
+                    != matches!(else_ty, Some(IrType::String))
+                {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} ternary branches mix String and non-String values",
+                            self.fid.0, self.bid.0
+                        ),
+                    });
+                }
                 self.check_expr(c, ports_ok, context);
                 self.check_expr(t, ports_ok, context);
                 self.check_expr(e2, ports_ok, context);
@@ -6652,6 +9040,14 @@ impl Checker<'_> {
                 inner,
                 ..
             } => {
+                if matches!(self.aggregate_assignment_expr_type(inner), Some(IrType::String)) {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} width cast is applied to a String value",
+                            self.fid.0, self.bid.0
+                        ),
+                    });
+                }
                 // `width` is the cast *destination* and carries the
                 // width-method language limit lowering enforces. `src_width`
                 // is best-effort receiver metadata read off a declared type,
@@ -6684,10 +9080,10 @@ impl Checker<'_> {
                 let mid_positions: Vec<usize> = mid_indices.iter().map(|(p, _)| *p).collect();
                 self.check_record_field(*local, field, path, &mid_positions);
                 for (_, idx) in mid_indices {
-                    self.check_expr(idx, ports_ok, context);
+                    self.check_non_string_expr(idx, ports_ok, "record path index");
                 }
                 if let Some(idx) = index {
-                    self.check_expr(idx, ports_ok, context);
+                    self.check_non_string_expr(idx, ports_ok, "record field index");
                 }
                 let vec_shape = self.record_field_vec_shape(
                     *local,
@@ -6719,13 +9115,41 @@ impl Checker<'_> {
                 self.check_local(*mirror);
                 self.check_record_field(*mirror, field, &[], &[]);
             }
-            Expr::CovBin { inst, .. } => self.check_covgroup(inst.covgroup),
+            Expr::CovBin { inst, point, bin } => {
+                self.check_covgroup(inst.covgroup);
+                let binding_is_valid = self
+                    .func
+                    .owner
+                    .and_then(|owner| self.prog.testbenches.get(owner.index()))
+                    .is_some_and(|testbench| {
+                        testbench
+                            .cov_fields
+                            .iter()
+                            .any(|(field, covgroup)| {
+                                field == &inst.tb_field && *covgroup == inst.covgroup
+                            })
+                    });
+                let bin_is_valid = self
+                    .prog
+                    .covgroups
+                    .get(inst.covgroup.index())
+                    .and_then(|schema| schema.points.iter().find(|candidate| candidate.name == *point))
+                    .is_some_and(|schema| schema.bins.iter().any(|candidate| candidate.name == *bin));
+                if !binding_is_valid || !bin_is_valid {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} references stale covergroup bin `{}.{}.{}`",
+                            self.fid.0, self.bid.0, inst.tb_field, point, bin
+                        ),
+                    });
+                }
+            }
             // A hook-param cover target carries the parameter NAME (no
             // resolvable local before the transactor pass); only its
             // optional index sub-expression needs checking.
             Expr::CovHookParam { index, .. } => {
                 if let Some(i) = index {
-                    self.check_expr(i, ports_ok, context);
+                    self.check_non_string_expr(i, ports_ok, "cover hook parameter index");
                 }
             }
             Expr::CovHookArg { .. } => {}
@@ -6747,7 +9171,7 @@ impl Checker<'_> {
                 index,
                 inner_index,
             } => {
-                self.check_expr(index, ports_ok, context);
+                self.check_non_string_expr(index, ports_ok, "component field index");
                 match self.component_indexed_field_type(base, field, *index_pos) {
                     Ok((ty, len)) => {
                         if matches!(index.as_ref(), Expr::Literal { value, .. } if *value as usize >= len)
@@ -6760,7 +9184,11 @@ impl Checker<'_> {
                         // `ty` must be a `FixedVec`; the second index is
                         // bounds-checked against its inner length.
                         if let Some(inner) = inner_index {
-                            self.check_expr(inner, ports_ok, context);
+                            self.check_non_string_expr(
+                                inner,
+                                ports_ok,
+                                "nested component field index",
+                            );
                             match &ty {
                                 IrType::FixedVec {
                                     len: inner_len, ..
@@ -6777,7 +9205,7 @@ impl Checker<'_> {
                                 )),
                             }
                         } else if let IrType::Seq(elem) = ty {
-                            let shape = crate::codegen::cpp_tb::ir_vec_elem_class(&elem)
+                            let shape = value_abi_class(&elem)
                                 .map(WholeCollectionShape::DynamicSeq);
                             match shape {
                                 Some(shape) if !whole_vec_ok => self.report_bad_whole_vec_use(
@@ -6809,29 +9237,40 @@ impl Checker<'_> {
                     "TbFieldVecElement",
                 );
             }
-            // A by-value component passed as a method arg. A `Local` base
-            // is a method-param local (verify it is defined); a
-            // `SelfField`/`Path` base is resolved at lowering.
-            Expr::ComponentValue { base } => match base {
-                crate::ir::ComponentBase::Local(l) => {
-                    self.check_local(*l);
-                    if !matches!(
-                        self.func.locals.get(l.index()).map(|local| &local.ty),
-                        Some(IrType::Component(_))
-                    ) {
-                        self.report_bad_component_field(
-                            "component value local is not component-typed".to_string(),
-                        );
-                    }
+            // A by-value component passed as a method arg or assigned into a
+            // typed value local. Replay path and activation resolution before
+            // codegen trusts the base.
+            Expr::ComponentValue { base } => {
+                if let crate::ir::ComponentBase::Local(local) = base {
+                    self.check_local(*local);
                 }
-                _ if self.component_base_id(base).is_err() => self.report_bad_component_field(
-                    "component value base does not resolve".to_string(),
-                ),
-                _ => {}
-            },
-            // Component-queue size/empty read — host state resolved at
-            // lowering against the component schema; nothing to verify.
-            Expr::ComponentQueueQuery { .. } => {}
+                if let Err(detail) = self.component_value_base_id(base) {
+                    self.report_bad_component_field(format!(
+                        "component value base does not resolve: {detail}"
+                    ));
+                }
+            }
+            Expr::ComponentQueueQuery { base, query } => {
+                let Some(queue) = query.queue() else {
+                    self.report_bad_component_field(
+                        "component queue query carries scalar metadata".to_string(),
+                    );
+                    return;
+                };
+                match resolve_component_queue_elem(self.prog, self.func, base, queue) {
+                    Ok(actual) => {
+                        if let ScoreboardQuery::QueueFront { elem, .. } = query {
+                            if elem != &actual {
+                                self.report_bad_component_field(format!(
+                                    "component queue `{queue}` front type {:?} does not match {:?}",
+                                    elem, actual
+                                ));
+                            }
+                        }
+                    }
+                    Err(detail) => self.report_bad_component_field(detail),
+                }
+            }
             Expr::DynamicListQuery { target, .. } => {
                 match self.expr_whole_collection_shape(target) {
                     Ok(Some(WholeCollectionShape::DynamicSeq(_))) => {
@@ -6853,7 +9292,7 @@ impl Checker<'_> {
                 base, subpath, n, ..
             } => {
                 self.check_component_idle(base, subpath);
-                self.check_expr(n, ports_ok, context);
+                self.check_non_string_expr(n, ports_ok, "component idle count");
             }
             Expr::TransactorIdle {
                 field,
@@ -6863,7 +9302,7 @@ impl Checker<'_> {
                 ..
             } => {
                 self.check_transactor_idle(field, *transactor, storage);
-                self.check_expr(n, ports_ok, context);
+                self.check_non_string_expr(n, ports_ok, "transactor idle count");
             }
             Expr::ScoreboardQuery {
                 sb,
@@ -6879,6 +9318,19 @@ impl Checker<'_> {
                     crate::ir::ScoreboardQuery::QueueSize { queue }
                     | crate::ir::ScoreboardQuery::QueueEmpty { queue } => {
                         self.check_scoreboard_container(*sb, queue)
+                    }
+                    crate::ir::ScoreboardQuery::QueueFront { queue, elem } => {
+                        self.check_scoreboard_queue(*sb, queue);
+                        if self.scoreboard_queue_elem(*sb, queue).as_ref() != Some(elem) {
+                            self.errs.push(VerifyError::BadScoreboard {
+                                func: self.fid,
+                                block: self.bid,
+                                detail: format!(
+                                    "scoreboard sb{} queue `{queue}` front type {:?} does not match schema",
+                                    sb.0, elem
+                                ),
+                            });
+                        }
                     }
                 }
             }
@@ -6901,190 +9353,295 @@ impl Checker<'_> {
                         ),
                     });
                 }
-                self.check_expr(index, ports_ok, context);
+                self.check_non_string_expr(index, ports_ok, "sequence index");
             }
-            Expr::Call(target, args) => {
-                let helper_schema = if let CallTarget::Helper { name, ret } = target {
-                    self.prog
-                        .functions
-                        .iter()
-                        .find(|function| {
-                        function.kind == FunctionKind::Helper && function.name == *name
-                        })
-                        .map(|helper| {
-                            let params = helper
-                                .params
-                                .iter()
-                                .map(|param| param.ty.clone())
-                                .collect::<Vec<_>>();
-                            let actual_ret = helper
-                                .ret
-                                .and_then(|local| helper.locals.get(local.index()))
-                                .map(|local| local.ty.clone());
-                            (params, actual_ret)
-                        })
-                        .or_else(|| {
+            Expr::Call(
+                CallTarget::Helper {
+                    function,
+                    name,
+                    ret,
+                },
+                args,
+            ) => {
+                let helper = self.prog.functions.get(function.index()).filter(|candidate| {
+                    candidate.id == *function
+                        && candidate.kind == FunctionKind::Helper
+                        && candidate.name == *name
+                });
+                match helper {
+                    Some(helper) => {
+                        if helper.params.len() != args.len() {
                             self.errs.push(VerifyError::BadProgramRef {
                                 what: format!(
-                                    "fn{} b{} helper call references missing helper `{name}`",
-                                    self.fid.0, self.bid.0
-                                ),
-                            });
-                            None
-                        })
-                        .map(|(params, actual_ret)| {
-                            if params.len() != args.len() {
-                                self.errs.push(VerifyError::BadProgramRef {
-                                    what: format!(
-                                        "fn{} b{} helper `{name}` arity mismatch: function has {}, call carries {}",
-                                        self.fid.0,
-                                        self.bid.0,
-                                        params.len(),
-                                        args.len()
-                                    ),
-                                });
-                            }
-                            match actual_ret.as_ref() {
-                                Some(actual) if actual != ret => {
-                                    self.errs.push(VerifyError::BadProgramRef {
-                                        what: format!(
-                                            "fn{} b{} helper `{name}` return metadata mismatch: function has {actual:?}, call carries {ret:?}",
-                                            self.fid.0, self.bid.0
-                                        ),
-                                    });
-                                }
-                                None if !matches!(ret, IrType::Unknown) => {
-                                    self.errs.push(VerifyError::BadProgramRef {
-                                        what: format!(
-                                            "fn{} b{} void helper `{name}` call carries return type {ret:?}",
-                                            self.fid.0, self.bid.0
-                                        ),
-                                    });
-                                }
-                                _ => {}
-                            }
-                            (params, actual_ret)
-                        })
-                } else {
-                    None
-                };
-                if let (CallTarget::Helper { name, .. }, Some((params, _))) =
-                    (target, helper_schema.as_ref())
-                {
-                    for (index, (arg, param_ty)) in args.iter().zip(params).enumerate() {
-                        let actual = if matches!(param_ty, IrType::FixedVec { .. }) {
-                                self.expr_whole_vec_type(arg)
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or(IrType::Unknown)
-                        } else {
-                            self.aggregate_assignment_expr_type(arg)
-                                .unwrap_or(IrType::Unknown)
-                        };
-                        if (matches!(
-                            param_ty,
-                            IrType::FixedVec { .. } | IrType::Seq(_) | IrType::RecordSeq(_)
-                        ) || matches!(
-                            &actual,
-                            IrType::FixedVec { .. } | IrType::Seq(_) | IrType::RecordSeq(_)
-                        )) && *param_ty != actual
-                        {
-                            self.errs.push(VerifyError::BadProgramRef {
-                                what: format!(
-                                    "fn{} b{} helper `{name}` argument {} expects {:?}, got {:?}",
+                                    "fn{} b{} helper `{name}` arity mismatch: takes {} argument(s), call carries {}",
                                     self.fid.0,
                                     self.bid.0,
-                                    index + 1,
-                                    param_ty,
-                                    actual
+                                    helper.params.len(),
+                                    args.len()
                                 ),
                             });
                         }
-                        self.check_expr_inner(
-                            arg,
-                            ports_ok,
-                            context,
-                            matches!(param_ty, IrType::FixedVec { .. }),
-                        );
+                        for (index, (arg, param)) in
+                            args.iter().zip(helper.params.iter()).enumerate()
+                        {
+                            let fixed_vec = matches!(param.ty, IrType::FixedVec { .. });
+                            let actual = if fixed_vec {
+                                self.expr_whole_vec_type(arg).ok().flatten()
+                            } else {
+                                self.aggregate_assignment_expr_type(arg)
+                            };
+                            if let Some(actual) = actual {
+                                if !call_argument_type_compatible(&param.ty, &actual) {
+                                    self.errs.push(VerifyError::BadProgramRef {
+                                        what: format!(
+                                            "fn{} b{} helper `{name}` argument {} has type {:?}, expected {:?}",
+                                            self.fid.0,
+                                            self.bid.0,
+                                            index + 1,
+                                            actual,
+                                            param.ty
+                                        ),
+                                    });
+                                }
+                            }
+                            self.check_expr_inner(arg, ports_ok, context, fixed_vec);
+                        }
+                        let actual_ret = helper
+                            .ret
+                            .and_then(|local| helper.locals.get(local.index()))
+                            .map(|local| &local.ty);
+                        if actual_ret != Some(ret) {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} helper `{name}` return metadata mismatch: call has {ret:?}, function has {actual_ret:?}",
+                                    self.fid.0, self.bid.0
+                                ),
+                            });
+                        }
+                    }
+                    None => self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} references missing helper `{name}`",
+                            self.fid.0, self.bid.0
+                        ),
+                    }),
+                }
+            }
+            Expr::Call(CallTarget::Tseq { function, name }, args) => {
+                let tseq = self.prog.functions.get(function.index()).filter(|candidate| {
+                    candidate.id == *function
+                        && matches!(candidate.kind, FunctionKind::Tseq { .. })
+                        && candidate.name == *name
+                });
+                match tseq {
+                    Some(tseq) => {
+                        if tseq.params.len() != args.len() {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} tseq `{name}` takes {} argument(s), call carries {}",
+                                    self.fid.0,
+                                    self.bid.0,
+                                    tseq.params.len(),
+                                    args.len()
+                                ),
+                            });
+                        }
+                        for (index, (arg, param)) in
+                            args.iter().zip(tseq.params.iter()).enumerate()
+                        {
+                            if let Some(actual) = self.aggregate_assignment_expr_type(arg) {
+                                if !aggregate_assignment_compatible(&param.ty, &actual) {
+                                    self.errs.push(VerifyError::BadProgramRef {
+                                        what: format!(
+                                            "fn{} b{} tseq `{name}` argument {} has type {:?}, expected {:?}",
+                                            self.fid.0,
+                                            self.bid.0,
+                                            index + 1,
+                                            actual,
+                                            param.ty
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    None => self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} references missing tseq `{name}`",
+                            self.fid.0, self.bid.0
+                        ),
+                    }),
+                }
+                for arg in args {
+                    self.check_expr(arg, ports_ok, context);
+                }
+            }
+            Expr::Call(CallTarget::ExternFn { name, params, ret }, args) => {
+                for (index, ty) in params.iter().enumerate() {
+                    if ir_type_is_nested_string(ty) {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} extern function `{name}` parameter {} cannot use a type containing String: {ty:?}",
+                                self.fid.0, self.bid.0, index + 1
+                            ),
+                        });
                     }
                 }
-                // Seam rule: a bound call edge is never an expression
-                // value. A sibling edge has one additional sanctioned
-                // landing: inside a re-evaluated wait predicate.
-                if let CallTarget::TransactorMethod { bus_field, method } = target {
-                    if self.transactor_predicate_expr_ok {
-                        self.check_transactor_call(None, e, ports_ok, true);
-                    } else {
+                if ir_type_is_nested_string(ret) {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} extern function `{name}` return cannot use a type containing String: {ret:?}",
+                            self.fid.0, self.bid.0
+                        ),
+                    });
+                }
+                if args.len() != params.len() {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} extern function `{name}` expects {} argument(s), call carries {}",
+                            self.fid.0,
+                            self.bid.0,
+                            params.len(),
+                            args.len()
+                        ),
+                    });
+                }
+                for (index, (arg, expected)) in args.iter().zip(params.iter()).enumerate() {
+                    if let Some(actual) = self.aggregate_assignment_expr_type(arg) {
+                        if !call_argument_type_compatible(expected, &actual) {
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} extern function `{name}` argument {} has type {:?}, expected {:?}",
+                                    self.fid.0,
+                                    self.bid.0,
+                                    index + 1,
+                                    actual,
+                                    expected
+                                ),
+                            });
+                        }
+                    }
+                    self.check_expr(arg, ports_ok, context);
+                }
+                if matches!(ret, IrType::Record(_) | IrType::Component(_) | IrType::Event(_)) {
+                    self.errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "fn{} b{} extern function `{name}` has unsupported return type {ret:?}",
+                            self.fid.0, self.bid.0
+                        ),
+                    });
+                }
+            }
+            Expr::Call(target, args) => {
+                if self.transactor_predicate_expr_ok {
+                    match target {
+                        CallTarget::TransactorMethod {
+                            bus_field, method, ..
+                        } => {
+                            let bus_bound = self.owner_testbench().is_some_and(|testbench| {
+                                testbench
+                                    .bus_bindings
+                                    .iter()
+                                    .any(|binding| binding.field == *bus_field)
+                            });
+                            if bus_bound {
+                                self.errs.push(VerifyError::BadTransactorCall {
+                                    func: self.fid,
+                                    block: self.bid,
+                                    detail: format!(
+                                        "`{bus_field}.{method}` is bus-bound and cannot execute \
+                                         inside a re-evaluated wait predicate"
+                                    ),
+                                });
+                            } else {
+                                self.check_transactor_call(None, e, ports_ok, true);
+                            }
+                            return;
+                        }
+                        CallTarget::TransactorSelfMethod { .. } => {
+                            self.check_transactor_self_call(None, e, ports_ok, true);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                // Seam rule: a call edge is never an expression VALUE.
+                // It reaches the verifier only as the top-level Assign
+                // RHS (bus) or the root payload of `Stmt::TransactorCall`
+                // (transactor) — both consumed by `check_block` before
+                // recursing. Reaching one here means it is nested or in
+                // a disallowed statement position.
+                if let CallTarget::TransactorMethod {
+                    bus_field, method, ..
+                } = target
+                {
+                    let bus_bound = self.owner_testbench().is_some_and(|testbench| {
+                        testbench
+                            .bus_bindings
+                            .iter()
+                            .any(|binding| binding.field == *bus_field)
+                    });
+                    if !self.transactor_predicate_expr_ok || bus_bound {
                         self.errs.push(VerifyError::BadTransactorCall {
                             func: self.fid,
                             block: self.bid,
                             detail: format!(
                                 "`{bus_field}.{method}` call edge in a disallowed position \
-                                 ({context}) — must be the entire RHS of an Assign (bus) \
-                                 or the payload of a Stmt::TransactorCall (transactor)"
+                                 ({context}) — synchronous transactor calls are expression-valued \
+                                 only in re-evaluated wait predicates, and bus-bound calls require \
+                                 the statement-level handshake seam"
                             ),
                         });
                     }
                 }
-                if !self.transactor_predicate_expr_ok {
-                    if let CallTarget::TransactorSelfMethod { transactor, method } = target {
+                if let CallTarget::TransactorSelfMethod {
+                    transactor_name,
+                    method,
+                    ..
+                } = target
+                {
+                    if !self.transactor_predicate_expr_ok {
                         self.errs.push(VerifyError::BadTransactorCall {
                             func: self.fid,
                             block: self.bid,
                             detail: format!(
-                                "`{transactor}.{method}` sibling call in a disallowed position \
-                                 ({context}) — lowering must hoist it into a \
-                                 Stmt::TransactorSelfCall"
+                                "`{transactor_name}.{method}` sibling call in a disallowed position \
+                                 ({context}) — synchronous sibling calls are expression-valued \
+                                 only in re-evaluated wait predicates"
                             ),
                         });
                     }
-                } else if matches!(target, CallTarget::TransactorSelfMethod { .. }) {
-                    self.check_transactor_self_call(None, e, ports_ok, true);
                 }
-                if let CallTarget::Tseq(name) = target {
-                    self.errs.push(VerifyError::BadProgramRef {
-                        what: format!(
-                            "fn{} b{} tseq `{name}` call in a disallowed position ({context}); \
-                             it must be the entire RHS of an Assign",
-                            self.fid.0, self.bid.0
-                        ),
-                    });
-                }
-                if helper_schema.is_none() {
-                    for a in args {
-                        self.check_expr(a, ports_ok, context);
-                    }
+                for a in args {
+                    self.check_expr(a, ports_ok, context);
                 }
             }
         }
     }
 
-    fn check_tseq_call(&mut self, dest: LocalId, name: &str, args: &[Expr]) {
-        let mut matches = self.prog.functions.iter().filter(|function| {
-            function.name == name && matches!(function.kind, FunctionKind::Tseq { .. })
-        });
-        let Some(target) = matches.next() else {
+    fn check_tseq_call(&mut self, dest: LocalId, function: FunctionId, name: &str, args: &[Expr]) {
+        let Some(target) = self
+            .prog
+            .functions
+            .get(function.index())
+            .filter(|candidate| {
+                candidate.id == function
+                    && candidate.name == name
+                    && matches!(candidate.kind, FunctionKind::Tseq { .. })
+            })
+        else {
             self.errs.push(VerifyError::BadProgramRef {
                 what: format!(
-                    "fn{} b{} tseq call `{name}` resolves to no Tseq function",
+                    "fn{} b{} references missing tseq `{name}`",
                     self.fid.0, self.bid.0
                 ),
             });
             return;
         };
-        if matches.next().is_some() {
-            self.errs.push(VerifyError::BadProgramRef {
-                what: format!(
-                    "fn{} b{} tseq call `{name}` resolves ambiguously",
-                    self.fid.0, self.bid.0
-                ),
-            });
-            return;
-        }
         if args.len() != target.params.len() {
             self.errs.push(VerifyError::BadProgramRef {
                 what: format!(
-                    "fn{} b{} tseq call `{name}` takes {} arguments, got {}",
+                    "fn{} b{} tseq `{name}` takes {} argument(s), call carries {}",
                     self.fid.0,
                     self.bid.0,
                     target.params.len(),
@@ -7097,15 +9654,15 @@ impl Checker<'_> {
             let actual = self
                 .aggregate_assignment_expr_type(arg)
                 .unwrap_or(IrType::Unknown);
-            if actual != IrType::Unknown && !assign_compatible(&param.ty, &actual) {
+            if actual != IrType::Unknown && !call_argument_type_compatible(&param.ty, &actual) {
                 self.errs.push(VerifyError::BadProgramRef {
                     what: format!(
-                        "fn{} b{} tseq call `{name}` argument {} expects {:?}, got {:?}",
+                        "fn{} b{} tseq `{name}` argument {} has type {:?}, expected {:?}",
                         self.fid.0,
                         self.bid.0,
                         index + 1,
-                        param.ty,
-                        actual
+                        actual,
+                        param.ty
                     ),
                 });
             }
@@ -7148,14 +9705,26 @@ impl Checker<'_> {
             block: bid,
             detail,
         };
-        let Expr::Call(CallTarget::TransactorSelfMethod { transactor, method }, args) = call else {
+        let Expr::Call(
+            CallTarget::TransactorSelfMethod {
+                transactor,
+                transactor_name,
+                method,
+                function,
+            },
+            args,
+        ) = call
+        else {
             self.errs
                 .push(bad("payload is not a TransactorSelfMethod call".to_string()));
             return;
         };
-        let FunctionKind::TransactorBody { transactor: xid } = self.func.kind else {
+        let FunctionKind::TransactorBody {
+            transactor: xid, ..
+        } = self.func.kind
+        else {
             self.errs.push(bad(format!(
-                "`{transactor}.{method}` sibling call outside a transactor method body"
+                "`{transactor_name}.{method}` sibling call outside a transactor method body"
             )));
             return;
         };
@@ -7164,10 +9733,10 @@ impl Checker<'_> {
                 .push(bad(format!("transactor t{} does not resolve", xid.0)));
             return;
         };
-        if schema.name != *transactor {
+        if xid != *transactor || schema.name != *transactor_name {
             self.errs.push(bad(format!(
-                "sibling call names transactor `{transactor}` from `{}` body",
-                schema.name
+                "sibling call names transactor x{} `{transactor_name}` from x{} `{}` body",
+                transactor.0, xid.0, schema.name
             )));
             return;
         }
@@ -7178,6 +9747,12 @@ impl Checker<'_> {
             )));
             return;
         };
+        if m.function != *function {
+            self.errs.push(bad(format!(
+                "transactor sibling method `{}.{method}` resolves to fn{} but the call carries fn{}",
+                schema.name, m.function.0, function.0
+            )));
+        }
         if args.len() != m.param_names.len() {
             self.errs.push(bad(format!(
                 "transactor method `{}.{method}` takes {} argument(s), call passes {}",
@@ -7198,10 +9773,12 @@ impl Checker<'_> {
                 let actual = if matches!(expected, IrType::FixedVec { .. }) {
                     self.expr_whole_vec_type(arg).ok().flatten()
                 } else {
-                    expr_type(self.prog, self.func, arg)
+                    self.aggregate_assignment_expr_type(arg)
                 };
                 match actual {
-                    Some(actual) if assign_compatible(expected, &actual) => {}
+                    Some(actual)
+                        if assign_compatible(expected, &actual)
+                            && call_argument_type_compatible(expected, &actual) => {}
                     Some(actual) => self.errs.push(bad(format!(
                         "transactor method `{}.{method}` parameter {} expects {expected:?}, got {actual:?}",
                         schema.name,
@@ -7227,8 +9804,7 @@ impl Checker<'_> {
             self.errs.push(bad(format!(
                 "transactor method `{}.{method}` must return a scalar truth value in a wait \
                  predicate, got {:?}",
-                schema.name,
-                m.ret_ty
+                schema.name, m.ret_ty
             )));
         }
         if let Some(dest) = dest {
@@ -7270,22 +9846,21 @@ impl Checker<'_> {
         dest: Option<LocalId>,
         bus_field: &str,
         method: &str,
+        target: &crate::ir::TransactorMethodTarget,
         args: &[Expr],
+        fork_tag: Option<Option<u64>>,
     ) {
-        // A `TransactorBody` function may carry a downstream blocking
-        // bus-call edge when it is a bound-to target responder
-        // re-issuing a TLM call (nested forwarding). The responder body
-        // is lowered standalone (no owner testbench), so the binding's
-        // wire names cannot be resolved here — emission resolves the edge
-        // against the binding testbench's `bus_bindings` (raising an
-        // EmitError if the downstream binding is absent). Only argument
-        // purity is checked here (below); the Run/Check resolution arm is
-        // skipped for the owner-less responder case.
-        if matches!(self.func.kind, FunctionKind::TransactorBody { .. })
-            && self.func.owner.is_none()
-        {
-            // Downstream forwarding edge — defer wire resolution to emit.
-        } else if !matches!(self.func.kind, FunctionKind::Run | FunctionKind::Check) {
+        if matches!(target, crate::ir::TransactorMethodTarget::Callable { .. }) {
+            self.bad_transactor(format!(
+                "`{bus_field}.{method}` carries a typed transactor callable on an Assign RHS"
+            ));
+        } else if !matches!(
+            self.func.kind,
+            FunctionKind::TestBody { .. }
+                | FunctionKind::TestbenchMethod { .. }
+                | FunctionKind::TransactorBody { .. }
+                | FunctionKind::ComponentMethod { .. }
+        ) {
             self.bad_transactor(format!(
                 "`{bus_field}.{method}` call edge in a {:?}-kind function \
                  (allowed only in Run/Check bodies or a bound-to responder \
@@ -7293,42 +9868,85 @@ impl Checker<'_> {
                 self.func.kind
             ));
         } else {
-            let owner_tb = self
-                .func
-                .owner
-                .and_then(|tb| self.prog.testbenches.get(tb.index()));
-            let binding =
-                owner_tb.and_then(|tb| tb.bus_bindings.iter().find(|b| b.field == bus_field));
-            let diag = match binding {
-                None if owner_tb
-                    .is_some_and(|tb| tb.transactor_fields.iter().any(|(f, _)| f == bus_field)) =>
-                {
-                    Some(format!(
-                        "`{bus_field}.{method}` names a transactor field but rides an \
-                         Assign RHS — transactor-bound edges must be a \
-                         Stmt::TransactorCall payload"
-                    ))
+            let bindings = self.applicable_bus_bindings(bus_field, method, target);
+            let actual_args = args
+                .iter()
+                .map(|arg| self.aggregate_assignment_expr_type(arg))
+                .collect::<Vec<_>>();
+            let destination = dest
+                .and_then(|local| self.func.locals.get(local.index()))
+                .map(|local| local.ty.clone());
+            let mut reference: Option<(String, crate::ir::TlmMethodSchema)> = None;
+            for (binding_label, binding) in bindings {
+                let Some(schema) = binding
+                    .methods
+                    .iter()
+                    .find(|candidate| candidate.name == method)
+                    .cloned()
+                else {
+                    self.bad_transactor(format!(
+                        "{binding_label} bus `{}` (binding `{bus_field}`) has no tlm_method `{method}`",
+                        binding.bus
+                    ));
+                    continue;
+                };
+                if let Some((reference_label, reference_schema)) = &reference {
+                    if reference_schema != &schema {
+                        self.bad_transactor(format!(
+                            "`{bus_field}.{method}` has divergent schemas in {reference_label} and {binding_label}"
+                        ));
+                    }
+                } else {
+                    reference = Some((binding_label.clone(), schema.clone()));
                 }
-                None => Some(format!(
-                    "`{bus_field}.{method}` does not resolve: owning testbench has no \
-                     bus binding `{bus_field}`"
-                )),
-                Some(b) => match b.methods.iter().find(|m| m.name == method) {
-                    None => Some(format!(
-                        "bus `{}` (binding `{bus_field}`) has no tlm_method `{method}`",
-                        b.bus
-                    )),
-                    Some(m) if m.args.len() != args.len() => Some(format!(
-                        "`{bus_field}.{method}` arity mismatch: schema declares {} \
-                         arg(s), call carries {}",
-                        m.args.len(),
+                if schema.args.len() != args.len() || schema.arg_types.len() != schema.args.len() {
+                    self.bad_transactor(format!(
+                        "{binding_label} `{bus_field}.{method}` arity mismatch: schema declares {} name(s)/{} type(s), call carries {} argument(s)",
+                        schema.args.len(),
+                        schema.arg_types.len(),
                         args.len()
-                    )),
-                    Some(_) => None,
-                },
-            };
-            if let Some(what) = diag {
-                self.bad_transactor(what);
+                    ));
+                }
+                for (index, (actual, expected)) in
+                    actual_args.iter().zip(schema.arg_types.iter()).enumerate()
+                {
+                    if let Some(actual) = actual {
+                        if !aggregate_assignment_compatible(expected, actual) {
+                            self.bad_transactor(format!(
+                                "{binding_label} `{bus_field}.{method}` argument {} has type {actual:?}, expected {expected:?}",
+                                index + 1
+                            ));
+                        }
+                    }
+                }
+                if let Some(actual) = destination
+                    .as_ref()
+                    .filter(|actual| !matches!(actual, IrType::Unknown))
+                {
+                    match &schema.ret_type {
+                        Some(expected) if assign_compatible(actual, expected) => {}
+                        Some(expected) => self.bad_transactor(format!(
+                            "{binding_label} `{bus_field}.{method}` returns {expected:?}, but destination is {actual:?}"
+                        )),
+                        None => self.bad_transactor(format!(
+                            "{binding_label} void TLM method `{bus_field}.{method}` is captured into a destination"
+                        )),
+                    }
+                }
+                let mode_valid = match (&schema.mode, fork_tag) {
+                    (crate::ir::TlmMethodMode::Blocking, None) => true,
+                    (crate::ir::TlmMethodMode::Blocking, Some(None)) => true,
+                    (crate::ir::TlmMethodMode::OutOfOrder { .. }, None) => false,
+                    (crate::ir::TlmMethodMode::Blocking, Some(Some(_))) => false,
+                    (crate::ir::TlmMethodMode::OutOfOrder { tags }, Some(Some(tag))) => tag < *tags,
+                    (crate::ir::TlmMethodMode::OutOfOrder { .. }, Some(None)) => false,
+                };
+                if !mode_valid {
+                    self.bad_transactor(format!(
+                        "{binding_label} `{bus_field}.{method}` has call tag {fork_tag:?}, incompatible with declared mode {:?}",
+                        schema.mode
+                    ));
+                }
             }
         }
         for a in args {
@@ -7358,6 +9976,180 @@ impl Checker<'_> {
                 "`{bus_field}.{method}` returns a dynamic-list record over a fixed TLM response wire"
             ));
         }
+    }
+
+    fn applicable_bus_bindings(
+        &mut self,
+        bus_field: &str,
+        method: &str,
+        target: &crate::ir::TransactorMethodTarget,
+    ) -> Vec<(String, crate::ir::BusBindingSchema)> {
+        let mut bindings = Vec::new();
+        match target {
+            crate::ir::TransactorMethodTarget::ConcreteBusBinding { binding, field } => {
+                if field != bus_field {
+                    self.bad_transactor(format!(
+                        "`{bus_field}.{method}` carries mismatched concrete binding field `{field}`"
+                    ));
+                    return bindings;
+                }
+                let Some(testbench) = self.owner_testbench() else {
+                    self.bad_transactor(format!(
+                        "`{bus_field}.{method}` has no owning testbench for concrete binding bb{}",
+                        binding.0
+                    ));
+                    return bindings;
+                };
+                let label = format!("testbench `{}`", testbench.name);
+                match testbench
+                    .bus_binding(*binding)
+                    .filter(|candidate| candidate.field == *field)
+                {
+                    Some(candidate) => bindings.push((label, candidate.clone())),
+                    None => self.bad_transactor(format!(
+                        "`{bus_field}.{method}` does not resolve concrete bus binding `{field}` bb{} in {label}",
+                        binding.0
+                    )),
+                }
+            }
+            crate::ir::TransactorMethodTarget::TestbenchBusField {
+                testbench,
+                field,
+                bus,
+            } => {
+                if field != bus_field
+                    || !matches!(
+                        self.func.kind,
+                        FunctionKind::TestbenchMethod {
+                            testbench: owner,
+                            ..
+                        } if owner == *testbench
+                    )
+                {
+                    self.bad_transactor(format!(
+                        "`{bus_field}.{method}` carries mismatched reusable testbench binding metadata"
+                    ));
+                    return bindings;
+                }
+                let mut candidates = self
+                    .prog
+                    .testbenches
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, schema)| schema.type_id == *testbench)
+                    .map(|(index, schema)| {
+                        (
+                            index,
+                            schema.name.clone(),
+                            schema
+                                .bus_bindings
+                                .iter()
+                                .find(|binding| binding.field == *field)
+                                .cloned(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                candidates
+                    .sort_by(|lhs, rhs| (lhs.1.as_str(), lhs.0).cmp(&(rhs.1.as_str(), rhs.0)));
+                if candidates.is_empty() {
+                    self.bad_transactor(format!(
+                        "`{bus_field}.{method}` has no implementation for reusable testbench type tbt{}",
+                        testbench.0
+                    ));
+                }
+                for (index, name, candidate) in candidates {
+                    let label = format!("testbench `{name}` (tb{index})");
+                    match candidate {
+                        Some(candidate) if candidate.bus == *bus => {
+                            bindings.push((label, candidate));
+                        }
+                        Some(candidate) => self.bad_transactor(format!(
+                            "reusable testbench bus field `{field}` in {label} has bus type `{}`, expected `{bus}`",
+                            candidate.bus
+                        )),
+                        None => self.bad_transactor(format!(
+                            "reusable testbench bus field `{field}` is missing from {label} of tbt{}",
+                            testbench.0
+                        )),
+                    }
+                }
+            }
+            crate::ir::TransactorMethodTarget::BoundBus => {
+                let owner = match self.func.kind {
+                    FunctionKind::TransactorBody { transactor, .. } => {
+                        crate::ir::BoundBusOwner::Transactor(transactor)
+                    }
+                    FunctionKind::ComponentMethod { component, .. } => {
+                        crate::ir::BoundBusOwner::Component(component)
+                    }
+                    _ => {
+                        self.bad_transactor(format!(
+                            "`{bus_field}.{method}` carries an unresolved bound-bus target outside a bound callable"
+                        ));
+                        return bindings;
+                    }
+                };
+                let mut contexts = self
+                    .prog
+                    .tests
+                    .iter()
+                    .filter_map(|test| {
+                        self.prog
+                            .testbenches
+                            .get(test.testbench.index())
+                            .map(|testbench| (test.name.clone(), testbench.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                contexts.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
+                for (test_name, testbench) in contexts {
+                    let target_binding = match owner {
+                        crate::ir::BoundBusOwner::Transactor(transactor)
+                            if testbench
+                                .target_tlm_actors
+                                .iter()
+                                .any(|actor| actor.transactor == transactor) =>
+                        {
+                            testbench
+                                .bus_bindings
+                                .iter()
+                                .find(|binding| binding.field == bus_field)
+                        }
+                        _ => None,
+                    };
+                    if let Some(binding) = target_binding {
+                        bindings.push((format!("test `{test_name}`"), binding.clone()));
+                        continue;
+                    }
+                    for instance in testbench
+                        .bound_bus_instances
+                        .iter()
+                        .filter(|instance| instance.owner == owner)
+                    {
+                        match testbench.bus_binding(instance.binding) {
+                            Some(binding) => bindings.push((
+                                format!("test `{test_name}` instance `{}`", instance.field),
+                                binding.clone(),
+                            )),
+                            None => self.bad_transactor(format!(
+                                "test `{test_name}` bound owner {owner:?} references missing binding bb{}",
+                                instance.binding.0
+                            )),
+                        }
+                    }
+                }
+                bindings.sort_by(|lhs, rhs| {
+                    (lhs.0.as_str(), lhs.1.id).cmp(&(rhs.0.as_str(), rhs.1.id))
+                });
+                bindings.dedup_by(|lhs, rhs| lhs.0 == rhs.0 && lhs.1.id == rhs.1.id);
+                if bindings.is_empty() {
+                    self.bad_transactor(format!(
+                        "`{bus_field}.{method}` has no concrete binding for bound owner {owner:?}"
+                    ));
+                }
+            }
+            crate::ir::TransactorMethodTarget::Callable { .. } => {}
+        }
+        bindings
     }
 }
 
@@ -7413,7 +10205,7 @@ fn check_port_snapshot_definitions(
 
 /// Best-effort expression typing for invariant 15. Returns `None` when
 /// the expression's type cannot be locally determined.
-fn common_scalar_expr_type(lhs: Option<IrType>, rhs: Option<IrType>) -> Option<IrType> {
+pub(crate) fn common_scalar_expr_type(lhs: Option<IrType>, rhs: Option<IrType>) -> Option<IrType> {
     let (lhs, rhs) = match (lhs, rhs) {
         (Some(lhs), Some(rhs)) => (lhs, rhs),
         (lhs, rhs) => return lhs.or(rhs),
@@ -7444,7 +10236,33 @@ fn common_scalar_expr_type(lhs: Option<IrType>, rhs: Option<IrType>) -> Option<I
     })
 }
 
-fn assignment_expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option<IrType> {
+pub(crate) fn assignment_expr_type(
+    prog: &TbProgram,
+    func: &TbFunction,
+    e: &Expr,
+) -> Option<IrType> {
+    assignment_expr_type_with(
+        prog,
+        func,
+        e,
+        &|local| func.locals.get(local.index()).map(|local| local.ty.clone()),
+        &|port| {
+            port.value_type
+                .clone()
+                .or_else(|| Some(IrType::UInt(port.width)))
+        },
+        &|_| None,
+    )
+}
+
+pub(crate) fn assignment_expr_type_with(
+    prog: &TbProgram,
+    func: &TbFunction,
+    e: &Expr,
+    local_type: &impl Fn(LocalId) -> Option<IrType>,
+    port_type: &impl Fn(&PortRef) -> Option<IrType>,
+    leaf_type: &impl Fn(&Expr) -> Option<IrType>,
+) -> Option<IrType> {
     match e {
         Expr::Literal {
             value,
@@ -7457,7 +10275,7 @@ fn assignment_expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option
                         return Some(IrType::UInt(Some((64 - value.leading_zeros()).max(1))));
                     }
                 }
-                assignment_expr_type(prog, func, e)
+                assignment_expr_type_with(prog, func, e, local_type, port_type, leaf_type)
             };
             let (lhs, rhs) = (bounded(lhs), bounded(rhs));
             let shape = |ty: IrType| match ty {
@@ -7495,7 +10313,9 @@ fn assignment_expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option
                 _ => None,
             }
         }
-        Expr::Binary(BinOp::Shl | BinOp::Shr, lhs, _) => assignment_expr_type(prog, func, lhs),
+        Expr::Binary(BinOp::Shl | BinOp::Shr, lhs, _) => {
+            assignment_expr_type_with(prog, func, lhs, local_type, port_type, leaf_type)
+        }
         Expr::Binary(
             BinOp::Eq
             | BinOp::Ne
@@ -7509,30 +10329,55 @@ fn assignment_expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option
             _,
         ) => Some(IrType::Bool),
         Expr::Binary(_, lhs, rhs) => common_scalar_expr_type(
-            assignment_expr_type(prog, func, lhs),
-            assignment_expr_type(prog, func, rhs),
+            assignment_expr_type_with(prog, func, lhs, local_type, port_type, leaf_type),
+            assignment_expr_type_with(prog, func, rhs, local_type, port_type, leaf_type),
         ),
         Expr::Ternary(_, then_expr, else_expr) => common_scalar_expr_type(
-            assignment_expr_type(prog, func, then_expr),
-            assignment_expr_type(prog, func, else_expr),
+            assignment_expr_type_with(prog, func, then_expr, local_type, port_type, leaf_type),
+            assignment_expr_type_with(prog, func, else_expr, local_type, port_type, leaf_type),
         ),
         Expr::Unary(crate::ir::UnOp::Not, _) => Some(IrType::Bool),
         Expr::Unary(crate::ir::UnOp::BitNotHost, _) => Some(IrType::SInt(None)),
-        Expr::Unary(_, inner) => assignment_expr_type(prog, func, inner),
-        _ => expr_type(prog, func, e),
+        Expr::Unary(_, inner) => {
+            assignment_expr_type_with(prog, func, inner, local_type, port_type, leaf_type)
+        }
+        _ => expr_type_with(prog, func, e, local_type, port_type, leaf_type),
     }
 }
 
 fn expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option<IrType> {
+    expr_type_with(
+        prog,
+        func,
+        e,
+        &|local| func.locals.get(local.index()).map(|local| local.ty.clone()),
+        &|port| {
+            port.value_type
+                .clone()
+                .or_else(|| Some(IrType::UInt(port.width)))
+        },
+        &|_| None,
+    )
+}
+
+fn expr_type_with(
+    prog: &TbProgram,
+    _func: &TbFunction,
+    e: &Expr,
+    local_type: &impl Fn(LocalId) -> Option<IrType>,
+    port_type: &impl Fn(&PortRef) -> Option<IrType>,
+    leaf_type: &impl Fn(&Expr) -> Option<IrType>,
+) -> Option<IrType> {
     match e {
         Expr::Literal { ty, .. } => Some(ty.clone()),
+        Expr::StringLiteral(_) => Some(IrType::String),
         Expr::WideLiteral(words) => Some(IrType::UInt(Some(wide_literal_bits(words)))),
-        Expr::Local(l) => func.locals.get(l.index()).map(|t| t.ty.clone()),
-        Expr::Port(port) => Some(IrType::UInt(port.width)),
-        Expr::SeqIndex { seq, .. } => match func.locals.get(seq.index()).map(|local| &local.ty) {
-            Some(IrType::RecordSeq(record)) => Some(IrType::Record(*record)),
-            Some(IrType::Seq(elem)) => Some((**elem).clone()),
-            Some(IrType::FixedVec { elem, .. }) => Some((**elem).clone()),
+        Expr::Local(local) => local_type(*local),
+        Expr::Port(port) | Expr::PortSnapshotLane { port, .. } => port_type(port),
+        Expr::SeqIndex { seq, .. } => match local_type(*seq) {
+            Some(IrType::RecordSeq(record)) => Some(IrType::Record(record)),
+            Some(IrType::Seq(elem)) => Some(*elem),
+            Some(IrType::FixedVec { elem, .. }) => Some(*elem),
             _ => None,
         },
         Expr::BitSlice { hi, lo, .. } => Some(IrType::UInt(Some(hi - lo + 1))),
@@ -7547,6 +10392,28 @@ fn expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option<IrType> {
         Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
             Some(ret.clone())
         }
+        Expr::Call(CallTarget::TransactorSelfMethod { function, .. }, _) => prog
+            .functions
+            .get(function.index())
+            .filter(|candidate| candidate.id == *function)
+            .and_then(|function| {
+                function
+                    .ret
+                    .and_then(|ret| function.locals.get(ret.index()))
+            })
+            .map(|local| local.ty.clone()),
+        Expr::Call(CallTarget::Tseq { function, name }, _) => prog
+            .functions
+            .get(function.index())
+            .filter(|candidate| {
+                candidate.id == *function
+                    && matches!(candidate.kind, FunctionKind::Tseq { .. })
+                    && candidate.name == *name
+            })
+            .and_then(|function| match &function.kind {
+                FunctionKind::Tseq { elem } => Some(elem.seq_type()),
+                _ => None,
+            }),
         Expr::ComponentIdle { .. } | Expr::TransactorIdle { .. } => Some(IrType::Bool),
         Expr::DynamicListQuery {
             query: crate::ir::DynamicListQuery::Size,
@@ -7556,6 +10423,10 @@ fn expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option<IrType> {
             query: crate::ir::DynamicListQuery::Empty,
             ..
         } => Some(IrType::Bool),
+        Expr::CycleCount | Expr::ErrorCount => Some(IrType::UInt(Some(64))),
+        Expr::TbQueueQuery { query, .. }
+        | Expr::TransactorStateQueueQuery { query, .. }
+        | Expr::ComponentQueueQuery { query, .. } => query.value_type(),
         Expr::ScoreboardQuery {
             sb,
             query: ScoreboardQuery::Scalar { scalar },
@@ -7569,15 +10440,8 @@ fn expr_type(prog: &TbProgram, func: &TbFunction, e: &Expr) -> Option<IrType> {
                 ScoreboardFieldKind::Record { record } => Some(IrType::Record(*record)),
                 _ => None,
             }),
-        Expr::ScoreboardQuery {
-            query: ScoreboardQuery::QueueSize { .. },
-            ..
-        } => Some(IrType::UInt(None)),
-        Expr::ScoreboardQuery {
-            query: ScoreboardQuery::QueueEmpty { .. },
-            ..
-        } => Some(IrType::Bool),
-        _ => None,
+        Expr::ScoreboardQuery { query, .. } => query.value_type(),
+        _ => leaf_type(e),
     }
 }
 
@@ -7595,7 +10459,12 @@ fn queue_elem_fits_dest(elem: &QueueElem, dest: &IrType) -> bool {
     matches!(dest, IrType::Unknown) || assign_compatible(dest, &elem.ir_type())
 }
 
-fn assign_compatible(expected: &IrType, actual: &IrType) -> bool {
+pub(crate) fn assign_compatible(expected: &IrType, actual: &IrType) -> bool {
+    let expected_string = matches!(expected, IrType::String);
+    let actual_string = matches!(actual, IrType::String);
+    if expected_string != actual_string {
+        return false;
+    }
     // Ordinary integer literals carry `Unknown` until a destination gives
     // them a width. Treat that as the same conservative wildcard used by
     // queue transfers; source lowering has already rejected literals that do
@@ -7624,10 +10493,41 @@ fn assign_compatible(expected: &IrType, actual: &IrType) -> bool {
     }
 }
 
+fn string_value_compatible(expected: &IrType, actual: &IrType) -> bool {
+    matches!(expected, IrType::String) == matches!(actual, IrType::String)
+}
+
+/// Preserve the established scalar call-boundary policy while making
+/// aggregate and component identities exact. Scalar direction/range checks
+/// happen during lowering, before literals and constant expressions lose
+/// their source-range information; the verifier cannot reconstruct them from
+/// the widened IR carrier alone.
+fn call_argument_type_compatible(expected: &IrType, actual: &IrType) -> bool {
+    match (expected, actual) {
+        (IrType::Component(expected), IrType::Component(actual)) => expected == actual,
+        (IrType::Component(_), _) | (_, IrType::Component(_)) => false,
+        (
+            IrType::Record(_) | IrType::RecordSeq(_) | IrType::Seq(_) | IrType::FixedVec { .. },
+            _,
+        )
+        | (
+            _,
+            IrType::Record(_) | IrType::RecordSeq(_) | IrType::Seq(_) | IrType::FixedVec { .. },
+        ) => aggregate_assignment_compatible(expected, actual),
+        _ => string_value_compatible(expected, actual),
+    }
+}
+
 fn aggregate_assignment_compatible(expected: &IrType, actual: &IrType) -> bool {
     match (expected, actual) {
         (IrType::Record(expected), IrType::Record(actual)) => expected == actual,
         (IrType::Record(_), _) | (_, IrType::Record(_)) => false,
+        (IrType::RecordSeq(expected), IrType::RecordSeq(actual)) => expected == actual,
+        (IrType::RecordSeq(_), _) | (_, IrType::RecordSeq(_)) => false,
+        (IrType::Seq(expected), IrType::Seq(actual)) => {
+            crate::ir::sequence_element_compatible(expected, actual)
+        }
+        (IrType::Seq(_), _) | (_, IrType::Seq(_)) => false,
         _ => assign_compatible(expected, actual),
     }
 }
@@ -7650,8 +10550,8 @@ fn fixed_vec_abi_compatible(expected: &IrType, actual: &IrType) -> bool {
         return false;
     };
     let (Some(expected_class), Some(actual_class)) = (
-        crate::codegen::cpp_tb::ir_vec_elem_class(expected_elem),
-        crate::codegen::cpp_tb::ir_vec_elem_class(actual_elem),
+        crate::ir::value_abi_class(expected_elem),
+        crate::ir::value_abi_class(actual_elem),
     ) else {
         return false;
     };
@@ -7754,7 +10654,11 @@ fn check_def_before_use(
     for (bi, b) in func.blocks.iter().enumerate() {
         for s in &b.stmts {
             match s {
-                Stmt::Assign(l, _) | Stmt::DutRead(l, _) | Stmt::RecordInit(l, _)
+                Stmt::Assign(l, _)
+                | Stmt::DutRead(l, _)
+                | Stmt::RecordInit(l, _)
+                | Stmt::AggregateInit(l)
+                | Stmt::ComponentInit { local: l, .. }
                 | Stmt::RecordRead { dest: l, .. } => {
                     bit_set(&mut gens[bi], l.index());
                 }
@@ -7769,6 +10673,7 @@ fn check_def_before_use(
                     ..
                 }
                 | Stmt::ComponentCall { dest: Some(l), .. }
+                | Stmt::TestbenchCall { dest: Some(l), .. }
                 | Stmt::ComponentQueuePop { dest: l, .. }
                 | Stmt::TransactorStateQueuePop { dest: l, .. }
                 | Stmt::TbQueuePop { dest: l, .. } => {
@@ -7842,7 +10747,15 @@ fn check_def_before_use(
                     check_e(e, &defined, errs);
                     bit_set(&mut defined, l.index());
                 }
-                Stmt::DutRead(l, _) | Stmt::RecordInit(l, _) | Stmt::AggregateInit(l) => {
+                Stmt::DutRead(l, port) => {
+                    crate::ir::visit::visit_port_lane_expr(port, &mut |index| {
+                        check_e(index, &defined, errs)
+                    });
+                    bit_set(&mut defined, l.index());
+                }
+                Stmt::RecordInit(l, _)
+                | Stmt::AggregateInit(l)
+                | Stmt::ComponentInit { local: l, .. } => {
                     bit_set(&mut defined, l.index());
                 }
                 Stmt::RecordRead {
@@ -7908,7 +10821,12 @@ fn check_def_before_use(
                     // Pop defines the destination local.
                     bit_set(&mut defined, dest.index());
                 }
-                Stmt::DutWrite(_, e) => check_e(e, &defined, errs),
+                Stmt::DutWrite(port, e) => {
+                    crate::ir::visit::visit_port_lane_expr(port, &mut |index| {
+                        check_e(index, &defined, errs)
+                    });
+                    check_e(e, &defined, errs);
+                }
                 Stmt::TransactorCall { dest, call } => {
                     check_e(call, &defined, errs);
                     if let Some(l) = dest {
@@ -7999,7 +10917,11 @@ fn check_def_before_use(
                         check_e(a, &defined, errs);
                     }
                 }
-                Stmt::ProbeRelease(_) => {}
+                Stmt::ProbeRelease(port) => {
+                    crate::ir::visit::visit_port_lane_expr(port, &mut |index| {
+                        check_e(index, &defined, errs)
+                    });
+                }
                 Stmt::FailDiag { guard, args } => {
                     if let Some(g) = guard {
                         check_e(g, &defined, errs);
@@ -8052,12 +10974,31 @@ fn check_def_before_use(
                         check_e(a, &defined, errs);
                     }
                 }
-                Stmt::ComponentCall { args, dest, .. } => {
+                Stmt::ComponentCall {
+                    base, args, dest, ..
+                } => {
+                    if let ComponentBase::Local(local) = base {
+                        if local.index() < nlocals && !bit_get(&defined, local.index()) {
+                            errs.push(VerifyError::LocalUseBeforeDef {
+                                func: fid,
+                                block: bid,
+                                local: *local,
+                            });
+                        }
+                    }
                     for a in args {
                         check_e(a, &defined, errs);
                     }
                     if let Some(l) = dest {
                         bit_set(&mut defined, l.index());
+                    }
+                }
+                Stmt::TestbenchCall { args, dest, .. } => {
+                    for arg in args {
+                        check_e(arg, &defined, errs);
+                    }
+                    if let Some(local) = dest {
+                        bit_set(&mut defined, local.index());
                     }
                 }
                 Stmt::SeqPush { seq, value } => {
@@ -8077,9 +11018,19 @@ fn check_def_before_use(
                     // Pop defines the destination local.
                     bit_set(&mut defined, dest.index());
                 }
-                // Whole sub-component copy — no local def/use (both ends
-                // are component values, not test locals).
-                Stmt::ComponentSubAssign { .. } => {}
+                Stmt::ComponentSubAssign { dst, src, .. } | Stmt::ComponentAssign { dst, src } => {
+                    for base in [dst, src] {
+                        if let ComponentBase::Local(local) = base {
+                            if local.index() < nlocals && !bit_get(&defined, local.index()) {
+                                errs.push(VerifyError::LocalUseBeforeDef {
+                                    func: fid,
+                                    block: bid,
+                                    local: *local,
+                                });
+                            }
+                        }
+                    }
+                }
                 Stmt::TlmFork(desc) => {
                     // Args read at the fork site; the dest is defined here
                     // (v1 declares + zero-inits `T x = {};` at the fork,
@@ -8137,112 +11088,22 @@ fn check_def_before_use(
 }
 
 fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
-    match e {
-        Expr::Literal { .. }
-        | Expr::WideLiteral(_)
-        | Expr::CycleCount
-        | Expr::ErrorCount
-        | Expr::Port(_)
-        | Expr::TbField(_)
-        | Expr::TemporalSlot { .. }
-        | Expr::TbQueueQuery { .. }
-        | Expr::TransactorState { .. }
-        | Expr::TransactorStateQueueQuery { .. }
-        | Expr::ComponentField { .. }
-        | Expr::ScoreboardQuery { .. }
-        | Expr::ComponentQueueQuery { .. }
-        | Expr::CovHookArg { .. } => {}
-        Expr::TransactorStateRecordField {
-            mid_indices, index, ..
-        } => {
-            for (_, idx) in mid_indices {
-                for_each_local(idx, f);
-            }
-            if let Some(idx) = index {
-                for_each_local(idx, f);
-            }
+    crate::ir::visit::walk_expr(e, &mut |expr| match expr {
+        Expr::Local(local)
+        | Expr::SeqLen(local)
+        | Expr::RecordField { local, .. }
+        | Expr::RegRead { mirror: local, .. }
+        | Expr::PortSnapshotLane {
+            snapshot: local, ..
         }
-        Expr::ComponentVecElement {
-            index, inner_index, ..
+        | Expr::SeqIndex { seq: local, .. } => f(*local),
+        Expr::ComponentValue {
+            base: ComponentBase::Local(local),
         }
-        | Expr::TbFieldVecElement {
-            index, inner_index, ..
-        } => {
-            for_each_local(index, f);
-            if let Some(inner) = inner_index {
-                for_each_local(inner, f);
-            }
-        }
-        Expr::ComponentValue { base } => {
-            if let crate::ir::ComponentBase::Local(l) = base {
-                f(*l);
-            }
-        }
-        Expr::Local(l) => f(*l),
-        Expr::RecordField {
-            local,
-            mid_indices,
-            index,
+        | Expr::ComponentIdle {
+            base: ComponentBase::Local(local),
             ..
-        } => {
-            f(*local);
-            for (_, idx) in mid_indices {
-                for_each_local(idx, f);
-            }
-            if let Some(idx) = index {
-                for_each_local(idx, f);
-            }
-        }
-        // The mirror record local is both used (read) and written (the
-        // inline assignment-expression predict), but it was defined at
-        // its `let` RecordInit site upstream — record it as a use.
-        Expr::RegRead { mirror, .. } => f(*mirror),
-        Expr::Binary(_, a, b) => {
-            for_each_local(a, f);
-            for_each_local(b, f);
-        }
-        Expr::Unary(_, a) => for_each_local(a, f),
-        Expr::DynamicListQuery { target, .. } => for_each_local(target, f),
-        Expr::BitSlice { target, .. } => for_each_local(target, f),
-        Expr::BitSliceDyn { target, hi, lo } => {
-            for_each_local(target, f);
-            for_each_local(hi, f);
-            for_each_local(lo, f);
-        }
-        Expr::PortSnapshotLane {
-            snapshot, index, ..
-        } => {
-            f(*snapshot);
-            for_each_local(index, f);
-        }
-        Expr::Ternary(c, t, e) => {
-            for_each_local(c, f);
-            for_each_local(t, f);
-            for_each_local(e, f);
-        }
-        Expr::WidthCast { inner, .. } => for_each_local(inner, f),
-        Expr::ComponentIdle { base, n, .. } => {
-            if let ComponentBase::Local(local) = base {
-                f(*local);
-            }
-            for_each_local(n, f);
-        }
-        Expr::TransactorIdle { n, .. } => for_each_local(n, f),
-        Expr::CovBin { .. } => {}
-        Expr::CovHookParam { index, .. } => {
-            if let Some(i) = index {
-                for_each_local(i, f);
-            }
-        }
-        Expr::SeqLen(l) => f(*l),
-        Expr::SeqIndex { seq, index } => {
-            f(*seq);
-            for_each_local(index, f);
-        }
-        Expr::Call(_, args) => {
-            for a in args {
-                for_each_local(a, f);
-            }
-        }
-    }
+        } => f(*local),
+        _ => {}
+    });
 }

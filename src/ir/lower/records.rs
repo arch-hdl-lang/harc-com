@@ -195,6 +195,8 @@ pub(crate) fn lower_transaction(
     enum_names: &std::collections::HashSet<String>,
     record_ids: &HashMap<String, RecordId>,
     consts: &HashMap<String, super::ConstVal>,
+    diagnostics: &super::LowerDiagnosticRecorder,
+    source_id: crate::ast::SourceId,
 ) -> Result<RecordSchema, LowerError> {
     let txn = &t.name.name;
     if !t.params.is_empty() {
@@ -233,6 +235,9 @@ pub(crate) fn lower_transaction(
     for item in &t.body {
         match item {
             TxnBodyItem::Field(f) => {
+                if let Some(span) = super::helpers::nested_string_type_span(Some(&f.ty)) {
+                    diagnostics.record(source_id, span);
+                }
                 lower_record_field(
                     "transaction",
                     txn,
@@ -313,6 +318,8 @@ pub(crate) fn lower_struct(
     enum_names: &std::collections::HashSet<String>,
     record_ids: &HashMap<String, RecordId>,
     consts: &HashMap<String, super::ConstVal>,
+    diagnostics: &super::LowerDiagnosticRecorder,
+    source_id: crate::ast::SourceId,
 ) -> Result<RecordSchema, LowerError> {
     let sname = &s.name.name;
     let mut fields: Vec<RecordFieldSchema> = Vec::new();
@@ -324,6 +331,9 @@ pub(crate) fn lower_struct(
     // scanned solely to reject the non-field items a struct must not
     // carry in this subset.
     for f in &s.fields {
+        if let Some(span) = super::helpers::nested_string_type_span(Some(&f.ty)) {
+            diagnostics.record(source_id, span);
+        }
         lower_record_field(
             "struct",
             sname,
@@ -378,6 +388,12 @@ fn lower_record_field(
     consts: &HashMap<String, super::ConstVal>,
 ) -> Result<(), LowerError> {
     let fname = &f.name.name;
+    if super::helpers::is_nested_string_type(Some(&f.ty)) {
+        return Err(unsupported(
+            &format!("{kind} `{owner}` field `{fname}` whose type contains `String`"),
+            "String containers and aggregates are not supported in persistent fields",
+        ));
+    }
     if fields.iter().any(|x| x.name == *fname) {
         return Err(LowerError::Invalid(format!(
             "{kind} `{owner}` declares field `{fname}` more than once"
@@ -678,7 +694,13 @@ fn fixed_vec_field(
         }
         _ => return None,
     };
-    let elem_ty = if matches!(elem, TypeExpr::Builtin { name: BuiltinTy::Vec, .. }) {
+    let elem_ty = if matches!(
+        elem,
+        TypeExpr::Builtin {
+            name: BuiltinTy::Vec,
+            ..
+        }
+    ) {
         super::components::fixed_vec_elem_ir_type(elem)?
     } else {
         field_ir_type(elem, enum_names)?

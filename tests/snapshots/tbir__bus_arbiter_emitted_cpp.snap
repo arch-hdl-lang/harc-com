@@ -55,11 +55,6 @@ static void _harc_eval_posedge(DUT* dut) {
     dut->eval();
 }
 
-static harc_rt::random::HarcRng harc_rng;
-static inline uint64_t harc_rng_next() {
-    return harc_rng.next();
-}
-
 struct ArbCov {
     struct {
         uint64_t r0 = 0;
@@ -73,7 +68,7 @@ struct ArbCov {
     } cp_valid;
     uint64_t _auto_cross_cp_grant__cp_valid[4][2] = {};
 
-    void report() const {
+    void report(harc_rt::log::HarcLogContext& log_ctx) const {
         uint64_t _total = 6; uint64_t _hit = 0;
         if (cp_grant.r0 > 0) _hit++;
         if (cp_grant.r1 > 0) _hit++;
@@ -82,40 +77,40 @@ struct ArbCov {
         if (cp_valid.granted > 0) _hit++;
         if (cp_valid.no_request > 0) _hit++;
         harc_rt::log::harc_print_covergroup_summary("ArbCov", _hit, _total);
-        harc_rt::log::harc_cov_json_summary("ArbCov", _hit, _total);
+        harc_rt::log::harc_cov_json_summary(log_ctx.coverage_json, "ArbCov", _hit, _total);
         harc_rt::log::harc_print_covergroup_bin("cp_grant", "r0", cp_grant.r0);
-        harc_rt::log::harc_cov_json_bin("ArbCov", "cp_grant", "r0", cp_grant.r0);
+        harc_rt::log::harc_cov_json_bin(log_ctx.coverage_json, "ArbCov", "cp_grant", "r0", cp_grant.r0);
         harc_rt::log::harc_print_covergroup_bin("cp_grant", "r1", cp_grant.r1);
-        harc_rt::log::harc_cov_json_bin("ArbCov", "cp_grant", "r1", cp_grant.r1);
+        harc_rt::log::harc_cov_json_bin(log_ctx.coverage_json, "ArbCov", "cp_grant", "r1", cp_grant.r1);
         harc_rt::log::harc_print_covergroup_bin("cp_grant", "r2", cp_grant.r2);
-        harc_rt::log::harc_cov_json_bin("ArbCov", "cp_grant", "r2", cp_grant.r2);
+        harc_rt::log::harc_cov_json_bin(log_ctx.coverage_json, "ArbCov", "cp_grant", "r2", cp_grant.r2);
         harc_rt::log::harc_print_covergroup_bin("cp_grant", "r3", cp_grant.r3);
-        harc_rt::log::harc_cov_json_bin("ArbCov", "cp_grant", "r3", cp_grant.r3);
+        harc_rt::log::harc_cov_json_bin(log_ctx.coverage_json, "ArbCov", "cp_grant", "r3", cp_grant.r3);
         harc_rt::log::harc_print_covergroup_bin("cp_valid", "granted", cp_valid.granted);
-        harc_rt::log::harc_cov_json_bin("ArbCov", "cp_valid", "granted", cp_valid.granted);
+        harc_rt::log::harc_cov_json_bin(log_ctx.coverage_json, "ArbCov", "cp_valid", "granted", cp_valid.granted);
         harc_rt::log::harc_print_covergroup_bin("cp_valid", "no_request", cp_valid.no_request);
-        harc_rt::log::harc_cov_json_bin("ArbCov", "cp_valid", "no_request", cp_valid.no_request);
+        harc_rt::log::harc_cov_json_bin(log_ctx.coverage_json, "ArbCov", "cp_valid", "no_request", cp_valid.no_request);
         {
             uint64_t _cross_hit = 0;
             uint64_t _cross_missing = 0;
             for (size_t _i = 0; _i < 4; ++_i) for (size_t _j = 0; _j < 2; ++_j) if (_auto_cross_cp_grant__cp_valid[_i][_j] > 0) _cross_hit++;
             harc_rt::log::harc_print_covergroup_cross_summary("ArbCov", "auto_cross", "cp_grant x cp_valid", _cross_hit, 8);
-            harc_rt::log::harc_cov_json_cross_summary("ArbCov", "auto_cross", "cp_grant x cp_valid", _cross_hit, 8);
-            harc_rt::log::harc_cov_json_cross_bin("ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r0 x cp_valid.granted", _auto_cross_cp_grant__cp_valid[0][0]);
+            harc_rt::log::harc_cov_json_cross_summary(log_ctx.coverage_json, "ArbCov", "auto_cross", "cp_grant x cp_valid", _cross_hit, 8);
+            harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, "ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r0 x cp_valid.granted", _auto_cross_cp_grant__cp_valid[0][0]);
             if (_auto_cross_cp_grant__cp_valid[0][0] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_grant.r0 x cp_valid.granted"); _cross_missing++; }
-            harc_rt::log::harc_cov_json_cross_bin("ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r0 x cp_valid.no_request", _auto_cross_cp_grant__cp_valid[0][1]);
+            harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, "ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r0 x cp_valid.no_request", _auto_cross_cp_grant__cp_valid[0][1]);
             if (_auto_cross_cp_grant__cp_valid[0][1] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_grant.r0 x cp_valid.no_request"); _cross_missing++; }
-            harc_rt::log::harc_cov_json_cross_bin("ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r1 x cp_valid.granted", _auto_cross_cp_grant__cp_valid[1][0]);
+            harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, "ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r1 x cp_valid.granted", _auto_cross_cp_grant__cp_valid[1][0]);
             if (_auto_cross_cp_grant__cp_valid[1][0] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_grant.r1 x cp_valid.granted"); _cross_missing++; }
-            harc_rt::log::harc_cov_json_cross_bin("ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r1 x cp_valid.no_request", _auto_cross_cp_grant__cp_valid[1][1]);
+            harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, "ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r1 x cp_valid.no_request", _auto_cross_cp_grant__cp_valid[1][1]);
             if (_auto_cross_cp_grant__cp_valid[1][1] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_grant.r1 x cp_valid.no_request"); _cross_missing++; }
-            harc_rt::log::harc_cov_json_cross_bin("ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r2 x cp_valid.granted", _auto_cross_cp_grant__cp_valid[2][0]);
+            harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, "ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r2 x cp_valid.granted", _auto_cross_cp_grant__cp_valid[2][0]);
             if (_auto_cross_cp_grant__cp_valid[2][0] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_grant.r2 x cp_valid.granted"); _cross_missing++; }
-            harc_rt::log::harc_cov_json_cross_bin("ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r2 x cp_valid.no_request", _auto_cross_cp_grant__cp_valid[2][1]);
+            harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, "ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r2 x cp_valid.no_request", _auto_cross_cp_grant__cp_valid[2][1]);
             if (_auto_cross_cp_grant__cp_valid[2][1] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_grant.r2 x cp_valid.no_request"); _cross_missing++; }
-            harc_rt::log::harc_cov_json_cross_bin("ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r3 x cp_valid.granted", _auto_cross_cp_grant__cp_valid[3][0]);
+            harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, "ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r3 x cp_valid.granted", _auto_cross_cp_grant__cp_valid[3][0]);
             if (_auto_cross_cp_grant__cp_valid[3][0] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_grant.r3 x cp_valid.granted"); _cross_missing++; }
-            harc_rt::log::harc_cov_json_cross_bin("ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r3 x cp_valid.no_request", _auto_cross_cp_grant__cp_valid[3][1]);
+            harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, "ArbCov", "auto_cross", "cp_grant x cp_valid", "cp_grant.r3 x cp_valid.no_request", _auto_cross_cp_grant__cp_valid[3][1]);
             if (_auto_cross_cp_grant__cp_valid[3][1] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_grant.r3 x cp_valid.no_request"); _cross_missing++; }
             harc_rt::log::harc_print_covergroup_more_missing(_cross_missing, 16, "auto-cross");
         }
@@ -130,6 +125,7 @@ struct BusArbiterTb {
 };
 
 struct HarcTestContext {
+    VerilatedContext verilated;
     VBusArbiter* dut = nullptr;
 #if HARC_TRACE_ENABLED
     HarcTraceC* tfp = nullptr;
@@ -141,15 +137,16 @@ struct HarcTestContext {
     int cycle_count = 0;
     harc_rt::trace::HarcTraceWriter trace;
     harc_rt::log::HarcLogContext log_ctx;
+    harc_rt::random::HarcRng rng;
     std::vector<std::function<void()>> _checkers;
     std::vector<std::function<void()>> _post_eval_services;
     std::vector<std::function<void()>> _auto_cov_reports;
 };
 
 int run_BusArbiterTest(int argc, char** argv) {
-    Verilated::commandArgs(argc, argv);
     HarcTestContext ctx;
-    ctx.dut = new VBusArbiter;
+    ctx.verilated.commandArgs(argc, argv);
+    ctx.dut = harc_rt::log::harc_make_dut<VBusArbiter>(&ctx.verilated);
     auto* dut = ctx.dut;
 #if HARC_TRACE_ENABLED
     auto* tfp = ctx.tfp;
@@ -161,6 +158,8 @@ int run_BusArbiterTest(int argc, char** argv) {
     auto& cycle_count = ctx.cycle_count;
     auto& trace = ctx.trace;
     auto& log_ctx = ctx.log_ctx;
+    auto& harc_rng = ctx.rng;
+    auto harc_rng_next = [&]() { return harc_rng.next(); };
     auto& _checkers = ctx._checkers;
     auto& _post_eval_services = ctx._post_eval_services;
     auto& _auto_cov_reports = ctx._auto_cov_reports;
@@ -223,7 +222,7 @@ int run_BusArbiterTest(int argc, char** argv) {
     // scheduler tick — same semantics as `log(fatal, ...)`. Emitted
     // verbatim by both codegens so the two traces stay diffable.
     harc_rt::HarcQueueFatalScope _queue_fatal_scope([&]() {
-        sim_log_line("FATAL", "pop() on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed");
+        sim_log_line("FATAL", "queue front/pop on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed");
         ctx.errors++;
         _fatal = true;
     });
@@ -325,7 +324,7 @@ int run_BusArbiterTest(int argc, char** argv) {
             while (!__done) {
                 switch (__bb) {
                 case 0: {
-                    _tb.cov.report();
+                    _tb.cov.report(log_ctx);
                     if (!((_tb.cov.cp_grant.r0 > 0))) {
                         sim_log_line("FAIL", "R0 grant coverage hole");
                         ctx.errors++;
@@ -395,8 +394,12 @@ int run_BusArbiterTest(int argc, char** argv) {
 
 
     for (auto& _r : _auto_cov_reports) _r();
+    _auto_cov_reports.clear();
+    _post_eval_services.clear();
+    _checkers.clear();
+    harc_rt::harc_destroy_scheduler_threads(sched);
     dut->final();
-    HARC_RT_WRITE_COVERAGE(Verilated::threadContextp()->coveragep());
+    HARC_RT_WRITE_COVERAGE(ctx.verilated.coveragep());
     HARC_RT_CLOSE_WAVE_TRACE(tfp);
     delete dut;
 

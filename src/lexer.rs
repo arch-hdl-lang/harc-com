@@ -21,7 +21,7 @@ pub struct Token {
 /// `u32::MAX`, and span offsets key the randomize-problem tables and appear in
 /// generated C++ identifiers. Saturating here only keeps a construction that
 /// slipped past the check from wrapping into a wildly wrong offset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Span {
     pub start: u32,
     pub end: u32,

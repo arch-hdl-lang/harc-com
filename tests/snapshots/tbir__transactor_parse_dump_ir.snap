@@ -13,8 +13,8 @@ tb-ir program
   component c0 AxilXactor (transactor)
     field completed : out event<Completion>
     field req active-only : out event<RegOp>
-    on bus.b.handshake [(dut.axil.b.valid && dut.axil.b.ready)] (rising) = fn1
-    on bus.r.handshake [(dut.axil.r.valid && dut.axil.r.ready)] (rising) = fn2
+    on bus.b.handshake [(dut.bus.b.valid && dut.bus.b.ready)] (rising) = fn1
+    on bus.r.handshake [(dut.bus.r.valid && dut.bus.r.ready)] (rising) = fn2
 
 fn fn0 comp_on_0 [kind=ComponentMethod(c0)]
   params:
@@ -26,16 +26,16 @@ fn fn0 comp_on_0 [kind=ComponentMethod(c0)]
   entry = b0
 
   b0:
-    DutWrite(dut.axil.aw.addr, %t.addr)
-    DutWrite(dut.axil.aw.valid, 1)
-    DutWrite(dut.axil.w.data, %t.value)
-    DutWrite(dut.axil.w.strb, 15)
-    DutWrite(dut.axil.w.valid, 1)
+    DutWrite(dut.bus.aw.addr, %t.addr)
+    DutWrite(dut.bus.aw.valid, 1)
+    DutWrite(dut.bus.w.data, %t.value)
+    DutWrite(dut.bus.w.strb, 15)
+    DutWrite(dut.bus.w.valid, 1)
     Assign(%__t0, 16)
     -> Jump(b1)
 
   b1:
-    DutRead(%__t1, dut.axil.w.ready)
+    DutRead(%__t1, dut.bus.w.ready)
     -> Branch((!%__t1 && (%__t0 > 0)), b2, b4)
 
   b2:
@@ -49,8 +49,8 @@ fn fn0 comp_on_0 [kind=ComponentMethod(c0)]
     -> WaitCycles(1, b5)
 
   b5:
-    DutWrite(dut.axil.w.valid, 0)
-    DutWrite(dut.axil.aw.valid, 0)
+    DutWrite(dut.bus.w.valid, 0)
+    DutWrite(dut.bus.aw.valid, 0)
     -> WaitCycles(2, b6)
 
   b6:
@@ -58,12 +58,12 @@ fn fn0 comp_on_0 [kind=ComponentMethod(c0)]
 
 fn fn1 comp_monitor_1 [kind=ComponentMethod(c0)]
   locals:
-    %0 b : uint
+    %0 b : uint<2>
     %1 c : record(r1)
   entry = b0
 
   b0:
-    DutRead(%b, dut.axil.b.resp)
+    DutRead(%b, dut.bus.b.resp)
     RecordInit(%c, r1)
     RecordFieldWrite(%c.resp, %b)
     ComponentEmit(self.completed, [%c])
@@ -72,13 +72,13 @@ fn fn1 comp_monitor_1 [kind=ComponentMethod(c0)]
 fn fn2 comp_monitor_2 [kind=ComponentMethod(c0)]
   locals:
     %0 r : uint
-    %1 r__resp : uint
+    %1 r__resp : uint<2>
     %2 c : record(r1)
   entry = b0
 
   b0:
-    DutRead(%r, dut.axil.r.data)
-    DutRead(%r__resp, dut.axil.r.resp)
+    DutRead(%r, dut.bus.r.data)
+    DutRead(%r__resp, dut.bus.r.resp)
     RecordInit(%c, r1)
     RecordFieldWrite(%c.resp, %r__resp)
     ComponentEmit(self.completed, [%c])

@@ -47,7 +47,7 @@ transactor SchedXactor
 
         hookable insert_after(after_handle: uint<32>, data: uint<32>) -> uint<32>
             dut.insert_after_req_valid = 1
-            dut.insert_after_req_handle = after_handle
+            dut.insert_after_req_handle = after_handle.trunc<4>()
             dut.insert_after_req_data = data
             wait 1 cycle
             dut.insert_after_req_valid = 0
@@ -74,7 +74,7 @@ transactor SchedXactor
         // tick to drop the request.
         hookable next(handle: uint<32>) -> uint<32>
             dut.next_req_valid = 1
-            dut.next_req_handle = handle
+            dut.next_req_handle = handle.trunc<4>()
             wait 1 cycle
             let h = dut.next_resp_valid ? dut.next_resp_handle : 255
             dut.next_req_valid = 0
@@ -85,7 +85,7 @@ transactor SchedXactor
 
         hookable prev(handle: uint<32>) -> uint<32>
             dut.prev_req_valid = 1
-            dut.prev_req_handle = handle
+            dut.prev_req_handle = handle.trunc<4>()
             wait 1 cycle
             let h = dut.prev_resp_valid ? dut.prev_resp_handle : 255
             dut.prev_req_valid = 0

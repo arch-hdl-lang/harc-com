@@ -21,19 +21,23 @@
 //! v1 uses — identical scheduler interaction, identical cycle timing.
 
 use super::expr::{
-    bounded_count_expr_cpp, comp_base_cpp, comp_base_cpp_subst_cx, escape_c, expr_cpp,
-    expr_static_width, fmt_arg_cpp, helper_cpp_name, lane_index_cpp, lane_width, port_read,
-    port_signal, probe_read_accessor, scalar_assignment_expr_cpp, truthy_expr_cpp,
-    wide_words_over_128, ECx,
+    bounded_count_expr_cpp, comp_base_cpp_subst_cx, escape_c, expr_cpp, expr_is_signed,
+    expr_static_width, fmt_arg_cpp, helper_cpp_name, lane_index_cpp, lane_width, local_cpp_name,
+    local_ir_type, owner_tb, port_read, port_signal, required_testbench_receiver,
+    scalar_assignment_expr_cpp, truthy_expr_cpp, wide_words_over_128, BusAdapterRenderBindings,
+    CallableRenderBindings, ECx, RuntimeCellRenderBinding, TestbenchBusAdapterPlan,
 };
-use crate::ast::ExprKind;
-use crate::codegen::cpp_tb::EmitError;
+use crate::codegen::cpp_tb::{
+    EmitError, TBIR_RANDOMIZE_CONTEXT_SENTINEL, TBIR_RANDOMIZE_SEQUENCER_SCOPE_SENTINEL,
+    TBIR_RANDOMIZE_STATE_SENTINEL, TBIR_RANDOMIZE_TARGET_SENTINEL,
+    TBIR_RANDOMIZE_TSEQ_SCOPE_SENTINEL,
+};
 use crate::ir::{
-    BlockId, BusBindingSchema, CallTarget, ConstraintRef, Expr, FileLogLevel, FmtArgs, IrType,
-    LocalId, LogLevel, PredSrc, RecordSchema, Stmt, TbFunction, TbProgram, Terminator,
-    TransactorMethodSchema, TransactorSchema, WaitMode,
+    BlockId, BusBindingSchema, CallTarget, ConstraintRef, Expr, FileLogLevel, FmtArgs, FunctionId,
+    FunctionKind, IrType, LocalId, LogLevel, PredSrc, RecordSchema, Stmt, TbFunction, TbProgram,
+    Terminator, TransactorMethodSchema, TransactorSchema, WaitMode,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
 const INDENT: &str = "    ";
@@ -45,6 +49,7 @@ const RESERVED: &[&str] = &[
     "dut",
     "tfp",
     "ctx",
+    "self",
     "errors",
     "cycle_count",
     "trace",
@@ -68,10 +73,15 @@ const RESERVED: &[&str] = &[
     "_checkers",
     "_post_eval_services",
     "_auto_cov_reports",
+    "runtime_cells",
+    "_harc_runtime_cells",
+    "_harc_run_state",
+    "_harc_opaque_state",
     "_run_slot",
     "_slot",
     "_harc_trace_dump_next",
     "_harc_trace_dump_at",
+    "_harc_unique_tseq",
     "__bb",
     "__done",
     "_wu_budget",
@@ -125,99 +135,148 @@ const RESERVED: &[&str] = &[
     "while",
 ];
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct FlowRenderBindings<'a> {
+    pub run_context: Option<&'a str>,
+    pub dut_receiver: Option<&'a str>,
+    pub dut_access: Option<&'a crate::ir::passes::dut_access::DutAccessPlan>,
+    pub dut_lane_widths: Option<&'a HashMap<String, u32>>,
+    pub testbench_receiver: Option<&'a str>,
+    pub testbench_components: Option<&'a [super::expr::TestbenchComponentRenderBinding]>,
+    pub testbench_transactor_states:
+        Option<&'a [super::expr::TestbenchTransactorStateRenderBinding]>,
+    pub bus_adapters: Option<BusAdapterRenderBindings<'a>>,
+    pub clocks: Option<&'a [crate::ir::ClockSpec]>,
+    pub reserved: &'a [&'a str],
+    pub durable_callbacks: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct TestHookRenderBindings<'a> {
+    pub flow: FlowRenderBindings<'a>,
+    pub runtime_cells: Option<RuntimeCellRenderBinding<'a>>,
+    pub common_contextual_tseqs: Option<&'a BTreeSet<FunctionId>>,
+    pub durable_capture: bool,
+}
+
 /// Per-local emitted C++ names. Lowering already deduplicated names
 /// within the function; this only steps around scaffolding collisions.
 fn cpp_local_names(func: &TbFunction) -> Vec<String> {
+    cpp_local_names_with_reserved(func, std::iter::empty())
+}
+
+fn cpp_local_names_with_reserved<'a>(
+    func: &TbFunction,
+    additional: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut used = RESERVED
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<HashSet<_>>();
+    used.extend(additional.into_iter().map(str::to_string));
     func.locals
         .iter()
-        .map(|l| {
-            if RESERVED.contains(&l.name.as_str()) {
-                format!("_u_{}", l.name)
-            } else {
-                l.name.clone()
+        .map(|local| {
+            let mut name = local.name.clone();
+            while used.contains(&name) {
+                name = format!("_u_{name}");
             }
+            used.insert(name.clone());
+            name
         })
         .collect()
 }
 
 fn randomize_snippet_for(
     prog: &TbProgram,
+    func: &TbFunction,
     names: &[String],
     target: LocalId,
     constraints: ConstraintRef,
     snippets: &[String],
-) -> Option<String> {
-    let snippet = snippets.get(constraints.index())?;
-    let site = prog.constraint_sites.get(constraints.index())?;
-    let ExprKind::Ident(src) = &*site.target.kind else {
-        return Some(snippet.clone());
+    run_context: &str,
+    state_receiver: &str,
+    self_receiver: Option<&str>,
+) -> Result<Option<String>, EmitError> {
+    let Some(snippet) = snippets.get(constraints.index()) else {
+        return Ok(None);
     };
-    let dst = names.get(target.index())?;
-    if src.name == *dst {
-        Some(snippet.clone())
-    } else {
-        Some(rewrite_cpp_ident(snippet, &src.name, dst))
+    let Some(site) = prog.constraint_sites.get(constraints.index()) else {
+        return Ok(None);
+    };
+    let Some(dst) = names.get(target.index()) else {
+        return Ok(None);
+    };
+    let uses_tseq_unique = snippet.contains(TBIR_RANDOMIZE_TSEQ_SCOPE_SENTINEL);
+    if uses_tseq_unique && !matches!(&func.kind, FunctionKind::Tseq { .. }) {
+        return Err(EmitError(format!(
+            "randomize({}): `[unique within tseq]` is only valid inside a tseq",
+            site.record
+        )));
     }
-}
-
-fn rewrite_cpp_ident(input: &str, src: &str, dst: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut it = input.char_indices().peekable();
-    while let Some((start, ch)) = it.next() {
-        if ch == '"' || ch == '\'' {
-            let quote = ch;
-            out.push(ch);
-            let mut escaped = false;
-            for (_, c) in it.by_ref() {
-                out.push(c);
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == quote {
-                    break;
-                }
-            }
-            continue;
+    let tseq_registry = "_harc_unique_tseq";
+    let uses_sequencer_unique = snippet.contains(TBIR_RANDOMIZE_SEQUENCER_SCOPE_SENTINEL);
+    if uses_sequencer_unique
+        && !matches!(
+            &func.kind,
+            FunctionKind::ComponentMethod { component, .. }
+                if prog.components.get(component.index()).is_some_and(|schema| {
+                    schema.kind == crate::ir::ComponentKindTag::Sequencer
+                })
+        )
+    {
+        return Err(EmitError(format!(
+            "randomize({}): `[unique within sequencer]` is only valid inside a sequencer",
+            site.record
+        )));
+    }
+    let sequencer_registry = match &func.kind {
+        FunctionKind::ComponentMethod { component, .. }
+            if prog
+                .components
+                .get(component.index())
+                .is_some_and(|schema| schema.kind == crate::ir::ComponentKindTag::Sequencer) =>
+        {
+            let schema = &prog.components[component.index()];
+            let member = crate::codegen::cpp_tb::component_unique_registry_name(
+                schema.fields.iter().map(|field| field.name.as_str()),
+            );
+            self_receiver
+                .map(|receiver| format!("{receiver}.{member}"))
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: sequencer method {} has no receiver for unique history",
+                        func.name
+                    ))
+                })?
         }
-        if is_cpp_ident_start(ch) {
-            let mut ident = String::new();
-            ident.push(ch);
-            while let Some((_, c)) = it.peek().copied() {
-                if !is_cpp_ident_continue(c) {
-                    break;
-                }
-                ident.push(c);
-                it.next();
-            }
-            if ident == src && should_rewrite_cpp_ident_at(input, start) {
-                out.push_str(dst);
-            } else {
-                out.push_str(&ident);
-            }
-            continue;
+        _ => String::new(),
+    };
+    Ok(Some(
+        snippet
+            .replace(TBIR_RANDOMIZE_TARGET_SENTINEL, dst)
+            .replace(TBIR_RANDOMIZE_CONTEXT_SENTINEL, run_context)
+            .replace(TBIR_RANDOMIZE_STATE_SENTINEL, state_receiver)
+            .replace(TBIR_RANDOMIZE_TSEQ_SCOPE_SENTINEL, tseq_registry)
+            .replace(TBIR_RANDOMIZE_SEQUENCER_SCOPE_SENTINEL, &sequencer_registry),
+    ))
+}
+
+fn randomize_state_receiver(
+    func: &TbFunction,
+    constraints: ConstraintRef,
+    runtime_cells: Option<RuntimeCellRenderBinding<'_>>,
+    run_context: &str,
+) -> Result<String, EmitError> {
+    if matches!(
+        func.kind,
+        FunctionKind::TestBody { .. } | FunctionKind::TestHook { .. }
+    ) {
+        if let Some(runtime_cells) = runtime_cells {
+            return runtime_cells.constraint_field(constraints);
         }
-        out.push(ch);
     }
-    out
-}
-
-fn should_rewrite_cpp_ident_at(input: &str, start: usize) -> bool {
-    let mut prev = input[..start].chars().rev().filter(|c| !c.is_whitespace());
-    match prev.next() {
-        Some('.') => false,
-        Some('>') if prev.next() == Some('-') => false,
-        Some(':') if prev.next() == Some(':') => false,
-        _ => true,
-    }
-}
-
-fn is_cpp_ident_start(c: char) -> bool {
-    c == '_' || c.is_ascii_alphabetic()
-}
-
-fn is_cpp_ident_continue(c: char) -> bool {
-    c == '_' || c.is_ascii_alphanumeric()
+    Ok(format!("{run_context}._harc_randomize_c{}", constraints.0))
 }
 
 /// Emit one function as a loop-switch at `depth` indentation levels,
@@ -238,19 +297,133 @@ pub(super) fn emit_function(
     dut_type: &str,
     predeclared: &HashSet<LocalId>,
     depth: usize,
-    // #619 M4b: `TestbenchLifecycle` FunctionIds emitted OUT-OF-LINE for
-    // THIS emission, each mapped to its variant. A `TbLifecycleCall` whose
-    // target is `Plain` lowers to a real `void` call; `Coro` lowers to the
-    // parent-drives-child coroutine drive loop; a target ABSENT from the map
-    // keeps the M4a re-inline. Empty on paths that do not emit the
-    // out-of-line definitions (split/separate shards), which therefore
-    // preserve the M4a re-inline unchanged.
+    runtime_cells: Option<RuntimeCellRenderBinding<'_>>,
+    flow_bindings: FlowRenderBindings<'_>,
+    // Native lifecycle functions emitted out-of-line for this layout.
     outofline_lifecycle: &HashMap<crate::ir::FunctionId, LifecycleEmit>,
 ) -> Result<(), EmitError> {
-    let mut names = cpp_local_names(func);
+    emit_function_with_tseq_calls(
+        out,
+        prog,
+        func,
+        records,
+        bindings,
+        lanes,
+        randomize_snippets,
+        dut_type,
+        predeclared,
+        depth,
+        None,
+        runtime_cells,
+        flow_bindings,
+        outofline_lifecycle,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_common_function(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+    records: &[RecordSchema],
+    bindings: &[BusBindingSchema],
+    lanes: &HashMap<String, u32>,
+    randomize_snippets: &[String],
+    dut_type: &str,
+    predeclared: &HashSet<LocalId>,
+    depth: usize,
+    contextual_tseqs: &std::collections::BTreeSet<FunctionId>,
+    runtime_cells: Option<RuntimeCellRenderBinding<'_>>,
+    flow_bindings: FlowRenderBindings<'_>,
+    outofline_lifecycle: &HashMap<crate::ir::FunctionId, LifecycleEmit>,
+) -> Result<(), EmitError> {
+    emit_function_with_tseq_calls(
+        out,
+        prog,
+        func,
+        records,
+        bindings,
+        lanes,
+        randomize_snippets,
+        dut_type,
+        predeclared,
+        depth,
+        Some(contextual_tseqs),
+        runtime_cells,
+        flow_bindings,
+        outofline_lifecycle,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_function_with_tseq_calls(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+    records: &[RecordSchema],
+    bindings: &[BusBindingSchema],
+    lanes: &HashMap<String, u32>,
+    randomize_snippets: &[String],
+    dut_type: &str,
+    predeclared: &HashSet<LocalId>,
+    depth: usize,
+    common_contextual_tseqs: Option<&std::collections::BTreeSet<FunctionId>>,
+    runtime_cells: Option<RuntimeCellRenderBinding<'_>>,
+    flow_bindings: FlowRenderBindings<'_>,
+    outofline_lifecycle: &HashMap<crate::ir::FunctionId, LifecycleEmit>,
+) -> Result<(), EmitError> {
+    let default_testbench_component_bindings = func
+        .owner
+        .and_then(|owner| prog.testbenches.get(owner.index()))
+        .map(|testbench| {
+            testbench
+                .component_fields
+                .iter()
+                .map(|binding| super::expr::TestbenchComponentRenderBinding {
+                    field: binding.field.clone(),
+                    component: binding.component,
+                    receiver: binding.field.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let testbench_component_bindings = flow_bindings
+        .testbench_components
+        .unwrap_or(default_testbench_component_bindings.as_slice());
+    let default_testbench_transactor_state_bindings = func
+        .owner
+        .and_then(|owner| prog.testbenches.get(owner.index()))
+        .map(|testbench| {
+            testbench
+                .unbound_state_actors
+                .iter()
+                .map(|actor| super::expr::TestbenchTransactorStateRenderBinding {
+                    field: actor.field.clone(),
+                    transactor: actor.transactor,
+                    receiver: actor.storage.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let testbench_transactor_state_bindings = flow_bindings
+        .testbench_transactor_states
+        .unwrap_or(default_testbench_transactor_state_bindings.as_slice());
+    let reserved = testbench_component_bindings
+        .iter()
+        .map(|binding| binding.receiver.as_str())
+        .chain(
+            testbench_transactor_state_bindings
+                .iter()
+                .map(|binding| binding.receiver.as_str()),
+        )
+        .chain(flow_bindings.reserved.iter().copied());
+    let mut names = cpp_local_names_with_reserved(func, reserved);
     for local in predeclared {
         if let Some(name) = names.get_mut(local.index()) {
-            *name = flow_hook_capture_name(func, *local);
+            *name = match runtime_cells {
+                Some(binding) => binding.persistent_local(func, *local)?,
+                None => flow_hook_capture_name(func, *local),
+            };
         }
     }
     let cx = ECx {
@@ -258,19 +431,51 @@ pub(super) fn emit_function(
         func,
         names: &names,
         lanes,
-        self_subst: None,
+        bindings: CallableRenderBindings {
+            run_context: flow_bindings
+                .run_context
+                .or_else(|| common_contextual_tseqs.map(|_| "ctx")),
+            dut_receiver: flow_bindings.dut_receiver,
+            self_receiver: None,
+            testbench_owner: func.owner,
+            testbench_receiver: flow_bindings
+                .testbench_receiver
+                .or_else(|| func.owner.map(|_| "_tb")),
+            bound_bus: None,
+            testbench_bus_bindings: Some(bindings),
+            bus_adapters: flow_bindings.bus_adapters,
+            clocks: flow_bindings.clocks,
+            actor_slot: None,
+            testbench_components: (!testbench_component_bindings.is_empty())
+                .then_some(testbench_component_bindings),
+            testbench_transactor_states: (!testbench_transactor_state_bindings.is_empty())
+                .then_some(testbench_transactor_state_bindings),
+            runtime_cells,
+            durable_callbacks: flow_bindings.durable_callbacks,
+        },
         dut_type,
+        dut_access: flow_bindings.dut_access,
         trace_component: "",
         state_receiver: None,
         temporal_widths: &[],
+        temporal_cell_prefix: None,
+        common_contextual_tseqs,
     };
     let pad = INDENT.repeat(depth);
     let pad1 = INDENT.repeat(depth + 1);
     let pad2 = INDENT.repeat(depth + 2);
     let pad3 = INDENT.repeat(depth + 3);
-
     writeln!(out, "{pad}{{ // {} (TB-IR loop-switch)", func.name).ok();
-    declare_locals_except(out, prog, func, &names, 0, predeclared, depth + 1)?;
+    declare_locals_except(
+        out,
+        prog,
+        func,
+        &names,
+        0,
+        predeclared,
+        depth + 1,
+        cx.dut_access,
+    )?;
     declare_port_snapshots(out, &cx, depth + 1)?;
     writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
     writeln!(out, "{pad1}bool __done = false;").ok();
@@ -306,39 +511,22 @@ pub(super) fn emit_function(
                     }
                     Some(c) => {
                         let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
-                        // `wait N cycles on <clock>` — mirror v1's
-                        // inline eval_clocks_until loop (cpp_tb.rs,
-                        // StmtKind::Wait with a clock): advance
-                        // simulated time edge-by-edge until the named
-                        // clock has seen N more rising edges, then run
-                        // the checkers. v1 emits this inline (no
-                        // coroutine yield) regardless of coroutine
-                        // context — the main loop's full-primary-period
-                        // stride is too coarse when the named clock is
-                        // faster than the primary — so the loop-switch
-                        // does the same: no co_await, identical
-                        // scheduler interaction, identical cycle
-                        // timing.
-                        let idx = c.index;
-                        writeln!(
-                            out,
-                            "{pad3}{{ long long _target = clocks_[{idx}].rising_count + \
-                             (long long)({n}); while (clocks_[{idx}].rising_count < _target) {{"
-                        )
-                        .ok();
-                        writeln!(
-                            out,
-                            "{pad3}{INDENT}long long _next = clocks_[0].next_edge_ps;"
-                        )
-                        .ok();
-                        writeln!(
-                            out,
-                            "{pad3}{INDENT}for (auto& _ck : clocks_) if (_ck.next_edge_ps < \
-                             _next) _next = _ck.next_edge_ps;"
-                        )
-                        .ok();
-                        writeln!(out, "{pad3}{INDENT}eval_clocks_until(_next);").ok();
-                        writeln!(out, "{pad3}}} for (auto& _c : _checkers) _c(); }}").ok();
+                        if let Some(context) = cx.bindings.run_context {
+                            writeln!(
+                                out,
+                                "{pad3}harc_wait_clock_cycles({context}, \"{}\", (long long)({n}));",
+                                super::expr::escape_c(&c.name)
+                            )
+                            .ok();
+                        } else {
+                            // `wait N cycles on <clock>` — mirror v1's
+                            // inline eval_clocks_until loop (cpp_tb.rs,
+                            // StmtKind::Wait with a clock): advance
+                            // simulated time edge-by-edge until the named
+                            // clock has seen N more rising edges, then run
+                            // the checkers.
+                            emit_local_qualified_clock_wait(out, &pad3, c.index, &n);
+                        }
                     }
                 }
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
@@ -348,14 +536,27 @@ pub(super) fn emit_function(
                 // method lambda bodies): synchronous tick loop, no
                 // scheduler yield.
                 let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
-                writeln!(out, "{pad3}for (int _w = 0; _w < {n}; _w++) tick();").ok();
+                let tick = cx
+                    .bindings
+                    .run_context
+                    .map(|context| format!("harc_tseq_tick({context})"))
+                    .unwrap_or_else(|| "tick()".to_string());
+                writeln!(out, "{pad3}for (int _w = 0; _w < {n}; _w++) {tick};").ok();
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::WaitTimePs(ps, b) => {
                 // Wall-clock wait — v1's inline emission for a Time
                 // duration: advance absolute time, no coroutine yield,
                 // no checker pass.
-                writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
+                if let Some(context) = cx.bindings.run_context {
+                    writeln!(
+                        out,
+                        "{pad3}harc_eval_clocks_until({context}, {context}.now_ps + {ps});"
+                    )
+                    .ok();
+                } else {
+                    writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
+                }
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::Return => {
@@ -377,9 +578,18 @@ pub(super) fn emit_function(
                 // docs/619-m4a-ir-ownership.md.
                 let callee = prog.function(*function);
                 debug_assert!(
-                    matches!(callee.kind, crate::ir::FunctionKind::TestbenchLifecycle { .. }),
+                    matches!(
+                        callee.kind,
+                        crate::ir::FunctionKind::TestbenchLifecycle { .. }
+                    ),
                     "TbLifecycleCall must target a TestbenchLifecycle function"
                 );
+                let testbench_receiver = cx.bindings.testbench_receiver.ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: lifecycle call in {} has no testbench receiver",
+                        func.name
+                    ))
+                })?;
                 match outofline_lifecycle.get(function).copied() {
                     Some(LifecycleEmit::Plain) => {
                         // #619 M4b: the non-suspending callee is emitted once
@@ -388,8 +598,12 @@ pub(super) fn emit_function(
                         // call site (the run coroutine captures both), so the
                         // shared body reaches all its runtime state through the
                         // two params — the de-duplication #619 is about.
-                        writeln!(out, "{pad3}{}(ctx, _tb);", lifecycle_cpp_name(&callee.name))
-                            .ok();
+                        writeln!(
+                            out,
+                            "{pad3}{}(ctx, {testbench_receiver});",
+                            lifecycle_cpp_name(&callee.name)
+                        )
+                        .ok();
                     }
                     Some(LifecycleEmit::Coro) => {
                         // #619 M4b: the SUSPENDING callee is emitted once as a
@@ -408,7 +622,7 @@ pub(super) fn emit_function(
                         // `emit_lifecycle_coroutine` and the runtime awaiter.
                         writeln!(
                             out,
-                            "{pad3}{{ auto _lc_sub = {}(ctx, _tb, _slot); _lc_sub.resume();",
+                            "{pad3}{{ auto _lc_sub = {}(ctx, {testbench_receiver}, _slot); _lc_sub.resume();",
                             lifecycle_cpp_name(&callee.name)
                         )
                         .ok();
@@ -442,6 +656,8 @@ pub(super) fn emit_function(
                             dut_type,
                             &HashSet::new(),
                             depth + 3,
+                            runtime_cells,
+                            flow_bindings,
                             outofline_lifecycle,
                         )?;
                     }
@@ -503,14 +719,30 @@ pub(super) fn emit_function(
                 // `ConstraintRef`, pre-indented at this body depth). The
                 // solve writes the record fields back into the target
                 // local and emits the trace event, exactly like v1.
-                let snippet =
-                    randomize_snippet_for(prog, &names, *target, *constraints, randomize_snippets)
-                        .ok_or_else(|| {
-                            EmitError(format!(
-                                "tbir: Randomize in {} references missing constraint snippet c{}",
-                                func.name, constraints.0
-                            ))
-                        })?;
+                let run_context = cx.bindings.run_context.unwrap_or("ctx");
+                let state_receiver = randomize_state_receiver(
+                    func,
+                    *constraints,
+                    runtime_cells.filter(|_| cx.bindings.run_context.is_some()),
+                    run_context,
+                )?;
+                let snippet = randomize_snippet_for(
+                    prog,
+                    func,
+                    &names,
+                    *target,
+                    *constraints,
+                    randomize_snippets,
+                    run_context,
+                    &state_receiver,
+                    cx.bindings.self_receiver,
+                )?
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: Randomize in {} references missing constraint snippet c{}",
+                        func.name, constraints.0
+                    ))
+                })?;
                 out.push_str(&snippet);
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
@@ -710,7 +942,7 @@ fn call_target_reaches_frame(t: &CallTarget) -> bool {
         t,
         CallTarget::TransactorMethod { .. }
             | CallTarget::TransactorSelfMethod { .. }
-            | CallTarget::Tseq(_)
+            | CallTarget::Tseq { .. }
     )
 }
 
@@ -845,6 +1077,7 @@ fn expr_reaches_frame_local(e: &Expr) -> bool {
         //      file-scope receivers with no frame-local sub-expression. ----
         Expr::Literal { .. }
         | Expr::WideLiteral(_)
+        | Expr::StringLiteral(_)
         | Expr::Local(_)
         | Expr::TbField(_)
         | Expr::TbQueueQuery { .. }
@@ -907,7 +1140,10 @@ fn stmt_rvalue_reaches_frame_local(s: &Stmt) -> bool {
         }
         Stmt::AssertCheck { cond, on_fail } | Stmt::AssumeCheck { cond, on_fail } => {
             expr_reaches_frame_local(cond)
-                || on_fail.args.iter().any(|a| expr_reaches_frame_local(&a.expr))
+                || on_fail
+                    .args
+                    .iter()
+                    .any(|a| expr_reaches_frame_local(&a.expr))
         }
         // Whitelisted kinds that carry NO expression — explicit so a future
         // expression field breaks the build here instead of slipping past.
@@ -930,17 +1166,33 @@ fn stmt_rvalue_reaches_frame_local(s: &Stmt) -> bool {
 /// are coroutine-locals in the inline form, not context members). Shared
 /// by the `Plain` and `Coro` emitters so both see an identical name
 /// environment (and therefore emit identical body text).
-fn emit_lifecycle_ambient_prologue(out: &mut String) {
+fn emit_lifecycle_ambient_prologue(out: &mut String, common_context: bool) {
+    let trace_time = if common_context {
+        "ctx.trace_time"
+    } else {
+        "ctx._trace_time"
+    };
+    let fatal = if common_context {
+        "ctx.fatal"
+    } else {
+        "ctx._fatal"
+    };
     out.push_str(
         "    (void)_tb;\n\
          \x20   auto* dut = ctx.dut; (void)dut;\n\
          #if HARC_TRACE_ENABLED\n\
              auto* tfp = ctx.tfp; (void)tfp;\n\
-         #endif\n\
-         \x20   auto& _trace_time = ctx._trace_time; (void)_trace_time;\n\
-         \x20   auto& errors = ctx.errors; (void)errors;\n\
-         \x20   auto& _fatal = ctx._fatal; (void)_fatal;\n\
-         \x20   auto& cycle_count = ctx.cycle_count; (void)cycle_count;\n\
+         #endif\n",
+    );
+    writeln!(
+        out,
+        "    auto& _trace_time = {trace_time}; (void)_trace_time;"
+    )
+    .ok();
+    out.push_str("    auto& errors = ctx.errors; (void)errors;\n");
+    writeln!(out, "    auto& _fatal = {fatal}; (void)_fatal;").ok();
+    out.push_str(
+        "    auto& cycle_count = ctx.cycle_count; (void)cycle_count;\n\
          \x20   auto& trace = ctx.trace; (void)trace;\n\
          \x20   auto& log_ctx = ctx.log_ctx; (void)log_ctx;\n\
          \x20   auto& _checkers = ctx._checkers; (void)_checkers;\n\
@@ -1027,11 +1279,18 @@ pub(super) fn emit_lifecycle_function(
     lanes: &HashMap<String, u32>,
     randomize_snippets: &[String],
     dut_type: &str,
+    dut_access: Option<&crate::ir::passes::dut_access::DutAccessPlan>,
+    common_context: bool,
     static_linkage: bool,
     outofline_lifecycle: &HashMap<crate::ir::FunctionId, LifecycleEmit>,
 ) -> Result<(), EmitError> {
-    writeln!(out, "{} {{", lifecycle_plain_sig(func, tb_name, static_linkage)).ok();
-    emit_lifecycle_ambient_prologue(out);
+    writeln!(
+        out,
+        "{} {{",
+        lifecycle_plain_sig(func, tb_name, static_linkage)
+    )
+    .ok();
+    emit_lifecycle_ambient_prologue(out, common_context);
     emit_function(
         out,
         prog,
@@ -1043,6 +1302,15 @@ pub(super) fn emit_lifecycle_function(
         dut_type,
         &HashSet::new(),
         1,
+        None,
+        FlowRenderBindings {
+            run_context: Some("ctx"),
+            dut_receiver: Some("dut"),
+            dut_access,
+            testbench_receiver: Some("_tb"),
+            dut_lane_widths: Some(lanes),
+            ..FlowRenderBindings::default()
+        },
         outofline_lifecycle,
     )?;
     writeln!(out, "}}").ok();
@@ -1071,12 +1339,19 @@ pub(super) fn emit_lifecycle_coroutine(
     lanes: &HashMap<String, u32>,
     randomize_snippets: &[String],
     dut_type: &str,
+    dut_access: Option<&crate::ir::passes::dut_access::DutAccessPlan>,
+    common_context: bool,
     static_linkage: bool,
     outofline_lifecycle: &HashMap<crate::ir::FunctionId, LifecycleEmit>,
 ) -> Result<(), EmitError> {
-    writeln!(out, "{} {{", lifecycle_coro_sig(func, tb_name, static_linkage)).ok();
+    writeln!(
+        out,
+        "{} {{",
+        lifecycle_coro_sig(func, tb_name, static_linkage)
+    )
+    .ok();
     writeln!(out, "{INDENT}(void)_slot;").ok();
-    emit_lifecycle_ambient_prologue(out);
+    emit_lifecycle_ambient_prologue(out, common_context);
     emit_function(
         out,
         prog,
@@ -1088,6 +1363,15 @@ pub(super) fn emit_lifecycle_coroutine(
         dut_type,
         &HashSet::new(),
         1,
+        None,
+        FlowRenderBindings {
+            run_context: Some("ctx"),
+            dut_receiver: Some("dut"),
+            dut_access,
+            testbench_receiver: Some("_tb"),
+            dut_lane_widths: Some(lanes),
+            ..FlowRenderBindings::default()
+        },
         outofline_lifecycle,
     )?;
     writeln!(out, "{INDENT}co_return;").ok();
@@ -1113,6 +1397,292 @@ pub(super) fn emit_tseq(
     randomize_snippets: &[String],
     depth: usize,
 ) -> Result<(), EmitError> {
+    emit_tseq_impl(
+        out,
+        prog,
+        func,
+        records,
+        randomize_snippets,
+        depth,
+        TseqEmission::LocalLambda,
+    )
+}
+
+pub(super) fn tseq_dependencies(function: &TbFunction) -> BTreeSet<FunctionId> {
+    let mut dependencies = BTreeSet::new();
+    for_each_function_expr(function, |expr| {
+        if let Expr::Call(CallTarget::Tseq { function, .. }, _) = expr {
+            dependencies.insert(*function);
+        }
+    });
+    dependencies
+}
+
+pub(super) fn tseq_emit_order(prog: &TbProgram) -> Result<Vec<FunctionId>, EmitError> {
+    let tseqs: Vec<&TbFunction> = prog
+        .functions
+        .iter()
+        .filter(|function| matches!(function.kind, FunctionKind::Tseq { .. }))
+        .collect();
+    let mut by_id = HashMap::new();
+    for (index, function) in tseqs.iter().enumerate() {
+        if by_id.insert(function.id, index).is_some() {
+            return Err(EmitError(format!(
+                "tbir: duplicate tseq name `{}` in callable dependency graph",
+                function.name
+            )));
+        }
+    }
+    let mut dependencies = vec![Vec::new(); tseqs.len()];
+    for (index, function) in tseqs.iter().enumerate() {
+        for dependency in tseq_dependencies(function) {
+            let Some(&dependency_index) = by_id.get(&dependency) else {
+                return Err(EmitError(format!(
+                    "tbir: tseq `{}` references missing tseq fn{}",
+                    function.name, dependency.0
+                )));
+            };
+            dependencies[index].push(dependency_index);
+        }
+    }
+
+    fn visit(
+        index: usize,
+        tseqs: &[&TbFunction],
+        dependencies: &[Vec<usize>],
+        state: &mut [u8],
+        stack: &mut Vec<usize>,
+        order: &mut Vec<FunctionId>,
+    ) -> Result<(), EmitError> {
+        match state[index] {
+            2 => return Ok(()),
+            1 => {
+                let start = stack.iter().position(|node| *node == index).unwrap_or(0);
+                let mut names: Vec<&str> = stack[start..]
+                    .iter()
+                    .map(|node| tseqs[*node].name.as_str())
+                    .collect();
+                names.push(tseqs[index].name.as_str());
+                return Err(EmitError(format!(
+                    "tbir: tseq dependency cycle: {}",
+                    names.join(" -> ")
+                )));
+            }
+            _ => {}
+        }
+        state[index] = 1;
+        stack.push(index);
+        for &dependency in &dependencies[index] {
+            visit(dependency, tseqs, dependencies, state, stack, order)?;
+        }
+        stack.pop();
+        state[index] = 2;
+        order.push(tseqs[index].id);
+        Ok(())
+    }
+
+    let mut state = vec![0; tseqs.len()];
+    let mut order = Vec::with_capacity(tseqs.len());
+    for index in 0..tseqs.len() {
+        visit(
+            index,
+            &tseqs,
+            &dependencies,
+            &mut state,
+            &mut Vec::new(),
+            &mut order,
+        )?;
+    }
+    Ok(order)
+}
+
+pub(super) fn for_each_function_expr(function: &TbFunction, mut visit: impl FnMut(&Expr)) {
+    for block in &function.blocks {
+        for stmt in &block.stmts {
+            crate::ir::visit::try_visit_stmt_exprs(stmt, &mut |expr| {
+                crate::ir::visit::walk_expr(expr, &mut visit);
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .unwrap_or_else(|error| match error {});
+        }
+        crate::ir::visit::try_visit_terminator_exprs(&block.terminator, &mut |expr| {
+            crate::ir::visit::walk_expr(expr, &mut visit);
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap_or_else(|error| match error {});
+    }
+}
+
+pub(super) fn emit_common_tseq_declaration(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+    needs_context: bool,
+) -> Result<(), EmitError> {
+    let ret_ty = tseq_return_cty(prog, func)?;
+    let params = tseq_param_list(prog, func, needs_context)?;
+    writeln!(
+        out,
+        "{ret_ty} {}({params});",
+        super::expr::tseq_cpp_name(&func.name)
+    )
+    .ok();
+    Ok(())
+}
+
+pub(super) fn emit_common_tseq_function(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+    records: &[RecordSchema],
+    randomize_snippets: &[String],
+    needs_context: bool,
+    contextual_tseqs: &BTreeSet<FunctionId>,
+) -> Result<(), EmitError> {
+    emit_tseq_impl(
+        out,
+        prog,
+        func,
+        records,
+        randomize_snippets,
+        0,
+        TseqEmission::Common {
+            needs_context,
+            contextual_tseqs,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+enum TseqEmission<'a> {
+    LocalLambda,
+    Common {
+        needs_context: bool,
+        contextual_tseqs: &'a BTreeSet<FunctionId>,
+    },
+}
+
+fn tseq_return_cty(prog: &TbProgram, func: &TbFunction) -> Result<String, EmitError> {
+    let acc_ty = func
+        .ret
+        .map(|r| func.local(r).ty.clone())
+        .unwrap_or(IrType::Unknown);
+    match &acc_ty {
+        IrType::RecordSeq(_) | IrType::Seq(_) => super::callable_value_cty(prog, &acc_ty),
+        _ => {
+            return Err(EmitError(format!(
+                "tbir: tseq `{}` has no RecordSeq/Seq return accumulator (lowering bug)",
+                func.name
+            )));
+        }
+    }
+}
+
+fn callable_value_cty(prog: &TbProgram, ty: &IrType) -> Result<String, EmitError> {
+    super::callable_value_cty(prog, ty)
+}
+
+#[cfg(test)]
+mod value_abi_type_tests {
+    use super::super::field_scalar_cty;
+    use crate::codegen::cpp_tb::ir_vec_elem_class;
+    use crate::ir::{sequence_element_compatible, value_abi_class, IrType, ValueAbiClass};
+
+    #[test]
+    fn neutral_classes_and_both_codegen_storage_mappings_agree() {
+        let cases = [
+            (IrType::Bool, ValueAbiClass::Bool, "bool"),
+            (IrType::UInt(Some(8)), ValueAbiClass::Unsigned64, "uint64_t"),
+            (
+                IrType::UInt(Some(64)),
+                ValueAbiClass::Unsigned64,
+                "uint64_t",
+            ),
+            (IrType::SInt(Some(8)), ValueAbiClass::Signed64, "int64_t"),
+            (IrType::UInt(Some(65)), ValueAbiClass::Wide128, "_harc_u128"),
+            (
+                IrType::SInt(Some(128)),
+                ValueAbiClass::Wide128,
+                "_harc_u128",
+            ),
+            (
+                IrType::UInt(Some(129)),
+                ValueAbiClass::WideWords(5),
+                "harc_rt::HarcWide<5>",
+            ),
+        ];
+        for (ty, class, cpp) in cases {
+            assert_eq!(value_abi_class(&ty), Some(class));
+            assert_eq!(ir_vec_elem_class(&ty).as_deref(), Some(cpp));
+            assert_eq!(field_scalar_cty(&ty), cpp);
+        }
+    }
+
+    #[test]
+    fn sequence_compatibility_requires_safe_direction_and_one_carrier() {
+        assert!(sequence_element_compatible(
+            &IrType::UInt(Some(32)),
+            &IrType::UInt(Some(8))
+        ));
+        assert!(!sequence_element_compatible(
+            &IrType::UInt(Some(8)),
+            &IrType::UInt(Some(32))
+        ));
+        assert!(!sequence_element_compatible(
+            &IrType::UInt(Some(8)),
+            &IrType::Bool
+        ));
+        assert!(!sequence_element_compatible(
+            &IrType::UInt(Some(65)),
+            &IrType::UInt(Some(64))
+        ));
+        assert!(!sequence_element_compatible(
+            &IrType::UInt(Some(32)),
+            &IrType::SInt(Some(8))
+        ));
+        assert!(sequence_element_compatible(
+            &IrType::UInt(Some(128)),
+            &IrType::UInt(Some(65))
+        ));
+        assert!(sequence_element_compatible(
+            &IrType::UInt(Some(130)),
+            &IrType::UInt(Some(129))
+        ));
+        assert!(!sequence_element_compatible(
+            &IrType::Seq(Box::new(IrType::UInt(Some(8)))),
+            &IrType::Seq(Box::new(IrType::UInt(Some(8))))
+        ));
+    }
+}
+
+fn tseq_param_list(
+    prog: &TbProgram,
+    func: &TbFunction,
+    needs_context: bool,
+) -> Result<String, EmitError> {
+    let names = cpp_local_names(func);
+    let mut params = Vec::with_capacity(func.params.len() + usize::from(needs_context));
+    if needs_context {
+        params.push("HarcTestContext& ctx".to_string());
+    }
+    for (index, name) in names[..func.params.len()].iter().enumerate() {
+        params.push(format!(
+            "{} {name}",
+            callable_value_cty(prog, &func.locals[index].ty)?
+        ));
+    }
+    Ok(params.join(", "))
+}
+
+fn emit_tseq_impl(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+    records: &[RecordSchema],
+    randomize_snippets: &[String],
+    depth: usize,
+    emission: TseqEmission<'_>,
+) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
     // tseq bodies hold no packed-lane DUT access (no DUT at all), so no
     // probe access either (`dut_type` unused → `""`).
@@ -1122,11 +1692,34 @@ pub(super) fn emit_tseq(
         func,
         names: &names,
         lanes: &empty_lanes,
-        self_subst: None,
+        bindings: CallableRenderBindings {
+            run_context: matches!(emission, TseqEmission::Common { .. }).then_some("ctx"),
+            dut_receiver: None,
+            self_receiver: None,
+            testbench_owner: None,
+            testbench_receiver: None,
+            bound_bus: None,
+            testbench_bus_bindings: None,
+            bus_adapters: None,
+            clocks: None,
+            actor_slot: None,
+            testbench_components: None,
+            testbench_transactor_states: None,
+            runtime_cells: None,
+            durable_callbacks: false,
+        },
         dut_type: "",
+        dut_access: None,
         trace_component: "",
         state_receiver: None,
         temporal_widths: &[],
+        temporal_cell_prefix: None,
+        common_contextual_tseqs: match emission {
+            TseqEmission::LocalLambda => None,
+            TseqEmission::Common {
+                contextual_tseqs, ..
+            } => Some(contextual_tseqs),
+        },
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -1134,45 +1727,80 @@ pub(super) fn emit_tseq(
     let pad2 = INDENT.repeat(depth + 2);
     let pad3 = INDENT.repeat(depth + 3);
 
-    // The element C++ type (for the `std::vector<T>` return type) — a
-    // record name for a `RecordSeq` accumulator, or the scalar C++ type
-    // for a `Seq` accumulator.
-    let acc_ty = func
-        .ret
-        .map(|r| func.local(r).ty.clone())
-        .unwrap_or(IrType::Unknown);
-    let elem = match &acc_ty {
-        IrType::RecordSeq(rid) => records
-            .get(rid.index())
-            .ok_or_else(|| {
-                EmitError(format!(
-                    "tbir: tseq `{}` references missing element record r{}",
-                    func.name, rid.0
-                ))
-            })?
-            .name
-            .clone(),
-        IrType::Seq(scalar) => super::field_scalar_cty(scalar),
-        _ => {
-            return Err(EmitError(format!(
-                "tbir: tseq `{}` has no RecordSeq/Seq return accumulator (lowering bug)",
-                func.name
-            )));
+    // The return type preserves the accumulator's record or scalar element.
+    let ret_ty = tseq_return_cty(prog, func)?;
+    match emission {
+        TseqEmission::LocalLambda => {
+            let params = tseq_param_list(prog, func, false)?;
+            writeln!(
+                out,
+                "{pad}auto {} = [&]({params}) -> {ret_ty} {{",
+                super::expr::tseq_cpp_name(&func.name)
+            )
+            .ok();
         }
-    };
-
-    let params = names[..nparams]
-        .iter()
-        .map(|n| format!("uint64_t {n}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    writeln!(
-        out,
-        "{pad}auto {} = [&]({params}) -> std::vector<{elem}> {{",
-        func.name
-    )
-    .ok();
-    declare_locals(out, prog, func, &names, nparams, depth + 1)?;
+        TseqEmission::Common { needs_context, .. } => {
+            let params = tseq_param_list(prog, func, needs_context)?;
+            writeln!(
+                out,
+                "{pad}{ret_ty} {}({params}) {{",
+                super::expr::tseq_cpp_name(&func.name)
+            )
+            .ok();
+            if needs_context {
+                writeln!(out, "{pad1}auto* dut = ctx.dut; (void)dut;").ok();
+                writeln!(out, "{pad1}auto& errors = ctx.errors;").ok();
+                writeln!(out, "{pad1}auto& _fatal = ctx.fatal;").ok();
+                writeln!(out, "{pad1}auto& cycle_count = ctx.cycle_count;").ok();
+                writeln!(out, "{pad1}auto& trace = ctx.trace;").ok();
+                writeln!(out, "{pad1}auto& log_ctx = ctx.log_ctx;").ok();
+                writeln!(
+                    out,
+                    "{pad1}auto& _auto_cov_reports = ctx._auto_cov_reports;"
+                )
+                .ok();
+                writeln!(out, "{pad1}auto& harc_rng = ctx.rng; (void)harc_rng;").ok();
+                writeln!(out, "{pad1}auto tick = [&]() {{ harc_tseq_tick(ctx); }};").ok();
+                writeln!(
+                    out,
+                    "{pad1}auto sim_logf_line = [&](FILE* f, const char* sev, const char* fmt, ...) {{"
+                )
+                .ok();
+                writeln!(
+                    out,
+                    "{pad2}HARC_RT_LOG_FILE_ONLY_PRINTF(f, cycle_count, sev, fmt);"
+                )
+                .ok();
+                writeln!(out, "{pad1}}};").ok();
+                writeln!(
+                    out,
+                    "{pad1}auto sim_log_line = [&](const char* sev, const char* fmt, ...) {{"
+                )
+                .ok();
+                writeln!(out, "{pad2}va_list ap;").ok();
+                writeln!(out, "{pad2}va_start(ap, fmt);").ok();
+                writeln!(out, "{pad2}harc_rt::log::harc_log_vline(log_ctx.sim_log, &trace, cycle_count, sev, fmt, ap);").ok();
+                writeln!(out, "{pad2}va_end(ap);").ok();
+                writeln!(out, "{pad1}}};").ok();
+            }
+        }
+    }
+    let uses_tseq_unique = func.blocks.iter().any(|block| {
+        let Terminator::Randomize { constraints, .. } = &block.terminator else {
+            return false;
+        };
+        randomize_snippets
+            .get(constraints.index())
+            .is_some_and(|snippet| snippet.contains(TBIR_RANDOMIZE_TSEQ_SCOPE_SENTINEL))
+    });
+    if uses_tseq_unique {
+        writeln!(
+            out,
+            "{pad1}harc_rt::random::HarcUniqueRegistry _harc_unique_tseq;"
+        )
+        .ok();
+    }
+    declare_locals(out, prog, func, &names, nparams, depth + 1, cx.dut_access)?;
     writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
     writeln!(out, "{pad1}while (true) {{").ok();
     writeln!(out, "{pad2}switch (__bb) {{").ok();
@@ -1195,7 +1823,7 @@ pub(super) fn emit_tseq(
                 )
                 .ok();
             }
-            Terminator::WaitCycles(n, None, b) | Terminator::WaitCyclesSync(n, b) => {
+            Terminator::WaitCycles(n, None, b) => {
                 // v1's synchronous lambda wait: one tick() per cycle.
                 let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
                 writeln!(
@@ -1215,14 +1843,26 @@ pub(super) fn emit_tseq(
                 constraints,
                 succ,
             } => {
-                let snippet =
-                    randomize_snippet_for(prog, &names, *target, *constraints, randomize_snippets)
-                        .ok_or_else(|| {
-                            EmitError(format!(
+                let run_context = cx.bindings.run_context.unwrap_or("ctx");
+                let state_receiver =
+                    randomize_state_receiver(func, *constraints, None, run_context)?;
+                let snippet = randomize_snippet_for(
+                    prog,
+                    func,
+                    &names,
+                    *target,
+                    *constraints,
+                    randomize_snippets,
+                    run_context,
+                    &state_receiver,
+                    cx.bindings.self_receiver,
+                )?
+                .ok_or_else(|| {
+                    EmitError(format!(
                         "tbir: Randomize in tseq {} references missing constraint snippet c{}",
                         func.name, constraints.0
                     ))
-                        })?;
+                })?;
                 out.push_str(&snippet);
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
@@ -1237,6 +1877,7 @@ pub(super) fn emit_tseq(
                 }
             },
             other @ (Terminator::WaitCycles(_, Some(_), _)
+            | Terminator::WaitCyclesSync(_, _)
             | Terminator::WaitTimePs(_, _)
             | Terminator::WaitUntilTimeout { .. }
             | Terminator::TbLifecycleCall { .. }
@@ -1253,33 +1894,29 @@ pub(super) fn emit_tseq(
     writeln!(out, "{pad2}default: return {{}};").ok();
     writeln!(out, "{pad2}}}").ok();
     writeln!(out, "{pad1}}}").ok();
-    writeln!(out, "{pad}}};").ok();
+    match emission {
+        TseqEmission::LocalLambda => writeln!(out, "{pad}}};").ok(),
+        TseqEmission::Common { .. } => writeln!(out, "{pad}}}").ok(),
+    };
     Ok(())
-}
-
-/// C++ value type for a pure-helper local (param, internal local, or return
-/// slot). Reuse the ordinary scalar mapping and add the fixed/dynamic
-/// aggregate carriers so helper ABIs keep exact element types and widths.
-fn helper_local_cty(ty: &crate::ir::IrType, records: &[RecordSchema]) -> String {
-    match ty {
-        IrType::FixedVec { .. } => super::aggregate_value_cty(ty, records),
-        IrType::RecordSeq(record) => format!("std::vector<{}>", records[record.index()].name),
-        IrType::Seq(elem) => format!("std::vector<{}>", super::field_scalar_cty(elem)),
-        _ => super::local_scalar_cty(ty),
-    }
 }
 
 /// Return type for a helper: the declared type of its return slot, or
 /// `void` when it has none. Kept identical between the prototype and the
 /// definition so the two C++ signatures match.
-fn helper_ret_cty(func: &TbFunction, records: &[RecordSchema]) -> String {
+fn helper_ret_cty(prog: &TbProgram, func: &TbFunction) -> Result<String, EmitError> {
     match func.ret {
         Some(r) => func
             .locals
             .get(r.index())
-            .map(|l| helper_local_cty(&l.ty, records))
-            .unwrap_or_else(|| "uint64_t".to_string()),
-        None => "void".to_string(),
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: helper `{}` return local %{} does not resolve",
+                    func.name, r.0
+                ))
+            })
+            .and_then(|local| callable_value_cty(prog, &local.ty)),
+        None => Ok("void".to_string()),
     }
 }
 
@@ -1287,41 +1924,64 @@ fn helper_ret_cty(func: &TbFunction, records: &[RecordSchema]) -> String {
 /// `params.len()` locals ARE the parameters (TB-IR convention), so each
 /// param's declared type comes from `func.locals[i].ty`.
 fn helper_param_list(
+    prog: &TbProgram,
     func: &TbFunction,
     names: &[String],
-    records: &[RecordSchema],
-) -> String {
+) -> Result<String, EmitError> {
     names[..func.params.len()]
         .iter()
         .enumerate()
         .map(|(i, n)| {
-            let cty = func
-                .locals
+            func.locals
                 .get(i)
-                .map(|l| helper_local_cty(&l.ty, records))
-                .unwrap_or_else(|| "uint64_t".to_string());
-            format!("{cty} {n}")
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: helper `{}` parameter {} has no mirrored local",
+                        func.name, i
+                    ))
+                })
+                .and_then(|local| callable_value_cty(prog, &local.ty))
+                .map(|cty| format!("{cty} {n}"))
         })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect::<Result<Vec<_>, _>>()
+        .map(|params| params.join(", "))
 }
 
 /// Forward declaration for a lowered pure helper, so source-order
 /// emission supports helper-to-helper calls in any order.
 pub(super) fn emit_helper_prototype(
     out: &mut String,
+    prog: &TbProgram,
     func: &TbFunction,
-    records: &[RecordSchema],
-) {
+) -> Result<(), EmitError> {
+    emit_helper_declaration(out, prog, func, true)
+}
+
+pub(super) fn emit_common_helper_declaration(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+) -> Result<(), EmitError> {
+    emit_helper_declaration(out, prog, func, false)
+}
+
+fn emit_helper_declaration(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+    internal: bool,
+) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
-    let ret_ty = helper_ret_cty(func, records);
-    let params = helper_param_list(func, &names, records);
+    let ret_ty = helper_ret_cty(prog, func)?;
+    let params = helper_param_list(prog, func, &names)?;
+    let linkage = if internal { "static " } else { "" };
     writeln!(
         out,
-        "static {ret_ty} {}({params});",
+        "{linkage}{ret_ty} {}({params});",
         helper_cpp_name(&func.name)
     )
     .ok();
+    Ok(())
 }
 
 /// Emit one `FunctionKind::Helper` function (a lowered *pure* helper)
@@ -1342,6 +2002,23 @@ pub(super) fn emit_helper_function(
     prog: &TbProgram,
     func: &TbFunction,
 ) -> Result<(), EmitError> {
+    emit_helper_function_with_linkage(out, prog, func, true)
+}
+
+pub(super) fn emit_common_helper_function(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+) -> Result<(), EmitError> {
+    emit_helper_function_with_linkage(out, prog, func, false)
+}
+
+fn emit_helper_function_with_linkage(
+    out: &mut String,
+    prog: &TbProgram,
+    func: &TbFunction,
+    internal: bool,
+) -> Result<(), EmitError> {
     let names = cpp_local_names(func);
     // Pure helpers have no DUT access, so no lane table or probe access
     // (`dut_type` unused → `""`). Record locals use the program's
@@ -1352,19 +2029,23 @@ pub(super) fn emit_helper_function(
         func,
         names: &names,
         lanes: &empty_lanes,
-        self_subst: None,
+        bindings: CallableRenderBindings::default(),
         dut_type: "",
+        dut_access: None,
         trace_component: "",
         state_receiver: None,
         temporal_widths: &[],
+        temporal_cell_prefix: None,
+        common_contextual_tseqs: None,
     };
     let nparams = func.params.len();
 
-    let ret_ty = helper_ret_cty(func, &prog.records);
-    let params = helper_param_list(func, &names, &prog.records);
+    let ret_ty = helper_ret_cty(prog, func)?;
+    let params = helper_param_list(prog, func, &names)?;
+    let linkage = if internal { "static " } else { "" };
     writeln!(
         out,
-        "static {ret_ty} {}({params}) {{",
+        "{linkage}{ret_ty} {}({params}) {{",
         helper_cpp_name(&func.name)
     )
     .ok();
@@ -1381,13 +2062,27 @@ pub(super) fn emit_helper_function(
                 // type name before this hoisted declaration.
                 writeln!(out, "{INDENT}::{} {name}{{}}; (void){name};", schema.name).ok();
             }
-            IrType::FixedVec { .. } | IrType::RecordSeq(_) | IrType::Seq(_) => {
-                let cty = helper_local_cty(&local.ty, &prog.records);
+            IrType::Component(component) => {
+                let schema = prog.components.get(component.index()).ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: local `{name}` in pure helper {} references missing component c{}",
+                        func.name, component.0
+                    ))
+                })?;
+                writeln!(out, "{INDENT}::{} {name}{{}}; (void){name};", schema.name).ok();
+            }
+            IrType::RecordSeq(_) | IrType::Seq(_) | IrType::FixedVec { .. } => {
+                let cty = callable_value_cty(prog, &local.ty)?;
                 writeln!(out, "{INDENT}{cty} {name}{{}}; (void){name};").ok();
             }
             _ => {
-                let cty = helper_local_cty(&local.ty, &prog.records);
-                writeln!(out, "{INDENT}{cty} {name} = 0; (void){name};").ok();
+                let cty = callable_value_cty(prog, &local.ty)?;
+                let init = if matches!(local.ty, IrType::String) {
+                    "nullptr"
+                } else {
+                    "0"
+                };
+                writeln!(out, "{INDENT}{cty} {name} = {init}; (void){name};").ok();
             }
         }
     }
@@ -1420,6 +2115,21 @@ pub(super) fn emit_helper_function(
                 Stmt::AggregateInit(local) => {
                     let name = &names[local.index()];
                     writeln!(out, "{pad3}{name} = decltype({name}){{}};").ok();
+                }
+                Stmt::ComponentInit {
+                    local, component, ..
+                } => {
+                    let name = &names[local.index()];
+                    prog.components.get(component.index()).ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: ComponentInit of `{name}` in pure helper {} references missing component c{}",
+                            func.name, component.0
+                        ))
+                    })?;
+                    writeln!(out, "{pad3}{name} = decltype({name}){{}};").ok();
+                }
+                Stmt::RecordFieldWrite { .. } => {
+                    emit_stmt(out, prog, &cx, &prog.records, &[], s, 3)?;
                 }
                 other => {
                     return Err(EmitError(format!(
@@ -1471,18 +2181,265 @@ pub(super) fn emit_helper_function(
     Ok(())
 }
 
-/// C++ name of the file-scope hit counter behind one `cover` check.
-/// File scope (not a closure-local `static`) so the end-of-test summary,
-/// which lives in the test's `run_*` function rather than inside the run
-/// coroutine, can read it. v1 declares the same counter as a `static`
-/// local INSIDE the coroutine lambda and then reads it from the enclosing
-/// function — a scope error that makes v1's `cover` emission fail to
-/// compile (documented divergence; see `docs/tbir-mvp.md`).
-pub(super) fn cover_counter_name(tag: &str) -> String {
-    format!("_cov_{tag}_hits")
+pub(super) fn temporal_cell_cpp_type(
+    prog: &TbProgram,
+    func: &TbFunction,
+    lanes: &HashMap<String, u32>,
+    dut_type: &str,
+    dut_access: Option<&crate::ir::passes::dut_access::DutAccessPlan>,
+    slot: &crate::ir::TemporalSlot,
+) -> String {
+    let names = cpp_local_names(func);
+    let cx = ECx {
+        prog: Some(prog),
+        func,
+        names: &names,
+        lanes,
+        bindings: CallableRenderBindings {
+            testbench_owner: func.owner,
+            testbench_receiver: func.owner.map(|_| "_tb"),
+            ..CallableRenderBindings::default()
+        },
+        dut_type,
+        dut_access,
+        trace_component: "",
+        state_receiver: None,
+        temporal_widths: &[],
+        temporal_cell_prefix: None,
+        common_contextual_tseqs: None,
+    };
+    match expr_static_width(&cx, &slot.inner) {
+        Some(width) if width > 128 => {
+            format!("harc_rt::HarcWide<{}>", width.div_ceil(32))
+        }
+        Some(width) if width > 64 => "_harc_u128".to_string(),
+        _ => "int64_t".to_string(),
+    }
 }
 
-/// Declare each temporal latch's `static` previous-value cell and this
+fn require_runtime_cell_receiver<'a>(
+    cx: &ECx<'a>,
+    kind: &crate::ir::passes::runtime_cells::RuntimeCellKind,
+) -> Result<&'a str, EmitError> {
+    cx.bindings
+        .runtime_cells
+        .ok_or_else(|| {
+            EmitError(format!(
+                "tbir: {} requires runtime cell {kind:?} without a typed binding",
+                cx.func.name
+            ))
+        })?
+        .require(kind)
+}
+
+fn test_hook_cpp_name(cx: &ECx<'_>, function: FunctionId) -> Result<String, EmitError> {
+    cx.bindings
+        .runtime_cells
+        .ok_or_else(|| {
+            EmitError(format!(
+                "tbir: {} references test-hook fn{} without a typed runtime-cell binding",
+                cx.func.name, function.0
+            ))
+        })?
+        .test_hook(function)
+}
+
+fn component_base_schema<'a>(
+    cx: &ECx<'a>,
+    base: &crate::ir::ComponentBase,
+) -> Result<&'a crate::ir::ComponentSchema, EmitError> {
+    use crate::ir::{ComponentBase, ComponentFieldKind, FunctionKind};
+    let prog = cx.prog.ok_or_else(|| {
+        EmitError(format!(
+            "tbir: component value in {} has no typed program binding",
+            cx.func.name
+        ))
+    })?;
+    let (mut component, tail): (crate::ir::ComponentId, &[String]) = match base {
+        ComponentBase::Local(local) => match cx.func.locals.get(local.index()).map(|l| &l.ty) {
+            Some(IrType::Component(component)) => (*component, &[]),
+            _ => {
+                return Err(EmitError(format!(
+                    "tbir: component value local %{} in {} has no component type",
+                    local.0, cx.func.name
+                )))
+            }
+        },
+        ComponentBase::SelfField => match cx.func.kind {
+            FunctionKind::ComponentMethod { component, .. } => (component, &[]),
+            _ => {
+                return Err(EmitError(format!(
+                    "tbir: self-relative component value in {} has no component owner",
+                    cx.func.name
+                )))
+            }
+        },
+        ComponentBase::Path(path) => {
+            let (root, mut tail) = path.split_first().ok_or_else(|| {
+                EmitError(format!("tbir: empty component path in {}", cx.func.name))
+            })?;
+            if root == "self" {
+                let FunctionKind::ComponentMethod { component, .. } = cx.func.kind else {
+                    return Err(EmitError(format!(
+                        "tbir: self-rooted component path in {} has no component owner",
+                        cx.func.name
+                    )));
+                };
+                (component, tail)
+            } else if let Some(binding) = cx
+                .bindings
+                .testbench_components
+                .and_then(|bindings| bindings.iter().find(|binding| binding.field == *root))
+            {
+                tail = &path[1..];
+                (binding.component, tail)
+            } else {
+                let owner = cx
+                    .bindings
+                    .testbench_owner
+                    .or(cx.func.owner)
+                    .ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: component path `{}` in {} has no testbench owner",
+                            path.join("."),
+                            cx.func.name
+                        ))
+                    })?;
+                let testbench = prog.testbenches.get(owner.index()).ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: component path `{}` references missing testbench tb{}",
+                        path.join("."),
+                        owner.0
+                    ))
+                })?;
+                let binding = testbench
+                    .component_fields
+                    .iter()
+                    .find(|binding| binding.field == *root)
+                    .ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: component path `{}` has no typed root binding",
+                            path.join(".")
+                        ))
+                    })?;
+                tail = &path[1..];
+                (binding.component, tail)
+            }
+        }
+    };
+    for field in tail {
+        let schema = prog.components.get(component.index()).ok_or_else(|| {
+            EmitError(format!("tbir: component c{} does not resolve", component.0))
+        })?;
+        component = schema
+            .field(field)
+            .and_then(|field| match field.kind {
+                ComponentFieldKind::Sub { component, .. } => Some(component),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: component path segment `{field}` in {} is not a sub-component",
+                    cx.func.name
+                ))
+            })?;
+    }
+    prog.components
+        .get(component.index())
+        .ok_or_else(|| EmitError(format!("tbir: component c{} does not resolve", component.0)))
+}
+
+fn component_subpath_schema<'a>(
+    cx: &ECx<'a>,
+    base: &crate::ir::ComponentBase,
+    subpath: &[String],
+) -> Result<(crate::ir::ComponentId, &'a crate::ir::ComponentSchema), EmitError> {
+    let prog = cx.prog.ok_or_else(|| {
+        EmitError(format!(
+            "tbir: component value in {} has no typed program binding",
+            cx.func.name
+        ))
+    })?;
+    let mut schema = component_base_schema(cx, base)?;
+    let mut component = prog
+        .components
+        .iter()
+        .position(|candidate| std::ptr::eq(candidate, schema))
+        .map(|index| crate::ir::ComponentId(index as u32))
+        .ok_or_else(|| EmitError("tbir: resolved component schema is not in the program".into()))?;
+    for field in subpath {
+        component = schema
+            .field(field)
+            .and_then(|field| match field.kind {
+                crate::ir::ComponentFieldKind::Sub { component, .. } => Some(component),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: component subpath segment `{field}` in {} is not a sub-component",
+                    cx.func.name
+                ))
+            })?;
+        schema = prog.components.get(component.index()).ok_or_else(|| {
+            EmitError(format!("tbir: component c{} does not resolve", component.0))
+        })?;
+    }
+    Ok((component, schema))
+}
+
+fn scalar_shape_type(cx: &ECx<'_>, destination: &Expr) -> Option<IrType> {
+    let width = expr_static_width(cx, destination)?;
+    Some(if expr_is_signed(cx, destination) {
+        IrType::SInt(Some(width))
+    } else {
+        IrType::UInt(Some(width))
+    })
+}
+
+fn scalar_sink_expr_cpp(
+    cx: &ECx<'_>,
+    value: &Expr,
+    destination: Option<IrType>,
+) -> Result<String, EmitError> {
+    match destination {
+        Some(ty @ (IrType::UInt(Some(target)) | IrType::SInt(Some(target))))
+            if expr_is_signed(cx, value)
+                && expr_static_width(cx, value)
+                    .is_some_and(|source| source < target && (target <= 128 || source > 64)) =>
+        {
+            scalar_assignment_expr_cpp(cx, value, &ty)
+        }
+        _ => expr_cpp(cx, value),
+    }
+}
+
+fn emit_local_qualified_clock_wait(out: &mut String, pad: &str, clock_index: usize, cycles: &str) {
+    writeln!(
+        out,
+        "{pad}{{ if (_harc_actor_tick_due) {{ _harc_advance_actors(); _harc_actor_tick_due = false; }} long long _target = clocks_[{clock_index}].rising_count + (long long)({cycles}); while (clocks_[{clock_index}].rising_count < _target && !_fatal) {{"
+    )
+    .ok();
+    writeln!(out, "{pad}{INDENT}int _before_cycle = cycle_count;").ok();
+    writeln!(
+        out,
+        "{pad}{INDENT}long long _next = clocks_[0].next_edge_ps;"
+    )
+    .ok();
+    writeln!(out, "{pad}{INDENT}for (auto& _ck : clocks_) if (_ck.next_edge_ps < _next) _next = _ck.next_edge_ps;").ok();
+    writeln!(out, "{pad}{INDENT}eval_clocks_until(_next);").ok();
+    writeln!(
+        out,
+        "{pad}{INDENT}if (cycle_count != _before_cycle) _harc_advance_actors();"
+    )
+    .ok();
+    writeln!(out, "{pad}}} for (auto& _c : _checkers) _c(); }}").ok();
+}
+
+fn event_payload_ir_type(payload: crate::ir::EventPayload) -> IrType {
+    payload.value_ir_type()
+}
+
+/// Declare each temporal latch's previous-value cell and this
 /// cycle's value local, at the head of a concurrent-check closure.
 /// Returns nothing; the matching write-back is `emit_temporal_writeback`.
 fn emit_temporal_latches(
@@ -1496,23 +2453,11 @@ fn emit_temporal_latches(
         .iter()
         .map(|slot| expr_static_width(cx, &slot.inner))
         .collect();
-    for (i, width) in widths.iter().enumerate() {
-        match width {
-            Some(width) if *width > 128 => {
-                let words = width.div_ceil(32);
-                writeln!(
-                    out,
-                    "{pad}static harc_rt::HarcWide<{words}> _harc_ps{i}{{}};"
-                )
-                .ok();
-            }
-            Some(width) if *width > 64 => {
-                writeln!(out, "{pad}static _harc_u128 _harc_ps{i} = 0;").ok();
-            }
-            _ => {
-                writeln!(out, "{pad}static int64_t _harc_ps{i} = 0;").ok();
-            }
-        }
+    if !temporals.is_empty() && cx.temporal_cell_prefix.is_none() {
+        return Err(EmitError(format!(
+            "tbir: {} has temporal history without a runtime-cell binding",
+            cx.func.name
+        )));
     }
     for (i, slot) in temporals.iter().enumerate() {
         let inner = expr_cpp(cx, &slot.inner)?;
@@ -1536,13 +2481,29 @@ fn emit_temporal_latches(
     Ok(widths)
 }
 
-/// Copy each latch's current value into its `static` cell, so the next
+/// Copy each latch's current value into its per-run cell, so the next
 /// cycle's `past`/`rose`/`fell`/`stable` reads see it.
-fn emit_temporal_writeback(out: &mut String, n: usize, depth: usize) {
+fn emit_temporal_writeback(
+    out: &mut String,
+    cx: &ECx<'_>,
+    n: usize,
+    depth: usize,
+) -> Result<(), EmitError> {
+    if n == 0 {
+        return Ok(());
+    }
+    let prefix = cx.temporal_cell_prefix.ok_or_else(|| {
+        EmitError(format!(
+            "tbir: {} has temporal history without a runtime-cell binding",
+            cx.func.name
+        ))
+    })?;
     let pad = INDENT.repeat(depth);
     for i in 0..n {
-        writeln!(out, "{pad}_harc_ps{i} = _harc_cur{i};").ok();
+        let previous = format!("{prefix}_{i}");
+        writeln!(out, "{pad}{previous} = _harc_cur{i};").ok();
     }
+    Ok(())
 }
 
 /// One concurrent property check: a `_checkers` closure evaluated after
@@ -1552,6 +2513,7 @@ fn emit_temporal_writeback(out: &mut String, n: usize, depth: usize) {
 fn emit_property_check(
     out: &mut String,
     cx: &ECx<'_>,
+    id: crate::ir::PropertyCheckId,
     schema: &crate::ir::PropertyCheckSchema,
     depth: usize,
 ) -> Result<(), EmitError> {
@@ -1562,11 +2524,41 @@ fn emit_property_check(
     let sev = schema.severity.tag();
     let label = escape_c(&schema.label);
 
-    writeln!(out, "{pad}_checkers.push_back([&]() {{").ok();
-    let temporal_widths = emit_temporal_latches(out, cx, &schema.temporals, depth + 1)?;
+    let capture = persistent_callback_capture(cx);
+    writeln!(out, "{pad}_checkers.push_back([{capture}]() {{").ok();
+    emit_persistent_callback_bindings(out, cx, depth + 1);
+    let temporal_prefix = if schema.temporals.is_empty() {
+        None
+    } else {
+        for slot in 0..schema.temporals.len() {
+            require_runtime_cell_receiver(
+                cx,
+                &crate::ir::passes::runtime_cells::RuntimeCellKind::TemporalPrevious {
+                    check: crate::ir::passes::runtime_cells::TemporalCheck::Property(id),
+                    slot: slot as u32,
+                },
+            )?;
+        }
+        let first = cx
+            .bindings
+            .runtime_cells
+            .expect("binding required above")
+            .field(
+                &crate::ir::passes::runtime_cells::RuntimeCellKind::TemporalPrevious {
+                    check: crate::ir::passes::runtime_cells::TemporalCheck::Property(id),
+                    slot: 0,
+                },
+            )?;
+        Some(first.strip_suffix("_0").unwrap_or(&first).to_string())
+    };
+    let cell_cx = ECx {
+        temporal_cell_prefix: temporal_prefix.as_deref(),
+        ..*cx
+    };
+    let temporal_widths = emit_temporal_latches(out, &cell_cx, &schema.temporals, depth + 1)?;
     let temporal_cx = ECx {
         temporal_widths: &temporal_widths,
-        ..*cx
+        ..cell_cx
     };
     let cx = &temporal_cx;
 
@@ -1597,13 +2589,26 @@ fn emit_property_check(
         PropertyShape::ImpliesNext { ante, cons } => {
             let a = truthy_expr_cpp(cx, ante)?;
             let b = truthy_expr_cpp(cx, cons)?;
-            writeln!(out, "{pad1}static bool _harc_prev = false;").ok();
+            let previous = cx
+                .bindings
+                .runtime_cells
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: {} has a property implication without runtime-cell storage",
+                        cx.func.name
+                    ))
+                })?
+                .field(
+                    &crate::ir::passes::runtime_cells::RuntimeCellKind::PropertyImplicationPrevious {
+                        property: id,
+                    },
+                )?;
             writeln!(out, "{pad1}bool _harc_a = (bool)({a});").ok();
             writeln!(out, "{pad1}bool _harc_b = (bool)({b});").ok();
-            writeln!(out, "{pad1}if (_harc_prev && !_harc_b) {{").ok();
+            writeln!(out, "{pad1}if ({previous} && !_harc_b) {{").ok();
             fail_arm(out, " (|=>)")?;
             writeln!(out, "{pad1}}}").ok();
-            writeln!(out, "{pad1}_harc_prev = _harc_a;").ok();
+            writeln!(out, "{pad1}{previous} = _harc_a;").ok();
         }
         PropertyShape::Implies { ante, cons } => {
             let a = truthy_expr_cpp(cx, ante)?;
@@ -1620,33 +2625,67 @@ fn emit_property_check(
         }
     }
 
-    emit_temporal_writeback(out, schema.temporals.len(), depth + 1);
+    emit_temporal_writeback(out, cx, schema.temporals.len(), depth + 1)?;
     writeln!(out, "{pad}}});").ok();
     Ok(())
 }
 
 /// One concurrent `cover` witness: a `_checkers` closure that bumps the
-/// check's file-scope hit counter on every primary-clock edge where the
+/// check's per-run hit counter on every primary-clock edge where the
 /// predicate holds. Mirrors v1's `StmtKind::Cover` emission, plus the
 /// temporal-latch machinery v1's cover path lacks.
 fn emit_cover_check(
     out: &mut String,
     cx: &ECx<'_>,
+    id: crate::ir::CoverCheckId,
     schema: &crate::ir::CoverCheckSchema,
     depth: usize,
 ) -> Result<(), EmitError> {
     let pad = INDENT.repeat(depth);
     let pad1 = INDENT.repeat(depth + 1);
-    let counter = cover_counter_name(&schema.tag);
-    writeln!(out, "{pad}_checkers.push_back([&]() {{").ok();
-    let temporal_widths = emit_temporal_latches(out, cx, &schema.temporals, depth + 1)?;
+    let binding = cx.bindings.runtime_cells.ok_or_else(|| {
+        EmitError(format!(
+            "tbir: {} has a cover check without runtime-cell storage",
+            cx.func.name
+        ))
+    })?;
+    let counter = binding
+        .field(&crate::ir::passes::runtime_cells::RuntimeCellKind::CoverHits { cover: id })?;
+    let capture = persistent_callback_capture(cx);
+    writeln!(out, "{pad}_checkers.push_back([{capture}]() {{").ok();
+    emit_persistent_callback_bindings(out, cx, depth + 1);
+    for slot in 0..schema.temporals.len() {
+        require_runtime_cell_receiver(
+            cx,
+            &crate::ir::passes::runtime_cells::RuntimeCellKind::TemporalPrevious {
+                check: crate::ir::passes::runtime_cells::TemporalCheck::Cover(id),
+                slot: slot as u32,
+            },
+        )?;
+    }
+    let temporal_prefix = if schema.temporals.is_empty() {
+        None
+    } else {
+        let first = binding.field(
+            &crate::ir::passes::runtime_cells::RuntimeCellKind::TemporalPrevious {
+                check: crate::ir::passes::runtime_cells::TemporalCheck::Cover(id),
+                slot: 0,
+            },
+        )?;
+        Some(first.strip_suffix("_0").unwrap_or(&first).to_string())
+    };
+    let cell_cx = ECx {
+        temporal_cell_prefix: temporal_prefix.as_deref(),
+        ..*cx
+    };
+    let temporal_widths = emit_temporal_latches(out, &cell_cx, &schema.temporals, depth + 1)?;
     let temporal_cx = ECx {
         temporal_widths: &temporal_widths,
-        ..*cx
+        ..cell_cx
     };
     let cond = truthy_expr_cpp(&temporal_cx, &schema.cond)?;
     writeln!(out, "{pad1}if ((bool)({cond})) {counter}++;").ok();
-    emit_temporal_writeback(out, schema.temporals.len(), depth + 1);
+    emit_temporal_writeback(out, &temporal_cx, schema.temporals.len(), depth + 1)?;
     writeln!(out, "{pad}}});").ok();
     Ok(())
 }
@@ -1665,7 +2704,6 @@ fn emit_cover_check(
 fn emit_cycle_handler(
     out: &mut String,
     cx: &ECx<'_>,
-    prog: &TbProgram,
     id: crate::ir::CycleHandlerId,
     schema: &crate::ir::CycleHandlerSchema,
     depth: usize,
@@ -1674,17 +2712,14 @@ fn emit_cycle_handler(
     let pad = INDENT.repeat(depth);
     let pad1 = INDENT.repeat(depth + 1);
     let pad2 = INDENT.repeat(depth + 2);
-    let lambda = &prog
-        .functions
-        .get(schema.function.index())
-        .ok_or_else(|| EmitError(format!("tbir: cycle handler h{} has no body", id.0)))?
-        .name;
-    // Per-handler tag for the `static` latch cells. Unique per closure
-    // scope already, but tagged by handler id so a debugger shows which
-    // `on` a cell belongs to.
+    let lambda = test_hook_cpp_name(cx, schema.function)?;
+    // Per-handler tag for temporary values. It is unique per closure and
+    // keeps debugger output attributable to the source handler.
     let tag = format!("_onh_{}", id.0);
     let vec = schema.phase.service_vec();
-    writeln!(out, "{pad}{vec}.push_back([&]() {{").ok();
+    let capture = persistent_callback_capture(cx);
+    writeln!(out, "{pad}{vec}.push_back([{capture}]() {{").ok();
+    emit_persistent_callback_bindings(out, cx, depth + 1);
     match &schema.kind {
         CycleHandlerKind::Periodic { period } => {
             // `last = 0` means the FIRST firing is at cycle `period`, not
@@ -1692,14 +2727,27 @@ fn emit_cycle_handler(
             // Re-read the expression every cycle, matching v1 and allowing a
             // captured statement local to change after registration.
             let period = expr_cpp(cx, period)?;
-            writeln!(out, "{pad1}static int64_t {tag}_last = 0;").ok();
+            let last = cx
+                .bindings
+                .runtime_cells
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: {} has a periodic handler without runtime-cell storage",
+                        cx.func.name
+                    ))
+                })?
+                .field(
+                    &crate::ir::passes::runtime_cells::RuntimeCellKind::StatementPeriodicLast {
+                        handler: id,
+                    },
+                )?;
             writeln!(out, "{pad1}int64_t {tag}_period = (int64_t)({period});").ok();
             writeln!(
                 out,
-                "{pad1}if ({tag}_period > 0 && (int64_t)cycle_count - {tag}_last >= {tag}_period) {{"
+                "{pad1}if ({tag}_period > 0 && (int64_t)cycle_count - {last} >= {tag}_period) {{"
             )
             .ok();
-            writeln!(out, "{pad2}{tag}_last = (int64_t)cycle_count;").ok();
+            writeln!(out, "{pad2}{last} = (int64_t)cycle_count;").ok();
             writeln!(out, "{pad2}{lambda}();").ok();
             writeln!(out, "{pad1}}}").ok();
         }
@@ -1712,16 +2760,29 @@ fn emit_cycle_handler(
                     writeln!(out, "{pad1}}}").ok();
                 }
                 crate::ir::CycleEdge::Rising | crate::ir::CycleEdge::Falling => {
-                    writeln!(out, "{pad1}static bool {tag}_prev = false;").ok();
+                    let previous = cx
+                        .bindings
+                        .runtime_cells
+                        .ok_or_else(|| {
+                            EmitError(format!(
+                                "tbir: {} has an edge handler without runtime-cell storage",
+                                cx.func.name
+                            ))
+                        })?
+                        .field(
+                            &crate::ir::passes::runtime_cells::RuntimeCellKind::StatementEdgePrevious {
+                                handler: id,
+                            },
+                        )?;
                     writeln!(out, "{pad1}bool {tag}_curr = (bool)({t});").ok();
                     let cond = match edge {
-                        crate::ir::CycleEdge::Rising => format!("!{tag}_prev && {tag}_curr"),
-                        _ => format!("{tag}_prev && !{tag}_curr"),
+                        crate::ir::CycleEdge::Rising => format!("!{previous} && {tag}_curr"),
+                        _ => format!("{previous} && !{tag}_curr"),
                     };
                     writeln!(out, "{pad1}if ({cond}) {{").ok();
                     writeln!(out, "{pad2}{lambda}();").ok();
                     writeln!(out, "{pad1}}}").ok();
-                    writeln!(out, "{pad1}{tag}_prev = {tag}_curr;").ok();
+                    writeln!(out, "{pad1}{previous} = {tag}_curr;").ok();
                 }
             }
         }
@@ -1746,9 +2807,9 @@ fn event_payload_cty(prog: &TbProgram, cx: &ECx<'_>, event: LocalId) -> Result<S
         Some(IrType::Event(crate::ir::EventPayload::Record(r))) => {
             Ok(prog.records[r.index()].name.clone())
         }
-        Some(IrType::Event(p @ crate::ir::EventPayload::FixedVec { .. })) => {
-            Ok(super::aggregate_value_cty(&p.value_ir_type(), &prog.records))
-        }
+        Some(IrType::Event(p @ crate::ir::EventPayload::FixedVec { .. })) => Ok(
+            super::aggregate_value_cty(&p.value_ir_type(), &prog.records),
+        ),
         _ => Err(EmitError(format!(
             "tbir: {} uses local {} as an event channel but it is not event-typed",
             cx.func.name, event.0
@@ -1756,15 +2817,83 @@ fn event_payload_cty(prog: &TbProgram, cx: &ECx<'_>, event: LocalId) -> Result<S
     }
 }
 
-fn hook_param_cty(prog: &TbProgram, ty: &IrType) -> String {
-    match ty {
-        IrType::Record(r) => prog.records[r.index()].name.clone(),
-        IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
-        IrType::Seq(scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
-        IrType::FixedVec { .. } => super::aggregate_value_cty(ty, &prog.records),
-        IrType::Component(c) => prog.components[c.index()].name.clone(),
-        other => super::local_scalar_cty(other),
+fn hook_param_cty(prog: &TbProgram, ty: &IrType) -> Result<String, EmitError> {
+    super::callable_value_cty(prog, ty)
+}
+
+fn persistent_callback_capture(cx: &ECx<'_>) -> &'static str {
+    if cx.bindings.durable_callbacks {
+        "_harc_callback_state = &_harc_run_state, _harc_callback_context = &ctx"
+    } else {
+        "&"
     }
+}
+
+fn emit_persistent_callback_bindings(out: &mut String, cx: &ECx<'_>, depth: usize) {
+    if !cx.bindings.durable_callbacks {
+        return;
+    }
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    writeln!(out, "{pad}auto& _harc_run_state = *_harc_callback_state;").ok();
+    writeln!(out, "{pad}auto& ctx = *_harc_callback_context;").ok();
+    writeln!(out, "{pad}auto* dut = ctx.dut;").ok();
+    writeln!(out, "{pad}auto& errors = ctx.errors;").ok();
+    writeln!(out, "{pad}auto& _fatal = ctx.fatal;").ok();
+    writeln!(out, "{pad}auto& cycle_count = ctx.cycle_count;").ok();
+    writeln!(out, "{pad}auto& trace = ctx.trace;").ok();
+    writeln!(out, "{pad}auto& log_ctx = ctx.log_ctx;").ok();
+    writeln!(out, "{pad}auto& _checkers = ctx._checkers;").ok();
+    writeln!(
+        out,
+        "{pad}auto& _post_eval_services = ctx._post_eval_services;"
+    )
+    .ok();
+    writeln!(out, "{pad}auto& _auto_cov_reports = ctx._auto_cov_reports;").ok();
+    writeln!(out, "{pad}auto& harc_rng = ctx.rng;").ok();
+    if let Some(testbench) = super::expr::owner_tb(cx) {
+        for binding in &testbench.regblock_bindings {
+            writeln!(
+                out,
+                "{pad}auto& {} = _harc_run_state.{};",
+                binding.field, binding.field
+            )
+            .ok();
+            if !binding.callbacks.is_empty() {
+                writeln!(
+                    out,
+                    "{pad}auto& {}_cb_depth = _harc_run_state.{}_cb_depth;",
+                    binding.field, binding.field
+                )
+                .ok();
+            }
+        }
+    }
+    writeln!(
+        out,
+        "{pad}auto sim_logf_line = [&](FILE* f, const char* sev, const char* fmt, ...) {{"
+    )
+    .ok();
+    writeln!(
+        out,
+        "{pad1}HARC_RT_LOG_FILE_ONLY_PRINTF(f, cycle_count, sev, fmt);"
+    )
+    .ok();
+    writeln!(out, "{pad}}};").ok();
+    writeln!(
+        out,
+        "{pad}auto sim_log_line = [&](const char* sev, const char* fmt, ...) {{"
+    )
+    .ok();
+    writeln!(out, "{pad1}va_list ap;").ok();
+    writeln!(out, "{pad1}va_start(ap, fmt);").ok();
+    writeln!(
+        out,
+        "{pad1}harc_rt::log::harc_log_vline(log_ctx.sim_log, &trace, cycle_count, sev, fmt, ap);"
+    )
+    .ok();
+    writeln!(out, "{pad1}va_end(ap);").ok();
+    writeln!(out, "{pad}}};").ok();
 }
 
 fn emit_stmt(
@@ -1785,21 +2914,34 @@ fn emit_stmt(
             // call; the single-site backend expands it here into v1's
             // blocking req/rsp wire protocol (the verifier pinned the
             // edge to exactly this position).
-            if let Expr::Call(CallTarget::TransactorMethod { bus_field, method }, args) = e {
+            if let Expr::Call(
+                CallTarget::TransactorMethod {
+                    bus_field,
+                    method,
+                    target,
+                },
+                args,
+            ) = e
+            {
                 return emit_transactor_call(
-                    out, cx, records, bindings, *l, bus_field, method, args, depth,
+                    out, cx, records, bindings, *l, bus_field, method, target, args, depth,
                 );
             }
-            let name = &names[l.index()];
-            let e = expr_cpp(cx, e)?;
+            let name = local_cpp_name(cx, *l)?;
+            let e = scalar_sink_expr_cpp(cx, e, local_ir_type(cx, *l).cloned())?;
             writeln!(out, "{pad}{name} = {e};").ok();
         }
         Stmt::RecordInit(l, r) => {
-            let name = &names[l.index()];
+            let name = local_cpp_name(cx, *l)?;
             // Shared test-scope records are default-constructed once by
             // the enclosing test. Re-initializing them inside run/check/
             // hook bodies would wipe persistent host state.
-            if shared_record_names(prog, func).contains(name) {
+            if func
+                .testbench_record_locals
+                .iter()
+                .any(|binding| binding.local == *l)
+                || shared_record_names(prog, func).contains(&name)
+            {
                 return Ok(());
             }
             let rec = records.get(r.index()).ok_or_else(|| {
@@ -1814,52 +2956,153 @@ fn emit_stmt(
             let name = &names[l.index()];
             writeln!(out, "{pad}{name} = decltype({name}){{}};").ok();
         }
+        Stmt::ComponentInit {
+            local, component, ..
+        } => {
+            let name = local_cpp_name(cx, *local)?;
+            prog.components.get(component.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: ComponentInit of `{name}` in {} references missing component c{}",
+                    func.name, component.0
+                ))
+            })?;
+            writeln!(out, "{pad}{name} = decltype({name}){{}};").ok();
+        }
         Stmt::TransactorCall { dest, call } => {
-            let Expr::Call(CallTarget::TransactorMethod { bus_field, method }, args) = call else {
+            let Expr::Call(
+                CallTarget::TransactorMethod {
+                    bus_field,
+                    method,
+                    target,
+                },
+                args,
+            ) = call
+            else {
                 return Err(EmitError(format!(
                     "tbir: TransactorCall in {} carries a non-call-edge payload \
                      (verifier invariant violated)",
                     func.name
                 )));
             };
+            let crate::ir::TransactorMethodTarget::Callable {
+                transactor,
+                function,
+            } = target
+            else {
+                return Err(EmitError(format!(
+                    "tbir: TransactorCall `{bus_field}.{method}` in {} does not carry a typed callable target",
+                    func.name
+                )));
+            };
             // Resolve the instance field to its transactor type via the
             // owner testbench — the lambda is named `<Type>_<method>`,
             // mirroring v1's hookable lambda naming.
-            let (xschema, state_storage) = func
-                .owner
-                .and_then(|o| prog.testbenches.get(o.index()))
-                .and_then(|tb| {
-                    tb.transactor_fields
-                        .iter()
-                        .find(|(f, _)| f == bus_field)
-                        .map(|(_, xid)| {
-                            let storage = tb
-                                .unbound_state_actors
-                                .iter()
-                                .find(|actor| actor.field == *bus_field)
-                                .map(|actor| actor.storage.clone())
-                                .unwrap_or_else(|| bus_field.clone());
-                            (prog.transactor(*xid), storage)
-                        })
-                })
+            let owner = super::expr::owner_tb(cx).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: TransactorCall `{bus_field}.{method}` in {} does not \
+                         resolve through the owner testbench",
+                    func.name
+                ))
+            })?;
+            let receiver_type = owner
+                .transactor_fields
+                .iter()
+                .find(|(field, _)| field == bus_field)
+                .map(|(_, transactor)| *transactor)
                 .ok_or_else(|| {
                     EmitError(format!(
-                        "tbir: TransactorCall `{bus_field}.{method}` in {} does not \
-                         resolve through the owner testbench",
+                        "tbir: TransactorCall `{bus_field}.{method}` in {} has no typed receiver field",
                         func.name
                     ))
                 })?;
+            if receiver_type != *transactor {
+                return Err(EmitError(format!(
+                    "tbir: TransactorCall `{bus_field}.{method}` in {} carries transactor x{} but the receiver has type x{}",
+                    func.name, transactor.0, receiver_type.0
+                )));
+            }
+            let xschema = prog.transactors.get(transactor.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: TransactorCall `{bus_field}.{method}` in {} references missing transactor x{}",
+                    func.name, transactor.0
+                ))
+            })?;
+            let Some(method_schema) = xschema
+                .method(method)
+                .filter(|schema| schema.function == *function)
+            else {
+                return Err(EmitError(format!(
+                    "tbir: TransactorCall `{bus_field}.{method}` in {} carries stale callable fn{}",
+                    func.name, function.0
+                )));
+            };
             let xname = xschema.emission_name();
-            let mut rendered = Vec::with_capacity(args.len() + 1);
+            let mut rendered = Vec::with_capacity(args.len() + 3);
+            if let Some(context) = cx.bindings.run_context {
+                rendered.push(context.to_string());
+            }
             // State-receiver ABI (#494 P1b): an unbound stateful
             // transactor's method takes the calling instance's per-instance
             // state struct by reference as the leading arg, so `a.go()` and
             // `b.go()` mutate their own state through one shared body.
             if uses_state_receiver(xschema) {
-                rendered.push(state_storage);
+                let explicit = cx
+                    .bindings
+                    .testbench_transactor_states
+                    .and_then(|bindings| {
+                        bindings.iter().find(|binding| {
+                            binding.field == *bus_field && binding.transactor == *transactor
+                        })
+                    })
+                    .map(|binding| binding.receiver.clone());
+                let receiver = explicit
+                    .or_else(|| {
+                        owner
+                            .unbound_state_actors
+                            .iter()
+                            .find(|actor| {
+                                actor.field == *bus_field && actor.transactor == *transactor
+                            })
+                            .map(|actor| {
+                                if cx.bindings.durable_callbacks {
+                                    format!("_harc_run_state.{}", actor.storage)
+                                } else {
+                                    actor.storage.clone()
+                                }
+                            })
+                    })
+                    .ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: stateful TransactorCall `{bus_field}.{method}` in {} has no typed state receiver",
+                            func.name
+                        ))
+                    })?;
+                rendered.push(receiver);
             }
-            for a in args {
-                rendered.push(expr_cpp(cx, a)?);
+            if cx.bindings.run_context.is_some() && xschema.bound_bus.is_some() {
+                let bound = owner
+                    .bound_bus_instances
+                    .iter()
+                    .find(|instance| {
+                        instance.field == *bus_field
+                            && instance.owner
+                                == crate::ir::BoundBusOwner::Transactor(*transactor)
+                    })
+                    .and_then(|instance| owner.bus_binding(instance.binding))
+                    .ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: common TransactorCall `{bus_field}.{method}` in {} has no explicit bound-bus adapter",
+                            func.name
+                        ))
+                    })?;
+                rendered.extend(testbench_bus_adapter_args(cx, *function, Some(bound))?);
+            }
+            for (index, a) in args.iter().enumerate() {
+                rendered.push(scalar_sink_expr_cpp(
+                    cx,
+                    a,
+                    method_schema.param_tys.get(index).cloned(),
+                )?);
             }
             let invoke = format!("{xname}_{method}({})", rendered.join(", "));
             match dest {
@@ -1872,7 +3115,15 @@ fn emit_stmt(
             }
         }
         Stmt::TransactorSelfCall { dest, call } => {
-            let Expr::Call(CallTarget::TransactorSelfMethod { transactor, method }, args) = call
+            let Expr::Call(
+                CallTarget::TransactorSelfMethod {
+                    transactor,
+                    transactor_name,
+                    method,
+                    function,
+                },
+                args,
+            ) = call
             else {
                 return Err(EmitError(format!(
                     "tbir: TransactorSelfCall in {} carries a non-self-call payload \
@@ -1880,7 +3131,31 @@ fn emit_stmt(
                     func.name
                 )));
             };
-            let mut rendered = Vec::with_capacity(args.len() + 1);
+            let schema = prog.transactors.get(transactor.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: TransactorSelfCall in {} references missing transactor x{}",
+                    func.name, transactor.0
+                ))
+            })?;
+            if schema.name != *transactor_name {
+                return Err(EmitError(format!(
+                    "tbir: TransactorSelfCall `{}.{method}` in {} carries stale typed callable fn{}",
+                    transactor_name, func.name, function.0
+                )));
+            }
+            let Some(method_schema) = schema
+                .method(method)
+                .filter(|candidate| candidate.function == *function)
+            else {
+                return Err(EmitError(format!(
+                    "tbir: TransactorSelfCall `{}.{method}` in {} carries stale typed callable fn{}",
+                    transactor_name, func.name, function.0
+                )));
+            };
+            let mut rendered = Vec::with_capacity(args.len() + 3);
+            if let Some(context) = cx.bindings.run_context {
+                rendered.push(context.to_string());
+            }
             // Same-type self-call: forward the current state receiver so the
             // callee mutates the SAME per-instance struct (#494 P1b). A
             // self-call only appears inside a method body, and a stateful
@@ -1889,10 +3164,17 @@ fn emit_stmt(
             if let Some(recv) = cx.state_receiver {
                 rendered.push(recv.to_string());
             }
-            for a in args {
-                rendered.push(expr_cpp(cx, a)?);
+            if cx.bindings.run_context.is_some() && schema.bound_bus.is_some() {
+                rendered.extend(testbench_bus_adapter_args(cx, *function, None)?);
             }
-            let invoke = format!("{transactor}_{method}({})", rendered.join(", "));
+            for (index, a) in args.iter().enumerate() {
+                rendered.push(scalar_sink_expr_cpp(
+                    cx,
+                    a,
+                    method_schema.param_tys.get(index).cloned(),
+                )?);
+            }
+            let invoke = format!("{}_{method}({})", schema.name, rendered.join(", "));
             match dest {
                 Some(d) => {
                     writeln!(out, "{pad}{} = {invoke};", &names[d.index()]).ok();
@@ -1914,10 +3196,23 @@ fn emit_stmt(
             // element store), or a mid-chain element write
             // (`tbl.entries[i].tag = value`) — one shared chain renderer
             // with the `Expr::RecordField` read side.
-            let name = &names[local.index()];
-            let e = expr_cpp(cx, value)?;
-            let dst =
-                super::expr::record_access_cpp(cx, name, field, path, mid_indices, index.as_ref())?;
+            let name = local_cpp_name(cx, *local)?;
+            let destination = Expr::RecordField {
+                local: *local,
+                field: field.clone(),
+                path: path.clone(),
+                mid_indices: mid_indices.clone(),
+                index: index.clone().map(Box::new),
+            };
+            let e = scalar_sink_expr_cpp(cx, value, scalar_shape_type(cx, &destination))?;
+            let dst = super::expr::record_access_cpp(
+                cx,
+                &name,
+                field,
+                path,
+                mid_indices,
+                index.as_ref(),
+            )?;
             writeln!(out, "{pad}{dst} = {e};").ok();
         }
         Stmt::RecordRead {
@@ -2001,7 +3296,11 @@ fn emit_stmt(
                     .callbacks
                     .iter()
                     .find(|(field, _)| field == &reg.name)
-                    .map(|(_, fid)| format!(" {}(_rec_data);", prog.function(*fid).name))
+                    .map(|(_, fid)| {
+                        test_hook_cpp_name(cx, *fid)
+                            .map(|callback| format!(" {callback}(_rec_data);"))
+                    })
+                    .transpose()?
                     .unwrap_or_default();
                 writeln!(
                     out,
@@ -2032,8 +3331,15 @@ fn emit_stmt(
             // observed value. Mirrors v1's `try_emit_record_write`
             // (`<binding>_cb_depth` / `HARC_RAL_CB_MAX_DEPTH`); the FATAL
             // message uses the const-decoded `at addr 0x..` to match v1.
-            let name = &names[local.index()];
-            let v = expr_cpp(cx, value)?;
+            let name = local_cpp_name(cx, *local)?;
+            let destination = Expr::RecordField {
+                local: *local,
+                field: field.clone(),
+                path: Vec::new(),
+                mid_indices: Vec::new(),
+                index: None,
+            };
+            let v = scalar_sink_expr_cpp(cx, value, scalar_shape_type(cx, &destination))?;
             writeln!(out, "{pad}{{").ok();
             let p1 = INDENT.repeat(depth + 1);
             let p2 = INDENT.repeat(depth + 2);
@@ -2052,7 +3358,7 @@ fn emit_stmt(
             // (v1 / runtime `RecordWrite` parity — see `RecordWriteCb` doc).
             writeln!(out, "{p2}{name}.{field} = _rec_data & 0x{mask:x}ull;").ok();
             if let Some(fid) = callback {
-                let cb_name = &prog.function(*fid).name;
+                let cb_name = test_hook_cpp_name(cx, *fid)?;
                 writeln!(out, "{p2}{cb_name}(_rec_data);").ok();
             }
             writeln!(out, "{p2}{binding}_cb_depth--;").ok();
@@ -2060,8 +3366,10 @@ fn emit_stmt(
             writeln!(out, "{pad}}}").ok();
         }
         Stmt::TbFieldWrite { field, value } => {
-            let e = expr_cpp(cx, value)?;
-            writeln!(out, "{pad}_tb.{field} = {e};").ok();
+            let destination = Expr::TbField(field.clone());
+            let e = scalar_sink_expr_cpp(cx, value, scalar_shape_type(cx, &destination))?;
+            let receiver = required_testbench_receiver(cx, "testbench field write")?;
+            writeln!(out, "{pad}{receiver}.{field} = {e};").ok();
         }
         // `_tb.mem[i] = v` (and `_tb.mem[i][j] = v` for a nested Vec) —
         // element write of a fixed-vector testbench field. Mirrors v1's
@@ -2073,20 +3381,38 @@ fn emit_stmt(
             value,
         } => {
             let idx = expr_cpp(cx, index)?;
-            let value = expr_cpp(cx, value)?;
-            let mut member = format!("_tb.{field}[{idx}]");
+            let destination = Expr::TbFieldVecElement {
+                field: field.clone(),
+                index: Box::new(index.clone()),
+                inner_index: inner_index.clone().map(Box::new),
+            };
+            let value = scalar_sink_expr_cpp(cx, value, scalar_shape_type(cx, &destination))?;
+            let mut member = format!(
+                "{}.{field}[{idx}]",
+                required_testbench_receiver(cx, "testbench vector write")?
+            );
             if let Some(inner) = inner_index {
                 member = format!("{member}[{}]", expr_cpp(cx, inner)?);
             }
             writeln!(out, "{pad}{member} = {value};").ok();
         }
         Stmt::TbQueuePush { field, value } => {
-            let e = expr_cpp(cx, value)?;
-            writeln!(out, "{pad}_tb.{field}.push({e});").ok();
+            let destination = owner_tb(cx)
+                .and_then(|testbench| {
+                    testbench
+                        .queue_fields
+                        .iter()
+                        .find(|queue| queue.name == *field)
+                })
+                .map(|queue| queue.elem.ir_type());
+            let e = scalar_sink_expr_cpp(cx, value, destination)?;
+            let receiver = required_testbench_receiver(cx, "testbench queue push")?;
+            writeln!(out, "{pad}{receiver}.{field}.push({e});").ok();
         }
         Stmt::TbQueuePop { field, dest } => {
             let name = &names[dest.index()];
-            writeln!(out, "{pad}{name} = _tb.{field}.pop();").ok();
+            let receiver = required_testbench_receiver(cx, "testbench queue pop")?;
+            writeln!(out, "{pad}{name} = {receiver}.{field}.pop();").ok();
         }
         Stmt::TransactorStateWrite {
             instance,
@@ -2094,7 +3420,11 @@ fn emit_stmt(
             value,
         } => {
             let recv = super::expr::resolve_state_instance(cx, instance)?;
-            let e = expr_cpp(cx, value)?;
+            let destination = Expr::TransactorState {
+                instance: instance.clone(),
+                field: field.clone(),
+            };
+            let e = scalar_sink_expr_cpp(cx, value, scalar_shape_type(cx, &destination))?;
             writeln!(out, "{pad}{recv}.{field} = {e};").ok();
         }
         // `last.addr = addr` on a bound-to target transactor whole-record
@@ -2113,7 +3443,14 @@ fn emit_stmt(
             // which is what a transactor's own method body carries for a
             // self-reference — emitted a leading-dot `.cur.tag = 5;`.
             let recv = super::expr::resolve_state_instance(cx, instance)?;
-            let e = expr_cpp(cx, value)?;
+            let destination = Expr::TransactorStateRecordField {
+                instance: instance.clone(),
+                field: field.clone(),
+                path: path.clone(),
+                mid_indices: mid_indices.clone(),
+                index: index.clone().map(Box::new),
+            };
+            let e = scalar_sink_expr_cpp(cx, value, scalar_shape_type(cx, &destination))?;
             let recv = format!("{recv}.{field}");
             let dst = if path.is_empty() {
                 let Some(index) = index.as_ref() else {
@@ -2147,7 +3484,18 @@ fn emit_stmt(
             value,
         } => {
             let recv = super::expr::resolve_state_instance(cx, instance)?;
-            let e = expr_cpp(cx, value)?;
+            let destination = super::expr::state_transactor(cx, instance)
+                .and_then(|transactor| {
+                    transactor
+                        .state_fields
+                        .iter()
+                        .find(|state| state.name == *field)
+                })
+                .and_then(|state| match &state.kind {
+                    crate::ir::StateFieldKind::Queue { elem } => Some(elem.ir_type()),
+                    _ => None,
+                });
+            let e = scalar_sink_expr_cpp(cx, value, destination)?;
             writeln!(out, "{pad}{recv}.{field}.push({e});").ok();
         }
         // `let v = pending.pop()` — pop the state-queue front into a local.
@@ -2166,13 +3514,33 @@ fn emit_stmt(
             // (docs/probe-signals.md §4.1; v1's `emit_signal_assignment`
             // force-probe arm). The read-side mangled accessor is the
             // base; `_drv`/`_en` derive by suffix.
-            let base = probe_read_accessor(cx.dut_type, p);
-            let val = expr_cpp(cx, e)?;
-            writeln!(out, "{pad}dut->rootp->{base}_drv = {val};").ok();
-            writeln!(out, "{pad}dut->rootp->{base}_en = 1;").ok();
+            let base = super::expr::port_signal(cx, p)?;
+            if let Some(words) = wide_words_over_128(e) {
+                let req = words
+                    .iter()
+                    .rposition(|word| *word != 0)
+                    .map_or(1, |i| i + 1);
+                let list = words
+                    .iter()
+                    .map(|word| format!("0x{word:x}u"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                writeln!(
+                    out,
+                    "{pad}harc_rt::harc_assign_words_checked<{req}>({base}_drv, {{{list}}});"
+                )
+                .ok();
+            } else {
+                let val = match super::expr::port_value_type(cx, p)? {
+                    Some(destination) => scalar_assignment_expr_cpp(cx, e, &destination)?,
+                    None => expr_cpp(cx, e)?,
+                };
+                writeln!(out, "{pad}harc_rt::harc_assign({base}_drv, {val});").ok();
+            }
+            writeln!(out, "{pad}{base}_en = 1;").ok();
         }
         Stmt::DutWrite(p, e) => {
-            let sig = port_signal(cx, p);
+            let sig = port_signal(cx, p)?;
             match &p.lane {
                 // Packed multi-lane port: bit-deposit through the
                 // runtime helper; unpacked-array port: raw subscript
@@ -2181,7 +3549,10 @@ fn emit_stmt(
                 // arbitrary `&Expr` here.
                 Some(lane) => {
                     let idx = lane_index_cpp(cx, lane)?;
-                    let e = expr_cpp(cx, e)?;
+                    let e = match super::expr::port_value_type(cx, p)? {
+                        Some(destination) => scalar_assignment_expr_cpp(cx, e, &destination)?,
+                        None => expr_cpp(cx, e)?,
+                    };
                     match lane_width(cx, p) {
                         Some(w) => {
                             writeln!(
@@ -2213,7 +3584,10 @@ fn emit_stmt(
                         )
                         .ok();
                     } else {
-                        let e = expr_cpp(cx, e)?;
+                        let e = match super::expr::port_value_type(cx, p)? {
+                            Some(destination) => scalar_assignment_expr_cpp(cx, e, &destination)?,
+                            None => expr_cpp(cx, e)?,
+                        };
                         writeln!(out, "{pad}harc_rt::harc_assign({sig}, {e});").ok();
                     }
                 }
@@ -2223,21 +3597,28 @@ fn emit_stmt(
             let name = &names[l.index()];
             if matches!(cx.func.locals[l.index()].ty, IrType::PortSnapshot) {
                 let sampled = if snapshot_preserves_port_shape(cx.func, *l) {
-                    format!("harc_rt::harc_port_snapshot({})", port_signal(cx, p))
+                    format!("harc_rt::harc_port_snapshot({})", port_signal(cx, p)?)
                 } else {
                     port_read(cx, p)?
                 };
                 writeln!(out, "{pad}{name} = {sampled};").ok();
             } else {
-                writeln!(out, "{pad}{name} = {};", port_read(cx, p)?).ok();
+                let destination = super::expr::local_ir_type(cx, *l).ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: DUT read targets missing local %{} in {}",
+                        l.0, cx.func.name
+                    ))
+                })?;
+                let value = scalar_assignment_expr_cpp(cx, &Expr::Port(p.clone()), destination)?;
+                writeln!(out, "{pad}{name} = {value};").ok();
             }
         }
         Stmt::ProbeRelease(p) => {
             // `release dut.<force_probe>` → clear the enable wire so the
             // bound SV stub releases its procedural force (v1's `release`
             // → `<mangled>_en = 0`). Lowering guaranteed `access == Force`.
-            let base = probe_read_accessor(cx.dut_type, p);
-            writeln!(out, "{pad}dut->rootp->{base}_en = 0;").ok();
+            let base = super::expr::port_signal(cx, p)?;
+            writeln!(out, "{pad}{base}_en = 0;").ok();
         }
         Stmt::Log { level, args } => {
             let (sev, file) = match level {
@@ -2285,7 +3666,8 @@ fn emit_stmt(
             writeln!(out, "{pad}}}").ok();
         }
         Stmt::CovReport(inst) => {
-            writeln!(out, "{pad}_tb.{}.report();", inst.tb_field).ok();
+            let testbench = cx.bindings.testbench_receiver.unwrap_or("_tb");
+            writeln!(out, "{pad}{testbench}.{}.report(log_ctx);", inst.tb_field).ok();
         }
         Stmt::PropertyCheck(p) => {
             let schema = prog.property_checks.get(p.index()).ok_or_else(|| {
@@ -2294,7 +3676,7 @@ fn emit_stmt(
                     func.name, p.0
                 ))
             })?;
-            emit_property_check(out, cx, schema, depth)?;
+            emit_property_check(out, cx, *p, schema, depth)?;
         }
         Stmt::CoverCheck(c) => {
             let schema = prog.cover_checks.get(c.index()).ok_or_else(|| {
@@ -2303,24 +3685,15 @@ fn emit_stmt(
                     func.name, c.0
                 ))
             })?;
-            emit_cover_check(out, cx, schema, depth)?;
+            emit_cover_check(out, cx, *c, schema, depth)?;
         }
         // v1's shape exactly: a subscriber is a closure pushed onto the
         // channel vector, and `emit` calls each subscriber synchronously
         // in subscription order. The subscriber BODY is a separate
         // test-scope lambda (like a cycle handler's) so the pushed
         // closure outlives the block that registered it.
-        Stmt::EventSubscribe { event, handler } => {
-            let body = &prog
-                .functions
-                .get(handler.index())
-                .ok_or_else(|| {
-                    EmitError(format!(
-                        "tbir: {} subscribes to fn{} which does not resolve",
-                        func.name, handler.0
-                    ))
-                })?
-                .name;
+        Stmt::EventSubscribe { event, handler, .. } => {
+            let body = test_hook_cpp_name(cx, *handler)?;
             let (chan, ty) = match event {
                 crate::ir::EventChannelRef::Local(event) => (
                     names[event.index()].clone(),
@@ -2332,21 +3705,30 @@ fn emit_stmt(
                     payload,
                     ..
                 } => (
-                    format!("{}.{event}", comp_base_cpp_subst_cx(cx, base)),
+                    format!("{}.{event}", comp_base_cpp_subst_cx(cx, base)?),
                     super::runtime::event_payload_cty(payload, records),
                 ),
             };
-            writeln!(
-                out,
-                "{pad}{chan}.push_back([&]({ty} _p) {{ {body}(_p); }});"
-            )
-            .ok();
+            if cx.bindings.durable_callbacks {
+                let capture = persistent_callback_capture(cx);
+                writeln!(out, "{pad}{chan}.push_back([{capture}]({ty} _p) {{").ok();
+                emit_persistent_callback_bindings(out, cx, depth + 1);
+                writeln!(out, "{pad}{INDENT}{body}(_p);").ok();
+                writeln!(out, "{pad}}});").ok();
+            } else {
+                writeln!(
+                    out,
+                    "{pad}{chan}.push_back([&]({ty} _p) {{ {body}(_p); }});"
+                )
+                .ok();
+            }
         }
         Stmt::MethodHookSubscribe {
             target,
             side,
             handler,
             captures,
+            ..
         } => {
             let body = prog.functions.get(handler.index()).ok_or_else(|| {
                 EmitError(format!(
@@ -2360,7 +3742,9 @@ fn emit_stmt(
             };
             let vector = match target {
                 crate::ir::MethodHookTarget::Transactor {
-                    transactor, method, ..
+                    field,
+                    transactor,
+                    method,
                 } => {
                     let schema = prog.transactors.get(transactor.index()).ok_or_else(|| {
                         EmitError(format!(
@@ -2368,10 +3752,35 @@ fn emit_stmt(
                             transactor.0
                         ))
                     })?;
-                    format!("{}_{}_{side}", schema.emission_name(), method)
+                    let owner = func.owner.ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: transactor method hook in {} has no testbench owner",
+                            func.name
+                        ))
+                    })?;
+                    let testbench = prog.testbenches.get(owner.index()).ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: transactor method hook in {} references missing testbench tb{}",
+                            func.name, owner.0
+                        ))
+                    })?;
+                    let state = testbench
+                        .unbound_state_actors
+                        .iter()
+                        .find(|actor| actor.field == *field && actor.transactor == *transactor)
+                        .ok_or_else(|| {
+                            EmitError(format!(
+                                "tbir: transactor method hook `{field}.{method}` in {} has no typed instance hook state",
+                                func.name
+                            ))
+                        })?;
+                    let hook = super::runtime::transactor_hook_field(schema, method, side);
+                    format!("{}.{hook}", state.storage)
                 }
                 crate::ir::MethodHookTarget::Component {
-                    component, method, ..
+                    base,
+                    component,
+                    method,
                 } => {
                     let schema = prog.components.get(component.index()).ok_or_else(|| {
                         EmitError(format!(
@@ -2379,7 +3788,11 @@ fn emit_stmt(
                             component.0
                         ))
                     })?;
-                    format!("{}_{}_{side}", schema.name, method)
+                    let field = super::runtime::component_internal_member_name(
+                        schema,
+                        &format!("_harc_hook_{method}_{side}"),
+                    );
+                    format!("{}.{field}", comp_base_cpp_subst_cx(cx, base)?)
                 }
             };
             let method_param_count =
@@ -2396,7 +3809,7 @@ fn emit_stmt(
             let mut args = Vec::with_capacity(body.params.len());
             for (i, local) in body.locals.iter().take(method_param_count).enumerate() {
                 let name = format!("_h{i}");
-                decls.push(format!("{} {name}", hook_param_cty(prog, &local.ty)));
+                decls.push(format!("{} {name}", hook_param_cty(prog, &local.ty)?));
                 args.push(name);
             }
             for capture in captures {
@@ -2408,20 +3821,37 @@ fn emit_stmt(
                 })?;
                 args.push(name.clone());
             }
-            writeln!(
-                out,
-                "{pad}{vector}.push_back([&]({}) {{ {}({}); }});",
-                decls.join(", "),
-                body.name,
-                args.join(", ")
-            )
-            .ok();
+            let handler = test_hook_cpp_name(cx, *handler)?;
+            if cx.bindings.durable_callbacks {
+                let capture = persistent_callback_capture(cx);
+                writeln!(
+                    out,
+                    "{pad}{vector}.push_back([{capture}]({}) {{",
+                    decls.join(", ")
+                )
+                .ok();
+                emit_persistent_callback_bindings(out, cx, depth + 1);
+                writeln!(out, "{pad}{INDENT}{handler}({});", args.join(", ")).ok();
+                writeln!(out, "{pad}}});").ok();
+            } else {
+                writeln!(
+                    out,
+                    "{pad}{vector}.push_back([&]({}) {{ {handler}({}); }});",
+                    decls.join(", "),
+                    args.join(", ")
+                )
+                .ok();
+            }
         }
         Stmt::EventEmit { event, args } => {
             let chan = &names[event.index()];
+            let destination = local_ir_type(cx, *event).and_then(|ty| match ty {
+                IrType::Event(payload) => Some(event_payload_ir_type(payload.clone())),
+                _ => None,
+            });
             let mut rendered = Vec::with_capacity(args.len());
             for a in args {
-                rendered.push(expr_cpp(cx, a)?);
+                rendered.push(scalar_sink_expr_cpp(cx, a, destination.clone())?);
             }
             writeln!(
                 out,
@@ -2437,7 +3867,7 @@ fn emit_stmt(
                     func.name, h.0
                 ))
             })?;
-            emit_cycle_handler(out, cx, prog, *h, schema, depth)?;
+            emit_cycle_handler(out, cx, *h, schema, depth)?;
         }
         Stmt::FailDiag { guard, args } => match guard {
             // Per-sub-predicate breakdown: log only if the predicate
@@ -2466,14 +3896,28 @@ fn emit_stmt(
             // `self_subst` (the cycle-trigger / on-handler poke form).
             let base = match nested_path {
                 Some(p) if p.first().map(String::as_str) == Some("self") => {
-                    let root = cx.self_subst.unwrap_or("self");
+                    let root = cx.bindings.self_receiver.ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: self-owned scoreboard write in {} has no typed receiver",
+                            func.name
+                        ))
+                    })?;
                     std::iter::once(root.to_string())
                         .chain(p.iter().skip(1).cloned())
                         .collect::<Vec<_>>()
                         .join(".")
                 }
                 Some(p) => p.join("."),
-                None => format!("_tb.{field}"),
+                None => format!(
+                    "{}.{}",
+                    cx.bindings.testbench_receiver.ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: testbench scoreboard write `{field}` in {} has no typed receiver",
+                            func.name
+                        ))
+                    })?,
+                    field
+                ),
             };
             match op {
                 ScoreboardOp::QueuePush { queue, value } => {
@@ -2534,7 +3978,11 @@ fn emit_stmt(
         // Composite-component scalar field write — `self.count = ...`
         // inside a method body, or `env.sb.errors = ...` from the test.
         Stmt::ComponentFieldWrite { base, field, value } => {
-            let e = expr_cpp(cx, value)?;
+            let destination = Expr::ComponentField {
+                base: base.clone(),
+                field: field.clone(),
+            };
+            let e = scalar_sink_expr_cpp(cx, value, scalar_shape_type(cx, &destination))?;
             // cx-aware so a `self.<field>` write re-roots at the running
             // instance under `cx.self_subst` (the `--mt` active-driver worker
             // coroutine has no `self` parameter). Byte-identical to the bare
@@ -2542,7 +3990,7 @@ fn emit_stmt(
             writeln!(
                 out,
                 "{pad}{}.{field} = {e};",
-                comp_base_cpp_subst_cx(cx, base)
+                comp_base_cpp_subst_cx(cx, base)?
             )
             .ok();
         }
@@ -2554,8 +4002,15 @@ fn emit_stmt(
             inner_index,
             value,
         } => {
+            let destination = Expr::ComponentVecElement {
+                base: base.clone(),
+                field: field.clone(),
+                index_pos: *index_pos,
+                index: Box::new(index.clone()),
+                inner_index: inner_index.clone().map(Box::new),
+            };
+            let value = scalar_sink_expr_cpp(cx, value, scalar_shape_type(cx, &destination))?;
             let index = expr_cpp(cx, index)?;
-            let value = expr_cpp(cx, value)?;
             let mut field = super::expr::indexed_member_cpp(field, *index_pos, &index);
             if let Some(inner) = inner_index {
                 field = format!("{field}[{}]", expr_cpp(cx, inner)?);
@@ -2563,7 +4018,7 @@ fn emit_stmt(
             writeln!(
                 out,
                 "{pad}{}.{field} = {value};",
-                comp_base_cpp_subst_cx(cx, base)
+                comp_base_cpp_subst_cx(cx, base)?
             )
             .ok();
         }
@@ -2576,17 +4031,28 @@ fn emit_stmt(
             event,
             args,
         } => {
+            let (_, component) = component_subpath_schema(cx, base, subpath)?;
+            let destination = component.field(event).and_then(|field| match &field.kind {
+                crate::ir::ComponentFieldKind::Event { payload } => {
+                    Some(event_payload_ir_type(payload.clone()))
+                }
+                _ => None,
+            });
             let mut rendered = Vec::with_capacity(args.len());
             for a in args {
-                rendered.push(expr_cpp(cx, a)?);
+                rendered.push(scalar_sink_expr_cpp(cx, a, destination.clone())?);
             }
             let csv = rendered.join(", ");
-            let recv = std::iter::once(comp_base_cpp_subst_cx(cx, base))
+            let recv = std::iter::once(comp_base_cpp_subst_cx(cx, base)?)
                 .chain(subpath.iter().cloned())
                 .collect::<Vec<_>>()
                 .join(".");
+            let heartbeat = super::runtime::component_heartbeat_field(
+                component,
+                crate::ir::passes::runtime_cells::ComponentHeartbeat::Output,
+            );
             writeln!(out, "{pad}for (auto& _s : {recv}.{event}) _s({csv});").ok();
-            writeln!(out, "{pad}{recv}._last_out_cycle = (uint64_t)cycle_count;").ok();
+            writeln!(out, "{pad}{recv}.{heartbeat} = (uint64_t)cycle_count;").ok();
         }
         // `env.source.publish(3)` — a free `<Comp>_<method>(receiver,
         // args)` lambda call (v1's `emit_component_method` shape).
@@ -2594,6 +4060,7 @@ fn emit_stmt(
             base,
             component,
             method,
+            function,
             args,
             dest,
         } => {
@@ -2603,9 +4070,28 @@ fn emit_stmt(
                     func.name, component.0
                 ))
             })?;
-            let mut rendered = vec![comp_base_cpp_subst_cx(cx, base)];
-            for a in args {
-                rendered.push(expr_cpp(cx, a)?);
+            let Some(method_schema) = comp
+                .method(method)
+                .filter(|schema| schema.function == *function)
+            else {
+                return Err(EmitError(format!(
+                    "tbir: ComponentCall `{}.{method}` in {} carries stale callable fn{}",
+                    comp.name, func.name, function.0
+                )));
+            };
+            let mut rendered = Vec::with_capacity(args.len() + 2);
+            if let Some(context) = cx.bindings.run_context {
+                rendered.push(context.to_string());
+            }
+            rendered.push(comp_base_cpp_subst_cx(cx, base)?);
+            let concrete_binding = component_bound_bus_binding(cx, base, *component)?;
+            rendered.extend(testbench_bus_adapter_args(cx, *function, concrete_binding)?);
+            for (index, a) in args.iter().enumerate() {
+                rendered.push(scalar_sink_expr_cpp(
+                    cx,
+                    a,
+                    method_schema.param_tys.get(index).cloned(),
+                )?);
             }
             let invoke = format!("{}_{method}({})", comp.name, rendered.join(", "));
             match dest {
@@ -2617,28 +4103,198 @@ fn emit_stmt(
                 }
             }
         }
+        Stmt::TestbenchCall {
+            function,
+            args,
+            dut_args,
+            dest,
+        } => {
+            let callee = prog.functions.get(function.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: TestbenchCall in {} references missing function fn{}",
+                    func.name, function.0
+                ))
+            })?;
+            let FunctionKind::TestbenchMethod { testbench, .. } = callee.kind else {
+                return Err(EmitError(format!(
+                    "tbir: TestbenchCall in {} targets non-testbench function fn{}",
+                    func.name, function.0
+                )));
+            };
+            let schema = prog.testbench_types.get(testbench.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: TestbenchCall in {} references missing testbench type tbt{}",
+                    func.name, testbench.0
+                ))
+            })?;
+            let method = schema
+                .methods
+                .iter()
+                .find(|method| method.function == *function)
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: TestbenchCall in {} has no owner entry for fn{}",
+                        func.name, function.0
+                    ))
+                })?;
+            let mut rendered = Vec::with_capacity(args.len() + 2);
+            if let Some(context) = cx.bindings.run_context {
+                rendered.push(context.to_string());
+            }
+            rendered.push(
+                cx.bindings
+                    .testbench_receiver
+                    .ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: TestbenchCall in {} has no typed testbench receiver",
+                            func.name
+                        ))
+                    })?
+                    .to_string(),
+            );
+            if cx.bindings.run_context.is_some() {
+                for (field, component) in &schema.component_fields {
+                    let receiver = cx
+                        .bindings
+                        .testbench_components
+                        .and_then(|bindings| {
+                            bindings.iter().find(|binding| {
+                                binding.field == *field && binding.component == *component
+                            })
+                        })
+                        .map(|binding| binding.receiver.clone())
+                        .ok_or_else(|| {
+                            EmitError(format!(
+                                "tbir: TestbenchCall in {} has no typed binding for component field `{field}` c{}",
+                                func.name, component.0
+                            ))
+                        })?;
+                    rendered.push(receiver);
+                }
+                for (field, transactor) in testbench_method_transactor_state_fields(prog, callee)? {
+                    let receiver = cx
+                        .bindings
+                        .testbench_transactor_states
+                        .and_then(|bindings| {
+                            bindings.iter().find(|binding| {
+                                binding.field == field && binding.transactor == transactor
+                            })
+                        })
+                        .map(|binding| binding.receiver.clone())
+                        .ok_or_else(|| {
+                            EmitError(format!(
+                                "tbir: TestbenchCall in {} has no typed state binding for transactor field `{field}` x{}",
+                                func.name, transactor.0
+                            ))
+                        })?;
+                    rendered.push(receiver);
+                }
+            }
+            rendered.extend(testbench_bus_adapter_args(cx, *function, None)?);
+            for (index, arg) in args.iter().enumerate() {
+                if dut_args.contains(&index) {
+                    let receiver = match arg {
+                        Expr::Literal {
+                            value: 0,
+                            ty: IrType::Unknown,
+                        } => super::expr::dut_receiver(cx)?.to_string(),
+                        Expr::Local(local) => super::expr::local_cpp_name(cx, *local)?,
+                        _ => {
+                            return Err(EmitError(format!(
+                            "tbir: TestbenchCall in {} has a non-canonical typed DUT argument {}",
+                            func.name,
+                            index + 1
+                        )))
+                        }
+                    };
+                    rendered.push(receiver);
+                } else {
+                    rendered.push(scalar_sink_expr_cpp(
+                        cx,
+                        arg,
+                        callee
+                            .params
+                            .get(index)
+                            .map(|parameter| parameter.ty.clone()),
+                    )?);
+                }
+            }
+            let invoke = format!("{}_{}({})", schema.name, method.name, rendered.join(", "));
+            match dest {
+                Some(dest) => {
+                    writeln!(out, "{pad}{} = {invoke};", &names[dest.index()]).ok();
+                }
+                None => {
+                    writeln!(out, "{pad}{invoke};").ok();
+                }
+            }
+        }
         // `<recv>.<queue>.push(value)` on a composite-component `queue<T>`
         // field — `self.errors.push(err)` inside a method body, or
         // `checker.sb.errors.push(e)` from the test. Mirrors v1's
         // `HarcQueue::push`.
         Stmt::ComponentQueuePush { base, queue, value } => {
-            let e = expr_cpp(cx, value)?;
-            writeln!(out, "{pad}{}.{queue}.push({e});", comp_base_cpp(base)).ok();
+            let destination = component_base_schema(cx, base)?
+                .field(queue)
+                .and_then(|field| match &field.kind {
+                    crate::ir::ComponentFieldKind::Queue { elem } => Some(elem.ir_type()),
+                    _ => None,
+                });
+            let e = scalar_sink_expr_cpp(cx, value, destination)?;
+            writeln!(
+                out,
+                "{pad}{}.{queue}.push({e});",
+                comp_base_cpp_subst_cx(cx, base)?
+            )
+            .ok();
         }
         // `let v = <recv>.<queue>.pop()` — pop the queue front into a local.
         Stmt::ComponentQueuePop { base, queue, dest } => {
             let name = &names[dest.index()];
-            writeln!(out, "{pad}{name} = {}.{queue}.pop();", comp_base_cpp(base)).ok();
-        }
-        // `<dst>.<field> = <src>` — whole sub-component value copy
-        // (`checker.sb = sb`). A plain C++ struct copy of two run-scope
-        // component locals (v1's `_tb.checker.sb = _tb.sb;`).
-        Stmt::ComponentSubAssign { dst, field, src } => {
             writeln!(
                 out,
-                "{pad}{}.{field} = {};",
-                comp_base_cpp(dst),
-                comp_base_cpp(src)
+                "{pad}{name} = {}.{queue}.pop();",
+                comp_base_cpp_subst_cx(cx, base)?
+            )
+            .ok();
+        }
+        // `<dst>.<field> = <src>` — whole sub-component value copy. Both
+        // bases use the context-aware renderer because method parameters and
+        // self-relative paths are legal on this statement.
+        Stmt::ComponentSubAssign { dst, field, src } => {
+            let parent = component_base_schema(cx, dst)?;
+            let component = parent
+                .field(field)
+                .and_then(|schema| match schema.kind {
+                    crate::ir::ComponentFieldKind::Sub { component, .. } => Some(component),
+                    _ => None,
+                })
+                .and_then(|component| prog.components.get(component.index()))
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: component copy destination field `{field}` in {} does not resolve",
+                        func.name
+                    ))
+                })?;
+            let copy = super::runtime::component_copy_method_name(component);
+            writeln!(
+                out,
+                "{pad}{}.{field}.{copy}({});",
+                comp_base_cpp_subst_cx(cx, dst)?,
+                comp_base_cpp_subst_cx(cx, src)?
+            )
+            .ok();
+        }
+        // `<dst> = <src>` — whole component value copy into a direct
+        // testbench component binding.
+        Stmt::ComponentAssign { dst, src } => {
+            let component = component_base_schema(cx, dst)?;
+            let copy = super::runtime::component_copy_method_name(component);
+            writeln!(
+                out,
+                "{pad}{}.{copy}({});",
+                comp_base_cpp_subst_cx(cx, dst)?,
+                comp_base_cpp_subst_cx(cx, src)?
             )
             .ok();
         }
@@ -2646,13 +4302,289 @@ fn emit_stmt(
         // (v1's `_result.push_back(t)`).
         Stmt::SeqPush { seq, value } => {
             let name = &names[seq.index()];
-            let v = expr_cpp(cx, value)?;
+            let destination = local_ir_type(cx, *seq).and_then(|ty| match ty {
+                IrType::RecordSeq(record) => Some(IrType::Record(*record)),
+                IrType::Seq(element) => Some((**element).clone()),
+                _ => None,
+            });
+            let v = scalar_sink_expr_cpp(cx, value, destination)?;
             writeln!(out, "{pad}{name}.push_back({v});").ok();
         }
         Stmt::TlmFork(desc) => emit_tlm_fork(out, cx, bindings, desc, depth)?,
         Stmt::TlmJoinAll(pending) => emit_tlm_join_all(out, cx, records, bindings, pending, depth)?,
     }
     Ok(())
+}
+
+fn component_bound_bus_binding<'a>(
+    cx: &'a ECx<'a>,
+    base: &crate::ir::ComponentBase,
+    component: crate::ir::ComponentId,
+) -> Result<Option<&'a BusBindingSchema>, EmitError> {
+    use crate::ir::ComponentBase;
+
+    if matches!(base, ComponentBase::SelfField)
+        || matches!(base, ComponentBase::Path(path) if path.first().map(String::as_str) == Some("self"))
+    {
+        return Ok(cx.bindings.bound_bus);
+    }
+    let ComponentBase::Path(path) = base else {
+        return Ok(None);
+    };
+    let Some(field) = path.first() else {
+        return Err(EmitError(format!(
+            "tbir: empty component path in {}",
+            cx.func.name
+        )));
+    };
+    let Some(testbench) = super::expr::owner_tb(cx) else {
+        return Ok(None);
+    };
+    Ok(testbench
+        .bound_bus_instances
+        .iter()
+        .find(|instance| {
+            instance.field == *field
+                && instance.owner == crate::ir::BoundBusOwner::Component(component)
+        })
+        .and_then(|instance| testbench.bus_binding(instance.binding)))
+}
+
+pub(super) fn testbench_bus_adapter_args(
+    cx: &ECx<'_>,
+    function: FunctionId,
+    concrete_binding: Option<&BusBindingSchema>,
+) -> Result<Vec<String>, EmitError> {
+    let Some(adapters) = cx.bindings.bus_adapters else {
+        return Ok(Vec::new());
+    };
+    let Some(adapter) = adapters
+        .callables
+        .iter()
+        .find(|adapter| adapter.function == function)
+    else {
+        return Ok(Vec::new());
+    };
+    let bindings = cx.bindings.testbench_bus_bindings.ok_or_else(|| {
+        EmitError(format!(
+            "tbir: call to fn{} from {} has no concrete testbench bus bindings",
+            function.0, cx.func.name
+        ))
+    })?;
+    render_bus_adapter_args(
+        cx.prog.ok_or_else(|| {
+            EmitError(format!(
+                "tbir: call to fn{} from {} has no program type catalog",
+                function.0, cx.func.name
+            ))
+        })?,
+        adapter,
+        adapters.current,
+        bindings,
+        concrete_binding,
+        super::expr::dut_receiver(cx)?,
+        &cx.func.name,
+    )
+}
+
+pub(super) fn transactor_call_context_args(
+    cx: &ECx<'_>,
+    bus_field: &str,
+    transactor: crate::ir::TransactorId,
+    function: FunctionId,
+) -> Result<Vec<String>, EmitError> {
+    let prog = cx.prog.ok_or_else(|| {
+        EmitError(format!(
+            "tbir: transactor call `{bus_field}` in {} has no program type catalog",
+            cx.func.name
+        ))
+    })?;
+    let schema = prog.transactors.get(transactor.index()).ok_or_else(|| {
+        EmitError(format!(
+            "tbir: transactor call `{bus_field}` in {} references missing transactor x{}",
+            cx.func.name, transactor.0
+        ))
+    })?;
+    let owner = super::expr::owner_tb(cx).ok_or_else(|| {
+        EmitError(format!(
+            "tbir: transactor call `{bus_field}` in {} has no owning testbench",
+            cx.func.name
+        ))
+    })?;
+    let mut rendered = Vec::new();
+    if let Some(context) = cx.bindings.run_context {
+        rendered.push(context.to_string());
+    }
+    if uses_state_receiver(schema) {
+        let explicit = cx
+            .bindings
+            .testbench_transactor_states
+            .and_then(|bindings| {
+                bindings
+                    .iter()
+                    .find(|binding| binding.field == bus_field && binding.transactor == transactor)
+            })
+            .map(|binding| binding.receiver.clone());
+        let receiver = explicit
+            .or_else(|| {
+                owner
+                    .unbound_state_actors
+                    .iter()
+                    .find(|actor| actor.field == bus_field && actor.transactor == transactor)
+                    .map(|actor| {
+                        if cx.bindings.durable_callbacks {
+                            format!("_harc_run_state.{}", actor.storage)
+                        } else {
+                            actor.storage.clone()
+                        }
+                    })
+            })
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: stateful transactor call `{bus_field}` in {} has no typed state receiver",
+                    cx.func.name
+                ))
+            })?;
+        rendered.push(receiver);
+    }
+    if cx.bindings.run_context.is_some() && schema.bound_bus.is_some() {
+        let bound = owner
+            .bound_bus_instances
+            .iter()
+            .find(|instance| {
+                instance.field == bus_field
+                    && instance.owner == crate::ir::BoundBusOwner::Transactor(transactor)
+            })
+            .and_then(|instance| owner.bus_binding(instance.binding))
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: common transactor call `{bus_field}` in {} has no explicit bound-bus adapter",
+                    cx.func.name
+                ))
+            })?;
+        rendered.extend(testbench_bus_adapter_args(cx, function, Some(bound))?);
+    }
+    Ok(rendered)
+}
+
+pub(super) fn component_callable_bus_adapter_args(
+    prog: &TbProgram,
+    function: FunctionId,
+    all_adapters: &[TestbenchBusAdapterPlan],
+    bound_bus: Option<&BusBindingSchema>,
+    dut_receiver: &str,
+    caller: &str,
+) -> Result<Vec<String>, EmitError> {
+    let Some(adapter) = all_adapters
+        .iter()
+        .find(|adapter| adapter.function == function)
+    else {
+        return Ok(Vec::new());
+    };
+    render_bus_adapter_args(prog, adapter, None, &[], bound_bus, dut_receiver, caller)
+}
+
+fn render_bus_adapter_args(
+    prog: &TbProgram,
+    adapter: &TestbenchBusAdapterPlan,
+    current: Option<&TestbenchBusAdapterPlan>,
+    bindings: &[BusBindingSchema],
+    concrete_binding: Option<&BusBindingSchema>,
+    dut_receiver: &str,
+    caller: &str,
+) -> Result<Vec<String>, EmitError> {
+    let mut rendered = Vec::with_capacity(adapter.signals.len());
+    for signal in &adapter.signals {
+        if let Some(current) = current.and_then(|current| {
+            current
+                .signals
+                .iter()
+                .find(|candidate| candidate.matches(&signal.field, &signal.channel, &signal.signal))
+        }) {
+            rendered.push(current.symbol.clone());
+            continue;
+        }
+        let binding = concrete_binding
+            .or_else(|| {
+                bindings
+                    .iter()
+                    .find(|binding| binding.field == signal.field)
+            })
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: call to fn{} from {} has no binding for logical bus field `{}`",
+                    adapter.function.0, caller, signal.field
+                ))
+            })?;
+        let physical = if signal.channel.is_empty() {
+            format!("{}_{}", binding.field, signal.signal)
+        } else {
+            binding.wire_name(&signal.channel, &signal.signal)
+        };
+        let wire = format!("{dut_receiver}->{physical}");
+        let ty = callable_value_cty(prog, &signal.ty)?;
+        let read = typed_wire_read_expr(prog, &wire, &signal.ty)?;
+        let write = typed_wire_write_stmt(prog, &wire, &signal.ty, "value")?;
+        rendered.push(format!(
+            "harc_rt::HarcBusSignalRef<{ty}>{{[&]() -> {ty} {{ return {read}; }}, [&](const {ty}& value) {{ {write} }}}}"
+        ));
+    }
+    Ok(rendered)
+}
+
+fn typed_wire_read_expr(prog: &TbProgram, wire: &str, ty: &IrType) -> Result<String, EmitError> {
+    Ok(match ty {
+        IrType::Bool => format!("(harc_rt::harc_read({wire}) != 0)"),
+        IrType::UInt(Some(width)) if *width <= 64 => {
+            format!("static_cast<uint64_t>(harc_rt::harc_read({wire}))")
+        }
+        IrType::SInt(Some(width)) if *width <= 64 => format!(
+            "static_cast<int64_t>(harc_rt::harc_sext_u128(static_cast<_harc_u128>(harc_rt::harc_read({wire})), {width}, 64))"
+        ),
+        IrType::UInt(Some(width)) | IrType::SInt(Some(width)) if *width <= 128 => {
+            format!("static_cast<_harc_u128>(harc_rt::harc_read({wire}))")
+        }
+        IrType::UInt(Some(width)) | IrType::SInt(Some(width)) => format!(
+            "harc_rt::harc_wide_trunc<{}>(harc_rt::harc_read({wire}), {width})",
+            width.div_ceil(32)
+        ),
+        IrType::Record(record) => format!(
+            "harc_unpack_{}({wire})",
+            prog.records
+                .get(record.index())
+                .ok_or_else(|| EmitError(format!(
+                    "tbir: typed wire access references missing record r{}",
+                    record.0
+                )))?
+                .name
+        ),
+        other => {
+            return Err(EmitError(format!(
+                "tbir: typed wire access cannot represent signal type {other:?}"
+            )))
+        }
+    })
+}
+
+fn typed_wire_write_stmt(
+    prog: &TbProgram,
+    wire: &str,
+    ty: &IrType,
+    value: &str,
+) -> Result<String, EmitError> {
+    Ok(match ty {
+        IrType::Record(record) => format!(
+            "harc_drive_{}({wire}, {value});",
+            prog.records
+                .get(record.index())
+                .ok_or_else(|| EmitError(format!(
+                    "tbir: typed wire access references missing record r{}",
+                    record.0
+                )))?
+                .name
+        ),
+        _ => format!("harc_rt::harc_assign({wire}, {value});"),
+    })
 }
 
 /// Function-scope exact C++ carriers used by ordered message capture.
@@ -2672,7 +4604,7 @@ fn declare_port_snapshots(out: &mut String, cx: &ECx<'_>, depth: usize) -> Resul
             match stmt {
                 Stmt::DutRead(dest, port) if *dest == id => {
                     let candidate = if snapshot_preserves_port_shape(cx.func, id) {
-                        format!("harc_rt::harc_port_snapshot({})", port_signal(cx, port))
+                        format!("harc_rt::harc_port_snapshot({})", port_signal(cx, port)?)
                     } else {
                         port_read(cx, port)?
                     };
@@ -2722,82 +4654,18 @@ fn snapshot_preserves_port_shape(func: &TbFunction, snapshot: LocalId) -> bool {
 }
 
 fn expr_uses_snapshot_lane(expr: &Expr, snapshot: LocalId) -> bool {
-    match expr {
-        Expr::PortSnapshotLane {
-            snapshot: used,
-            index,
-            ..
-        } => *used == snapshot || expr_uses_snapshot_lane(index, snapshot),
-        Expr::Binary(_, lhs, rhs) => {
-            expr_uses_snapshot_lane(lhs, snapshot) || expr_uses_snapshot_lane(rhs, snapshot)
+    let mut found = false;
+    crate::ir::visit::walk_expr(expr, &mut |expr| {
+        if matches!(
+            expr,
+            Expr::PortSnapshotLane {
+                snapshot: used, ..
+            } if *used == snapshot
+        ) {
+            found = true;
         }
-        Expr::Unary(_, inner)
-        | Expr::BitSlice { target: inner, .. }
-        | Expr::WidthCast { inner, .. }
-        | Expr::DynamicListQuery { target: inner, .. }
-        | Expr::ComponentIdle { n: inner, .. }
-        | Expr::TransactorIdle { n: inner, .. } => expr_uses_snapshot_lane(inner, snapshot),
-        Expr::Ternary(cond, then_expr, else_expr) => {
-            expr_uses_snapshot_lane(cond, snapshot)
-                || expr_uses_snapshot_lane(then_expr, snapshot)
-                || expr_uses_snapshot_lane(else_expr, snapshot)
-        }
-        Expr::BitSliceDyn { target, hi, lo } => {
-            expr_uses_snapshot_lane(target, snapshot)
-                || expr_uses_snapshot_lane(hi, snapshot)
-                || expr_uses_snapshot_lane(lo, snapshot)
-        }
-        Expr::RecordField {
-            mid_indices, index, ..
-        }
-        | Expr::TransactorStateRecordField {
-            mid_indices, index, ..
-        } => {
-            mid_indices
-                .iter()
-                .any(|(_, value)| expr_uses_snapshot_lane(value, snapshot))
-                || index
-                    .as_deref()
-                    .is_some_and(|value| expr_uses_snapshot_lane(value, snapshot))
-        }
-        Expr::ComponentVecElement {
-            index, inner_index, ..
-        }
-        | Expr::TbFieldVecElement {
-            index, inner_index, ..
-        } => {
-            expr_uses_snapshot_lane(index, snapshot)
-                || inner_index
-                    .as_deref()
-                    .is_some_and(|inner| expr_uses_snapshot_lane(inner, snapshot))
-        }
-        Expr::SeqIndex { index, .. } => expr_uses_snapshot_lane(index, snapshot),
-        Expr::CovHookParam { index, .. } => index
-            .as_deref()
-            .is_some_and(|value| expr_uses_snapshot_lane(value, snapshot)),
-        Expr::Call(_, args) => args
-            .iter()
-            .any(|value| expr_uses_snapshot_lane(value, snapshot)),
-        Expr::Literal { .. }
-        | Expr::WideLiteral(_)
-        | Expr::Local(_)
-        | Expr::Port(_)
-        | Expr::TbField(_)
-        | Expr::TemporalSlot { .. }
-        | Expr::TbQueueQuery { .. }
-        | Expr::TransactorState { .. }
-        | Expr::TransactorStateQueueQuery { .. }
-        | Expr::ScoreboardQuery { .. }
-        | Expr::ComponentField { .. }
-        | Expr::ComponentValue { .. }
-        | Expr::ComponentQueueQuery { .. }
-        | Expr::CycleCount
-        | Expr::ErrorCount
-        | Expr::CovBin { .. }
-        | Expr::CovHookArg { .. }
-        | Expr::SeqLen(_)
-        | Expr::RegRead { .. } => false,
-    }
+    });
+    found
 }
 
 /// Expand one `fork bus.<method>(args)` request issue (v1's
@@ -2815,8 +4683,9 @@ fn emit_tlm_fork(
     depth: usize,
 ) -> Result<(), EmitError> {
     let pad = INDENT.repeat(depth);
-    let binding = resolve_binding(bindings, &desc.bus_field, &desc.method, cx.func)?;
-    let wire = |sig: &str| format!("dut->{}", binding.wire_name(&desc.method, sig));
+    let advance = tlm_cycle_advance(cx)?;
+    let binding = resolve_tlm_binding(bindings, cx, &desc.bus_field, &desc.method, &desc.target)?;
+    let wire = |sig: &str| tlm_wire(cx, binding, &desc.bus_field, &desc.method, sig);
     writeln!(out, "{pad}// fork bus.{} tlm_method issue", desc.method).ok();
     let schema = binding
         .methods
@@ -2871,7 +4740,7 @@ fn emit_tlm_fork(
         // edge with the new tag/payload held stable; deasserting the next cycle
         // keeps the request out of any stalled window. (Mirrors v1's
         // `try_emit_bus_tlm_fork`; response drained at join_all.)
-        writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+        writeln!(out, "{pad}{advance};").ok();
     } else {
         // Blocking forks still need the legacy ready-wait: unlike tagged OOO
         // lanes, a blocking target may legitimately hold req_ready low for
@@ -2882,12 +4751,12 @@ fn emit_tlm_fork(
             crate::codegen::bounded_handshake_wait(
                 &wire("req_ready"),
                 crate::codegen::TLM_WAIT_BOUND,
-                "co_await harc_rt::wait_cycles(_slot, 1)",
+                &advance,
                 &format!("TLM {}.{} fork request", desc.bus_field, desc.method),
             )
         )
         .ok();
-        writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+        writeln!(out, "{pad}{advance};").ok();
     }
     writeln!(out, "{pad}{} = 0;", wire("req_valid")).ok();
     Ok(())
@@ -2934,9 +4803,10 @@ fn emit_ordered_tlm_join_all(
     let pad1 = INDENT.repeat(depth + 1);
     let pad2 = INDENT.repeat(depth + 2);
     let names = cx.names;
+    let advance = tlm_cycle_advance(cx)?;
     for p in pending {
-        let binding = resolve_binding(bindings, &p.bus_field, &p.method, cx.func)?;
-        let wire = |sig: &str| format!("dut->{}", binding.wire_name(&p.method, sig));
+        let binding = resolve_tlm_binding(bindings, cx, &p.bus_field, &p.method, &p.target)?;
+        let wire = |sig: &str| tlm_wire(cx, binding, &p.bus_field, &p.method, sig);
         writeln!(out, "{pad}// join_all bus.{} response", p.method).ok();
         writeln!(out, "{pad}{} = 1;", wire("rsp_ready")).ok();
         writeln!(out, "{pad}{{",).ok();
@@ -2947,7 +4817,7 @@ fn emit_ordered_tlm_join_all(
             crate::codegen::bounded_handshake_wait_into(
                 &wire("rsp_valid"),
                 crate::codegen::TLM_JOIN_DRAIN_BOUND,
-                "co_await harc_rt::wait_cycles(_slot, 1)",
+                &advance,
                 &format!("TLM {}.{} fork response", p.bus_field, p.method),
                 "_rsp_ok",
             )
@@ -2955,7 +4825,13 @@ fn emit_ordered_tlm_join_all(
         .ok();
         writeln!(out, "{pad1}if (_rsp_ok) {{").ok();
         if let (Some(dest), true) = (p.dest, p.has_ret) {
-            let capture = tlm_capture_expr(cx, records, dest, &wire("rsp_data"));
+            let capture = tlm_capture_expr(
+                cx,
+                records,
+                dest,
+                &wire("rsp_data"),
+                super::expr::bus_adapter_signal(cx, &p.bus_field, &p.method, "rsp_data").is_some(),
+            )?;
             writeln!(out, "{pad2}{} = {capture};", names[dest.index()]).ok();
         }
         emit_tlm_trace(
@@ -2970,7 +4846,7 @@ fn emit_ordered_tlm_join_all(
         );
         writeln!(out, "{pad1}}}").ok();
         writeln!(out, "{pad}}}").ok();
-        writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+        writeln!(out, "{pad}{advance};").ok();
         writeln!(out, "{pad}{} = 0;", wire("rsp_ready")).ok();
     }
     Ok(())
@@ -2994,6 +4870,7 @@ fn emit_tagged_tlm_join_all(
     let pad2 = INDENT.repeat(depth + 2);
     let pad3 = INDENT.repeat(depth + 3);
     let names = cx.names;
+    let advance = tlm_cycle_advance(cx)?;
     writeln!(out, "{pad}{{").ok();
     writeln!(out, "{pad1}int _tlm_pending = {};", pending.len()).ok();
     for idx in 0..pending.len() {
@@ -3002,11 +4879,11 @@ fn emit_tagged_tlm_join_all(
     writeln!(out, "{pad1}int _tlm_budget = 256;").ok();
     writeln!(out, "{pad1}while (_tlm_pending > 0 && _tlm_budget > 0) {{").ok();
     for p in pending {
-        let binding = resolve_binding(bindings, &p.bus_field, &p.method, cx.func)?;
+        let binding = resolve_tlm_binding(bindings, cx, &p.bus_field, &p.method, &p.target)?;
         writeln!(
             out,
-            "{pad2}dut->{} = 0;",
-            binding.wire_name(&p.method, "rsp_ready")
+            "{pad2}{} = 0;",
+            tlm_wire(cx, binding, &p.bus_field, &p.method, "rsp_ready")
         )
         .ok();
     }
@@ -3019,8 +4896,8 @@ fn emit_tagged_tlm_join_all(
                 cx.func.name
             ))
         })?;
-        let binding = resolve_binding(bindings, &p.bus_field, &p.method, cx.func)?;
-        let wire = |sig: &str| format!("dut->{}", binding.wire_name(&p.method, sig));
+        let binding = resolve_tlm_binding(bindings, cx, &p.bus_field, &p.method, &p.target)?;
+        let wire = |sig: &str| tlm_wire(cx, binding, &p.bus_field, &p.method, sig);
         writeln!(
             out,
             "{pad2}if (!_tlm_seen_{idx} && {} && {} == {tag}) {{",
@@ -3029,7 +4906,13 @@ fn emit_tagged_tlm_join_all(
         )
         .ok();
         if let (Some(dest), true) = (p.dest, p.has_ret) {
-            let capture = tlm_capture_expr(cx, records, dest, &wire("rsp_data"));
+            let capture = tlm_capture_expr(
+                cx,
+                records,
+                dest,
+                &wire("rsp_data"),
+                super::expr::bus_adapter_signal(cx, &p.bus_field, &p.method, "rsp_data").is_some(),
+            )?;
             writeln!(out, "{pad3}{} = {capture};", names[dest.index()]).ok();
         }
         emit_tlm_trace(
@@ -3048,15 +4931,23 @@ fn emit_tagged_tlm_join_all(
         writeln!(out, "{pad3}_tlm_accept = true;").ok();
         writeln!(out, "{pad2}}}").ok();
     }
-    writeln!(out, "{pad2}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+    writeln!(out, "{pad2}{advance};").ok();
     writeln!(out, "{pad2}if (!_tlm_accept) _tlm_budget--;").ok();
     writeln!(out, "{pad1}}}").ok();
+    writeln!(out, "{pad1}if (_tlm_pending > 0) {{").ok();
+    writeln!(
+        out,
+        "{pad2}sim_log_line(\"FAIL\", \"TLM fork join_all timed out after 256 cycles waiting for a matching response tag\");"
+    )
+    .ok();
+    writeln!(out, "{pad2}ctx.errors++;").ok();
+    writeln!(out, "{pad1}}}").ok();
     for p in pending {
-        let binding = resolve_binding(bindings, &p.bus_field, &p.method, cx.func)?;
+        let binding = resolve_tlm_binding(bindings, cx, &p.bus_field, &p.method, &p.target)?;
         writeln!(
             out,
-            "{pad1}dut->{} = 0;",
-            binding.wire_name(&p.method, "rsp_ready")
+            "{pad1}{} = 0;",
+            tlm_wire(cx, binding, &p.bus_field, &p.method, "rsp_ready")
         )
         .ok();
     }
@@ -3070,37 +4961,132 @@ fn emit_tagged_tlm_join_all(
 /// (v1's `record_unpack_expr`); any other type is a plain scalar read.
 fn tlm_capture_expr(
     cx: &ECx<'_>,
-    records: &[RecordSchema],
+    _records: &[RecordSchema],
     dest: crate::ir::LocalId,
     raw_wire: &str,
-) -> String {
-    if let Some(IrType::Record(rid)) = cx.func.locals.get(dest.index()).map(|l| &l.ty) {
-        if let Some(rec) = records.get(rid.index()) {
-            return format!("harc_unpack_{}({raw_wire})", rec.name);
-        }
+    typed_adapter: bool,
+) -> Result<String, EmitError> {
+    let ty = cx
+        .func
+        .locals
+        .get(dest.index())
+        .map(|local| &local.ty)
+        .ok_or_else(|| {
+            EmitError(format!(
+                "tbir: TLM response in {} references missing local %{}",
+                cx.func.name, dest.0
+            ))
+        })?;
+    if typed_adapter {
+        return Ok(format!("{raw_wire}.harc_read()"));
     }
-    format!("harc_rt::harc_read({raw_wire})")
+    typed_wire_read_expr(
+        cx.prog.ok_or_else(|| {
+            EmitError(format!(
+                "tbir: TLM response in {} has no program type catalog",
+                cx.func.name
+            ))
+        })?,
+        raw_wire,
+        ty,
+    )
 }
 
 /// Resolve a bus binding for a fork/join wire emission, with the same
 /// "verifier should have rejected it" hard-error contract as
 /// `emit_transactor_call`.
-fn resolve_binding<'a>(
+fn resolve_tlm_binding<'a>(
     bindings: &'a [BusBindingSchema],
+    cx: &ECx<'a>,
     bus_field: &str,
     method: &str,
-    func: &TbFunction,
+    target: &crate::ir::TransactorMethodTarget,
 ) -> Result<&'a BusBindingSchema, EmitError> {
-    bindings
-        .iter()
-        .find(|b| b.field == bus_field)
-        .ok_or_else(|| {
-            EmitError(format!(
-                "tbir: unresolved fork/join binding `{bus_field}.{method}` in {} — \
-             verifier should have rejected it",
-                func.name
-            ))
-        })
+    match target {
+        crate::ir::TransactorMethodTarget::ConcreteBusBinding { binding, field } => {
+            if field != bus_field {
+                return Err(EmitError(format!(
+                    "tbir: fork/join `{bus_field}.{method}` in {} carries concrete binding field `{field}`",
+                    cx.func.name
+                )));
+            }
+            let resolved = bindings.get(binding.index()).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: unresolved fork/join binding bb{} for `{bus_field}.{method}` in {}",
+                    binding.0, cx.func.name
+                ))
+            })?;
+            if resolved.field != bus_field {
+                return Err(EmitError(format!(
+                    "tbir: fork/join `{bus_field}.{method}` in {} names bb{} owned by `{}`",
+                    cx.func.name, binding.0, resolved.field
+                )));
+            }
+            Ok(resolved)
+        }
+        crate::ir::TransactorMethodTarget::TestbenchBusField {
+            testbench,
+            field,
+            bus,
+        } => {
+            if field != bus_field
+                || !matches!(
+                    cx.func.kind,
+                    FunctionKind::TestbenchMethod {
+                        testbench: owner,
+                        ..
+                    } if owner == *testbench
+                )
+            {
+                return Err(EmitError(format!(
+                    "tbir: fork/join `{bus_field}.{method}` in {} carries a mismatched reusable testbench binding",
+                    cx.func.name
+                )));
+            }
+            let binding = bindings
+                .iter()
+                .find(|binding| binding.field == *field)
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: fork/join `{bus_field}.{method}` in {} has no typed binding for reusable testbench field `{field}`",
+                        cx.func.name
+                    ))
+                })?;
+            if binding.bus != *bus {
+                return Err(EmitError(format!(
+                    "tbir: fork/join `{bus_field}.{method}` in {} resolves `{field}` as bus `{}`, expected `{bus}`",
+                    cx.func.name, binding.bus
+                )));
+            }
+            Ok(binding)
+        }
+        crate::ir::TransactorMethodTarget::BoundBus => bindings
+            .iter()
+            .find(|binding| binding.field == bus_field)
+            .or(cx.bindings.bound_bus)
+            .ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: bound-bus fork/join `{bus_field}.{method}` in {} has no callable adapter",
+                    cx.func.name
+                ))
+            }),
+        crate::ir::TransactorMethodTarget::Callable { .. } => Err(EmitError(format!(
+            "tbir: callable edge `{bus_field}.{method}` in {} reached the bus protocol renderer",
+            cx.func.name
+        ))),
+    }
+}
+
+fn tlm_wire(
+    cx: &ECx<'_>,
+    binding: &BusBindingSchema,
+    bus_field: &str,
+    method: &str,
+    signal: &str,
+) -> String {
+    super::expr::bus_adapter_signal(cx, bus_field, method, signal)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("dut->{}", binding.wire_name(method, signal)))
 }
 
 /// One `trace.tlm_call(...)` line, with the OOO tag appended when present
@@ -3151,6 +5137,7 @@ fn emit_transactor_call(
     dest: crate::ir::LocalId,
     bus_field: &str,
     method: &str,
+    target: &crate::ir::TransactorMethodTarget,
     args: &[Expr],
     depth: usize,
 ) -> Result<(), EmitError> {
@@ -3159,16 +5146,8 @@ fn emit_transactor_call(
     let pad2 = INDENT.repeat(depth + 2);
     let func = cx.func;
     let names = cx.names;
-    let binding = bindings
-        .iter()
-        .find(|b| b.field == bus_field)
-        .ok_or_else(|| {
-            EmitError(format!(
-                "tbir: unresolved transactor call `{bus_field}.{method}` in {} — \
-             verifier should have rejected it",
-                func.name
-            ))
-        })?;
+    let advance = tlm_cycle_advance(cx)?;
+    let binding = resolve_tlm_binding(bindings, cx, bus_field, method, target)?;
     let schema = binding
         .methods
         .iter()
@@ -3191,7 +5170,7 @@ fn emit_transactor_call(
     // `bind ... with { method.sig: "port" }` remaps override the
     // `<field>_<method>_<sig>` flat-name convention (mirrors v1's
     // `bus_signal_name`).
-    let wire = |sig: &str| format!("dut->{}", binding.wire_name(method, sig));
+    let wire = |sig: &str| tlm_wire(cx, binding, bus_field, method, sig);
     let budget_wait = |out: &mut String, sig: &str, label: &str| {
         writeln!(
             out,
@@ -3199,7 +5178,7 @@ fn emit_transactor_call(
             crate::codegen::bounded_handshake_wait(
                 &wire(sig),
                 crate::codegen::TLM_WAIT_BOUND,
-                "co_await harc_rt::wait_cycles(_slot, 1)",
+                &advance,
                 label,
             )
         )
@@ -3228,7 +5207,7 @@ fn emit_transactor_call(
         "req_ready",
         &format!("TLM {bus_field}.{method} request"),
     );
-    writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+    writeln!(out, "{pad}{advance};").ok();
     writeln!(out, "{pad}{} = 0;", wire("req_valid")).ok();
     writeln!(out, "{pad}{} = 1;", wire("rsp_ready")).ok();
     writeln!(out, "{pad}{{").ok();
@@ -3239,7 +5218,7 @@ fn emit_transactor_call(
         crate::codegen::bounded_handshake_wait_into(
             &wire("rsp_valid"),
             crate::codegen::TLM_WAIT_BOUND,
-            "co_await harc_rt::wait_cycles(_slot, 1)",
+            &advance,
             &format!("TLM {bus_field}.{method} response"),
             "_rsp_ok",
         )
@@ -3260,14 +5239,37 @@ fn emit_transactor_call(
         // discarded calls v1 skips the capture but still completes the
         // rsp handshake). A record-typed return is bit-unpacked from the
         // lowered response pin (v1's `record_unpack_expr`).
-        let capture = tlm_capture_expr(cx, records, dest, &wire("rsp_data"));
+        let capture = tlm_capture_expr(
+            cx,
+            records,
+            dest,
+            &wire("rsp_data"),
+            super::expr::bus_adapter_signal(cx, bus_field, method, "rsp_data").is_some(),
+        )?;
         writeln!(out, "{pad2}{} = {capture};", names[dest.index()]).ok();
     }
     writeln!(out, "{pad1}}}").ok();
     writeln!(out, "{pad}}}").ok();
-    writeln!(out, "{pad}co_await harc_rt::wait_cycles(_slot, 1);").ok();
+    writeln!(out, "{pad}{advance};").ok();
     writeln!(out, "{pad}{} = 0;", wire("rsp_ready")).ok();
     Ok(())
+}
+
+fn tlm_cycle_advance(cx: &ECx<'_>) -> Result<String, EmitError> {
+    if let Some(slot) = cx.bindings.actor_slot {
+        return Ok(format!("co_await harc_rt::wait_cycles({slot}, 1)"));
+    }
+    match cx.func.kind {
+        FunctionKind::TestBody { .. } => Ok("co_await harc_rt::wait_cycles(_slot, 1)".to_string()),
+        FunctionKind::TestbenchMethod { .. }
+        | FunctionKind::ComponentMethod { .. }
+        | FunctionKind::TransactorBody { .. }
+        | FunctionKind::TestHook { .. } => Ok("tick()".to_string()),
+        ref kind => Err(EmitError(format!(
+            "tbir: TLM call in fn{} `{}` has no cycle-advance binding for {kind:?}",
+            cx.func.id.0, cx.func.name
+        ))),
+    }
 }
 
 /// Hoisted local declarations for a loop-switch body, skipping the
@@ -3277,24 +5279,29 @@ fn emit_transactor_call(
 /// `let` site re-runs the field defaults (v1 declares at the let
 /// site, so loop iterations re-default-construct).
 ///
-/// Names of record locals that are SHARED test-scope host state. This
-/// includes transaction/struct-typed testbench fields plus regblock
-/// mirrors whose binding declares `on regs.REG` write callbacks. These
-/// are declared + default-constructed ONCE at test scope and captured by
-/// `[&]`, so every function that touches them must reference that one
-/// cell by name — never re-declare or re-init it.
+/// Names of record locals that are shared test-scope host state in the
+/// self-contained layout. Typed testbench record fields use the explicit
+/// receiver binding; callback-bearing register mirrors retain their local
+/// compatibility mapping until their common-runtime ownership is modeled.
 pub(super) fn shared_record_names(prog: &TbProgram, func: &TbFunction) -> HashSet<String> {
     let mut out = HashSet::new();
-    if let Some(o) = func.owner {
-        if let Some(tb) = prog.testbenches.get(o.index()) {
-            for (field, _) in &tb.record_fields {
-                out.insert(field.clone());
-            }
-            for b in &tb.regblock_bindings {
-                if !b.callbacks.is_empty() {
-                    out.insert(b.field.clone());
-                }
-            }
+    let owner = func
+        .owner
+        .and_then(|owner| prog.testbenches.get(owner.index()))
+        .or_else(|| {
+            let FunctionKind::TestbenchMethod { testbench, .. } = func.kind else {
+                return None;
+            };
+            prog.testbenches
+                .iter()
+                .find(|schema| schema.type_id == testbench)
+        });
+    if let Some(tb) = owner {
+        for (field, _) in &tb.record_fields {
+            out.insert(field.clone());
+        }
+        for b in &tb.regblock_bindings {
+            out.insert(b.field.clone());
         }
     }
     out
@@ -3307,8 +5314,18 @@ fn declare_locals(
     names: &[String],
     skip: usize,
     depth: usize,
+    dut_access: Option<&crate::ir::passes::dut_access::DutAccessPlan>,
 ) -> Result<(), EmitError> {
-    declare_locals_except(out, prog, func, names, skip, &HashSet::new(), depth)
+    declare_locals_except(
+        out,
+        prog,
+        func,
+        names,
+        skip,
+        &HashSet::new(),
+        depth,
+        dut_access,
+    )
 }
 
 fn declare_locals_except(
@@ -3319,6 +5336,7 @@ fn declare_locals_except(
     skip: usize,
     excluded: &HashSet<LocalId>,
     depth: usize,
+    dut_access: Option<&crate::ir::passes::dut_access::DutAccessPlan>,
 ) -> Result<(), EmitError> {
     let pad = INDENT.repeat(depth);
     let shared = shared_record_names(prog, func);
@@ -3329,13 +5347,25 @@ fn declare_locals_except(
         // Shared test-scope record state is declared once by the enclosing
         // test; skip its per-function declaration so references resolve to
         // the captured object.
-        if shared.contains(n) {
+        if func
+            .testbench_record_locals
+            .iter()
+            .any(|binding| binding.local.index() == index)
+            || shared.contains(n)
+        {
             continue;
         }
         if matches!(l.ty, IrType::PortSnapshot) {
             continue;
         }
-        match &l.ty {
+        let ty = if matches!(l.ty, IrType::Unknown) {
+            dut_access
+                .and_then(|plan| plan.inferred_local_type(func.id, LocalId(index as u32)))
+                .unwrap_or(&l.ty)
+        } else {
+            &l.ty
+        };
+        match ty {
             IrType::Record(r) => {
                 let rec = prog.records.get(r.index()).ok_or_else(|| {
                     EmitError(format!(
@@ -3412,39 +5442,18 @@ fn declare_locals_except(
             // Scalar local. Wide (>64-bit) `uint`/`sint` locals — e.g. a
             // wide method param hoisted as the first N locals — take v1's
             // `_harc_u128` storage; everything else widens to uint64_t.
-            ref ty => {
+            ty => {
                 let cty = super::local_scalar_cty(ty);
-                writeln!(out, "{pad}{cty} {n} = 0; (void){n};").ok();
+                let init = if matches!(ty, IrType::String) {
+                    "nullptr"
+                } else {
+                    "0"
+                };
+                writeln!(out, "{pad}{cty} {n} = {init}; (void){n};").ok();
             }
         }
     }
     Ok(())
-}
-
-/// Declare run locals captured by statement-position hooks in the enclosing
-/// coroutine scope. Their references can then remain valid while the later
-/// check phase fires a hook registered during run.
-pub(super) fn declare_flow_hook_captures(
-    out: &mut String,
-    prog: &TbProgram,
-    func: &TbFunction,
-    captures: &HashSet<LocalId>,
-    depth: usize,
-) -> Result<(), EmitError> {
-    if captures.is_empty() {
-        return Ok(());
-    }
-    let mut names = cpp_local_names(func);
-    for local in captures {
-        if let Some(name) = names.get_mut(local.index()) {
-            *name = flow_hook_capture_name(func, *local);
-        }
-    }
-    let excluded: HashSet<LocalId> = (0..func.locals.len())
-        .map(|index| LocalId(index as u32))
-        .filter(|local| !captures.contains(local))
-        .collect();
-    declare_locals_except(out, prog, func, &names, 0, &excluded, depth)
 }
 
 fn flow_hook_capture_name(func: &TbFunction, local: LocalId) -> String {
@@ -3455,26 +5464,17 @@ fn flow_hook_capture_name(func: &TbFunction, local: LocalId) -> String {
 /// ABI (#494 P1b): the shared body takes a leading `<Type>_state&
 /// self_state` param and each call site passes its instance's struct.
 ///
-/// True only for an UNBOUND stateful transactor — that is the form whose
-/// method bodies lowering leaves with empty-instance state placeholders so
-/// they resolve against the receiver. A bound-to initiator BFM instead
-/// bakes its (single) instance name into the shared body, so it keeps the
-/// plain arg-only signature even when it carries state; a stateless type
-/// has no per-instance struct at all.
-///
-/// Paired with the verifier's receiver-storage guard in
-/// `ir::verify` (the `requires_state_storage` predicate over
-/// `tb.transactor_fields`). That guard is intentionally the WEAKER of the
-/// two (`!state_fields.is_empty()`, without the `bound_bus` clause): it must
-/// never reject a program this ABI would emit. If this predicate ever
-/// changes which transactors get a receiver, update that guard in lockstep.
+/// Every stateful transactor method receives explicit per-instance state.
+/// Bound and unbound callables therefore share the same receiver contract;
+/// no source instance name is written into a type-owned function body.
 pub(super) fn uses_state_receiver(schema: &TransactorSchema) -> bool {
-    !schema.state_fields.is_empty() && schema.bound_bus.is_none()
+    schema.requires_runtime_receiver()
 }
 
 pub(super) fn declare_method_slot(
     out: &mut String,
     prog: &TbProgram,
+    transactor: crate::ir::TransactorId,
     schema: &TransactorSchema,
     m: &TransactorMethodSchema,
     depth: usize,
@@ -3497,7 +5497,7 @@ pub(super) fn declare_method_slot(
     if uses_state_receiver(schema) {
         param_tys.push(format!(
             "{}&",
-            super::runtime::unbound_state_struct_ty(schema)
+            super::runtime::unbound_state_struct_ref(prog, transactor)
         ));
     }
     param_tys.extend((0..func.params.len()).map(|i| match func.locals[i].ty {
@@ -3512,7 +5512,8 @@ pub(super) fn declare_method_slot(
     writeln!(
         out,
         "{pad}std::function<{ret_ty}({params})> {}_{};",
-        schema.emission_name(), m.name
+        schema.emission_name(),
+        m.name
     )
     .ok();
     Ok(())
@@ -3534,10 +5535,11 @@ pub(super) fn declare_method_slot(
 pub(super) fn emit_method(
     out: &mut String,
     prog: &TbProgram,
-    owner: crate::ir::TestbenchId,
+    _owner: crate::ir::TestbenchId,
     transactor: crate::ir::TransactorId,
     schema: &TransactorSchema,
     m: &TransactorMethodSchema,
+    bound_bus: Option<&BusBindingSchema>,
     randomize_snippets: &[String],
     depth: usize,
 ) -> Result<(), EmitError> {
@@ -3563,11 +5565,17 @@ pub(super) fn emit_method(
         func,
         names: &names,
         lanes: &empty_lanes,
-        self_subst: None,
+        bindings: CallableRenderBindings {
+            bound_bus,
+            ..CallableRenderBindings::default()
+        },
         dut_type: &schema.dut_type,
+        dut_access: None,
         trace_component: "",
         state_receiver: has_state.then_some("self_state"),
         temporal_widths: &[],
+        temporal_cell_prefix: None,
+        common_contextual_tseqs: None,
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
@@ -3594,7 +5602,7 @@ pub(super) fn emit_method(
     if has_state {
         param_list.push(format!(
             "{}& self_state",
-            super::runtime::unbound_state_struct_ty(schema)
+            super::runtime::unbound_state_struct_ref(prog, transactor)
         ));
     }
     param_list.extend(
@@ -3619,24 +5627,28 @@ pub(super) fn emit_method(
     writeln!(
         out,
         "{pad}{}_{} = [&]({params}) -> {ret_ty} {{",
-        schema.emission_name(), m.name
+        schema.emission_name(),
+        m.name
     )
     .ok();
-    declare_locals(out, prog, func, &names, nparams, depth + 1)?;
+    declare_locals(out, prog, func, &names, nparams, depth + 1, cx.dut_access)?;
     declare_port_snapshots(out, &cx, depth + 1)?;
     let hook_args = names[..nparams].join(", ");
-    // Fan out covergroup and user-hook subscriptions before/after the body.
-    // Vectors are type-scoped, matching v1, while declaration is restricted
-    // to tests that actually install a subscription for this method.
-    let has_hook_vector = !m.cov_hook_subs.is_empty()
-        || super::has_transactor_method_hook_subscription(prog, owner, transactor, &m.name);
-    let has_pre_hooks = has_hook_vector;
-    let has_post_hooks = has_hook_vector;
-    if has_pre_hooks {
+    let has_coverage_hooks = !m.cov_hook_subs.is_empty();
+    let has_user_hooks = m.hookable;
+    if has_coverage_hooks {
+        let field = super::runtime::transactor_coverage_hook_field(schema, &m.name, "pre");
         writeln!(
             out,
-            "{pad1}for (auto& _h : {}_{}_pre) _h({hook_args});",
-            schema.emission_name(), m.name
+            "{pad1}for (auto& _h : self_state.{field}) _h({hook_args});"
+        )
+        .ok();
+    }
+    if has_user_hooks {
+        let field = super::runtime::transactor_hook_field(schema, &m.name, "pre");
+        writeln!(
+            out,
+            "{pad1}for (auto& _h : self_state.{field}) _h({hook_args});"
         )
         .ok();
     }
@@ -3692,11 +5704,20 @@ pub(super) fn emit_method(
             Terminator::Return => {
                 // Hook-vector fan-out for hook-triggered covergroups
                 // sampled on this method's `post` boundary.
-                if has_post_hooks && func.implicit_returns.contains(&BlockId(bi as u32)) {
+                if has_coverage_hooks && func.implicit_returns.contains(&BlockId(bi as u32)) {
+                    let field =
+                        super::runtime::transactor_coverage_hook_field(schema, &m.name, "post");
                     writeln!(
                         out,
-                        "{pad3}for (auto& _h : {}_{}_post) _h({hook_args});",
-                        schema.emission_name(), m.name
+                        "{pad3}for (auto& _h : self_state.{field}) _h({hook_args});"
+                    )
+                    .ok();
+                }
+                if has_user_hooks && func.implicit_returns.contains(&BlockId(bi as u32)) {
+                    let field = super::runtime::transactor_hook_field(schema, &m.name, "post");
+                    writeln!(
+                        out,
+                        "{pad3}for (auto& _h : self_state.{field}) _h({hook_args});"
                     )
                     .ok();
                 }
@@ -3722,15 +5743,27 @@ pub(super) fn emit_method(
                 // only catalogs test/tseq spans, in BOTH codegens), so
                 // the snippet uses v1's nullptr-descriptor solve path —
                 // identical bytes to v1's method-body emission.
-                let snippet =
-                    randomize_snippet_for(prog, &names, *target, *constraints, randomize_snippets)
-                        .ok_or_else(|| {
-                            EmitError(format!(
-                                "tbir: Randomize in method {} references missing constraint \
+                let run_context = cx.bindings.run_context.unwrap_or("ctx");
+                let state_receiver =
+                    randomize_state_receiver(func, *constraints, None, run_context)?;
+                let snippet = randomize_snippet_for(
+                    prog,
+                    func,
+                    &names,
+                    *target,
+                    *constraints,
+                    randomize_snippets,
+                    run_context,
+                    &state_receiver,
+                    cx.bindings.self_receiver,
+                )?
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: Randomize in method {} references missing constraint \
                                  snippet c{}",
-                                func.name, constraints.0
-                            ))
-                        })?;
+                        func.name, constraints.0
+                    ))
+                })?;
                 out.push_str(&snippet);
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
@@ -3808,6 +5841,10 @@ pub(super) fn emit_component_method(
     component: crate::ir::ComponentId,
     comp: &crate::ir::ComponentSchema,
     m: &crate::ir::ComponentMethodSchema,
+    bound_bus: Option<&BusBindingSchema>,
+    dut_type: &str,
+    dut_access: Option<&crate::ir::passes::dut_access::DutAccessPlan>,
+    dut_lane_widths: &HashMap<String, u32>,
     randomize_snippets: &[String],
     depth: usize,
 ) -> Result<(), EmitError> {
@@ -3815,11 +5852,15 @@ pub(super) fn emit_component_method(
     emit_component_fn_lambda(
         out,
         prog,
-        comp,
+        &comp.name,
+        "self",
         m.function,
         &lambda,
-        Some(ComponentHookCtx {
-            owner_name: &comp.name,
+        dut_type,
+        dut_access,
+        Some(dut_lane_widths),
+        Some(CallableHookCtx::Component {
+            component: comp,
             method_name: &m.name,
             has_instance_hook_vector: !m.cov_hook_subs.is_empty(),
             has_method_hook_vector: super::has_component_method_hook_subscription(
@@ -3827,7 +5868,596 @@ pub(super) fn emit_component_method(
             ),
         }),
         randomize_snippets,
+        None,
+        &[],
+        bound_bus,
+        None,
+        None,
+        None,
+        None,
         depth,
+        ComponentFunctionEmission::LocalLambda,
+        None,
+    )
+}
+
+fn testbench_method_schema<'a>(
+    prog: &'a TbProgram,
+    function: &TbFunction,
+) -> Result<
+    (
+        &'a crate::ir::TestbenchTypeSchema,
+        &'a crate::ir::TestbenchMethodSchema,
+    ),
+    EmitError,
+> {
+    let FunctionKind::TestbenchMethod {
+        testbench, method, ..
+    } = function.kind
+    else {
+        return Err(EmitError(format!(
+            "tbir: fn{} `{}` is not a testbench method",
+            function.id.0, function.name
+        )));
+    };
+    let schema = prog.testbench_types.get(testbench.index()).ok_or_else(|| {
+        EmitError(format!(
+            "tbir: testbench method fn{} references missing type tbt{}",
+            function.id.0, testbench.0
+        ))
+    })?;
+    let method = schema
+        .methods
+        .get(method.index())
+        .filter(|method| method.function == function.id)
+        .ok_or_else(|| {
+            EmitError(format!(
+                "tbir: testbench type `{}` does not own method fn{}",
+                schema.name, function.id.0
+            ))
+        })?;
+    Ok((schema, method))
+}
+
+fn testbench_component_param_name(field: &str) -> String {
+    format!("_harc_tb_component_{field}")
+}
+
+fn testbench_transactor_state_param_name(field: &str) -> String {
+    format!("_harc_tb_transactor_state_{field}")
+}
+
+fn collect_testbench_method_transactor_fields(
+    prog: &TbProgram,
+    testbench: crate::ir::TestbenchTypeId,
+    function: FunctionId,
+    visited: &mut HashSet<FunctionId>,
+    fields: &mut BTreeSet<String>,
+) -> Result<(), EmitError> {
+    if !visited.insert(function) {
+        return Ok(());
+    }
+    let body = prog.functions.get(function.index()).ok_or_else(|| {
+        EmitError(format!(
+            "tbir: testbench method field analysis references missing fn{}",
+            function.0
+        ))
+    })?;
+    if !matches!(
+        body.kind,
+        FunctionKind::TestbenchMethod {
+            testbench: owner,
+            ..
+        } if owner == testbench
+    ) {
+        return Err(EmitError(format!(
+            "tbir: fn{} `{}` is not a method of testbench type tbt{}",
+            body.id.0, body.name, testbench.0
+        )));
+    }
+    for block in &body.blocks {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::TransactorStateWrite { instance, .. }
+                | Stmt::TransactorStateRecordFieldWrite { instance, .. }
+                | Stmt::TransactorStateQueuePush { instance, .. }
+                | Stmt::TransactorStateQueuePop { instance, .. } => {
+                    if !instance.is_empty() {
+                        fields.insert(instance.clone());
+                    }
+                }
+                Stmt::TestbenchCall {
+                    function: callee, ..
+                } => collect_testbench_method_transactor_fields(
+                    prog, testbench, *callee, visited, fields,
+                )?,
+                _ => {}
+            }
+        }
+    }
+    for_each_function_expr(body, |expr| match expr {
+        Expr::TransactorState { instance, .. }
+        | Expr::TransactorStateRecordField { instance, .. }
+        | Expr::TransactorStateQueueQuery { instance, .. } => {
+            if !instance.is_empty() {
+                fields.insert(instance.clone());
+            }
+        }
+        Expr::TransactorIdle { field, .. } => {
+            fields.insert(field.clone());
+        }
+        Expr::Call(
+            CallTarget::TransactorMethod {
+                bus_field,
+                target: crate::ir::TransactorMethodTarget::Callable { transactor, .. },
+                ..
+            },
+            _,
+        ) if prog
+            .transactors
+            .get(transactor.index())
+            .is_some_and(uses_state_receiver) =>
+        {
+            fields.insert(bus_field.clone());
+        }
+        _ => {}
+    });
+    Ok(())
+}
+
+pub(super) fn testbench_method_transactor_state_fields(
+    prog: &TbProgram,
+    function: &TbFunction,
+) -> Result<Vec<(String, crate::ir::TransactorId)>, EmitError> {
+    let FunctionKind::TestbenchMethod { testbench, .. } = function.kind else {
+        return Err(EmitError(format!(
+            "tbir: fn{} `{}` is not a testbench method",
+            function.id.0, function.name
+        )));
+    };
+    let mut required = BTreeSet::new();
+    collect_testbench_method_transactor_fields(
+        prog,
+        testbench,
+        function.id,
+        &mut HashSet::new(),
+        &mut required,
+    )?;
+    if required.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let implementations = prog
+        .testbenches
+        .iter()
+        .filter(|instance| instance.type_id == testbench)
+        .collect::<Vec<_>>();
+    let Some(first) = implementations.first() else {
+        return Ok(Vec::new());
+    };
+    let mut fields = Vec::new();
+    for (field, transactor) in &first.transactor_fields {
+        if !required.remove(field) {
+            continue;
+        }
+        prog.transactors.get(transactor.index()).ok_or_else(|| {
+            EmitError(format!(
+                "tbir: testbench `{}` field `{field}` references missing transactor x{}",
+                first.name, transactor.0
+            ))
+        })?;
+        fields.push((field.clone(), *transactor));
+    }
+    if let Some(field) = required.first() {
+        return Err(EmitError(format!(
+            "tbir: testbench method `{}` references transactor field `{field}` missing from implementation `{}`",
+            function.name, first.name
+        )));
+    }
+    for instance in implementations {
+        for (field, transactor) in &fields {
+            let matches = instance
+                .transactor_fields
+                .iter()
+                .filter(|(candidate, owner)| candidate == field && owner == transactor)
+                .count();
+            if matches != 1 {
+                return Err(EmitError(format!(
+                    "tbir: testbench `{}` must provide exactly one transactor field `{field}` x{} required by method `{}`; found {matches}",
+                    instance.name, transactor.0, function.name
+                )));
+            }
+            let state_matches = instance
+                .unbound_state_actors
+                .iter()
+                .filter(|actor| actor.field == *field && actor.transactor == *transactor)
+                .count();
+            if state_matches != 1 {
+                return Err(EmitError(format!(
+                    "tbir: testbench `{}` must provide exactly one state binding for transactor field `{field}` x{} required by method `{}`; found {state_matches}",
+                    instance.name, transactor.0, function.name
+                )));
+            }
+        }
+    }
+    Ok(fields)
+}
+
+pub(super) fn testbench_method_emit_order(
+    prog: &TbProgram,
+    testbench: crate::ir::TestbenchTypeId,
+) -> Result<Vec<crate::ir::FunctionId>, EmitError> {
+    if prog
+        .testbench_types
+        .get(testbench.index())
+        .is_none_or(|schema| schema.methods.is_empty())
+    {
+        return Ok(Vec::new());
+    }
+    crate::ir::passes::callable_placement::analyze(prog)
+        .and_then(|catalog| catalog.testbench_method_order(testbench))
+        .map_err(|error| EmitError(format!("tbir: {error}")))
+}
+
+pub(super) fn component_method_emit_order(
+    prog: &TbProgram,
+) -> Result<Vec<crate::ir::FunctionId>, EmitError> {
+    if !prog.functions.iter().any(|function| {
+        matches!(
+            function.kind,
+            FunctionKind::ComponentMethod {
+                method_name: Some(_),
+                ..
+            }
+        )
+    }) {
+        return Ok(Vec::new());
+    }
+    crate::ir::passes::callable_placement::analyze(prog)
+        .and_then(|catalog| catalog.component_method_order())
+        .map_err(|error| EmitError(format!("tbir: {error}")))
+}
+
+pub(super) fn emit_testbench_method(
+    out: &mut String,
+    prog: &TbProgram,
+    function: &TbFunction,
+    owner: crate::ir::TestbenchId,
+    bus_bindings: &[BusBindingSchema],
+    dut_type: &str,
+    dut_access: Option<&crate::ir::passes::dut_access::DutAccessPlan>,
+    dut_lane_widths: &HashMap<String, u32>,
+    randomize_snippets: &[String],
+    depth: usize,
+) -> Result<(), EmitError> {
+    let (schema, method) = testbench_method_schema(prog, function)?;
+    testbench_method_transactor_state_fields(prog, function)?;
+    emit_component_fn_lambda(
+        out,
+        prog,
+        &schema.name,
+        "_tb",
+        function.id,
+        &format!("{}_{}", schema.name, method.name),
+        dut_type,
+        dut_access,
+        Some(dut_lane_widths),
+        None,
+        randomize_snippets,
+        Some(owner),
+        bus_bindings,
+        None,
+        Some(&method.module_param_types),
+        None,
+        None,
+        None,
+        depth,
+        ComponentFunctionEmission::LocalLambda,
+        None,
+    )
+}
+
+pub(super) fn emit_common_testbench_method_declaration(
+    out: &mut String,
+    prog: &TbProgram,
+    function: &TbFunction,
+    bus_adapter: Option<&TestbenchBusAdapterPlan>,
+) -> Result<(), EmitError> {
+    let (schema, method) = testbench_method_schema(prog, function)?;
+    let transactor_fields = testbench_method_transactor_state_fields(prog, function)?;
+    let component_param_names = schema
+        .component_fields
+        .iter()
+        .map(|(field, _)| testbench_component_param_name(field))
+        .collect::<Vec<_>>();
+    let transactor_param_names = transactor_fields
+        .iter()
+        .map(|(field, _)| testbench_transactor_state_param_name(field))
+        .collect::<Vec<_>>();
+    let names = cpp_local_names_with_reserved(
+        function,
+        component_param_names
+            .iter()
+            .chain(&transactor_param_names)
+            .map(String::as_str),
+    );
+    let ret_ty = callable_return_cty(prog, function)?;
+    let params = callable_param_list(
+        prog,
+        &schema.name,
+        "_tb",
+        function,
+        &names,
+        true,
+        Some(&method.module_param_types),
+        Some(&schema.component_fields),
+        Some(&transactor_fields),
+        bus_adapter,
+    )?;
+    writeln!(out, "{ret_ty} {}_{}({params});", schema.name, method.name).ok();
+    Ok(())
+}
+
+pub(super) fn emit_common_testbench_method_function(
+    out: &mut String,
+    prog: &TbProgram,
+    function: &TbFunction,
+    bus_bindings: &[BusBindingSchema],
+    bus_adapter: Option<&TestbenchBusAdapterPlan>,
+    all_bus_adapters: &[TestbenchBusAdapterPlan],
+    dut_type: &str,
+    dut_access: &crate::ir::passes::dut_access::DutAccessPlan,
+    randomize_snippets: &[String],
+    contextual_tseqs: &BTreeSet<FunctionId>,
+) -> Result<(), EmitError> {
+    let (schema, method) = testbench_method_schema(prog, function)?;
+    let transactor_fields = testbench_method_transactor_state_fields(prog, function)?;
+    emit_component_fn_lambda(
+        out,
+        prog,
+        &schema.name,
+        "_tb",
+        function.id,
+        &format!("{}_{}", schema.name, method.name),
+        dut_type,
+        Some(dut_access),
+        None,
+        None,
+        randomize_snippets,
+        None,
+        bus_bindings,
+        None,
+        Some(&method.module_param_types),
+        Some(&schema.component_fields),
+        Some(&transactor_fields),
+        Some(BusAdapterRenderBindings {
+            current: bus_adapter,
+            callables: all_bus_adapters,
+        }),
+        0,
+        ComponentFunctionEmission::CommonFunction,
+        Some(contextual_tseqs),
+    )
+}
+
+pub(super) fn emit_common_transactor_method_declaration(
+    out: &mut String,
+    prog: &TbProgram,
+    transactor: crate::ir::TransactorId,
+    schema: &TransactorSchema,
+    method: &TransactorMethodSchema,
+    bus_adapter: Option<&TestbenchBusAdapterPlan>,
+) -> Result<(), EmitError> {
+    let function = prog.function(method.function);
+    let names = cpp_local_names(function);
+    let ret_ty = callable_return_cty(prog, function)?;
+    let receiver_type = uses_state_receiver(schema)
+        .then(|| super::runtime::unbound_state_struct_ref(prog, transactor))
+        .unwrap_or_default();
+    let receiver_name = (!receiver_type.is_empty())
+        .then_some("self_state")
+        .unwrap_or("");
+    let params = callable_param_list(
+        prog,
+        &receiver_type,
+        receiver_name,
+        function,
+        &names,
+        true,
+        None,
+        None,
+        None,
+        bus_adapter,
+    )?;
+    writeln!(out, "{ret_ty} {}_{}({params});", schema.name, method.name).ok();
+    Ok(())
+}
+
+pub(super) fn emit_common_transactor_method_function(
+    out: &mut String,
+    prog: &TbProgram,
+    transactor: crate::ir::TransactorId,
+    schema: &TransactorSchema,
+    method: &TransactorMethodSchema,
+    bus_bindings: &[BusBindingSchema],
+    bus_adapter: Option<&TestbenchBusAdapterPlan>,
+    all_bus_adapters: &[TestbenchBusAdapterPlan],
+    dut_type: &str,
+    dut_access: &crate::ir::passes::dut_access::DutAccessPlan,
+    randomize_snippets: &[String],
+    contextual_tseqs: &BTreeSet<FunctionId>,
+) -> Result<(), EmitError> {
+    let receiver_type = uses_state_receiver(schema)
+        .then(|| super::runtime::unbound_state_struct_ref(prog, transactor))
+        .unwrap_or_default();
+    let receiver_name = (!receiver_type.is_empty())
+        .then_some("self_state")
+        .unwrap_or("");
+    emit_component_fn_lambda(
+        out,
+        prog,
+        &receiver_type,
+        receiver_name,
+        method.function,
+        &format!("{}_{}", schema.name, method.name),
+        dut_type,
+        Some(dut_access),
+        None,
+        Some(CallableHookCtx::Transactor { schema, method }),
+        randomize_snippets,
+        None,
+        bus_bindings,
+        None,
+        None,
+        None,
+        None,
+        Some(BusAdapterRenderBindings {
+            current: bus_adapter,
+            callables: all_bus_adapters,
+        }),
+        0,
+        ComponentFunctionEmission::CommonFunction,
+        Some(contextual_tseqs),
+    )
+}
+
+pub(super) fn emit_common_component_method_declaration(
+    out: &mut String,
+    prog: &TbProgram,
+    comp: &crate::ir::ComponentSchema,
+    method: &crate::ir::ComponentMethodSchema,
+    bus_adapter: Option<&TestbenchBusAdapterPlan>,
+) -> Result<(), EmitError> {
+    let function = prog.function(method.function);
+    let names = cpp_local_names(function);
+    let ret_ty = callable_return_cty(prog, function)?;
+    let params = callable_param_list(
+        prog,
+        &comp.name,
+        "self",
+        function,
+        &names,
+        true,
+        None,
+        None,
+        None,
+        bus_adapter,
+    )?;
+    writeln!(out, "{ret_ty} {}_{}({params});", comp.name, method.name).ok();
+    Ok(())
+}
+
+pub(super) fn emit_common_component_method_function(
+    out: &mut String,
+    prog: &TbProgram,
+    comp: &crate::ir::ComponentSchema,
+    method: &crate::ir::ComponentMethodSchema,
+    bus_bindings: &[BusBindingSchema],
+    bus_adapter: Option<&TestbenchBusAdapterPlan>,
+    all_bus_adapters: &[TestbenchBusAdapterPlan],
+    dut_type: &str,
+    dut_access: &crate::ir::passes::dut_access::DutAccessPlan,
+    randomize_snippets: &[String],
+    contextual_tseqs: &BTreeSet<FunctionId>,
+) -> Result<(), EmitError> {
+    emit_component_fn_lambda(
+        out,
+        prog,
+        &comp.name,
+        "self",
+        method.function,
+        &format!("{}_{}", comp.name, method.name),
+        dut_type,
+        Some(dut_access),
+        None,
+        Some(CallableHookCtx::Component {
+            component: comp,
+            method_name: &method.name,
+            has_instance_hook_vector: !method.cov_hook_subs.is_empty(),
+            has_method_hook_vector: method.hookable,
+        }),
+        randomize_snippets,
+        None,
+        bus_bindings,
+        None,
+        None,
+        None,
+        None,
+        Some(BusAdapterRenderBindings {
+            current: bus_adapter,
+            callables: all_bus_adapters,
+        }),
+        0,
+        ComponentFunctionEmission::CommonFunction,
+        Some(contextual_tseqs),
+    )
+}
+
+pub(super) fn emit_common_component_lifecycle_declaration(
+    out: &mut String,
+    prog: &TbProgram,
+    comp: &crate::ir::ComponentSchema,
+    function: &TbFunction,
+    symbol: &str,
+    bus_adapter: Option<&TestbenchBusAdapterPlan>,
+) -> Result<(), EmitError> {
+    let names = cpp_local_names(function);
+    let ret_ty = callable_return_cty(prog, function)?;
+    let params = callable_param_list(
+        prog,
+        &comp.name,
+        "self",
+        function,
+        &names,
+        true,
+        None,
+        None,
+        None,
+        bus_adapter,
+    )?;
+    writeln!(out, "{ret_ty} {symbol}({params});").ok();
+    Ok(())
+}
+
+pub(super) fn emit_common_component_lifecycle_function(
+    out: &mut String,
+    prog: &TbProgram,
+    comp: &crate::ir::ComponentSchema,
+    function: &TbFunction,
+    symbol: &str,
+    bus_bindings: &[BusBindingSchema],
+    bus_adapter: Option<&TestbenchBusAdapterPlan>,
+    all_bus_adapters: &[TestbenchBusAdapterPlan],
+    dut_type: &str,
+    dut_access: &crate::ir::passes::dut_access::DutAccessPlan,
+    randomize_snippets: &[String],
+    contextual_tseqs: &BTreeSet<FunctionId>,
+) -> Result<(), EmitError> {
+    emit_component_fn_lambda(
+        out,
+        prog,
+        &comp.name,
+        "self",
+        function.id,
+        symbol,
+        dut_type,
+        Some(dut_access),
+        None,
+        None,
+        randomize_snippets,
+        None,
+        bus_bindings,
+        None,
+        None,
+        None,
+        None,
+        Some(BusAdapterRenderBindings {
+            current: bus_adapter,
+            callables: all_bus_adapters,
+        }),
+        0,
+        ComponentFunctionEmission::CommonFunction,
+        Some(contextual_tseqs),
     )
 }
 
@@ -3840,6 +6470,10 @@ pub(super) fn emit_component_on_handler(
     prog: &TbProgram,
     comp: &crate::ir::ComponentSchema,
     oh: &crate::ir::OnHandlerSchema,
+    bound_bus: Option<&BusBindingSchema>,
+    dut_type: &str,
+    dut_access: Option<&crate::ir::passes::dut_access::DutAccessPlan>,
+    dut_lane_widths: &HashMap<String, u32>,
     randomize_snippets: &[String],
     depth: usize,
 ) -> Result<(), EmitError> {
@@ -3847,12 +6481,25 @@ pub(super) fn emit_component_on_handler(
     emit_component_fn_lambda(
         out,
         prog,
-        comp,
+        &comp.name,
+        "self",
         oh.function,
         &lambda,
+        dut_type,
+        dut_access,
+        Some(dut_lane_widths),
         None,
         randomize_snippets,
+        None,
+        &[],
+        bound_bus,
+        None,
+        None,
+        None,
+        None,
         depth,
+        ComponentFunctionEmission::LocalLambda,
+        None,
     )
 }
 
@@ -3872,6 +6519,10 @@ pub(super) fn emit_component_periodic_handler(
     prog: &TbProgram,
     comp: &crate::ir::ComponentSchema,
     ph: &crate::ir::PeriodicHandlerSchema,
+    bound_bus: Option<&BusBindingSchema>,
+    dut_type: &str,
+    dut_access: Option<&crate::ir::passes::dut_access::DutAccessPlan>,
+    dut_lane_widths: &HashMap<String, u32>,
     randomize_snippets: &[String],
     depth: usize,
 ) -> Result<(), EmitError> {
@@ -3879,12 +6530,25 @@ pub(super) fn emit_component_periodic_handler(
     emit_component_fn_lambda(
         out,
         prog,
-        comp,
+        &comp.name,
+        "self",
         ph.function,
         &lambda,
+        dut_type,
+        dut_access,
+        Some(dut_lane_widths),
         None,
         randomize_snippets,
+        None,
+        &[],
+        bound_bus,
+        None,
+        None,
+        None,
+        None,
         depth,
+        ComponentFunctionEmission::LocalLambda,
+        None,
     )
 }
 
@@ -3906,6 +6570,10 @@ pub(super) fn emit_component_cycle_handler(
     prog: &TbProgram,
     comp: &crate::ir::ComponentSchema,
     ch: &crate::ir::CycleTriggerHandlerSchema,
+    bound_bus: Option<&BusBindingSchema>,
+    dut_type: &str,
+    dut_access: Option<&crate::ir::passes::dut_access::DutAccessPlan>,
+    dut_lane_widths: &HashMap<String, u32>,
     randomize_snippets: &[String],
     depth: usize,
 ) -> Result<(), EmitError> {
@@ -3913,12 +6581,25 @@ pub(super) fn emit_component_cycle_handler(
     emit_component_fn_lambda(
         out,
         prog,
-        comp,
+        &comp.name,
+        "self",
         ch.function,
         &lambda,
+        dut_type,
+        dut_access,
+        Some(dut_lane_widths),
         None,
         randomize_snippets,
+        None,
+        &[],
+        bound_bus,
+        None,
+        None,
+        None,
+        None,
         depth,
+        ComponentFunctionEmission::LocalLambda,
+        None,
     )
 }
 
@@ -3941,6 +6622,10 @@ pub(super) fn emit_component_watchdog(
     prog: &TbProgram,
     comp: &crate::ir::ComponentSchema,
     w: &crate::ir::WatchdogSchema,
+    bound_bus: Option<&BusBindingSchema>,
+    dut_type: &str,
+    dut_access: Option<&crate::ir::passes::dut_access::DutAccessPlan>,
+    dut_lane_widths: &HashMap<String, u32>,
     randomize_snippets: &[String],
     depth: usize,
 ) -> Result<(), EmitError> {
@@ -3948,12 +6633,25 @@ pub(super) fn emit_component_watchdog(
     emit_component_fn_lambda(
         out,
         prog,
-        comp,
+        &comp.name,
+        "self",
         w.function,
         &lambda,
+        dut_type,
+        dut_access,
+        Some(dut_lane_widths),
         None,
         randomize_snippets,
+        None,
+        &[],
+        bound_bus,
+        None,
+        None,
+        None,
+        None,
         depth,
+        ComponentFunctionEmission::LocalLambda,
+        None,
     )
 }
 
@@ -3971,21 +6669,46 @@ pub(super) fn clause_predicate_cpp(
     prog: &TbProgram,
     function: crate::ir::FunctionId,
     instance: &str,
+    dut_type: &str,
+    dut_access: Option<&crate::ir::passes::dut_access::DutAccessPlan>,
+    dut_lane_widths: &HashMap<String, u32>,
+    bound_bus: Option<&BusBindingSchema>,
     e: &Expr,
 ) -> Result<String, EmitError> {
     let func = prog.function(function);
     let names = cpp_local_names(func);
-    let empty_lanes = HashMap::new();
     let cx = ECx {
         prog: Some(prog),
         func,
         names: &names,
-        lanes: &empty_lanes,
-        self_subst: Some(instance),
-        dut_type: "",
+        lanes: dut_lane_widths,
+        bindings: CallableRenderBindings {
+            run_context: None,
+            dut_receiver: Some(if dut_access.is_some() {
+                "ctx.dut"
+            } else {
+                "dut"
+            }),
+            self_receiver: Some(instance),
+            testbench_owner: None,
+            testbench_receiver: None,
+            bound_bus,
+            testbench_bus_bindings: None,
+            bus_adapters: None,
+            clocks: None,
+            actor_slot: None,
+            testbench_components: None,
+            testbench_transactor_states: None,
+            runtime_cells: None,
+            durable_callbacks: false,
+        },
+        dut_type,
+        dut_access,
         trace_component: "",
         state_receiver: None,
         temporal_widths: &[],
+        temporal_cell_prefix: None,
+        common_contextual_tseqs: None,
     };
     truthy_expr_cpp(&cx, e)
 }
@@ -3995,21 +6718,46 @@ pub(super) fn clause_count_cpp(
     prog: &TbProgram,
     function: crate::ir::FunctionId,
     instance: &str,
+    dut_type: &str,
+    dut_access: Option<&crate::ir::passes::dut_access::DutAccessPlan>,
+    dut_lane_widths: &HashMap<String, u32>,
+    bound_bus: Option<&BusBindingSchema>,
     e: &Expr,
 ) -> Result<String, EmitError> {
     let func = prog.function(function);
     let names = cpp_local_names(func);
-    let empty_lanes = HashMap::new();
     let cx = ECx {
         prog: Some(prog),
         func,
         names: &names,
-        lanes: &empty_lanes,
-        self_subst: Some(instance),
-        dut_type: "",
+        lanes: dut_lane_widths,
+        bindings: CallableRenderBindings {
+            run_context: None,
+            dut_receiver: Some(if dut_access.is_some() {
+                "ctx.dut"
+            } else {
+                "dut"
+            }),
+            self_receiver: Some(instance),
+            testbench_owner: None,
+            testbench_receiver: None,
+            bound_bus,
+            testbench_bus_bindings: None,
+            bus_adapters: None,
+            clocks: None,
+            actor_slot: None,
+            testbench_components: None,
+            testbench_transactor_states: None,
+            runtime_cells: None,
+            durable_callbacks: false,
+        },
+        dut_type,
+        dut_access,
         trace_component: "",
         state_receiver: None,
         temporal_widths: &[],
+        temporal_cell_prefix: None,
+        common_contextual_tseqs: None,
     };
     bounded_count_expr_cpp(&cx, e, i64::MAX as u64)
 }
@@ -4023,64 +6771,313 @@ pub(super) fn tb_service_expr_cpp(
     prog: &TbProgram,
     function: crate::ir::FunctionId,
     dut_type: &str,
+    dut_access: Option<&crate::ir::passes::dut_access::DutAccessPlan>,
+    dut_lane_widths: &HashMap<String, u32>,
     e: &Expr,
 ) -> Result<String, EmitError> {
     let func = prog.function(function);
     let names = cpp_local_names(func);
-    let empty_lanes = HashMap::new();
+    let owner = func.owner.ok_or_else(|| {
+        EmitError(format!(
+            "tbir: testbench service fn{} `{}` has no owning testbench",
+            func.id.0, func.name
+        ))
+    })?;
+    let clocks = prog
+        .tests
+        .iter()
+        .find(|test| test.testbench == owner)
+        .map(|test| test.clocks.as_slice());
     let cx = ECx {
         prog: Some(prog),
         func,
         names: &names,
-        lanes: &empty_lanes,
-        self_subst: None,
+        lanes: dut_lane_widths,
+        bindings: CallableRenderBindings {
+            dut_receiver: Some(if dut_access.is_some() {
+                "ctx.dut"
+            } else {
+                "dut"
+            }),
+            testbench_owner: Some(owner),
+            testbench_receiver: Some("_tb"),
+            clocks,
+            ..CallableRenderBindings::default()
+        },
         dut_type,
+        dut_access,
         trace_component: "",
         state_receiver: None,
         temporal_widths: &[],
+        temporal_cell_prefix: None,
+        common_contextual_tseqs: None,
     };
     truthy_expr_cpp(&cx, e)
 }
 
 /// Shared lambda emission for component methods and on-handlers: a free
 /// `<lambda>(<Comp>& self, args...)` loop-switch over the lowered CFG.
-struct ComponentHookCtx<'a> {
-    owner_name: &'a str,
-    method_name: &'a str,
-    has_instance_hook_vector: bool,
-    has_method_hook_vector: bool,
+enum CallableHookCtx<'a> {
+    Component {
+        component: &'a crate::ir::ComponentSchema,
+        method_name: &'a str,
+        has_instance_hook_vector: bool,
+        has_method_hook_vector: bool,
+    },
+    Transactor {
+        schema: &'a TransactorSchema,
+        method: &'a TransactorMethodSchema,
+    },
+}
+
+impl CallableHookCtx<'_> {
+    fn coverage_vector(&self, receiver: &str, side: &str) -> Option<String> {
+        match self {
+            Self::Component {
+                method_name,
+                has_instance_hook_vector,
+                ..
+            } => has_instance_hook_vector
+                .then(|| format!("{receiver}._harc_cov_{method_name}_{side}")),
+            Self::Transactor { schema, method } => (!method.cov_hook_subs.is_empty()).then(|| {
+                format!(
+                    "{receiver}.{}",
+                    super::runtime::transactor_coverage_hook_field(schema, &method.name, side)
+                )
+            }),
+        }
+    }
+
+    fn method_vector(&self, receiver: &str, side: &str) -> Option<String> {
+        match self {
+            Self::Component {
+                component,
+                method_name,
+                has_method_hook_vector,
+                ..
+            } => has_method_hook_vector.then(|| {
+                format!(
+                    "{receiver}.{}",
+                    super::runtime::component_internal_member_name(
+                        component,
+                        &format!("_harc_hook_{method_name}_{side}"),
+                    )
+                )
+            }),
+            Self::Transactor { schema, method } => method.hookable.then(|| {
+                format!(
+                    "{receiver}.{}",
+                    super::runtime::transactor_hook_field(schema, &method.name, side)
+                )
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ComponentFunctionEmission {
+    LocalLambda,
+    CommonFunction,
+}
+
+fn callable_return_cty(prog: &TbProgram, func: &TbFunction) -> Result<String, EmitError> {
+    match func.ret.map(|ret| &func.locals[ret.index()].ty) {
+        Some(ty) => callable_value_cty(prog, ty),
+        None => Ok("void".to_string()),
+    }
+}
+
+fn callable_param_list(
+    prog: &TbProgram,
+    receiver_type: &str,
+    receiver_name: &str,
+    func: &TbFunction,
+    names: &[String],
+    with_context: bool,
+    module_param_types: Option<&[Option<String>]>,
+    testbench_components: Option<&[(String, crate::ir::ComponentId)]>,
+    testbench_transactors: Option<&[(String, crate::ir::TransactorId)]>,
+    bus_adapter: Option<&TestbenchBusAdapterPlan>,
+) -> Result<String, EmitError> {
+    let mut params = Vec::with_capacity(func.params.len() + 2);
+    if with_context {
+        params.push("HarcTestContext& ctx".to_string());
+    }
+    if !receiver_type.is_empty() {
+        params.push(format!("{receiver_type}& {receiver_name}"));
+    }
+    for (field, component) in testbench_components.into_iter().flatten() {
+        let schema = prog.components.get(component.index()).ok_or_else(|| {
+            EmitError(format!(
+                "tbir: testbench component field `{field}` references missing component c{}",
+                component.0
+            ))
+        })?;
+        params.push(format!(
+            "{}& {}",
+            schema.name,
+            testbench_component_param_name(field)
+        ));
+    }
+    for (field, transactor) in testbench_transactors.into_iter().flatten() {
+        prog.transactors.get(transactor.index()).ok_or_else(|| {
+            EmitError(format!(
+                "tbir: testbench transactor field `{field}` references missing transactor x{}",
+                transactor.0
+            ))
+        })?;
+        params.push(format!(
+            "{}& {}",
+            super::runtime::unbound_state_struct_ref(prog, *transactor),
+            testbench_transactor_state_param_name(field)
+        ));
+    }
+    for signal in bus_adapter.into_iter().flat_map(|adapter| &adapter.signals) {
+        let ty = callable_value_cty(prog, &signal.ty)?;
+        params.push(format!("harc_rt::HarcBusSignalRef<{ty}> {}", signal.symbol));
+    }
+    for (i, name) in names[..func.params.len()].iter().enumerate() {
+        let ty = module_param_types
+            .and_then(|types| types.get(i))
+            .and_then(Option::as_deref)
+            .map(|module| format!("V{module}*"))
+            .map(Ok)
+            .unwrap_or_else(|| callable_value_cty(prog, &func.locals[i].ty))?;
+        params.push(format!("{ty} {name}"));
+    }
+    Ok(params.join(", "))
 }
 
 fn emit_component_fn_lambda(
     out: &mut String,
     prog: &TbProgram,
-    comp: &crate::ir::ComponentSchema,
+    receiver_type: &str,
+    receiver_name: &str,
     function: crate::ir::FunctionId,
     lambda: &str,
-    hook_ctx: Option<ComponentHookCtx<'_>>,
+    dut_type: &str,
+    dut_access: Option<&crate::ir::passes::dut_access::DutAccessPlan>,
+    dut_lane_widths: Option<&HashMap<String, u32>>,
+    hook_ctx: Option<CallableHookCtx<'_>>,
     randomize_snippets: &[String],
+    testbench_owner: Option<crate::ir::TestbenchId>,
+    bus_bindings: &[BusBindingSchema],
+    bound_bus: Option<&BusBindingSchema>,
+    module_param_types: Option<&[Option<String>]>,
+    testbench_component_fields: Option<&[(String, crate::ir::ComponentId)]>,
+    testbench_transactor_fields: Option<&[(String, crate::ir::TransactorId)]>,
+    bus_adapters: Option<BusAdapterRenderBindings<'_>>,
     depth: usize,
+    emission: ComponentFunctionEmission,
+    common_contextual_tseqs: Option<&BTreeSet<FunctionId>>,
 ) -> Result<(), EmitError> {
     let func = prog.function(function);
-    let names = cpp_local_names(func);
+    let testbench_component_bindings = testbench_component_fields
+        .into_iter()
+        .flatten()
+        .map(
+            |(field, component)| super::expr::TestbenchComponentRenderBinding {
+                field: field.clone(),
+                component: *component,
+                receiver: testbench_component_param_name(field),
+            },
+        )
+        .collect::<Vec<_>>();
+    let testbench_transactor_state_bindings = if let Some(fields) = testbench_transactor_fields {
+        fields
+            .iter()
+            .map(
+                |(field, transactor)| super::expr::TestbenchTransactorStateRenderBinding {
+                    field: field.clone(),
+                    transactor: *transactor,
+                    receiver: testbench_transactor_state_param_name(field),
+                },
+            )
+            .collect::<Vec<_>>()
+    } else if matches!(func.kind, FunctionKind::TestbenchMethod { .. }) {
+        testbench_owner
+            .and_then(|owner| prog.testbenches.get(owner.index()))
+            .map(|testbench| {
+                testbench
+                    .unbound_state_actors
+                    .iter()
+                    .map(|actor| super::expr::TestbenchTransactorStateRenderBinding {
+                        field: actor.field.clone(),
+                        transactor: actor.transactor,
+                        receiver: actor.storage.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let names = cpp_local_names_with_reserved(
+        func,
+        testbench_component_bindings
+            .iter()
+            .map(|binding| binding.receiver.as_str())
+            .chain(
+                testbench_transactor_state_bindings
+                    .iter()
+                    .map(|binding| binding.receiver.as_str()),
+            ),
+    );
     let empty_lanes = HashMap::new();
-    // Component method/on-handler bodies are host-side; no DUT probes.
+    let clock_bindings = testbench_owner.and_then(|owner| {
+        prog.tests
+            .iter()
+            .find(|test| test.testbench == owner)
+            .map(|test| test.clocks.as_slice())
+    });
+    // Component method/on-handler bodies share the test's bound DUT and may
+    // read, force, or release suite-cataloged probes.
     let cx = ECx {
         prog: Some(prog),
         func,
         names: &names,
-        lanes: &empty_lanes,
-        self_subst: None,
-        dut_type: "",
+        lanes: dut_lane_widths.unwrap_or(&empty_lanes),
+        bindings: CallableRenderBindings {
+            run_context: matches!(emission, ComponentFunctionEmission::CommonFunction)
+                .then_some("ctx"),
+            dut_receiver: Some(match emission {
+                ComponentFunctionEmission::LocalLambda => "dut",
+                ComponentFunctionEmission::CommonFunction => "ctx.dut",
+            }),
+            self_receiver: (!receiver_name.is_empty()).then_some(receiver_name),
+            testbench_owner,
+            testbench_receiver: matches!(func.kind, FunctionKind::TestbenchMethod { .. })
+                .then_some(receiver_name),
+            bound_bus,
+            testbench_bus_bindings: Some(bus_bindings),
+            bus_adapters,
+            clocks: clock_bindings,
+            actor_slot: None,
+            testbench_components: (!testbench_component_bindings.is_empty())
+                .then_some(testbench_component_bindings.as_slice()),
+            testbench_transactor_states: (!testbench_transactor_state_bindings.is_empty())
+                .then_some(testbench_transactor_state_bindings.as_slice()),
+            runtime_cells: None,
+            durable_callbacks: false,
+        },
+        dut_type,
+        dut_access,
         trace_component: "",
-        state_receiver: None,
+        state_receiver: matches!(hook_ctx.as_ref(), Some(CallableHookCtx::Transactor { schema, .. }) if uses_state_receiver(schema))
+            .then_some(receiver_name),
         temporal_widths: &[],
+        temporal_cell_prefix: None,
+        common_contextual_tseqs,
     };
     let nparams = func.params.len();
     let pad = INDENT.repeat(depth);
     let pad1 = INDENT.repeat(depth + 1);
     let pad2 = INDENT.repeat(depth + 2);
     let pad3 = INDENT.repeat(depth + 3);
+    let tick_call = match emission {
+        ComponentFunctionEmission::LocalLambda => "tick()",
+        ComponentFunctionEmission::CommonFunction => "harc_tseq_tick(ctx)",
+    };
 
     // A record-returning method (`function predict_read(...) ->
     // ReadResponse`) returns the record struct by value; a scalar return
@@ -4093,66 +7090,90 @@ fn emit_component_fn_lambda(
     // its field was stored wide (issue #642). The `__ret` local now
     // carries the declared return type, so this reads the same
     // `IrType` the params below do and the two cannot drift.
-    let ret_ty = match func.ret.map(|r| &func.locals[r.index()].ty) {
-        Some(IrType::Record(r)) => prog.records[r.index()].name.clone(),
-        Some(IrType::RecordSeq(r)) => format!("std::vector<{}>", prog.records[r.index()].name),
-        Some(IrType::Seq(elem)) => format!("std::vector<{}>", super::field_scalar_cty(elem)),
-        Some(ty @ IrType::FixedVec { .. }) => super::aggregate_value_cty(ty, &prog.records),
-        Some(ty) => super::local_scalar_cty(ty),
-        None => "void".to_string(),
-    };
+    let ret_ty = callable_return_cty(prog, func)?;
     // The receiver `self`, then one parameter per declared param — a
     // record param (`on in_ev(t)` with `event<TinyTxn>`) is taken by
     // value as the record struct; a component-typed param (`observe(addr,
     // model: ProtocolModel)`) by value as the component struct; every
     // other param widens to uint64_t.
-    let mut params = vec![format!("{}& self", comp.name)];
-    for (i, n) in names[..nparams].iter().enumerate() {
-        let pty = match func.locals[i].ty {
-            IrType::Record(r) => prog.records[r.index()].name.clone(),
-            // A transaction-sequence param (a sequencer's
-            // `hookable dispatch(txns: TSeq<RegOp>)`) is taken by value as
-            // `std::vector<Record>`, matching the tseq generator's return.
-            IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
-            // The scalar-element analogue (`TSeq<uint<N>>`) — `std::vector<T>`
-            // over the scalar C++ type (#453).
-            IrType::Seq(ref scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
-            ref ty @ IrType::FixedVec { .. } => {
-                super::aggregate_value_cty(ty, &prog.records)
-            }
-            IrType::Component(c) => prog.components[c.index()].name.clone(),
-            ref ty => super::local_scalar_cty(ty),
-        };
-        params.push(format!("{pty} {n}"));
+    let params = callable_param_list(
+        prog,
+        receiver_type,
+        receiver_name,
+        func,
+        &names,
+        matches!(emission, ComponentFunctionEmission::CommonFunction),
+        module_param_types,
+        testbench_component_fields,
+        testbench_transactor_fields,
+        bus_adapters.and_then(|bindings| bindings.current),
+    )?;
+    match emission {
+        ComponentFunctionEmission::LocalLambda => {
+            writeln!(out, "{pad}auto {lambda} = [&]({params}) -> {ret_ty} {{").ok();
+        }
+        ComponentFunctionEmission::CommonFunction => {
+            writeln!(out, "{pad}{ret_ty} {lambda}({params}) {{").ok();
+            writeln!(out, "{pad1}auto* dut = ctx.dut;").ok();
+            writeln!(out, "{pad1}auto& errors = ctx.errors;").ok();
+            writeln!(out, "{pad1}auto& _fatal = ctx.fatal;").ok();
+            writeln!(out, "{pad1}auto& cycle_count = ctx.cycle_count;").ok();
+            writeln!(out, "{pad1}auto& trace = ctx.trace;").ok();
+            writeln!(out, "{pad1}auto& log_ctx = ctx.log_ctx;").ok();
+            writeln!(
+                out,
+                "{pad1}auto& _auto_cov_reports = ctx._auto_cov_reports;"
+            )
+            .ok();
+            writeln!(out, "{pad1}auto& harc_rng = ctx.rng;").ok();
+            writeln!(out, "{pad1}auto tick = [&]() {{ harc_tseq_tick(ctx); }};").ok();
+            writeln!(
+                out,
+                "{pad1}auto sim_logf_line = [&](FILE* f, const char* sev, const char* fmt, ...) {{"
+            )
+            .ok();
+            writeln!(
+                out,
+                "{pad2}HARC_RT_LOG_FILE_ONLY_PRINTF(f, cycle_count, sev, fmt);"
+            )
+            .ok();
+            writeln!(out, "{pad1}}};").ok();
+            writeln!(
+                out,
+                "{pad1}auto sim_log_line = [&](const char* sev, const char* fmt, ...) {{"
+            )
+            .ok();
+            writeln!(out, "{pad2}va_list ap;").ok();
+            writeln!(out, "{pad2}va_start(ap, fmt);").ok();
+            writeln!(
+                out,
+                "{pad2}harc_rt::log::harc_log_vline(log_ctx.sim_log, &trace, cycle_count, sev, fmt, ap);"
+            )
+            .ok();
+            writeln!(out, "{pad2}va_end(ap);").ok();
+            writeln!(out, "{pad1}}};").ok();
+        }
     }
-    let params = params.join(", ");
-    writeln!(out, "{pad}auto {lambda} = [&]({params}) -> {ret_ty} {{").ok();
-    declare_locals(out, prog, func, &names, nparams, depth + 1)?;
+    declare_locals(out, prog, func, &names, nparams, depth + 1, cx.dut_access)?;
     declare_port_snapshots(out, &cx, depth + 1)?;
     let hook_args = names[..nparams].join(", ");
-    let has_instance_hooks = hook_ctx
+    let coverage_pre = hook_ctx
         .as_ref()
-        .is_some_and(|ctx| ctx.has_instance_hook_vector);
-    let has_method_hooks = hook_ctx
+        .and_then(|ctx| ctx.coverage_vector(receiver_name, "pre"));
+    let method_pre = hook_ctx
         .as_ref()
-        .is_some_and(|ctx| ctx.has_method_hook_vector);
-    if has_instance_hooks {
-        let ctx = hook_ctx.as_ref().expect("pre hook context present");
-        writeln!(
-            out,
-            "{pad1}for (auto& _h : self._harc_cov_{}_pre) _h({hook_args});",
-            ctx.method_name
-        )
-        .ok();
+        .and_then(|ctx| ctx.method_vector(receiver_name, "pre"));
+    let coverage_post = hook_ctx
+        .as_ref()
+        .and_then(|ctx| ctx.coverage_vector(receiver_name, "post"));
+    let method_post = hook_ctx
+        .as_ref()
+        .and_then(|ctx| ctx.method_vector(receiver_name, "post"));
+    if let Some(vector) = &coverage_pre {
+        writeln!(out, "{pad1}for (auto& _h : {vector}) _h({hook_args});").ok();
     }
-    if has_method_hooks {
-        let ctx = hook_ctx.as_ref().expect("pre hook context present");
-        writeln!(
-            out,
-            "{pad1}for (auto& _h : {}_{}_pre) _h({hook_args});",
-            ctx.owner_name, ctx.method_name
-        )
-        .ok();
+    if let Some(vector) = &method_pre {
+        writeln!(out, "{pad1}for (auto& _h : {vector}) _h({hook_args});").ok();
     }
     writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
     writeln!(out, "{pad1}while (true) {{").ok();
@@ -4162,7 +7183,7 @@ fn emit_component_fn_lambda(
         for s in &block.stmts {
             // Record table visible so an `on`-handler body that inits a
             // record local (`let c : Completion`) resolves `RecordInit`.
-            emit_stmt(out, prog, &cx, &prog.records, &[], s, depth + 3)?;
+            emit_stmt(out, prog, &cx, &prog.records, bus_bindings, s, depth + 3)?;
         }
         match &block.terminator {
             Terminator::Jump(b) => {
@@ -4177,65 +7198,81 @@ fn emit_component_fn_lambda(
                 )
                 .ok();
             }
-            Terminator::WaitCycles(n, None, b) => {
+            Terminator::WaitCycles(n, None, b) | Terminator::WaitCyclesSync(n, b) => {
                 let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
                 writeln!(
                     out,
-                    "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) tick();"
+                    "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) {tick_call};"
                 )
                 .ok();
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
+            Terminator::WaitCycles(n, Some(clock), b) => {
+                if matches!(emission, ComponentFunctionEmission::CommonFunction) {
+                    let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
+                    writeln!(
+                        out,
+                        "{pad3}harc_wait_clock_cycles(ctx, \"{}\", (long long)({n}));",
+                        super::expr::escape_c(&clock.name)
+                    )
+                    .ok();
+                } else {
+                    let clocks = cx.bindings.clocks.ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: callable `{}` has clock-qualified wait on `{}` without typed clock bindings",
+                            func.name, clock.name
+                        ))
+                    })?;
+                    let index = clocks
+                        .iter()
+                        .position(|candidate| candidate.name == clock.name)
+                        .ok_or_else(|| {
+                            EmitError(format!(
+                                "tbir: callable `{}` waits on clock `{}` absent from its owning test",
+                                func.name, clock.name
+                            ))
+                        })?;
+                    let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
+                    emit_local_qualified_clock_wait(out, &pad3, index, &n);
+                }
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
             Terminator::WaitUntil { preds, mode, succ } => {
                 let cond = preds_cpp(&cx, preds, *mode)?;
-                writeln!(out, "{pad3}while (!({cond})) tick();").ok();
+                writeln!(out, "{pad3}while (!({cond})) {tick_call};").ok();
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
             Terminator::WaitTimePs(ps, b) => {
-                // Same wall-clock settle support as transactor methods.
-                writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
+                match emission {
+                    ComponentFunctionEmission::LocalLambda => {
+                        writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
+                    }
+                    ComponentFunctionEmission::CommonFunction => {
+                        writeln!(out, "{pad3}harc_eval_clocks_until(ctx, ctx.now_ps + {ps});").ok();
+                    }
+                }
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::Return => match func.ret {
                 Some(r) => {
-                    if has_instance_hooks && func.implicit_returns.contains(&BlockId(bi as u32)) {
-                        let ctx = hook_ctx.as_ref().expect("post hook context present");
-                        writeln!(
-                            out,
-                            "{pad3}for (auto& _h : self._harc_cov_{}_post) _h({hook_args});",
-                            ctx.method_name
-                        )
-                        .ok();
-                    }
-                    if has_method_hooks && func.implicit_returns.contains(&BlockId(bi as u32)) {
-                        let ctx = hook_ctx.as_ref().expect("post hook context present");
-                        writeln!(
-                            out,
-                            "{pad3}for (auto& _h : {}_{}_post) _h({hook_args});",
-                            ctx.owner_name, ctx.method_name
-                        )
-                        .ok();
+                    if func.implicit_returns.contains(&BlockId(bi as u32)) {
+                        if let Some(vector) = &coverage_post {
+                            writeln!(out, "{pad3}for (auto& _h : {vector}) _h({hook_args});").ok();
+                        }
+                        if let Some(vector) = &method_post {
+                            writeln!(out, "{pad3}for (auto& _h : {vector}) _h({hook_args});").ok();
+                        }
                     }
                     writeln!(out, "{pad3}return {};", names[r.index()]).ok();
                 }
                 None => {
-                    if has_instance_hooks && func.implicit_returns.contains(&BlockId(bi as u32)) {
-                        let ctx = hook_ctx.as_ref().expect("post hook context present");
-                        writeln!(
-                            out,
-                            "{pad3}for (auto& _h : self._harc_cov_{}_post) _h({hook_args});",
-                            ctx.method_name
-                        )
-                        .ok();
-                    }
-                    if has_method_hooks && func.implicit_returns.contains(&BlockId(bi as u32)) {
-                        let ctx = hook_ctx.as_ref().expect("post hook context present");
-                        writeln!(
-                            out,
-                            "{pad3}for (auto& _h : {}_{}_post) _h({hook_args});",
-                            ctx.owner_name, ctx.method_name
-                        )
-                        .ok();
+                    if func.implicit_returns.contains(&BlockId(bi as u32)) {
+                        if let Some(vector) = &coverage_post {
+                            writeln!(out, "{pad3}for (auto& _h : {vector}) _h({hook_args});").ok();
+                        }
+                        if let Some(vector) = &method_post {
+                            writeln!(out, "{pad3}for (auto& _h : {vector}) _h({hook_args});").ok();
+                        }
                     }
                     writeln!(out, "{pad3}return;").ok();
                 }
@@ -4253,15 +7290,27 @@ fn emit_component_fn_lambda(
                 // carry no problem-id in either codegen, so the snippet
                 // uses v1's nullptr-descriptor solve path — identical
                 // bytes to v1's component-body emission.
-                let snippet =
-                    randomize_snippet_for(prog, &names, *target, *constraints, randomize_snippets)
-                        .ok_or_else(|| {
-                            EmitError(format!(
-                                "tbir: Randomize in component body {} references missing \
+                let run_context = cx.bindings.run_context.unwrap_or("ctx");
+                let state_receiver =
+                    randomize_state_receiver(func, *constraints, None, run_context)?;
+                let snippet = randomize_snippet_for(
+                    prog,
+                    func,
+                    &names,
+                    *target,
+                    *constraints,
+                    randomize_snippets,
+                    run_context,
+                    &state_receiver,
+                    cx.bindings.self_receiver,
+                )?
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: Randomize in component body {} references missing \
                                  constraint snippet c{}",
-                                func.name, constraints.0
-                            ))
-                        })?;
+                        func.name, constraints.0
+                    ))
+                })?;
                 out.push_str(&snippet);
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
@@ -4286,7 +7335,7 @@ fn emit_component_fn_lambda(
                 writeln!(
                     out,
                     "{pad3}while (!({cond}) && ((int64_t)cycle_count - _wu_start) < _wu_budget) \
-                     tick();"
+                     {tick_call};"
                 )
                 .ok();
                 writeln!(
@@ -4296,10 +7345,7 @@ fn emit_component_fn_lambda(
                 )
                 .ok();
             }
-            other @ (Terminator::WaitCycles(_, Some(_), _)
-            | Terminator::WaitCyclesSync(_, _)
-            | Terminator::TbLifecycleCall { .. }
-            | Terminator::Fatal(_)) => {
+            other @ (Terminator::TbLifecycleCall { .. } | Terminator::Fatal(_)) => {
                 return Err(EmitError(format!(
                     "tbir: component method `{}` contains terminator {other:?} — \
                      lowering gate failed",
@@ -4319,7 +7365,10 @@ fn emit_component_fn_lambda(
     };
     writeln!(out, "{pad2}}}").ok(); // switch
     writeln!(out, "{pad1}}}").ok(); // while
-    writeln!(out, "{pad}}};").ok(); // lambda
+    match emission {
+        ComponentFunctionEmission::LocalLambda => writeln!(out, "{pad}}};").ok(),
+        ComponentFunctionEmission::CommonFunction => writeln!(out, "{pad}}}").ok(),
+    };
     Ok(())
 }
 
@@ -4336,6 +7385,37 @@ fn emit_component_fn_lambda(
 ///      `rsp_valid`, awaits `rsp_ready`, ticks, drops `rsp_valid`.
 /// Trace payloads match v1 exactly (`tlm_call(cycle, instance, "bus",
 /// method, phase, "target")`) so the semantic trace diffs clean.
+fn register_target_actor_slot(
+    out: &mut String,
+    mt: bool,
+    actor_threads: &mut Vec<(String, String)>,
+    context_storage: Option<&str>,
+    sched_var: &str,
+    slot_var: &str,
+    depth: usize,
+) {
+    if let Some(context) = context_storage {
+        crate::codegen::tbir::runtime::register_context_actor_slot(
+            out,
+            mt,
+            actor_threads,
+            context,
+            sched_var,
+            slot_var,
+            depth,
+        );
+    } else {
+        crate::codegen::tbir::runtime::register_actor_slot(
+            out,
+            mt,
+            actor_threads,
+            sched_var,
+            slot_var,
+            depth,
+        );
+    }
+}
+
 pub(super) fn emit_target_actor(
     out: &mut String,
     prog: &TbProgram,
@@ -4343,6 +7423,7 @@ pub(super) fn emit_target_actor(
     bindings: &[BusBindingSchema],
     mt: bool,
     actor_threads: &mut Vec<(String, String)>,
+    context_storage: Option<&str>,
     depth: usize,
 ) -> Result<(), EmitError> {
     let schema = prog.transactor(actor.transactor);
@@ -4363,6 +7444,14 @@ pub(super) fn emit_target_actor(
         let method = &tm.name;
         let func = prog.function(tm.function);
         let names = cpp_local_names(func);
+        let input_heartbeat = crate::codegen::tbir::runtime::transactor_heartbeat_field(
+            schema,
+            crate::ir::passes::runtime_cells::ComponentHeartbeat::Input,
+        );
+        let output_heartbeat = crate::codegen::tbir::runtime::transactor_heartbeat_field(
+            schema,
+            crate::ir::passes::runtime_cells::ComponentHeartbeat::Output,
+        );
         let empty_lanes = HashMap::new();
         // Target-TLM responder bodies are wire-protocol only; no probes.
         // A downstream forwarded `back.read(...)` initiator trace event
@@ -4373,14 +7462,20 @@ pub(super) fn emit_target_actor(
             func,
             names: &names,
             lanes: &empty_lanes,
-            self_subst: None,
+            bindings: CallableRenderBindings {
+                actor_slot: Some("_slot"),
+                ..CallableRenderBindings::default()
+            },
             dut_type: "",
+            dut_access: None,
             trace_component: instance,
             // Target responder functions are shared by every binding of the
             // transactor type. Resolve their empty-instance state nodes
             // against this actor's concrete storage object.
             state_receiver: Some(instance),
             temporal_widths: &[],
+            temporal_cell_prefix: None,
+            common_contextual_tseqs: None,
         };
         let wire = |sig: &str| match binding {
             Some(b) => format!("dut->{}", b.wire_name(method, sig)),
@@ -4414,19 +7509,23 @@ pub(super) fn emit_target_actor(
                 tm,
                 instance,
                 &wire,
+                &input_heartbeat,
+                &output_heartbeat,
                 tag_count as usize,
                 bindings,
                 mt,
                 actor_threads,
+                context_storage,
                 depth,
             )?;
             continue;
         }
 
-        crate::codegen::tbir::runtime::register_actor_slot(
+        register_target_actor_slot(
             out,
             mt,
             actor_threads,
+            context_storage,
             &sched_var,
             &slot_var,
             depth,
@@ -4451,18 +7550,21 @@ pub(super) fn emit_target_actor(
         let nparams = func.params.len();
         for (i, arg) in tm.args.iter().enumerate() {
             let local = &names[i];
-            writeln!(
-                out,
-                "{pad2}uint64_t {local} = harc_rt::harc_read({});",
-                wire(arg)
-            )
-            .ok();
+            let value_type = tm.param_tys.get(i).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: target responder `{}` has no type for request argument `{arg}`",
+                    func.name
+                ))
+            })?;
+            let cty = callable_value_cty(prog, value_type)?;
+            let capture = typed_wire_read_expr(prog, &wire(arg), value_type)?;
+            writeln!(out, "{pad2}{cty} {local} = {capture};",).ok();
         }
         writeln!(out, "{pad2}co_await harc_rt::wait_cycles(_slot, 1);").ok();
         writeln!(out, "{pad2}{} = 0;", wire("req_ready")).ok();
         writeln!(
             out,
-            "{pad2}{instance}._last_in_cycle = (uint64_t)cycle_count;"
+            "{pad2}{instance}.{input_heartbeat} = (uint64_t)cycle_count;"
         )
         .ok();
         trace_event(out, "request", depth + 2);
@@ -4489,27 +7591,18 @@ pub(super) fn emit_target_actor(
             // A record-typed return is packed onto the lowered response
             // pin through the record's generated `harc_drive_<R>` helper
             // (v1's `record_drive_stmt`); a scalar is a plain assign.
+            let ret_type = func
+                .locals
+                .get(ret.index())
+                .map(|local| &local.ty)
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: target responder `{}` references missing return local %{}",
+                        func.name, ret.0
+                    ))
+                })?;
             let drive =
-                if let Some(IrType::Record(rid)) = func.locals.get(ret.index()).map(|l| &l.ty) {
-                    let rec = prog.records.get(rid.index()).ok_or_else(|| {
-                        EmitError(format!(
-                            "tbir: target responder `{}` returns missing record r{}",
-                            func.name, rid.0
-                        ))
-                    })?;
-                    format!(
-                        "harc_drive_{}({}, {});",
-                        rec.name,
-                        wire("rsp_data"),
-                        &names[ret.index()]
-                    )
-                } else {
-                    format!(
-                        "harc_rt::harc_assign({}, {});",
-                        wire("rsp_data"),
-                        &names[ret.index()]
-                    )
-                };
+                typed_wire_write_stmt(prog, &wire("rsp_data"), ret_type, &names[ret.index()])?;
             writeln!(out, "{pad2}{INDENT}{drive}").ok();
         }
         writeln!(out, "{pad2}}}").ok(); // body scope
@@ -4526,7 +7619,7 @@ pub(super) fn emit_target_actor(
         writeln!(out, "{pad2}{} = 0;", wire("rsp_valid")).ok();
         writeln!(
             out,
-            "{pad2}{instance}._last_out_cycle = (uint64_t)cycle_count;"
+            "{pad2}{instance}.{output_heartbeat} = (uint64_t)cycle_count;"
         )
         .ok();
         writeln!(out, "{pad1}}}").ok(); // while(true)
@@ -4560,7 +7653,7 @@ fn emit_responder_loop_switch(
     bindings: &[BusBindingSchema],
     depth: usize,
 ) -> Result<(), EmitError> {
-    declare_locals(out, prog, func, names, nparams, depth)?;
+    declare_locals(out, prog, func, names, nparams, depth, cx.dut_access)?;
     declare_port_snapshots(out, cx, depth)?;
     writeln!(out, "{}int __bb = {};", INDENT.repeat(depth), func.entry.0).ok();
     writeln!(out, "{}bool __done = false;", INDENT.repeat(depth)).ok();
@@ -4657,11 +7750,17 @@ pub(super) fn emit_active_bound_driver_actor(
     prog: &TbProgram,
     component: crate::ir::ComponentId,
     inst_path: &str,
+    dut_type: &str,
     bindings: &[BusBindingSchema],
+    bound_bus: Option<&BusBindingSchema>,
     actor_threads: &mut Vec<(String, String)>,
     depth: usize,
 ) -> Result<(), EmitError> {
     let comp = &prog.components[component.index()];
+    let input_heartbeat = super::runtime::component_heartbeat_field(
+        comp,
+        crate::ir::passes::runtime_cells::ComponentHeartbeat::Input,
+    );
     let inst_tag = inst_path.replace('.', "_");
     let pad = INDENT.repeat(depth);
     let pad1 = INDENT.repeat(depth + 1);
@@ -4670,8 +7769,8 @@ pub(super) fn emit_active_bound_driver_actor(
         let func = prog.function(oh.function);
         let names = cpp_local_names(func);
         let empty_lanes = HashMap::new();
-        // Driver bodies poke the bound bus's DUT wires (already prefix-filled
-        // at lowering) and forward downstream blocking TLM calls; no probes.
+        // Driver bodies poke bound-bus DUT wires through the explicit instance
+        // adapter and forward downstream blocking TLM calls; no probes.
         // `self_subst = inst_path` so a `self.<field>` access (`self.last_read
         // = val`) resolves to the running instance (`drv.last_read`) — the
         // worker coroutine has no `self` parameter, unlike the synchronous
@@ -4681,11 +7780,29 @@ pub(super) fn emit_active_bound_driver_actor(
             func,
             names: &names,
             lanes: &empty_lanes,
-            self_subst: Some(inst_path),
-            dut_type: "",
+            bindings: CallableRenderBindings {
+                run_context: None,
+                dut_receiver: Some("dut"),
+                self_receiver: Some(inst_path),
+                testbench_owner: None,
+                testbench_receiver: None,
+                bound_bus,
+                testbench_bus_bindings: None,
+                bus_adapters: None,
+                clocks: None,
+                actor_slot: Some("_slot"),
+                testbench_components: None,
+                testbench_transactor_states: None,
+                runtime_cells: None,
+                durable_callbacks: false,
+            },
+            dut_type,
+            dut_access: None,
             trace_component: inst_path,
             state_receiver: None,
             temporal_widths: &[],
+            temporal_cell_prefix: None,
+            common_contextual_tseqs: None,
         };
         let payload_ty =
             crate::codegen::tbir::runtime::event_payload_cty(&oh.arg_payload, &prog.records);
@@ -4732,7 +7849,7 @@ pub(super) fn emit_active_bound_driver_actor(
         writeln!(out, "{pad2}{queue_var}.pop_front();").ok();
         writeln!(
             out,
-            "{pad2}{inst_path}._last_in_cycle = (uint64_t)cycle_count;"
+            "{pad2}{inst_path}.{input_heartbeat} = (uint64_t)cycle_count;"
         )
         .ok();
         // Body as a coroutine loop-switch: param 0 (the txn) is declared
@@ -4761,11 +7878,9 @@ pub(super) fn emit_active_bound_driver_actor(
 /// method, mirroring v1's `emit_bound_tagged_tlm_target_actors`:
 ///
 ///  1. Per-tag shared state arrays (`std::array<…, N>`): `lane_busy`,
-///     `lane_req_valid`, `lane_rsp_valid`, one arg array per request arg,
-///     and (value methods) a `lane_rsp_data` array. The TB-IR value model
-///     is uniformly `uint64_t` (unlike v1's precise C-types), so every
-///     array element is `uint64_t` / `bool`; the runtime `harc_read`/
-///     `harc_assign` helpers still width-correct the bus wires.
+///     `lane_req_valid`, `lane_rsp_valid`, one exactly typed array per
+///     request arg, and (value methods) an exactly typed `lane_rsp_data`
+///     array.
 ///  2. A combinational `_post_eval_services` closure that drives
 ///     `req_ready` = "a lane is free for the requested (or any) tag",
 ///     matching v1's dispatcher accept gate.
@@ -4796,10 +7911,13 @@ fn emit_tagged_target_actors(
     tm: &crate::ir::TargetTlmMethodSchema,
     instance: &str,
     wire: &dyn Fn(&str) -> String,
+    input_heartbeat: &str,
+    output_heartbeat: &str,
     tag_count: usize,
     bindings: &[BusBindingSchema],
     mt: bool,
     actor_threads: &mut Vec<(String, String)>,
+    context_storage: Option<&str>,
     depth: usize,
 ) -> Result<(), EmitError> {
     let method = &tm.name;
@@ -4830,14 +7948,28 @@ fn emit_tagged_target_actors(
         "{pad}std::array<std::atomic<bool>, {tag_count}> {lane_rsp_valid}{{}};"
     )
     .ok();
-    for arg in &tm.args {
+    for (index, arg) in tm.args.iter().enumerate() {
+        let value_type = tm.param_tys.get(index).ok_or_else(|| {
+            EmitError(format!(
+                "tbir: OOO target responder `{}` has no type for request argument `{arg}`",
+                func.name
+            ))
+        })?;
+        let cty = callable_value_cty(prog, value_type)?;
         let arr = format!("{prefix}_arg_{arg}");
-        writeln!(out, "{pad}std::array<uint64_t, {tag_count}> {arr}{{}};").ok();
+        writeln!(out, "{pad}std::array<{cty}, {tag_count}> {arr}{{}};").ok();
     }
     if tm.has_ret {
+        let ret_type = tm.ret_ty.as_ref().ok_or_else(|| {
+            EmitError(format!(
+                "tbir: OOO target responder `{}` has no declared return type",
+                func.name
+            ))
+        })?;
+        let cty = callable_value_cty(prog, ret_type)?;
         writeln!(
             out,
-            "{pad}std::array<uint64_t, {tag_count}> {lane_rsp_data}{{}};"
+            "{pad}std::array<{cty}, {tag_count}> {lane_rsp_data}{{}};"
         )
         .ok();
     }
@@ -4865,10 +7997,11 @@ fn emit_tagged_target_actors(
     writeln!(out, "{pad}}});").ok();
 
     // --- (3) Dispatcher coroutine. ---
-    crate::codegen::tbir::runtime::register_actor_slot(
+    register_target_actor_slot(
         out,
         mt,
         actor_threads,
+        context_storage,
         &dispatcher_sched,
         &dispatcher_slot,
         depth,
@@ -4890,20 +8023,22 @@ fn emit_tagged_target_actors(
     writeln!(out, "{pad2}{{").ok();
     let pad3 = INDENT.repeat(depth + 3);
     writeln!(out, "{pad3}auto _tag = (size_t){};", wire("req_tag")).ok();
-    for arg in &tm.args {
+    for (index, arg) in tm.args.iter().enumerate() {
+        let value_type = tm.param_tys.get(index).ok_or_else(|| {
+            EmitError(format!(
+                "tbir: OOO target responder `{}` has no type for request argument `{arg}`",
+                func.name
+            ))
+        })?;
         let arr = format!("{prefix}_arg_{arg}");
-        writeln!(
-            out,
-            "{pad3}{arr}[_tag] = harc_rt::harc_read({});",
-            wire(arg)
-        )
-        .ok();
+        let capture = typed_wire_read_expr(prog, &wire(arg), value_type)?;
+        writeln!(out, "{pad3}{arr}[_tag] = {capture};",).ok();
     }
     writeln!(out, "{pad3}{lane_busy}[_tag].store(true);").ok();
     writeln!(out, "{pad3}{lane_req_valid}[_tag].store(true);").ok();
     writeln!(
         out,
-        "{pad3}{instance}._last_in_cycle = (uint64_t)cycle_count;"
+        "{pad3}{instance}.{input_heartbeat} = (uint64_t)cycle_count;"
     )
     .ok();
     writeln!(
@@ -4929,10 +8064,11 @@ fn emit_tagged_target_actors(
     for lane in 0..tag_count {
         let lane_slot = format!("{prefix}_lane{lane}_slot");
         let lane_sched = format!("{prefix}_lane{lane}_sched");
-        crate::codegen::tbir::runtime::register_actor_slot(
+        register_target_actor_slot(
             out,
             mt,
             actor_threads,
+            context_storage,
             &lane_sched,
             &lane_slot,
             depth,
@@ -4953,7 +8089,14 @@ fn emit_tagged_target_actors(
         for (i, arg) in tm.args.iter().enumerate() {
             let local = &names[i];
             let arr = format!("{prefix}_arg_{arg}");
-            writeln!(out, "{pad2}uint64_t {local} = {arr}[{lane}];").ok();
+            let value_type = tm.param_tys.get(i).ok_or_else(|| {
+                EmitError(format!(
+                    "tbir: OOO target responder `{}` has no type for request argument `{arg}`",
+                    func.name
+                ))
+            })?;
+            let cty = callable_value_cty(prog, value_type)?;
+            writeln!(out, "{pad2}{cty} {local} = {arr}[{lane}];").ok();
         }
         // Responder body loop-switch (shared with the blocking path).
         writeln!(
@@ -4996,10 +8139,11 @@ fn emit_tagged_target_actors(
     }
 
     // --- (5) Arbiter coroutine. ---
-    crate::codegen::tbir::runtime::register_actor_slot(
+    register_target_actor_slot(
         out,
         mt,
         actor_threads,
+        context_storage,
         &arbiter_sched,
         &arbiter_slot,
         depth,
@@ -5024,12 +8168,19 @@ fn emit_tagged_target_actors(
     .ok();
     writeln!(out, "{pad2}if (_sel >= 0) {{").ok();
     if tm.has_ret {
-        writeln!(
-            out,
-            "{pad3}harc_rt::harc_assign({}, {lane_rsp_data}[(size_t)_sel]);",
-            wire("rsp_data")
-        )
-        .ok();
+        let ret_type = tm.ret_ty.as_ref().ok_or_else(|| {
+            EmitError(format!(
+                "tbir: OOO target responder `{}` has no declared return type",
+                func.name
+            ))
+        })?;
+        let drive = typed_wire_write_stmt(
+            prog,
+            &wire("rsp_data"),
+            ret_type,
+            &format!("{lane_rsp_data}[(size_t)_sel]"),
+        )?;
+        writeln!(out, "{pad3}{drive}",).ok();
     }
     writeln!(out, "{pad3}{} = _sel;", wire("rsp_tag")).ok();
     writeln!(
@@ -5052,7 +8203,7 @@ fn emit_tagged_target_actors(
     writeln!(out, "{pad3}{lane_rsp_valid}[(size_t)_sel].store(false);").ok();
     writeln!(
         out,
-        "{pad3}{instance}._last_out_cycle = (uint64_t)cycle_count;"
+        "{pad3}{instance}.{output_heartbeat} = (uint64_t)cycle_count;"
     )
     .ok();
     writeln!(out, "{pad2}}}").ok();
@@ -5134,46 +8285,118 @@ fn emit_log_call(
     Ok(())
 }
 
-/// Emit one closure-hook body (`FunctionKind::TestHook`) as a free
-/// `[&]`-capturing lambda named by `func.name`. Structurally identical to
-/// a transactor method (synchronous loop-switch, `tick()`-based waits)
-/// since a hook fires inside the synchronous method call / `record_write`
-/// dispatch, not the run coroutine. The body resolves the shared `_tb`
-/// host struct, the firing transactor's state, and the regblock mirror
-/// (all `[&]`-captured) — v1's reference-capturing hook closure.
+/// Emit one closure-hook body (`FunctionKind::TestHook`) as a free lambda
+/// named by `func.name`. Structurally identical to a transactor method
+/// (synchronous loop-switch, `tick()`-based waits) since a hook fires inside
+/// synchronous callback dispatch rather than the run coroutine.
 pub(super) fn emit_test_hook(
     out: &mut String,
     prog: &TbProgram,
     func: &TbFunction,
     dut_type: &str,
     depth: usize,
+    render: TestHookRenderBindings<'_>,
 ) -> Result<(), EmitError> {
-    let names = cpp_local_names(func);
+    let default_testbench_component_bindings = func
+        .owner
+        .and_then(|owner| prog.testbenches.get(owner.index()))
+        .map(|testbench| {
+            testbench
+                .component_fields
+                .iter()
+                .map(|binding| super::expr::TestbenchComponentRenderBinding {
+                    field: binding.field.clone(),
+                    component: binding.component,
+                    receiver: binding.field.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let testbench_component_bindings = render
+        .flow
+        .testbench_components
+        .unwrap_or(default_testbench_component_bindings.as_slice());
+    let default_testbench_transactor_state_bindings = func
+        .owner
+        .and_then(|owner| prog.testbenches.get(owner.index()))
+        .map(|testbench| {
+            testbench
+                .unbound_state_actors
+                .iter()
+                .map(|actor| super::expr::TestbenchTransactorStateRenderBinding {
+                    field: actor.field.clone(),
+                    transactor: actor.transactor,
+                    receiver: actor.storage.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let testbench_transactor_state_bindings = render
+        .flow
+        .testbench_transactor_states
+        .unwrap_or(default_testbench_transactor_state_bindings.as_slice());
+    let names = cpp_local_names_with_reserved(
+        func,
+        testbench_component_bindings
+            .iter()
+            .map(|binding| binding.receiver.as_str())
+            .chain(
+                testbench_transactor_state_bindings
+                    .iter()
+                    .map(|binding| binding.receiver.as_str()),
+            )
+            .chain(render.flow.reserved.iter().copied()),
+    );
     let empty_lanes = HashMap::new();
+    let owner = func.owner.ok_or_else(|| {
+        EmitError(format!(
+            "tbir: test hook fn{} `{}` has no owning testbench",
+            func.id.0, func.name
+        ))
+    })?;
+    let owner_testbench = prog.testbenches.get(owner.index()).ok_or_else(|| {
+        EmitError(format!(
+            "tbir: test hook fn{} `{}` references missing testbench tb{}",
+            func.id.0, func.name, owner.0
+        ))
+    })?;
+    let clocks = render.flow.clocks.or_else(|| {
+        prog.tests
+            .iter()
+            .find(|test| test.testbench == owner)
+            .map(|test| test.clocks.as_slice())
+    });
     let cx = ECx {
         prog: Some(prog),
         func,
         names: &names,
-        lanes: &empty_lanes,
-        self_subst: None,
+        lanes: render.flow.dut_lane_widths.unwrap_or(&empty_lanes),
+        bindings: CallableRenderBindings {
+            run_context: render.flow.run_context,
+            dut_receiver: render.flow.dut_receiver,
+            testbench_owner: Some(owner),
+            testbench_receiver: render.flow.testbench_receiver.or(Some("_tb")),
+            clocks,
+            testbench_components: (!testbench_component_bindings.is_empty())
+                .then_some(testbench_component_bindings),
+            testbench_transactor_states: (!testbench_transactor_state_bindings.is_empty())
+                .then_some(testbench_transactor_state_bindings),
+            testbench_bus_bindings: Some(&owner_testbench.bus_bindings),
+            bus_adapters: render.flow.bus_adapters,
+            runtime_cells: render.runtime_cells,
+            durable_callbacks: render.durable_capture,
+            ..CallableRenderBindings::default()
+        },
         dut_type,
+        dut_access: render.flow.dut_access,
         trace_component: "",
         state_receiver: None,
         temporal_widths: &[],
+        temporal_cell_prefix: None,
+        common_contextual_tseqs: render.common_contextual_tseqs,
     };
     let nparams = func.params.len();
-    let capture_count = prog
-        .functions
-        .iter()
-        .flat_map(|owner| &owner.blocks)
-        .flat_map(|block| &block.stmts)
-        .find_map(|stmt| match stmt {
-            Stmt::MethodHookSubscribe {
-                handler, captures, ..
-            } if *handler == func.id => Some(captures.len()),
-            _ => None,
-        })
-        .unwrap_or(0);
+    let capture_count = super::runtime::test_hook_capture_count(prog, func.id);
     let capture_base = nparams.saturating_sub(capture_count);
     let pad = INDENT.repeat(depth);
     let pad1 = INDENT.repeat(depth + 1);
@@ -5182,32 +8405,100 @@ pub(super) fn emit_test_hook(
 
     // Hooks are void in this subset; a value-returning hook is never
     // produced by lowering (the firing site discards any result).
-    let param_ty = |i: usize| hook_param_cty(prog, &func.locals[i].ty);
+    let param_ty = |i: usize| -> Result<String, EmitError> {
+        hook_param_cty(
+            prog,
+            local_ir_type(&cx, crate::ir::LocalId(i as u32)).unwrap_or(&func.locals[i].ty),
+        )
+    };
     let params = names[..nparams]
         .iter()
         .enumerate()
         .map(|(i, n)| {
             let reference = if i >= capture_base { "&" } else { "" };
-            format!("{}{reference} {n}", param_ty(i))
+            Ok(format!("{}{reference} {n}", param_ty(i)?))
         })
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>, EmitError>>()?
         .join(", ");
-    // A per-register `on regs.REG` write callback can re-enter
-    // `record_write` and thus call ITSELF — a direct `auto` lambda cannot
-    // reference its own deduced type in its initializer, so hooks are
-    // declared as a forward `std::function` slot, then assigned (mirrors
-    // v1's `std::function` callback holder). Method pre/post hooks never
-    // self-recurse but use the same shape uniformly.
-    let sig_params = (0..nparams)
-        .map(|i| {
-            let reference = if i >= capture_base { "&" } else { "" };
-            format!("{}{reference}", param_ty(i))
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    writeln!(out, "{pad}std::function<void({sig_params})> {};", func.name).ok();
-    writeln!(out, "{pad}{} = [&]({params}) -> void {{", func.name).ok();
-    declare_locals(out, prog, func, &names, nparams, depth + 1)?;
+    // A per-register `on regs.REG` callback can re-enter `record_write` and
+    // call itself. Every callback body therefore binds through its planned
+    // run-owned `std::function` slot rather than a deduced `auto` lambda.
+    let storage = render
+        .runtime_cells
+        .ok_or_else(|| {
+            EmitError(format!(
+                "tbir: test hook fn{} `{}` has no typed runtime-cell binding",
+                func.id.0, func.name
+            ))
+        })?
+        .test_hook(func.id)?;
+    if render.durable_capture {
+        writeln!(
+            out,
+            "{pad}{storage} = [_harc_callback_state = &_harc_run_state, _harc_callback_context = &ctx]({params}) -> void {{"
+        )
+        .ok();
+        writeln!(out, "{pad1}auto& _harc_run_state = *_harc_callback_state;").ok();
+        writeln!(out, "{pad1}auto& ctx = *_harc_callback_context;").ok();
+        writeln!(out, "{pad1}auto* dut = ctx.dut;").ok();
+        writeln!(out, "{pad1}auto& errors = ctx.errors;").ok();
+        writeln!(out, "{pad1}auto& _fatal = ctx.fatal;").ok();
+        writeln!(out, "{pad1}auto& cycle_count = ctx.cycle_count;").ok();
+        writeln!(out, "{pad1}auto& trace = ctx.trace;").ok();
+        writeln!(out, "{pad1}auto& log_ctx = ctx.log_ctx;").ok();
+        writeln!(out, "{pad1}auto& _checkers = ctx._checkers;").ok();
+        writeln!(
+            out,
+            "{pad1}auto& _post_eval_services = ctx._post_eval_services;"
+        )
+        .ok();
+        writeln!(
+            out,
+            "{pad1}auto& _auto_cov_reports = ctx._auto_cov_reports;"
+        )
+        .ok();
+        writeln!(out, "{pad1}auto& harc_rng = ctx.rng;").ok();
+        for binding in &owner_testbench.regblock_bindings {
+            writeln!(
+                out,
+                "{pad1}auto& {} = _harc_run_state.{};",
+                binding.field, binding.field
+            )
+            .ok();
+            if !binding.callbacks.is_empty() {
+                writeln!(
+                    out,
+                    "{pad1}auto& {}_cb_depth = _harc_run_state.{}_cb_depth;",
+                    binding.field, binding.field
+                )
+                .ok();
+            }
+        }
+        writeln!(
+            out,
+            "{pad1}auto sim_logf_line = [&](FILE* f, const char* sev, const char* fmt, ...) {{"
+        )
+        .ok();
+        writeln!(
+            out,
+            "{pad2}HARC_RT_LOG_FILE_ONLY_PRINTF(f, cycle_count, sev, fmt);"
+        )
+        .ok();
+        writeln!(out, "{pad1}}};").ok();
+        writeln!(
+            out,
+            "{pad1}auto sim_log_line = [&](const char* sev, const char* fmt, ...) {{"
+        )
+        .ok();
+        writeln!(out, "{pad2}va_list ap;").ok();
+        writeln!(out, "{pad2}va_start(ap, fmt);").ok();
+        writeln!(out, "{pad2}harc_rt::log::harc_log_vline(log_ctx.sim_log, &trace, cycle_count, sev, fmt, ap);").ok();
+        writeln!(out, "{pad2}va_end(ap);").ok();
+        writeln!(out, "{pad1}}};").ok();
+    } else {
+        writeln!(out, "{pad}{storage} = [&]({params}) -> void {{").ok();
+    }
+    declare_locals(out, prog, func, &names, nparams, depth + 1, cx.dut_access)?;
     declare_port_snapshots(out, &cx, depth + 1)?;
     writeln!(out, "{pad1}int __bb = {};", func.entry.0).ok();
     writeln!(out, "{pad1}while (true) {{").ok();
@@ -5230,24 +8521,70 @@ pub(super) fn emit_test_hook(
                 )
                 .ok();
             }
-            Terminator::WaitCycles(n, None, b) => {
+            Terminator::WaitCycles(n, None, b) | Terminator::WaitCyclesSync(n, b) => {
                 let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
+                let tick = render
+                    .flow
+                    .run_context
+                    .map(|context| format!("harc_tseq_tick({context})"))
+                    .unwrap_or_else(|| "tick()".to_string());
                 writeln!(
                     out,
-                    "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) tick();"
+                    "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) {tick};"
                 )
                 .ok();
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
+            Terminator::WaitCycles(n, Some(clock), b) => {
+                if render.flow.run_context.is_some() {
+                    let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
+                    writeln!(
+                        out,
+                        "{pad3}harc_wait_clock_cycles(ctx, \"{}\", (long long)({n}));",
+                        super::expr::escape_c(&clock.name)
+                    )
+                    .ok();
+                } else {
+                    let clocks = clocks.ok_or_else(|| {
+                        EmitError(format!(
+                            "tbir: test hook `{}` has clock-qualified wait on `{}` without typed clock bindings",
+                            func.name, clock.name
+                        ))
+                    })?;
+                    let index = clocks
+                        .iter()
+                        .position(|candidate| candidate.name == clock.name)
+                        .ok_or_else(|| {
+                            EmitError(format!(
+                                "tbir: test hook `{}` waits on clock `{}` absent from its owning test",
+                                func.name, clock.name
+                            ))
+                        })?;
+                    let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
+                    emit_local_qualified_clock_wait(out, &pad3, index, &n);
+                }
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
             Terminator::WaitUntil { preds, mode, succ } => {
                 let cond = preds_cpp(&cx, preds, *mode)?;
-                writeln!(out, "{pad3}while (!({cond})) tick();").ok();
+                let tick = render
+                    .flow
+                    .run_context
+                    .map(|context| format!("harc_tseq_tick({context})"))
+                    .unwrap_or_else(|| "tick()".to_string());
+                writeln!(out, "{pad3}while (!({cond})) {tick};").ok();
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
             Terminator::WaitTimePs(ps, b) => {
-                // Same wall-clock settle support as the method lambdas that
-                // invoke hooks: closure hooks capture scheduler time by reference.
-                writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
+                if let Some(context) = render.flow.run_context {
+                    writeln!(
+                        out,
+                        "{pad3}harc_eval_clocks_until({context}, {context}.now_ps + {ps});"
+                    )
+                    .ok();
+                } else {
+                    writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
+                }
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::Return => {
@@ -5314,6 +8651,7 @@ mod lifecycle_classifier_tests {
             owner: Some(TestbenchId(0)),
             ret: None,
             implicit_returns: vec![],
+            testbench_record_locals: vec![],
         }
     }
 
@@ -5323,6 +8661,7 @@ mod lifecycle_classifier_tests {
             CallTarget::TransactorMethod {
                 bus_field: "mem".to_string(),
                 method: "read".to_string(),
+                target: crate::ir::TransactorMethodTarget::BoundBus,
             },
             vec![],
         )
@@ -5330,7 +8669,10 @@ mod lifecycle_classifier_tests {
 
     #[test]
     fn tlm_call_in_lifecycle_is_not_shareable() {
-        let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), tlm_call())], Terminator::Return);
+        let f = single_block_lifecycle(
+            vec![Stmt::Assign(LocalId(0), tlm_call())],
+            Terminator::Return,
+        );
         assert_eq!(
             lifecycle_shareable_kind(&f),
             None,
@@ -5340,7 +8682,13 @@ mod lifecycle_classifier_tests {
 
     #[test]
     fn tseq_call_in_lifecycle_is_not_shareable() {
-        let call = Expr::Call(CallTarget::Tseq("Gen".to_string()), vec![]);
+        let call = Expr::Call(
+            CallTarget::Tseq {
+                function: FunctionId(0),
+                name: "Gen".to_string(),
+            },
+            vec![],
+        );
         let f = single_block_lifecycle(vec![Stmt::Assign(LocalId(0), call)], Terminator::Return);
         assert_eq!(lifecycle_shareable_kind(&f), None);
     }
@@ -5358,8 +8706,10 @@ mod lifecycle_classifier_tests {
         // relaxation cannot silently start sharing such a body.
         let call = Expr::Call(
             CallTarget::TransactorSelfMethod {
-                transactor: "Drv".to_string(),
+                transactor: TransactorId(0),
+                transactor_name: "Drv".to_string(),
                 method: "step".to_string(),
+                function: FunctionId(0),
             },
             vec![],
         );
@@ -5453,6 +8803,7 @@ mod lifecycle_classifier_tests {
         // A pure-helper call resolves to a file-scope symbol → safe to share.
         let call = Expr::Call(
             CallTarget::Helper {
+                function: FunctionId(0),
                 name: "h".to_string(),
                 ret: IrType::UInt(Some(32)),
             },
@@ -5723,12 +9074,15 @@ mod lifecycle_classifier_tests {
     fn dut_vec_port(lane: Option<LaneIndex>) -> PortRef {
         PortRef {
             testbench_field: "dut".to_string(),
+            origin: crate::ir::PortOrigin::Dut,
             port_path: vec!["vec".to_string()],
             aggregate_path: false,
             deferred_bus_binding: None,
             direction: None,
             width: None,
             access: PortAccess::Port,
+            probe: None,
+            value_type: None,
             lane,
         }
     }
@@ -5738,13 +9092,10 @@ mod lifecycle_classifier_tests {
         // `dut.vec[direct.count] = 1` — the runtime lane subscript reads a
         // frame local. The `PortRef` lane is an expression position the first
         // fix never scanned.
-        let port = dut_vec_port(Some(LaneIndex::Var(Box::new(scoreboard_scalar_read(Some(
-            vec!["direct".to_string()],
-        ))))));
-        let f = single_block_lifecycle(
-            vec![Stmt::DutWrite(port, lit(1))],
-            Terminator::Return,
-        );
+        let port = dut_vec_port(Some(LaneIndex::Var(Box::new(scoreboard_scalar_read(
+            Some(vec!["direct".to_string()]),
+        )))));
+        let f = single_block_lifecycle(vec![Stmt::DutWrite(port, lit(1))], Terminator::Return);
         assert_eq!(lifecycle_shareable_kind(&f), None);
     }
 
@@ -5752,10 +9103,7 @@ mod lifecycle_classifier_tests {
     fn dut_port_const_lane_stays_shareable() {
         // A constant lane renders a literal — must not over-reject.
         let port = dut_vec_port(Some(LaneIndex::Const(2)));
-        let f = single_block_lifecycle(
-            vec![Stmt::DutWrite(port, lit(1))],
-            Terminator::Return,
-        );
+        let f = single_block_lifecycle(vec![Stmt::DutWrite(port, lit(1))], Terminator::Return);
         assert_eq!(lifecycle_shareable_kind(&f), Some(LifecycleEmit::Plain));
     }
 

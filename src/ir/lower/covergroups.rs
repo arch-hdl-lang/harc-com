@@ -543,12 +543,15 @@ fn lower_point_target(
                     segments.reverse();
                     return Ok(Some(PortRef {
                         testbench_field: "dut".to_string(),
+                        origin: crate::ir::PortOrigin::Dut,
                         port_path: segments,
                         aggregate_path: true,
                         deferred_bus_binding: None,
                         direction: None,
                         width: None,
+                        value_type: None,
                         access: PortAccess::Port,
+                        probe: None,
                         lane,
                     }));
                 }
@@ -886,6 +889,12 @@ fn lower_point_target(
                         )?;
                         return Ok(Expr::Call(
                             CallTarget::Helper {
+                                function: entry.function.ok_or_else(|| {
+                                    LowerError::Invalid(format!(
+                                        "pure helper `{}` is missing its canonical function identity",
+                                        id.name
+                                    ))
+                                })?,
                                 name: id.name.clone(),
                                 ret: super::helpers::ir_type_of_with_records(
                                     entry.decl.return_ty.as_ref(),
@@ -920,6 +929,13 @@ fn lower_point_target(
                         return Ok(Expr::Call(
                             CallTarget::ExternFn {
                                 name: id.name.clone(),
+                                params: decl
+                                    .params
+                                    .iter()
+                                    .map(|p| {
+                                        super::helpers::slot_ir_type(p.ty.as_ref(), &HashMap::new())
+                                    })
+                                    .collect(),
                                 ret: super::helpers::slot_ir_type(
                                     decl.return_ty.as_ref(),
                                     &HashMap::new(),
@@ -1680,7 +1696,8 @@ fn reject_ambiguous_variant_use(
             ExprKind::Call { callee, args } => {
                 walk(callee, ambiguous_variants, hook_params, found);
                 for a in args {
-                    let (crate::ast::CallArg::Expr(ex) | crate::ast::CallArg::Named { value: ex, .. }) = a;
+                    let (crate::ast::CallArg::Expr(ex)
+                    | crate::ast::CallArg::Named { value: ex, .. }) = a;
                     walk(ex, ambiguous_variants, hook_params, found);
                 }
             }

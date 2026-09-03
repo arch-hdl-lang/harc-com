@@ -3,8 +3,8 @@ source: tests/tbir.rs
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
-  testbench tb0 TbReactive { dut: ScoreboardTypedQueue } component collector=c0 component auditor=c1 periodic every 1 cyc phase post_eval fn3
-  test TbReactivePostEval tb=tb0 run=fn2 check=-
+  testbench tb0 TbReactive { dut: ScoreboardTypedQueue } component collector=c0 component auditor=c1 periodic every 1 cyc phase post_eval fn4
+  test TbReactivePostEval tb=tb0 run=fn3 check=-
   record r0 Sample
     got : uint<64>
     exp : uint<64>
@@ -56,7 +56,26 @@ fn fn1 comp_method_1 [kind=ComponentMethod(c1)]
   b3:
     -> Jump(b1)
 
-fn fn2 run_TbReactivePostEval [kind=Run, owner=tb0]
+fn fn2 tb_method_0_drain_samples [kind=TestbenchMethod(tbt0)]
+  locals:
+    %0 s : record(r0)
+  entry = b0
+
+  b0:
+    -> Jump(b1)
+
+  b1:
+    -> Branch((ComponentQueueQuery(collector.samples.size()) != 0), b2, b3)
+
+  b2:
+    ComponentQueuePop(%s = collector.samples.pop())
+    ComponentCall(auditor.c1::audit([%s.got, %s.exp]))
+    -> Jump(b1)
+
+  b3:
+    -> Return
+
+fn fn3 run_TbReactivePostEval [kind=Run, owner=tb0]
   entry = b0
 
   b0:
@@ -70,31 +89,15 @@ fn fn2 run_TbReactivePostEval [kind=Run, owner=tb0]
     Log(info, "ALL TESTS PASSED - testbench_periodic_post_eval")
     -> Return
 
-fn fn3 TbReactivePostEval_tb_periodic_3 [kind=TestHook, owner=tb0]
+fn fn4 TbReactivePostEval_tb_periodic_0 [kind=TestHook(TestbenchPeriodic { service: 0 }), owner=tb0]
   locals:
     %0 __t0 : unknown
     %1 __t1 : unknown
-    %2 __t2 : unknown
-    %3 s : record(r0)
   entry = b0
 
   b0:
     DutRead(%__t0, dut.dut_value)
     DutRead(%__t1, dut.expected_value)
     ComponentCall(collector.c0::push_sample([%__t0, %__t1]))
-    Assign(%__t2, 0)
-    -> Jump(b2)
-
-  b1:
+    TestbenchCall(fn2())
     -> Return
-
-  b2:
-    -> Branch((ComponentQueueQuery(collector.samples.size()) != 0), b3, b4)
-
-  b3:
-    ComponentQueuePop(%s = collector.samples.pop())
-    ComponentCall(auditor.c1::audit([%s.got, %s.exp]))
-    -> Jump(b2)
-
-  b4:
-    -> Jump(b1)

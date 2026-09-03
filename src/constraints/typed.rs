@@ -22,7 +22,7 @@ use crate::lexer::Span;
 /// per `(TxnSchema, randomize-with site)` pair; the runtime layer uses
 /// it to key into the problem table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ConstraintProblemId(pub u32);
+pub struct ConstraintProblemId(pub u64);
 
 /// Handle into `FieldEnv::enums`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

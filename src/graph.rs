@@ -1724,28 +1724,25 @@ fn source_name_for_ir_function<'a>(
     program: &'a ir::TbProgram,
 ) -> (&'static str, String) {
     match &func.kind {
-        ir::FunctionKind::Run | ir::FunctionKind::Check => {
-            let owner = func
-                .owner
-                .map(|id| program.testbench(id).name.clone())
-                .unwrap_or_else(|| func.name.clone());
-            ("testbench", owner)
-        }
+        ir::FunctionKind::TestBody { name, .. } => ("test", name.clone()),
         ir::FunctionKind::SamplerAuto { covgroup } => (
             "covergroup",
             program.covgroups[covgroup.index()].name.clone(),
         ),
         ir::FunctionKind::Helper => ("function", func.name.clone()),
-        ir::FunctionKind::TransactorBody { transactor } => {
+        ir::FunctionKind::TestbenchMethod { testbench, .. } => (
+            "testbench",
+            program.testbench_types[testbench.index()].name.clone(),
+        ),
+        ir::FunctionKind::TransactorBody { transactor, .. } => {
             ("transactor", program.transactor(*transactor).name.clone())
         }
-        ir::FunctionKind::ComponentMethod { component } => {
+        ir::FunctionKind::ComponentMethod { component, .. } => {
             ("env", program.components[component.index()].name.clone())
         }
         ir::FunctionKind::Tseq { .. } => ("pseq", func.name.clone()),
-        ir::FunctionKind::TestHook => ("test", func.name.clone()),
-        ir::FunctionKind::TestbenchLifecycle { testbench, .. }
-        | ir::FunctionKind::TestbenchMethod { testbench } => {
+        ir::FunctionKind::TestHook { .. } => ("test", func.name.clone()),
+        ir::FunctionKind::TestbenchLifecycle { testbench, .. } => {
             ("testbench", program.testbench(*testbench).name.clone())
         }
     }
@@ -1753,24 +1750,29 @@ fn source_name_for_ir_function<'a>(
 
 fn function_kind_label(kind: &ir::FunctionKind, program: &ir::TbProgram) -> String {
     match kind {
-        ir::FunctionKind::Run => "run".to_string(),
-        ir::FunctionKind::Check => "check".to_string(),
+        ir::FunctionKind::TestBody { member, .. } => match member {
+            ir::TestCallableMember::Run => "run".to_string(),
+            ir::TestCallableMember::Check => "check".to_string(),
+        },
         ir::FunctionKind::SamplerAuto { covgroup } => {
             format!("sampler:{}", program.covgroups[covgroup.index()].name)
         }
         ir::FunctionKind::Helper => "helper".to_string(),
-        ir::FunctionKind::TransactorBody { transactor } => {
+        ir::FunctionKind::TestbenchMethod { testbench, .. } => format!(
+            "testbench_method:{}",
+            program.testbench_types[testbench.index()].name
+        ),
+        ir::FunctionKind::TransactorBody { transactor, .. } => {
             format!("transactor:{}", program.transactor(*transactor).name)
         }
-        ir::FunctionKind::ComponentMethod { component } => {
+        ir::FunctionKind::ComponentMethod { component, .. } => {
             format!("component:{}", program.components[component.index()].name)
         }
         ir::FunctionKind::Tseq { .. } => "tseq".to_string(),
-        ir::FunctionKind::TestHook => "test_hook".to_string(),
+        ir::FunctionKind::TestHook { .. } => "test_hook".to_string(),
         ir::FunctionKind::TestbenchLifecycle { phase, .. } => {
             format!("testbench_lifecycle:{}", phase.keyword())
         }
-        ir::FunctionKind::TestbenchMethod { .. } => "testbench_method".to_string(),
     }
 }
 
@@ -1964,20 +1966,32 @@ fn resolve_imported_bus_files(parsed: &[ParsedFile]) -> Vec<ParsedFile> {
             let Ok(source) = fs::read_to_string(&path) else {
                 break;
             };
-            let Ok(ast) = parser::parse_source(&source) else {
+            let Ok(ast) = parser::parse_source_named(display.clone(), &source) else {
                 break;
             };
-            let bus_items: Vec<Item> = ast
-                .items
-                .into_iter()
-                .filter(|item| matches!(item, Item::Bus(_)))
-                .collect();
+            let SourceFile {
+                items: ast_items,
+                item_sources: ast_item_sources,
+                sources: ast_sources,
+                ..
+            } = ast;
+            let mut bus_items = Vec::new();
+            let mut item_sources = Vec::new();
+            assert_eq!(ast_items.len(), ast_item_sources.len());
+            for (item, source_id) in ast_items.into_iter().zip(ast_item_sources) {
+                if matches!(item, Item::Bus(_)) {
+                    bus_items.push(item);
+                    item_sources.push(source_id);
+                }
+            }
             if !bus_items.is_empty() {
                 imported.push(ParsedFile {
                     display,
                     source,
                     ast: SourceFile {
                         items: bus_items,
+                        item_sources,
+                        sources: ast_sources,
                         inner_doc: None,
                         frontmatter: None,
                     },

@@ -41,7 +41,10 @@ fn tbir_wide_cover_selectors_compile_and_run() {
             "        assert cov.cp_unpacked0.u42 > 0",
             "        assert cov.cp_wide_slice.two > 0 else fail(\"wide runtime slice coverpoint did not hit\")\n        assert cov.cp_oob_slice.zero > 0 else fail(\"out-of-range wide slice did not return zero\")\n        assert cov.cp_unpacked0.u42 > 0",
         );
-    assert_ne!(source_text, base, "wide-selector probe substitutions applied");
+    assert_ne!(
+        source_text, base,
+        "wide-selector probe substitutions applied"
+    );
 
     let outdir = std::env::temp_dir().join(format!(
         "harc_tbir_wide_cover_selectors_e2e_{}",

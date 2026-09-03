@@ -3,6 +3,10 @@
 use crate::ast::*;
 use crate::diagnostics::CompileError;
 use crate::lexer::{Span, Token, TokenKind};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
+static NEXT_SOURCE_ID: AtomicU32 = AtomicU32::new(1);
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -12,7 +16,9 @@ pub struct Parser {
     /// Source text — kept so that newline-aware disambiguation (e.g.
     /// `property foo\n(body)` vs `property foo(args) body`) can check for
     /// newlines between tokens.
-    source: String,
+    source: Arc<str>,
+    source_id: SourceId,
+    source_name: Arc<str>,
 }
 
 /// Render a `tokenize` failure as a `CompileError`. Shared by every entry
@@ -78,19 +84,42 @@ pub fn parse_type_expr_fragment(source: &str) -> Result<TypeExpr, CompileError> 
 }
 
 pub fn parse_source(source: &str) -> Result<SourceFile, CompileError> {
+    parse_source_named("<input>", source)
+}
+
+pub fn parse_source_named(
+    name: impl Into<String>,
+    source: &str,
+) -> Result<SourceFile, CompileError> {
     let tokens = crate::lexer::tokenize(source).map_err(lex_error)?;
-    let mut p = Parser::new(tokens, source);
+    let source_id = SourceId(NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed));
+    let mut p = Parser::new_named(tokens, source, source_id, Arc::from(name.into()));
     p.parse_source_file()
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>, source: &str) -> Self {
+        Self::new_named(tokens, source, SourceId::default(), Arc::from("<fragment>"))
+    }
+
+    fn new_named(
+        tokens: Vec<Token>,
+        source: &str,
+        source_id: SourceId,
+        source_name: Arc<str>,
+    ) -> Self {
         Self {
             tokens,
             pos: 0,
             no_angle: false,
-            source: source.to_string(),
+            source: Arc::from(source),
+            source_id,
+            source_name,
         }
+    }
+
+    fn block(&self, stmts: Vec<Stmt>, span: Span) -> Block {
+        Block::new(stmts, span, self.source_id)
     }
 
     /// True if a newline appears in the source between `prev_end` (the end
@@ -302,8 +331,15 @@ impl Parser {
         while !self.at_end() {
             items.push(self.parse_item()?);
         }
+        let item_sources = vec![self.source_id; items.len()];
         Ok(SourceFile {
             items,
+            item_sources,
+            sources: vec![SourceInfo {
+                id: self.source_id,
+                name: self.source_name.clone(),
+                text: self.source.clone(),
+            }],
             inner_doc,
             frontmatter,
         })
@@ -800,10 +836,7 @@ impl Parser {
         let body_start = self.peek_span();
         let stmts = self.parse_stmt_list_until_end()?;
         let end = self.expect_end(TokenKind::Tseq, &name.name)?;
-        let body = Block {
-            stmts,
-            span: body_start.merge(end),
-        };
+        let body = self.block(stmts, body_start.merge(end));
         Ok(TseqDecl {
             name,
             params,
@@ -962,10 +995,7 @@ impl Parser {
         Ok(TargetTlmThread {
             method,
             params,
-            body: Block {
-                stmts,
-                span: body_start.merge(end),
-            },
+            body: self.block(stmts, body_start.merge(end)),
             span: start.merge(end),
         })
     }
@@ -1015,10 +1045,7 @@ impl Parser {
                 disabled: true,
                 period: None,
                 max_idle: None,
-                body: Block {
-                    stmts: Vec::new(),
-                    span: start.merge(end),
-                },
+                body: self.block(Vec::new(), start.merge(end)),
                 span: start.merge(end),
             });
         }
@@ -1054,10 +1081,7 @@ impl Parser {
             disabled: false,
             period,
             max_idle,
-            body: Block {
-                stmts,
-                span: body_start.merge(end),
-            },
+            body: self.block(stmts, body_start.merge(end)),
             span: start.merge(end),
         })
     }
@@ -1303,10 +1327,7 @@ impl Parser {
         let body_start = self.peek_span();
         let stmts = self.parse_stmt_list_until_end()?;
         let end = self.expect_end_anon(TokenKind::On)?;
-        let body = Block {
-            stmts,
-            span: body_start.merge(end),
-        };
+        let body = self.block(stmts, body_start.merge(end));
         Ok(OnHandler {
             event,
             hook,
@@ -1338,10 +1359,7 @@ impl Parser {
             name,
             params,
             return_ty,
-            body: Block {
-                stmts,
-                span: body_start.merge(end),
-            },
+            body: self.block(stmts, body_start.merge(end)),
             span: start.merge(end),
             is_hookable: true,
         })
@@ -1376,10 +1394,7 @@ impl Parser {
             name,
             params,
             return_ty,
-            body: Block {
-                stmts,
-                span: body_start.merge(end),
-            },
+            body: self.block(stmts, body_start.merge(end)),
             span: start.merge(end),
             is_hookable: false,
         })
@@ -1430,10 +1445,7 @@ impl Parser {
                             kw_span,
                         ));
                     }
-                    inline_scope.run = Some(Block {
-                        stmts,
-                        span: end_span,
-                    });
+                    inline_scope.run = Some(self.block(stmts, end_span));
                     inline_scope.span = end_span;
                     saw_inline_phase = true;
                 }
@@ -1447,10 +1459,7 @@ impl Parser {
                             kw_span,
                         ));
                     }
-                    inline_scope.setup = Some(Block {
-                        stmts,
-                        span: end_span,
-                    });
+                    inline_scope.setup = Some(self.block(stmts, end_span));
                     inline_scope.span = end_span;
                     saw_inline_phase = true;
                 }
@@ -1464,10 +1473,7 @@ impl Parser {
                             kw_span,
                         ));
                     }
-                    inline_scope.check = Some(Block {
-                        stmts,
-                        span: end_span,
-                    });
+                    inline_scope.check = Some(self.block(stmts, end_span));
                     inline_scope.span = end_span;
                     saw_inline_phase = true;
                 }
@@ -1481,10 +1487,7 @@ impl Parser {
                             kw_span,
                         ));
                     }
-                    inline_scope.teardown = Some(Block {
-                        stmts,
-                        span: end_span,
-                    });
+                    inline_scope.teardown = Some(self.block(stmts, end_span));
                     inline_scope.span = end_span;
                     saw_inline_phase = true;
                 }
@@ -1493,13 +1496,7 @@ impl Parser {
                     let phase_name = self.expect_ident()?;
                     let stmts = self.parse_stmt_list_until_end()?;
                     let end_span = self.expect_end(TokenKind::Phase, &phase_name.name)?;
-                    items.push(TestItem::Phase(
-                        phase_name,
-                        Block {
-                            stmts,
-                            span: end_span,
-                        },
-                    ));
+                    items.push(TestItem::Phase(phase_name, self.block(stmts, end_span)));
                 }
                 _ => {
                     items.push(self.parse_test_item()?);
@@ -1513,6 +1510,7 @@ impl Parser {
         Ok(TestDecl {
             name,
             params,
+            item_sources: vec![self.source_id; items.len()],
             items,
             span: start.merge(end),
             doc,
@@ -1570,10 +1568,7 @@ impl Parser {
                             kw_span,
                         ));
                     }
-                    inline_scope.run = Some(Block {
-                        stmts,
-                        span: end_span,
-                    });
+                    inline_scope.run = Some(self.block(stmts, end_span));
                     inline_scope.span = end_span;
                     saw_inline_phase = true;
                 }
@@ -1587,10 +1582,7 @@ impl Parser {
                             kw_span,
                         ));
                     }
-                    inline_scope.setup = Some(Block {
-                        stmts,
-                        span: end_span,
-                    });
+                    inline_scope.setup = Some(self.block(stmts, end_span));
                     inline_scope.span = end_span;
                     saw_inline_phase = true;
                 }
@@ -1604,10 +1596,7 @@ impl Parser {
                             kw_span,
                         ));
                     }
-                    inline_scope.check = Some(Block {
-                        stmts,
-                        span: end_span,
-                    });
+                    inline_scope.check = Some(self.block(stmts, end_span));
                     inline_scope.span = end_span;
                     saw_inline_phase = true;
                 }
@@ -1621,10 +1610,7 @@ impl Parser {
                             kw_span,
                         ));
                     }
-                    inline_scope.teardown = Some(Block {
-                        stmts,
-                        span: end_span,
-                    });
+                    inline_scope.teardown = Some(self.block(stmts, end_span));
                     inline_scope.span = end_span;
                     saw_inline_phase = true;
                 }
@@ -1633,13 +1619,7 @@ impl Parser {
                     let phase_name = self.expect_ident()?;
                     let stmts = self.parse_stmt_list_until_end()?;
                     let end_span = self.expect_end(TokenKind::Phase, &phase_name.name)?;
-                    items.push(TestItem::Phase(
-                        phase_name,
-                        Block {
-                            stmts,
-                            span: end_span,
-                        },
-                    ));
+                    items.push(TestItem::Phase(phase_name, self.block(stmts, end_span)));
                 }
                 _ => {
                     items.push(self.parse_test_item()?);
@@ -1653,6 +1633,7 @@ impl Parser {
         Ok(TestDecl {
             name,
             params: Vec::new(),
+            item_sources: vec![self.source_id; items.len()],
             items,
             span: start.merge(end),
             doc,
@@ -1726,10 +1707,7 @@ impl Parser {
             ));
         }
 
-        let body = Block {
-            stmts,
-            span: end_span,
-        };
+        let body = self.block(stmts, end_span);
         Ok(ComponentItem::Lifecycle(phase, body))
     }
 
@@ -2651,10 +2629,7 @@ impl Parser {
             name,
             params,
             return_ty,
-            body: Block {
-                stmts,
-                span: body_start.merge(end),
-            },
+            body: self.block(stmts, body_start.merge(end)),
             span: start.merge(end),
             doc,
             inner_doc,
@@ -3026,10 +3001,11 @@ impl Parser {
         // identifier as an expression makes the nested `<uint...>` parse as
         // a comparison and fails before lowering can classify the queue.
         // Accept the formatter's canonical `list#(T)` spelling too.
-        let starts_list_type = matches!(
-            self.peek_kind(),
-            Some(TokenKind::Ident(name)) if matches!(name.as_str(), "list" | "List")
-        ) && matches!(self.peek2_kind(), Some(TokenKind::Lt | TokenKind::Hash));
+        let starts_list_type =
+            matches!(
+                self.peek_kind(),
+                Some(TokenKind::Ident(name)) if matches!(name.as_str(), "list" | "List")
+            ) && matches!(self.peek2_kind(), Some(TokenKind::Lt | TokenKind::Hash));
         if starts_type || starts_list_type {
             let ty = self.parse_type_expr()?;
             return Ok(TypeArg::Type(ty));
@@ -3095,10 +3071,7 @@ impl Parser {
                 let stmts = self.parse_stmt_list_until_end()?;
                 let end = self.expect_end_anon(TokenKind::Loop)?;
                 Ok(Stmt {
-                    kind: StmtKind::Loop(Block {
-                        stmts,
-                        span: body_start.merge(end),
-                    }),
+                    kind: StmtKind::Loop(self.block(stmts, body_start.merge(end))),
                     span: start.merge(end),
                 })
             }
@@ -3112,10 +3085,7 @@ impl Parser {
                 Ok(Stmt {
                     kind: StmtKind::While {
                         cond,
-                        body: Block {
-                            stmts,
-                            span: body_start.merge(end),
-                        },
+                        body: self.block(stmts, body_start.merge(end)),
                         span,
                     },
                     span,
@@ -3190,10 +3160,7 @@ impl Parser {
                     self.expect(TokenKind::FatArrow)?;
                     let action_stmt = self.parse_stmt()?;
                     let span = event.span.merge(action_stmt.span);
-                    let action = Block {
-                        stmts: vec![action_stmt],
-                        span,
-                    };
+                    let action = self.block(vec![action_stmt], span);
                     arms.push(SelectArm {
                         event,
                         action,
@@ -3408,10 +3375,7 @@ impl Parser {
                 Ok(Stmt {
                     kind: StmtKind::After {
                         duration: dur,
-                        body: Block {
-                            stmts,
-                            span: body_start.merge(end),
-                        },
+                        body: self.block(stmts, body_start.merge(end)),
                         span: start.merge(end),
                     },
                     span: start.merge(end),
@@ -3581,10 +3545,7 @@ impl Parser {
         // Each "branch" is a single statement at this level, lifted to a Block.
         let s = self.parse_stmt()?;
         let span = s.span;
-        Ok(Block {
-            stmts: vec![s],
-            span,
-        })
+        Ok(self.block(vec![s], span))
     }
 
     fn parse_let_stmt(&mut self) -> Result<LetStmt, CompileError> {
@@ -3817,10 +3778,7 @@ impl Parser {
         Ok(ForStmt {
             var,
             iter,
-            body: Block {
-                stmts,
-                span: body_start.merge(end),
-            },
+            body: self.block(stmts, body_start.merge(end)),
             span: start.merge(end),
         })
     }
@@ -3883,10 +3841,7 @@ impl Parser {
         let end = self.expect_end_anon(TokenKind::Repeat)?;
         Ok(RepeatStmt {
             count,
-            body: Block {
-                stmts,
-                span: body_start.merge(end),
-            },
+            body: self.block(stmts, body_start.merge(end)),
             span: start.merge(end),
         })
     }
@@ -3902,10 +3857,7 @@ impl Parser {
         ) {
             then_stmts.push(self.parse_stmt()?);
         }
-        let then_block = Block {
-            stmts: then_stmts,
-            span: then_start,
-        };
+        let then_block = self.block(then_stmts, then_start);
         let mut elsifs = Vec::new();
         while self.check(TokenKind::ElsIf) {
             self.advance();
@@ -3918,13 +3870,7 @@ impl Parser {
             ) {
                 block_stmts.push(self.parse_stmt()?);
             }
-            elsifs.push((
-                c,
-                Block {
-                    stmts: block_stmts,
-                    span: block_start,
-                },
-            ));
+            elsifs.push((c, self.block(block_stmts, block_start)));
         }
         let else_block = if self.check(TokenKind::Else) {
             self.advance();
@@ -3947,10 +3893,7 @@ impl Parser {
             while !self.check(TokenKind::End) {
                 block_stmts.push(self.parse_stmt()?);
             }
-            Some(Block {
-                stmts: block_stmts,
-                span: block_start,
-            })
+            Some(self.block(block_stmts, block_start))
         } else {
             None
         };
@@ -3972,10 +3915,7 @@ impl Parser {
             let body_start = self.peek_span();
             let stmts = self.parse_stmt_list_until_end()?;
             let end = self.expect_end_anon(TokenKind::Branch)?;
-            branches.push(Block {
-                stmts,
-                span: body_start.merge(end),
-            });
+            branches.push(self.block(stmts, body_start.merge(end)));
         }
         let (join, end) = match self.peek_kind() {
             Some(TokenKind::JoinAll) => (ForkJoin::All, self.advance().unwrap().span),

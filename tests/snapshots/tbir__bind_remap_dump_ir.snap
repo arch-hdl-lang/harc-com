@@ -21,16 +21,16 @@ fn fn0 AxilHelper_write [kind=TransactorBody(x0)]
   entry = b0
 
   b0:
-    DutWrite(dut.s_axi_awaddr, %addr)
-    DutWrite(dut.s_axi_awvalid, 1)
-    DutWrite(dut.s_axi_wdata, %data)
-    DutWrite(dut.s_axi_wstrb, 15)
-    DutWrite(dut.s_axi_wvalid, 1)
+    DutWrite(dut.bus.aw.addr, %addr)
+    DutWrite(dut.bus.aw.valid, 1)
+    DutWrite(dut.bus.w.data, %data)
+    DutWrite(dut.bus.w.strb, 15)
+    DutWrite(dut.bus.w.valid, 1)
     Assign(%__t0, 16)
     -> Jump(b1)
 
   b1:
-    DutRead(%__t1, dut.s_axi_wready)
+    DutRead(%__t1, dut.bus.w.ready)
     -> Branch((!%__t1 && (%__t0 > 0)), b2, b4)
 
   b2:
@@ -44,8 +44,8 @@ fn fn0 AxilHelper_write [kind=TransactorBody(x0)]
     -> WaitCycles(1, b5)
 
   b5:
-    DutWrite(dut.s_axi_wvalid, 0)
-    DutWrite(dut.s_axi_awvalid, 0)
+    DutWrite(dut.bus.w.valid, 0)
+    DutWrite(dut.bus.aw.valid, 0)
     -> WaitCycles(1, b6)
 
   b6:
@@ -65,14 +65,14 @@ fn fn1 AxilHelper_read [kind=TransactorBody(x0)]
   entry = b0
 
   b0:
-    DutWrite(dut.s_axi_araddr, %addr)
-    DutWrite(dut.s_axi_arvalid, 1)
-    DutWrite(dut.s_axi_rready, 1)
+    DutWrite(dut.bus.ar.addr, %addr)
+    DutWrite(dut.bus.ar.valid, 1)
+    DutWrite(dut.bus.r.ready, 1)
     Assign(%__t0, 16)
     -> Jump(b1)
 
   b1:
-    DutRead(%__t1, dut.s_axi_rvalid)
+    DutRead(%__t1, dut.bus.r.valid)
     -> Branch((!%__t1 && (%__t0 > 0)), b2, b4)
 
   b2:
@@ -83,13 +83,13 @@ fn fn1 AxilHelper_read [kind=TransactorBody(x0)]
     -> Jump(b1)
 
   b4:
-    DutRead(%r, dut.s_axi_rdata)
-    DutRead(%r__resp, dut.s_axi_rresp)
+    DutRead(%r, dut.bus.r.data)
+    DutRead(%r__resp, dut.bus.r.resp)
     -> WaitCycles(1, b5)
 
   b5:
-    DutWrite(dut.s_axi_rready, 0)
-    DutWrite(dut.s_axi_arvalid, 0)
+    DutWrite(dut.bus.r.ready, 0)
+    DutWrite(dut.bus.ar.valid, 0)
     -> WaitCycles(1, b6)
 
   b6:
@@ -103,11 +103,11 @@ fn fn2 run_BindRemapTest [kind=Run, owner=tb0]
 
   b0:
     DutWrite(dut.rst, 1)
-    DutWrite(dut.s_axi_awvalid, 0)
-    DutWrite(dut.s_axi_wvalid, 0)
-    DutWrite(dut.s_axi_bready, 1)
-    DutWrite(dut.s_axi_arvalid, 0)
-    DutWrite(dut.s_axi_rready, 1)
+    DutWrite(dut.s_axi.aw.valid, 0)
+    DutWrite(dut.s_axi.w.valid, 0)
+    DutWrite(dut.s_axi.b.ready, 1)
+    DutWrite(dut.s_axi.ar.valid, 0)
+    DutWrite(dut.s_axi.r.ready, 1)
     -> WaitCycles(2, b1)
 
   b1:

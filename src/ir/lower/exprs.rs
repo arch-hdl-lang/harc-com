@@ -8,8 +8,44 @@ use crate::ast::{
     BinaryOp, BuiltinTy, CallArg, Expr as AstExpr, ExprKind, TypeArg, TypeExpr, UnaryOp,
 };
 use crate::ir::{
-    BinOp, Expr, IrType, LocalId, PortAccess, PortRef, RecordId, Stmt, UnOp, WidthCastKind,
+    BinOp, Expr, IrType, LocalId, PortAccess, PortRef, RecordId, Stmt, Terminator, UnOp,
+    WidthCastKind,
 };
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ValuePreludeSummary {
+    inline_statements: bool,
+    transactor_edge_span: Option<crate::lexer::Span>,
+}
+
+impl ValuePreludeSummary {
+    const INLINE_STATEMENTS: Self = Self {
+        inline_statements: true,
+        transactor_edge_span: None,
+    };
+
+    fn transactor_edge(span: crate::lexer::Span) -> Self {
+        Self {
+            inline_statements: false,
+            transactor_edge_span: Some(span),
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        Self {
+            inline_statements: self.inline_statements || other.inline_statements,
+            transactor_edge_span: self.transactor_edge_span.or(other.transactor_edge_span),
+        }
+    }
+
+    pub(crate) fn emits_statements(self) -> bool {
+        self.inline_statements || self.transactor_edge_span.is_some()
+    }
+
+    pub(crate) fn has_inline_statements(self) -> bool {
+        self.inline_statements
+    }
+}
 
 pub(super) fn common_expr_type(lhs: Option<IrType>, rhs: Option<IrType>) -> Option<IrType> {
     let (lhs, rhs) = match (lhs, rhs) {
@@ -43,6 +79,27 @@ pub(super) fn common_expr_type(lhs: Option<IrType>, rhs: Option<IrType>) -> Opti
     } else {
         IrType::UInt(width)
     })
+}
+
+fn fixed_vec_element_abi_compatible(lhs: &IrType, rhs: &IrType) -> bool {
+    match (lhs, rhs) {
+        (
+            IrType::FixedVec {
+                elem: lhs_elem,
+                len: lhs_len,
+            },
+            IrType::FixedVec {
+                elem: rhs_elem,
+                len: rhs_len,
+            },
+        ) => lhs_len == rhs_len && fixed_vec_element_abi_compatible(lhs_elem, rhs_elem),
+        _ => {
+            let Some(lhs) = crate::ir::value_abi_class(lhs) else {
+                return false;
+            };
+            crate::ir::value_abi_class(rhs) == Some(lhs)
+        }
+    }
 }
 
 fn narrowest_scalar_type(lhs: Option<IrType>, rhs: Option<IrType>) -> Option<IrType> {
@@ -232,6 +289,46 @@ fn indexed_path_parts<'a>(
     Some((root, segs, indices))
 }
 
+/// Flatten a record-field path while retaining an arbitrary expression root.
+/// Unlike [`indexed_path_parts`], this accepts an effectful value as the root
+/// so lowering can materialize it before resolving the field suffix.
+fn record_field_path_parts<'a>(
+    e: &'a AstExpr,
+) -> Option<(&'a AstExpr, Vec<String>, Vec<(usize, &'a AstExpr)>)> {
+    let mut segs = Vec::new();
+    let mut raw_indices = Vec::new();
+    let mut pending_indices = Vec::new();
+    let mut cur = e;
+    loop {
+        match &*cur.kind {
+            ExprKind::Field { target, name } => {
+                for idx in pending_indices.drain(..).rev() {
+                    raw_indices.push((segs.len(), idx));
+                }
+                segs.push(name.name.clone());
+                cur = target;
+            }
+            ExprKind::Index { target, index } => {
+                pending_indices.push(index);
+                cur = target;
+            }
+            _ if pending_indices.is_empty() => break,
+            _ => return None,
+        }
+    }
+    if segs.is_empty() {
+        return None;
+    }
+    let total = segs.len();
+    segs.reverse();
+    let mut indices = Vec::with_capacity(raw_indices.len());
+    for (raw_pos, idx) in raw_indices {
+        indices.push((total - 1 - raw_pos, idx));
+    }
+    indices.sort_by_key(|(position, _)| *position);
+    Some((cur, segs, indices))
+}
+
 fn record_path_index_is_static_literal(e: &AstExpr) -> bool {
     let mut e = e;
     while let ExprKind::Paren(inner) = &*e.kind {
@@ -305,7 +402,9 @@ impl super::FuncBuilder<'_> {
                 )));
             }
         }
-        self.lower_expr(e)
+        let index = self.lower_expr(e)?;
+        self.validate_numeric_expr(&index, "record `Vec` index")?;
+        Ok(index)
     }
 
     pub(crate) fn as_indexed_component_record_field(
@@ -465,7 +564,10 @@ impl super::FuncBuilder<'_> {
     /// propagating that turned a working program into a hard error
     /// before its own lowering path ever saw it. Whether an operand
     /// lowers at all is decided later, by whoever owns it.
-    pub(crate) fn whole_vec_leaf(&mut self, e: &crate::ast::Expr) -> Option<(usize, String)> {
+    pub(crate) fn whole_vec_leaf(
+        &mut self,
+        e: &crate::ast::Expr,
+    ) -> Option<(usize, crate::ir::ValueAbiClass)> {
         // PURE DOTTED PATHS ONLY, checked before anything else, because
         // `try_record_field_chain` is not an oracle — it LOWERS every
         // mid-chain index it walks past, pushing statements and
@@ -504,8 +606,8 @@ impl super::FuncBuilder<'_> {
         } else {
             return None;
         };
-        // The C++ CLASS, not the `IrType`. Both backends declare the
-        // member as `std::array<elem, N>` and collapse every unsigned
+        // The value ABI class, not the `IrType`. Both backends declare
+        // the member as `std::array<elem, N>` and collapse every unsigned
         // scalar of 64 bits or fewer to `uint64_t`, so
         // `Vec<uint<8>, 4> == Vec<uint<32>, 4>` compiles and compares
         // element-wise — v1 emits it and g++ accepts, measured. Pairing
@@ -514,14 +616,17 @@ impl super::FuncBuilder<'_> {
         // backend runs it. The write arm one file over
         // (`stmts.rs`) had already written this rule down; it is called
         // from there now rather than restated.
-        Some((len, crate::codegen::cpp_tb::ir_vec_elem_class(&ty)?))
+        Some((len, crate::ir::value_abi_class(&ty)?))
     }
 
-    /// The C++ element class of a whole dynamic-list record-field read.
+    /// The value ABI class of a whole dynamic-list record-field read.
     /// Resolution stays policy-free because whole-list copies and Eq/Ne
     /// are valid C++; scalar consumption, indexing, and queries make
     /// different v1-safety promises and diagnose at their own sinks.
-    pub(crate) fn whole_seq_leaf(&mut self, e: &crate::ast::Expr) -> Option<String> {
+    pub(crate) fn whole_seq_leaf(
+        &mut self,
+        e: &crate::ast::Expr,
+    ) -> Option<crate::ir::ValueAbiClass> {
         let dotted = super::components::dotted_path(e).is_some();
         if !dotted {
             let (_, _, indices) = indexed_path_parts(e)?;
@@ -558,12 +663,12 @@ impl super::FuncBuilder<'_> {
         let IrType::Seq(elem) = ty else {
             return None;
         };
-        crate::codegen::cpp_tb::ir_vec_elem_class(&elem)
+        crate::ir::value_abi_class(&elem)
     }
 
     pub(crate) fn whole_seq_copy_rhs(
         &mut self,
-        dst_elem_class: &str,
+        dst_elem_class: crate::ir::ValueAbiClass,
         value: &crate::ast::Expr,
     ) -> Result<Option<Expr>, LowerError> {
         if !path_expr(value) {
@@ -578,7 +683,7 @@ impl super::FuncBuilder<'_> {
         self.vec_read_span = saved_span;
         let value = value?;
         let is_matching_seq = matches!(self.expr_type(&value), Some(IrType::Seq(ref elem))
-            if crate::codegen::cpp_tb::ir_vec_elem_class(elem).as_deref() == Some(dst_elem_class));
+            if crate::ir::value_abi_class(elem) == Some(dst_elem_class));
         Ok(is_matching_seq.then_some(value))
     }
 
@@ -597,13 +702,16 @@ impl super::FuncBuilder<'_> {
     /// statement.
     pub(crate) fn whole_vec_copy_rhs(
         &mut self,
-        dst_shape: (usize, String),
+        dst_shape: (usize, IrType),
         value: &crate::ast::Expr,
     ) -> Result<Option<Expr>, LowerError> {
         let Some(e) = self.whole_vec_value_rhs(value)? else {
             return Ok(None);
         };
-        if self.ir_whole_vec_shape(&e) != Some(dst_shape) {
+        let Some(IrType::FixedVec { elem, len }) = self.ir_whole_vec_type(&e) else {
+            return Ok(None);
+        };
+        if len != dst_shape.0 || !fixed_vec_element_abi_compatible(&elem, &dst_shape.1) {
             return Ok(None);
         }
         Ok(Some(e))
@@ -824,16 +932,6 @@ impl super::FuncBuilder<'_> {
         })
     }
 
-    /// The `(len, C++ element class)` of a LOWERED whole-`Vec` field read.
-    /// Event payload matching uses the exact type above because distinct
-    /// widths can share one C++ carrier.
-    pub(crate) fn ir_whole_vec_shape(&self, e: &Expr) -> Option<(usize, String)> {
-        let IrType::FixedVec { elem, len } = self.ir_whole_vec_type(e)? else {
-            unreachable!("whole-vector type is fixed-vector typed")
-        };
-        Some((len, crate::codegen::cpp_tb::ir_vec_elem_class(&elem)?))
-    }
-
     /// Whether both operands are whole-`Vec` record-field reads of the
     /// SAME length and element type — the pairing `==`/`!=` needs before
     /// the read is permitted at all.
@@ -903,76 +1001,13 @@ fn path_expr(e: &crate::ast::Expr) -> bool {
     }
 }
 
-/// `pop()` in a nested expression, at any of the five queue spellings.
+/// A queue method in expression position that no value-query arm claimed.
 ///
-/// The verdict is `Unsupported` and it is not a placeholder: v1 evaluates
-/// the call where it is written, and TB-IR has no way to. Lowering an
-/// expression-position call means hoisting it into a statement before
-/// the expression, and for a MUTATING call that is only equivalent when
-/// the surrounding expression evaluates it unconditionally, exactly once.
-///
-/// Short-circuit operators break that, and C++ preserves them. Measured —
-/// `assert (guard == 1 && sb.q.pop() == 7) || sb.q.size() == 1` emits from
-/// v1 as `if (!((guard == 1 && _tb.sb.q.pop() == 7) || _tb.sb.q.size() == 1))`,
-/// so with `guard == 0` the pop NEVER RUNS and the queue keeps its
-/// element. A hoisted lowering would pop first, empty the queue, and
-/// fail an assert v1 passes — a silent behavioural divergence, which is
-/// the one outcome worth refusing a program over.
-///
-/// Repeated evaluation is an obstacle at ONE of the two looping
-/// constructs, and an earlier version of this note said it was neither.
-///
-///   * `while` is fine. `lower_while` opens the header block before
-///     lowering the condition, so a hoisted call lands IN the header and
-///     the back-edge targets it — measured on a `while tick() < 3` over
-///     a testbench method, whose `b1` holds the inlined body and whose
-///     `b5` jumps back to `b1`. A pop there would re-run each iteration,
-///     as it should. (A pure file-scope helper does not CFG-inline, so
-///     it is not a witness for this; the testbench method is.)
-///   * `wait until` is NOT. `lower_wait_until` lowers the predicate into
-///     the block PRECEDING the terminator, so a hoisted call runs
-///     exactly once — while v1 emits the predicate as a lambda
-///     (`wait_until_timeout(_slot, [&]{ return _tb.sb.q.pop() == 7; }, …)`)
-///     and re-runs it every cycle. That function already says as much
-///     about transactor edges thirty lines up: "hoisting would run it
-///     exactly once, the wrong semantics".
-///
-/// So implementing this needs BOTH: `&&`/`||` lowered to branches when a
-/// side-effecting call sits under them, and a `wait until` predicate that
-/// re-evaluates rather than hoists. `wait until sb.q.pop() == 7` contains
-/// no short-circuit at all, so the first alone would not reach it.
-fn queue_pop_in_expression_position(what: &str) -> LowerError {
-    unsupported(
-        &format!("{what} in a nested expression"),
-        "bind it to its own `let` first — `pop` mutates the queue, and TB-IR would have \
-         to hoist the call out of the expression, which changes whether a short-circuited \
-         one runs at all",
-    )
-}
-
-/// A queue method in EXPRESSION position that no query arm claimed.
-///
-/// `size` and `empty` lower here and `pop` has its own arm immediately
-/// above, so what reaches this is either `push` — which returns void —
-/// or a name `harc_rt::HarcQueue` never declares. Both are program
-/// errors rather than subset gaps, which is the difference from
-/// [`super::stmts::queue_method_in_statement_position`]: there the
-/// value is DISCARDED, so `size`/`empty` make a legal no-op that v1
-/// compiles and runs, and only they keep the `--codegen v1` suggestion.
-///
-/// Measured at all five landings — testbench-owned field, scoreboard
-/// queue, component queue, bare target-state field, instance-qualified
-/// target-state field — rather than four inferred from one. v1 emits
-/// `uint64_t z = <recv>.<name>(...);` at every one, and g++ rejects
-/// every one:
-///
-/// | call | g++ |
-/// |---|---|
-/// | `q.push(3)` | "void value not ignored as it ought to be" |
-/// | `q.push()` | "no matching function for call to `HarcQueue<...>::push()`" |
-/// | `q.front()` / `q.clear()` / a typo | "has no member named `front`" |
-///
-/// (`q.size()` compiles, which is why it never reaches this arm.)
+/// `size`, `empty`, and `front` lower through their query paths, while `pop`
+/// lowers through the effectful value seam. What reaches this handler is
+/// therefore `push`, which has no value, or an unknown member outside the
+/// `HarcQueue` API. All five queue-owner forms share this classification. In
+/// statement position, discarded `size` and `empty` queries are legal no-ops.
 fn queue_method_in_expression_position(what: &str, method: &str) -> LowerError {
     if method == "push" {
         return LowerError::Invalid(format!(
@@ -980,14 +1015,324 @@ fn queue_method_in_expression_position(what: &str, method: &str) -> LowerError {
         ));
     }
     LowerError::Invalid(format!(
-        "{what} in expression position: `HarcQueue` has only `push`, `pop`, `size` and \
-         `empty`"
+        "{what} in expression position: `HarcQueue` has only `push`, `pop`, `size`, \
+         `empty`, and `front`"
     ))
 }
 
 impl FuncBuilder<'_> {
+    fn is_queue_front_value(&self, e: &AstExpr) -> bool {
+        let ExprKind::Call { callee, .. } = &*e.kind else {
+            return false;
+        };
+        matches!(&*callee.kind, ExprKind::Field { name, .. } if name.name == "front")
+    }
+
+    fn is_queue_pop_call(&self, callee: &AstExpr) -> bool {
+        if self
+            .as_tb_queue_call(callee)
+            .is_some_and(|(_, method)| method == "pop")
+        {
+            return true;
+        }
+        if self
+            .as_scoreboard_queue_call(callee)
+            .is_some_and(|(_, _, _, method, _)| method == "pop")
+        {
+            return true;
+        }
+        if matches!(
+            self.as_component_queue_call(callee),
+            Ok(Some((_, _, method))) if method == "pop"
+        ) {
+            return true;
+        }
+        if self
+            .as_state_queue_call(callee)
+            .is_some_and(|(_, method)| method == "pop")
+        {
+            return true;
+        }
+        let ExprKind::Field { target, name } = &*callee.kind else {
+            return false;
+        };
+        name.name == "pop"
+            && matches!(
+                self.as_transactor_state_any(target),
+                Some((_, _, crate::ir::StateFieldKind::Queue { .. }))
+            )
+    }
+
+    /// Classify the lowering work a call contributes before its value exists.
+    /// The distinction preserves the dedicated `wait until` diagnostic for
+    /// transactor edges while every statement-producing call shares the lazy
+    /// CFG decision.
+    fn call_value_prelude_summary(
+        &self,
+        callee: &AstExpr,
+        call_span: crate::lexer::Span,
+    ) -> ValuePreludeSummary {
+        if self.is_queue_pop_call(callee) {
+            return ValuePreludeSummary::INLINE_STATEMENTS;
+        }
+        // Transactor calls are synchronous expression edges inside a
+        // re-evaluated wait predicate. Classify them before component-call
+        // resolution: transactor instances also participate in the component
+        // hierarchy and would otherwise be mislabeled as statement-producing
+        // component calls.
+        if let Ok(Some((field, transactor, method))) = self.as_transactor_call(callee) {
+            let method = self.ctx.transactors[transactor.index()]
+                .method(&method)
+                .expect("as_transactor_call validated the method");
+            return if method.active_only && self.ctx.passive_transactor_fields.contains(&field) {
+                ValuePreludeSummary::default()
+            } else {
+                ValuePreludeSummary::transactor_edge(call_span)
+            };
+        }
+        if let ExprKind::Ident(id) = &*callee.kind {
+            if self.in_transactor_method {
+                match self.self_transactor_methods.get(&id.name) {
+                    Some((_, _, _, active_only, _))
+                        if !(*active_only && !self.self_transactor_method_active_only) =>
+                    {
+                        return ValuePreludeSummary::transactor_edge(call_span);
+                    }
+                    Some(_) => return ValuePreludeSummary::default(),
+                    None => {}
+                }
+            }
+        }
+        if matches!(self.as_component_method_call(callee), Ok(Some(_)))
+            || self.tb_method_call_name(callee).is_some()
+        {
+            return ValuePreludeSummary::INLINE_STATEMENTS;
+        }
+        match &*callee.kind {
+            ExprKind::Ident(id) if self.helpers.emits_value_prelude(&id.name) => {
+                ValuePreludeSummary::INLINE_STATEMENTS
+            }
+            _ => ValuePreludeSummary::default(),
+        }
+    }
+
+    pub(crate) fn expr_value_prelude_summary(&self, e: &AstExpr) -> ValuePreludeSummary {
+        match &*e.kind {
+            ExprKind::Call { callee, args } => {
+                let mut summary = self.expr_value_prelude_summary(callee);
+                for arg in args {
+                    let (CallArg::Expr(value) | CallArg::Named { value, .. }) = arg;
+                    summary = summary.merge(self.expr_value_prelude_summary(value));
+                }
+                summary.merge(self.call_value_prelude_summary(callee, e.span))
+            }
+            ExprKind::Paren(inner)
+            | ExprKind::Unary { expr: inner, .. }
+            | ExprKind::Cast { expr: inner, .. } => self.expr_value_prelude_summary(inner),
+            ExprKind::Field { target: inner, .. } => {
+                let summary = self.expr_value_prelude_summary(inner);
+                if self.is_queue_front_value(inner) {
+                    summary.merge(ValuePreludeSummary::INLINE_STATEMENTS)
+                } else {
+                    summary
+                }
+            }
+            ExprKind::Index { target, index } => self
+                .expr_value_prelude_summary(target)
+                .merge(self.expr_value_prelude_summary(index)),
+            ExprKind::BitSlice { target, hi, lo } => self
+                .expr_value_prelude_summary(target)
+                .merge(self.expr_value_prelude_summary(hi))
+                .merge(self.expr_value_prelude_summary(lo)),
+            ExprKind::Send { target, value } => self
+                .expr_value_prelude_summary(target)
+                .merge(self.expr_value_prelude_summary(value)),
+            ExprKind::Binary { lhs, rhs, .. } => self
+                .expr_value_prelude_summary(lhs)
+                .merge(self.expr_value_prelude_summary(rhs)),
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => self
+                .expr_value_prelude_summary(cond)
+                .merge(self.expr_value_prelude_summary(then_branch))
+                .merge(self.expr_value_prelude_summary(else_branch)),
+            ExprKind::RangeLit { lo, hi } => {
+                let lo = lo
+                    .as_ref()
+                    .map(|value| self.expr_value_prelude_summary(value))
+                    .unwrap_or_default();
+                let hi = hi
+                    .as_ref()
+                    .map(|value| self.expr_value_prelude_summary(value))
+                    .unwrap_or_default();
+                lo.merge(hi)
+            }
+            ExprKind::SetLit(values) | ExprKind::SystemCall { args: values, .. } => values
+                .iter()
+                .fold(ValuePreludeSummary::default(), |summary, value| {
+                    summary.merge(self.expr_value_prelude_summary(value))
+                }),
+            ExprKind::StructLit { fields, .. } => fields
+                .iter()
+                .fold(ValuePreludeSummary::default(), |summary, field| {
+                    summary.merge(self.expr_value_prelude_summary(&field.value))
+                }),
+            ExprKind::NamedArg { value, .. } => self.expr_value_prelude_summary(value),
+            ExprKind::Membership { expr, set } => self
+                .expr_value_prelude_summary(expr)
+                .merge(self.expr_value_prelude_summary(set)),
+            _ => ValuePreludeSummary::default(),
+        }
+    }
+
+    /// Whether lowering `e` can emit a value-producing effect statement.
+    /// Callers use this before lowering siblings so an earlier value can be
+    /// snapshotted before a later value prelude mutates state.
+    pub(crate) fn expr_has_effectful_value_prelude(&self, e: &AstExpr) -> bool {
+        let summary = self.expr_value_prelude_summary(e);
+        summary.has_inline_statements()
+            || (!self.in_reevaluated_predicate && summary.emits_statements())
+    }
+
+    pub(crate) fn materialize_ordered_value(&mut self, value: Expr) -> Expr {
+        self.materialize_ordered_value_as(value, None)
+    }
+
+    pub(crate) fn materialize_ordered_value_as(
+        &mut self,
+        value: Expr,
+        type_hint: Option<IrType>,
+    ) -> Expr {
+        // Component values, component-typed locals/parameters, and the
+        // synthetic locals that name shared testbench records all alias
+        // mutable storage until C++ evaluates the eventual call. Ordinary
+        // lexical scalar/record locals are already stable values.
+        let stable_local = |local: LocalId| {
+            !matches!(self.local_type(local), IrType::Component(_))
+                && !self
+                    .tb_record_locals
+                    .values()
+                    .any(|shared| *shared == local)
+        };
+        if matches!(
+            &value,
+            Expr::Literal { .. } | Expr::StringLiteral(_) | Expr::WideLiteral(_)
+        ) || matches!(&value, Expr::Local(local) if stable_local(*local))
+        {
+            return value;
+        }
+        let value = self.hoist_ports(value);
+        let ty = type_hint
+            .or_else(|| self.expr_type(&value))
+            .or_else(|| self.record_id_of_expr(&value).map(IrType::Record))
+            .or_else(|| self.scalar_assignment_type(&value))
+            .unwrap_or(IrType::Unknown);
+        let temp = self.fresh_temp();
+        self.set_local_type(temp, ty);
+        self.push(Stmt::Assign(temp, value));
+        Expr::Local(temp)
+    }
+
+    fn lower_effectful_short_circuit(
+        &mut self,
+        op: BinaryOp,
+        lhs: &AstExpr,
+        rhs: &AstExpr,
+    ) -> Result<Expr, LowerError> {
+        let lhs = self.lower_expr_no_ports(lhs)?;
+        self.validate_truth_expr(&lhs, "logical left operand")?;
+        let rhs_block = self.new_block();
+        let short_block = self.new_block();
+        let merge = self.new_block();
+        let result = self.fresh_temp();
+        self.set_local_type(result, IrType::Bool);
+
+        match op {
+            BinaryOp::AndAnd | BinaryOp::AndKw => {
+                self.terminate(Terminator::Branch(lhs, rhs_block, short_block));
+            }
+            BinaryOp::OrOr | BinaryOp::OrKw => {
+                self.terminate(Terminator::Branch(lhs, short_block, rhs_block));
+            }
+            _ => unreachable!("only short-circuit operators use this lowering"),
+        }
+
+        self.start_block(short_block);
+        self.push(Stmt::Assign(
+            result,
+            Expr::Literal {
+                value: u64::from(matches!(op, BinaryOp::OrOr | BinaryOp::OrKw)),
+                ty: IrType::Bool,
+            },
+        ));
+        self.terminate(Terminator::Jump(merge));
+
+        self.start_block(rhs_block);
+        let rhs = self.lower_expr_no_ports(rhs)?;
+        self.validate_truth_expr(&rhs, "logical right operand")?;
+        let rhs_bool = Expr::Binary(
+            BinOp::Ne,
+            Box::new(rhs),
+            Box::new(Expr::Literal {
+                value: 0,
+                ty: IrType::Unknown,
+            }),
+        );
+        self.push(Stmt::Assign(result, rhs_bool));
+        self.terminate(Terminator::Jump(merge));
+
+        self.start_block(merge);
+        Ok(Expr::Local(result))
+    }
+
+    fn lower_effectful_ternary(
+        &mut self,
+        cond: &AstExpr,
+        then_branch: &AstExpr,
+        else_branch: &AstExpr,
+    ) -> Result<Expr, LowerError> {
+        let cond = self.lower_expr_no_ports(cond)?;
+        self.validate_truth_expr(&cond, "ternary condition")?;
+        let then_block = self.new_block();
+        let else_block = self.new_block();
+        let merge = self.new_block();
+        let result = self.fresh_temp();
+        self.terminate(Terminator::Branch(cond, then_block, else_block));
+
+        self.start_block(then_block);
+        let then_value = self.lower_expr_no_ports(then_branch)?;
+        let then_ty = self.expr_type(&then_value);
+        let then_check = then_value.clone();
+        self.push(Stmt::Assign(result, then_value));
+        self.terminate(Terminator::Jump(merge));
+
+        self.start_block(else_block);
+        let else_value = self.lower_expr_no_ports(else_branch)?;
+        let else_ty = self.expr_type(&else_value);
+        let else_check = else_value.clone();
+        self.push(Stmt::Assign(result, else_value));
+        self.terminate(Terminator::Jump(merge));
+
+        let result_ty = common_expr_type(then_ty, else_ty).unwrap_or(IrType::Unknown);
+        self.check_slot_ir(&then_check, &result_ty, "ternary then branch")?;
+        self.check_slot_ir(&else_check, &result_ty, "ternary else branch")?;
+        self.set_local_type(result, result_ty.clone());
+        self.start_block(merge);
+        Ok(Expr::Local(result))
+    }
+
     /// Lower with `Expr::Port` allowed in the result.
     pub(crate) fn lower_expr(&mut self, e: &AstExpr) -> Result<Expr, LowerError> {
+        let result = self.lower_expr_inner(e);
+        if result.is_err() {
+            self.record_error_span(e.span);
+        }
+        result
+    }
+
+    fn lower_expr_inner(&mut self, e: &AstExpr) -> Result<Expr, LowerError> {
         // Inside a concurrent check body, a `past`/`rose`/`fell`/`stable`
         // occurrence resolves to its pre-assigned latch slot rather than
         // recursing into the operand — the operand is latched once per
@@ -995,7 +1340,7 @@ impl FuncBuilder<'_> {
         // Mirrors v1's span-keyed `prop_subs` hook at the head of
         // `emit_expr_with_arrow`.
         if !self.temporal_slots.is_empty() {
-            if let Some(&(slot, kind)) = self.temporal_slots.get(&(e.span.start, e.span.end)) {
+            if let Some(&(slot, kind)) = self.temporal_slots.get(&self.source_site(e.span)) {
                 return Ok(Expr::TemporalSlot { slot, kind });
             }
         }
@@ -1069,6 +1414,27 @@ impl FuncBuilder<'_> {
                         return Ok(Expr::Local(local));
                     }
                 }
+                // File-scope constants and enum variants are source-level
+                // values, so they win over generated runtime helper names
+                // such as `errors` and `cycle_count`. Locals already won
+                // above. Keep the ambiguity check ahead of substitution so
+                // two enums cannot silently select the first declaration.
+                if let Some(owners) = self.ctx.ambiguous_variants.get(&id.name) {
+                    return Err(LowerError::Invalid(format!(
+                        "enum variant `{name}`: it is declared by more than one \
+                         enum (`{owners}`), so no single index is correct for a \
+                         bare `{name}`. HARC has no qualified `Enum.VARIANT` form, \
+                         so rename one of them.",
+                        name = id.name,
+                        owners = owners,
+                    )));
+                }
+                if let Some(v) = self.ctx.consts.get(&id.name) {
+                    return Ok(Expr::Literal {
+                        value: v.bits,
+                        ty: v.value_type(),
+                    });
+                }
                 // The framework cycle counter (`cycle_count`), conventionally
                 // referenced from `${cycle_count}` in a watchdog/log
                 // diagnostic. A local of the same name shadows it (checked
@@ -1121,44 +1487,6 @@ impl FuncBuilder<'_> {
                         "DUT access must name a port (`dut.<port>`)",
                         V1Status::EmitsUncompilable,
                     ));
-                }
-                // A bare enum-variant name declared by more than one
-                // enum has no correct index as a value: `consts` folded it
-                // first-wins, so substituting would silently pick one enum's
-                // numbering (harc#666). Reject instead. This is value
-                // position only — constraint lowering resolves variants
-                // through its own path, so a use inside a `keep` still
-                // lowers under the documented first-wins rule. A local of
-                // the same name shadowed this above, so a shadowing binder
-                // is unaffected.
-                if let Some(owners) = self.ctx.ambiguous_variants.get(&id.name) {
-                    return Err(LowerError::Invalid(format!(
-                        "enum variant `{name}`: it is declared by more than one \
-                         enum (`{owners}`), so no single index is correct for a \
-                         bare `{name}`. HARC has no qualified `Enum.VARIANT` form, \
-                         so rename one of them.",
-                        name = id.name,
-                        owners = owners,
-                    )));
-                }
-                // File-scope `const` / enum-variant substitution
-                // (locals shadow — checked above; v1's constexpr /
-                // variant-index emission is value-identical).
-                if let Some(v) = self.ctx.consts.get(&id.name) {
-                    return Ok(Expr::Literal {
-                        value: *v,
-                        ty: if self
-                            .ctx
-                            .const_signed
-                            .get(&id.name)
-                            .copied()
-                            .unwrap_or(false)
-                        {
-                            IrType::SInt(None)
-                        } else {
-                            IrType::UInt(None)
-                        },
-                    });
                 }
                 // Self-relative component field read inside a method body
                 // (`count` → `self.count`). Locals shadow (checked above).
@@ -1354,7 +1682,7 @@ impl FuncBuilder<'_> {
                 }
                 // `t.field` read on a record-typed local (and nested
                 // `t.a.b`). Resolve the field chain to its leaf schema.
-                if let Some(chain) = self.try_record_field_chain(e)? {
+                if let Some(chain) = self.try_value_record_field_chain(e)? {
                     if matches!(chain.leaf_ty, IrType::Seq(_)) && !self.whole_vec_read_allowed(e) {
                         return Err(dynamic_record_list_value(&chain.spelled));
                     }
@@ -1460,6 +1788,11 @@ impl FuncBuilder<'_> {
                         V1Status::EmitsUncompilable,
                     ));
                 }
+                if matches!(self.expr_type(&inner), Some(IrType::String)) {
+                    return Err(LowerError::Invalid(
+                        "unary operators are not defined for `String` values".to_string(),
+                    ));
+                }
                 let op = match op {
                     UnaryOp::Neg => UnOp::Neg,
                     UnaryOp::Not | UnaryOp::NotKw => UnOp::Not,
@@ -1469,6 +1802,13 @@ impl FuncBuilder<'_> {
                 Ok(Expr::Unary(op, Box::new(inner)))
             }
             ExprKind::Binary { op, lhs, rhs } => {
+                if matches!(
+                    op,
+                    BinaryOp::AndAnd | BinaryOp::OrOr | BinaryOp::AndKw | BinaryOp::OrKw
+                ) && self.expr_has_effectful_value_prelude(rhs)
+                {
+                    return self.lower_effectful_short_circuit(*op, lhs, rhs);
+                }
                 let ir_op = lower_bin_op(*op)?;
                 // `==`/`!=` is the one landing a whole-`Vec` read works
                 // in — see `vec_read_ok`. It is set for BOTH operands
@@ -1495,7 +1835,14 @@ impl FuncBuilder<'_> {
                 let saved_span = self.vec_read_span;
                 self.vec_read_ok = eq;
                 self.vec_read_span = eq.then(|| unparen_expr(lhs).span);
-                let l = self.lower_expr(lhs);
+                let rhs_has_prelude = self.expr_has_effectful_value_prelude(rhs);
+                let l = self.lower_expr(lhs).map(|value| {
+                    if rhs_has_prelude {
+                        self.materialize_ordered_value(value)
+                    } else {
+                        value
+                    }
+                });
                 let r = if l.is_ok() {
                     self.vec_read_span = eq.then(|| unparen_expr(rhs).span);
                     self.lower_expr(rhs)
@@ -1512,9 +1859,8 @@ impl FuncBuilder<'_> {
                 if matches!(lty, Some(IrType::FixedVec { .. }))
                     || matches!(rty, Some(IrType::FixedVec { .. }))
                 {
-                    let matching_equality = matches!(ir_op, BinOp::Eq | BinOp::Ne)
-                        && lty.is_some()
-                        && lty == rty;
+                    let matching_equality =
+                        matches!(ir_op, BinOp::Eq | BinOp::Ne) && lty.is_some() && lty == rty;
                     if !matching_equality {
                         return Err(not_implemented(
                             "a scalar binary operator applied to a fixed-vector local",
@@ -1525,9 +1871,8 @@ impl FuncBuilder<'_> {
                     }
                 }
                 if matches!(lty, Some(IrType::Seq(_))) || matches!(rty, Some(IrType::Seq(_))) {
-                    let matching_equality = matches!(ir_op, BinOp::Eq | BinOp::Ne)
-                        && lty.is_some()
-                        && lty == rty;
+                    let matching_equality =
+                        matches!(ir_op, BinOp::Eq | BinOp::Ne) && lty.is_some() && lty == rty;
                     if !matching_equality {
                         return Err(not_implemented(
                             "a scalar binary operator applied to a dynamic-list local",
@@ -1536,6 +1881,11 @@ impl FuncBuilder<'_> {
                             V1Status::EmitsUncompilable,
                         ));
                     }
+                }
+                if matches!(lty, Some(IrType::String)) || matches!(rty, Some(IrType::String)) {
+                    return Err(LowerError::Invalid(format!(
+                        "binary operator `{op:?}` is not defined for `String` values"
+                    )));
                 }
                 let (l, r) = self.zext_mixed_width_unsigned_operands(ir_op, l, r);
                 self.reject_unbuildable_wide_operator(*op, ir_op, &l, &r)?;
@@ -1559,6 +1909,11 @@ impl FuncBuilder<'_> {
                 then_branch,
                 else_branch,
             } => {
+                if self.expr_has_effectful_value_prelude(then_branch)
+                    || self.expr_has_effectful_value_prelude(else_branch)
+                {
+                    return self.lower_effectful_ternary(cond, then_branch, else_branch);
+                }
                 // Lowered to the IR ternary, emitted as the C++ `?:`
                 // operator — the not-taken arm stays lazily skipped,
                 // exactly v1's emission. (Port reads hoisted out of a
@@ -1589,12 +1944,22 @@ impl FuncBuilder<'_> {
                         V1Status::EmitsUncompilable,
                     ));
                 }
+                let then_is_string = matches!(tty, Some(IrType::String));
+                let else_is_string = matches!(ety, Some(IrType::String));
+                if then_is_string != else_is_string {
+                    return Err(LowerError::Invalid(
+                        "ternary branches cannot mix `String` and non-`String` values".to_string(),
+                    ));
+                }
                 Ok(Expr::Ternary(Box::new(c), Box::new(t), Box::new(e)))
             }
             ExprKind::Call { callee, args } => {
                 let what = match &*callee.kind {
                     ExprKind::Ident(id) => {
-                        if self.in_testbench_method_frame()
+                        if let Some(value) = self.lower_component_call_value(callee, args)? {
+                            return Ok(value);
+                        }
+                        if self.in_testbench_method_scope()
                             && self.ctx.tb_methods.contains_key(&id.name)
                         {
                             return self.lower_tb_method_call(&id.name, args);
@@ -1716,39 +2081,14 @@ impl FuncBuilder<'_> {
                         if let Some(idle) = self.as_transactor_idle(callee, args)? {
                             return Ok(idle);
                         }
-                        // Testbench-owned queue value-queries. `pop()`
-                        // mutates and is accepted only as a standalone let
-                        // RHS by the statement lowering path.
-                        if let Some(q) = self.lower_tb_queue_query_call(callee, args)? {
-                            return Ok(q);
+                        // Every queue owner reaches one value seam. Pure
+                        // size/empty/front reads stay expression values;
+                        // pop materializes exactly once into a typed temp.
+                        if let Some(value) = self.lower_queue_value_call(callee, args)? {
+                            return Ok(value);
                         }
-                        // Scoreboard queue value-queries: `sb.q.size()`,
-                        // `sb.q.empty()`. (`sb.q.pop()` mutates and is
-                        // lowered only as a statement — reaching it here
-                        // means it was used in a deeper expression
-                        // position, which is rejected below.)
-                        if let Some(q) = self.lower_scoreboard_query_call(callee, args)? {
-                            return Ok(q);
-                        }
-                        // Composite-component queue value-queries:
-                        // `checker.sb.errors.size()` / `.empty()`.
-                        // (`.pop()` mutates → statement-only; rejected here.)
-                        if let Some(q) = self.lower_component_queue_query(callee, args)? {
-                            return Ok(q);
-                        }
-                        // Bound-to target-responder queue state-field
-                        // value-queries: `pending.size()` / `.empty()`
-                        // (bare field name inside a responder body).
-                        // (`.pop()` mutates → statement-only; rejected here.)
-                        self.reject_inactive_target_state_root(target)?;
-                        if let Some(q) = self.lower_state_queue_query(callee, args)? {
-                            return Ok(q);
-                        }
-                        // Test-scope target-responder queue state read:
-                        // `target.pending.size()` / `.empty()` (fully
-                        // resolved instance). (`.pop()` → statement-only.)
-                        if let Some(q) = self.lower_test_state_queue_query(callee, args)? {
-                            return Ok(q);
+                        if let Some(value) = self.lower_component_call_value(callee, args)? {
+                            return Ok(value);
                         }
                         // Testbench helper method call (`_tb.reset()`),
                         // CFG-inlined like an impure helper.
@@ -1868,6 +2208,11 @@ impl FuncBuilder<'_> {
                             V1Status::EmitsUncompilable,
                         ));
                     }
+                    if matches!(self.expr_type(&inner), Some(IrType::String)) {
+                        return Err(LowerError::Invalid(
+                            "a `String` value cannot be cast to an integer type".to_string(),
+                        ));
+                    }
                     return Ok(Expr::WidthCast {
                         kind,
                         width,
@@ -1935,6 +2280,7 @@ impl FuncBuilder<'_> {
                     }
                     if let Some(len) = chain.leaf_vec_len {
                         let idx = self.lower_expr(index)?;
+                        self.validate_numeric_expr(&idx, "record `Vec` index")?;
                         check_literal_vec_index_bounds(
                             &format!("{}.{}", chain.field, chain.path.join(".")),
                             &idx,
@@ -1969,10 +2315,12 @@ impl FuncBuilder<'_> {
                         {
                             if !matches!(**inner_elem, IrType::FixedVec { .. }) {
                                 let outer = self.lower_expr(outer_idx)?;
+                                self.validate_numeric_expr(&outer, "outer `Vec` index")?;
                                 check_literal_component_vec_index_bounds(
                                     &base, &field, &outer, vec.len,
                                 )?;
                                 let inner = self.lower_expr(index)?;
+                                self.validate_numeric_expr(&inner, "inner `Vec` index")?;
                                 let inner_len = *inner_len;
                                 check_literal_component_vec_index_bounds(
                                     &base, &field, &inner, inner_len,
@@ -1990,6 +2338,7 @@ impl FuncBuilder<'_> {
                 }
                 if let Some((base, field, vec)) = self.as_component_vec_field(target)? {
                     let index = self.lower_expr(index)?;
+                    self.validate_numeric_expr(&index, "component `Vec` index")?;
                     check_literal_component_vec_index_bounds(&base, &field, &index, vec.len)?;
                     return Ok(Expr::ComponentVecElement {
                         base,
@@ -2019,8 +2368,10 @@ impl FuncBuilder<'_> {
                         {
                             if !matches!(**inner_elem, IrType::FixedVec { .. }) {
                                 let outer = self.lower_expr(outer_idx)?;
+                                self.validate_numeric_expr(&outer, "outer `Vec` index")?;
                                 check_literal_tb_vec_index_bounds(&field, &outer, len)?;
                                 let inner = self.lower_expr(index)?;
+                                self.validate_numeric_expr(&inner, "inner `Vec` index")?;
                                 check_literal_tb_vec_index_bounds(&field, &inner, *inner_len)?;
                                 return Ok(Expr::TbFieldVecElement {
                                     field,
@@ -2035,6 +2386,7 @@ impl FuncBuilder<'_> {
                 // read (`_tb.mem[i]`).
                 if let Some((field, IrType::FixedVec { len, .. })) = self.as_tb_vec_field(target) {
                     let index = self.lower_expr(index)?;
+                    self.validate_numeric_expr(&index, "testbench `Vec` index")?;
                     check_literal_tb_vec_index_bounds(&field, &index, len)?;
                     return Ok(Expr::TbFieldVecElement {
                         field,
@@ -2058,6 +2410,7 @@ impl FuncBuilder<'_> {
                     }
                     if let Some((len, _)) = rf.leaf_vec {
                         let index = self.lower_expr(index)?;
+                        self.validate_numeric_expr(&index, "component record `Vec` index")?;
                         check_literal_component_vec_index_bounds(
                             &rf.base, &rf.dotted, &index, len,
                         )?;
@@ -2105,7 +2458,9 @@ impl FuncBuilder<'_> {
                 match (parse_int_literal_expr(hi), parse_int_literal_expr(lo)) {
                     (Some(h), Some(l)) if h >= l => match (u32::try_from(h), u32::try_from(l)) {
                         (Ok(hi), Ok(lo)) => {
-                            let target = Box::new(self.lower_expr(target)?);
+                            let target = self.lower_expr(target)?;
+                            self.validate_numeric_expr(&target, "bit-slice target")?;
+                            let target = Box::new(target);
                             Ok(Expr::BitSlice { target, hi, lo })
                         }
                         // v1 casts the bound to `uint32_t` with no
@@ -2134,36 +2489,28 @@ impl FuncBuilder<'_> {
                     // `harc_bits` helper — which is what v1 emits for
                     // every slice, constant bounds included.
                     _ => {
-                        let target = Box::new(self.lower_expr(target)?);
-                        let hi = Box::new(self.lower_expr(hi)?);
-                        let lo = Box::new(self.lower_expr(lo)?);
+                        let target = self.lower_expr(target)?;
+                        self.validate_numeric_expr(&target, "bit-slice target")?;
+                        let target = Box::new(target);
+                        let hi = self.lower_expr(hi)?;
+                        self.validate_numeric_expr(&hi, "bit-slice upper bound")?;
+                        let hi = Box::new(hi);
+                        let lo = self.lower_expr(lo)?;
+                        self.validate_numeric_expr(&lo, "bit-slice lower bound")?;
+                        let lo = Box::new(lo);
                         Ok(Expr::BitSliceDyn { target, hi, lo })
                     }
                 }
             }
-            // A bare string literal in expression position has no
-            // v1-supported landing surface: v1's `local_value_c_type` for a
-            // `let s : String` routes through `record_field_c_type ->
-            // txn_field_c_type`, which lacks a `BuiltinTy::String` case and
-            // falls through to `uint64_t` — emitting `uint64_t s = "...";`,
-            // a C++ compile error. (The `const char*` mapping in
-            // `c_type_for` only applies to method *params*, never lets.)
-            // And `${s}` interpolation always emits `%lld` +
-            // `harc_printf_ll`, which also fails for a pointer. Since v1
-            // cannot compile ANY string-valued local, lowering it in tbir
-            // would diverge from v1 rather than mirror it — keep it out of
-            // subset until v1 grows a real string-local surface (audit #425
-            // deferral). String *interpolation* (`${...}`) and `log`/`logf`
-            // format strings are separate statement-level paths that work.
-            // HARC's value slot is a 64-bit integer; a string is only a
-            // `log`/`fail` message operand. v1 emits the literal into an
-            // integer slot (`int64_t s = "hello";`), which is a C++
-            // compile error.
-            ExprKind::String(_) => Err(not_implemented(
-                "a string value in expression position",
-                "strings are `log`/`fail`/`logf` message operands, not values",
-                V1Status::EmitsUncompilable,
-            )),
+            ExprKind::String(s) => {
+                if s.contains("${") {
+                    return Err(LowerError::Invalid(
+                        "String value literals do not support interpolation; `${...}` is only available in message literals"
+                            .into(),
+                    ));
+                }
+                Ok(Expr::StringLiteral(s.clone()))
+            }
             // Same integer value slot: v1 emits `int64_t f = 1.5;`, which
             // COMPILES and silently truncates to 1.
             ExprKind::Float(_) => Err(not_implemented(
@@ -2193,13 +2540,9 @@ impl FuncBuilder<'_> {
                     .take_while(|c| c.is_ascii_digit() || *c == '_')
                     .filter(|c| *c != '_')
                     .collect();
-                let value = digits
-                    .parse::<u64>()
-                    .map_err(|_| {
-                        LowerError::Invalid(
-                            "time literal has no leading numeric value".to_string(),
-                        )
-                    })?;
+                let value = digits.parse::<u64>().map_err(|_| {
+                    LowerError::Invalid("time literal has no leading numeric value".to_string())
+                })?;
                 Ok(Expr::Literal {
                     value,
                     ty: IrType::UInt(Some(64)),
@@ -2325,48 +2668,12 @@ impl FuncBuilder<'_> {
         &mut self,
         e: &AstExpr,
     ) -> Result<Option<RecordFieldChain>, LowerError> {
-        // Flatten `a.b.c` → root `a`, segments `[b, c]` (outer-to-inner
-        // during the walk, reversed to declaration order after). An
-        // `Index` node between segments records a pending element
-        // selection that attaches to the NEXT (inner) `Field` segment:
-        // in `tbl.entries[i].tag` the walk sees `.tag`, then `[i]`, then
-        // `.entries` — so `[i]` belongs to `entries`.
-        let mut segs: Vec<String> = Vec::new();
-        // `(push-order seg position, index AST)` per element selection.
-        let mut raw_indices: Vec<(usize, &AstExpr)> = Vec::new();
-        let mut pending_indices: Vec<&AstExpr> = Vec::new();
-        let mut cur = e;
-        let root = loop {
-            match &*cur.kind {
-                ExprKind::Field { target, name } => {
-                    for idx in pending_indices.drain(..).rev() {
-                        raw_indices.push((segs.len(), idx));
-                    }
-                    segs.push(name.name.clone());
-                    cur = target;
-                }
-                ExprKind::Index { target, index } => {
-                    pending_indices.push(index);
-                    cur = target;
-                }
-                ExprKind::Ident(root) => {
-                    if !pending_indices.is_empty() {
-                        // `ident[i].f` — the root local itself is indexed;
-                        // not a record-field chain (lane ports and seq
-                        // element reads route elsewhere).
-                        return Ok(None);
-                    }
-                    break root;
-                }
-                // Innermost target is not a bare ident (`f().x`, …):
-                // not a record-local chain this lane handles.
-                _ => return Ok(None),
-            }
+        let Some((root_expr, segs, raw_indices)) = record_field_path_parts(e) else {
+            return Ok(None);
         };
-        if segs.is_empty() {
-            return Ok(None); // bare ident, no field access
-        }
-        segs.reverse();
+        let ExprKind::Ident(root) = &*root_expr.kind else {
+            return Ok(None);
+        };
         let mut field_start = 0usize;
         let local = if let Some(local) = self.lookup(&root.name) {
             local
@@ -2386,7 +2693,7 @@ impl FuncBuilder<'_> {
         } else {
             return Ok(None);
         };
-        let Some(mut cur_rid) = self.record_of_local(local) else {
+        let Some(cur_rid) = self.record_of_local(local) else {
             return Ok(None);
         };
         // Component record fields have mirror locals in method lowering,
@@ -2402,22 +2709,81 @@ impl FuncBuilder<'_> {
         if field_start >= segs.len() {
             return Ok(None);
         }
-        // Convert element selections from push-order to declaration-order
-        // positions relative to `fields`. An index landing BELOW
-        // `field_start` selects on the record local itself (`_tb.cur[i]…`)
-        // — not this lane's chain. Checked for every entry before any
-        // index lowers, so the fall-through leaves no hoisted temps.
-        let total = segs.len();
-        if raw_indices.iter().any(|(p, _)| total - 1 - p < field_start) {
+        let spelled = if field_start == 0 {
+            root.name.clone()
+        } else {
+            segs[field_start - 1].clone()
+        };
+        self.resolve_record_field_chain(local, cur_rid, segs, raw_indices, field_start, spelled)
+    }
+
+    /// Resolve a record field read whose root expression must be materialized
+    /// before selecting fields. Effectful calls are evaluated exactly once;
+    /// a typed queue `front()` is also materialized because `RecordField`
+    /// deliberately addresses a local rather than an arbitrary expression.
+    fn try_value_record_field_chain(
+        &mut self,
+        e: &AstExpr,
+    ) -> Result<Option<RecordFieldChain>, LowerError> {
+        if let Some(chain) = self.try_record_field_chain(e)? {
+            return Ok(Some(chain));
+        }
+        let Some((root, segs, raw_indices)) = record_field_path_parts(e) else {
+            return Ok(None);
+        };
+        if matches!(&*root.kind, ExprKind::Ident(_))
+            || !(self.expr_has_effectful_value_prelude(root) || self.is_queue_front_value(root))
+        {
             return Ok(None);
         }
-        // Lower the index expressions left-to-right (chain order — the
-        // walk collected them inner-to-outer), so hoisted statements keep
-        // source order.
-        let mut mid_indices: Vec<(usize, Expr)> = Vec::with_capacity(raw_indices.len());
-        let mut ordered_indices: Vec<(usize, &AstExpr)> = raw_indices
+
+        let value = self.lower_expr_no_ports(root)?;
+        let Some(IrType::Record(record)) = self.expr_type(&value) else {
+            return Err(LowerError::Invalid(
+                "field access on a materialized value requires a struct or transaction result"
+                    .into(),
+            ));
+        };
+        let value = self.materialize_ordered_value(value);
+        let Expr::Local(local) = value else {
+            return Err(LowerError::Invalid(
+                "record-valued result could not be materialized".into(),
+            ));
+        };
+        self.resolve_record_field_chain(
+            local,
+            record,
+            segs,
+            raw_indices,
+            0,
+            "<effectful value>".into(),
+        )
+    }
+
+    fn resolve_record_field_chain(
+        &mut self,
+        local: LocalId,
+        mut cur_rid: RecordId,
+        segs: Vec<String>,
+        indices: Vec<(usize, &AstExpr)>,
+        field_start: usize,
+        mut spelled: String,
+    ) -> Result<Option<RecordFieldChain>, LowerError> {
+        // `record_field_path_parts` already returns declaration-order positions
+        // relative to `segs`. An index landing BELOW `field_start` selects on
+        // the record local itself (`_tb.cur[i]…`) — not this lane's chain.
+        // Check every entry before lowering any index so the fall-through
+        // leaves no hoisted temps.
+        if indices.iter().any(|(position, _)| *position < field_start) {
+            return Ok(None);
+        }
+        // Lower the index expressions left-to-right (chain order), so hoisted
+        // statements keep source order. Rebase the positions when a synthetic
+        // testbench receiver segment was consumed above.
+        let mut mid_indices: Vec<(usize, Expr)> = Vec::with_capacity(indices.len());
+        let mut ordered_indices: Vec<(usize, &AstExpr)> = indices
             .into_iter()
-            .map(|(raw_pos, idx)| ((total - 1 - raw_pos) - field_start, idx))
+            .map(|(position, idx)| (position - field_start, idx))
             .collect();
         ordered_indices.sort_by_key(|(position, _)| *position);
         for (pos, idx_ast) in ordered_indices {
@@ -2425,14 +2791,6 @@ impl FuncBuilder<'_> {
             mid_indices.push((pos, idx));
         }
         let mut dotted = self.ctx.records[cur_rid.index()].name.clone();
-        // The user's own root: the local's name, or — under the `_tb`
-        // testbench-field prefix, where `field_start` skipped a segment
-        // — the bare field name they actually wrote.
-        let mut spelled = if field_start == 0 {
-            root.name.clone()
-        } else {
-            segs[field_start - 1].clone()
-        };
         let fields = &segs[field_start..];
         let last = fields.len() - 1;
         let mut leaf_vec_len = None;
@@ -2634,6 +2992,27 @@ impl FuncBuilder<'_> {
                     crate::ir::ScoreboardFieldKind::Record { record } => Some(record),
                     _ => None,
                 }),
+            Expr::TbQueueQuery {
+                query: crate::ir::ScoreboardQuery::QueueFront { elem, .. },
+                ..
+            }
+            | Expr::TransactorStateQueueQuery {
+                query: crate::ir::ScoreboardQuery::QueueFront { elem, .. },
+                ..
+            }
+            | Expr::ScoreboardQuery {
+                query: crate::ir::ScoreboardQuery::QueueFront { elem, .. },
+                ..
+            }
+            | Expr::ComponentQueueQuery {
+                query: crate::ir::ScoreboardQuery::QueueFront { elem, .. },
+                ..
+            } => match elem {
+                crate::ir::QueueElem::Record(record) => Some(*record),
+                crate::ir::QueueElem::Scalar { .. }
+                | crate::ir::QueueElem::FixedVec { .. }
+                | crate::ir::QueueElem::List { .. } => None,
+            },
             // One element of a component-record `Vec<Record, N>` leaf
             // (`a.kids[i]`) is a whole record value, exactly as
             // `tbl.entries[i]` is on a record local. Answered through
@@ -2795,6 +3174,11 @@ impl FuncBuilder<'_> {
                 "{context} must be a scalar value, not a dynamic list"
             )));
         }
+        if matches!(self.expr_type(e), Some(IrType::String)) {
+            return Err(LowerError::Invalid(format!(
+                "{context} must be a numeric or boolean value, not `String`"
+            )));
+        }
         if let Some(record) = self.record_id_of_expr(e) {
             let name = &self.ctx.records[record.index()].name;
             return Err(LowerError::Invalid(format!(
@@ -2804,6 +3188,15 @@ impl FuncBuilder<'_> {
         if self.bool_expr_has_invalid_record_operand(e) {
             return Err(LowerError::Invalid(format!(
                 "{context} applies a scalar operator to a record value"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_numeric_expr(&self, e: &Expr, context: &str) -> Result<(), LowerError> {
+        if matches!(self.expr_type(e), Some(IrType::String)) {
+            return Err(LowerError::Invalid(format!(
+                "{context} must be an integer value, not `String`"
             )));
         }
         Ok(())
@@ -2915,7 +3308,7 @@ impl FuncBuilder<'_> {
         target: &AstExpr,
         index: &AstExpr,
     ) -> Result<Option<Expr>, LowerError> {
-        let Some(chain) = self.try_record_field_chain(target)? else {
+        let Some(chain) = self.try_value_record_field_chain(target)? else {
             return Ok(None);
         };
         if matches!(chain.leaf_ty, IrType::Seq(_)) {
@@ -2931,6 +3324,7 @@ impl FuncBuilder<'_> {
             ));
         }
         let idx = self.lower_expr(index)?;
+        self.validate_numeric_expr(&idx, "record `Vec` index")?;
         check_literal_vec_index_bounds(&chain.dotted, &idx, chain.leaf_vec_len.unwrap_or(0))?;
         Ok(Some(Expr::RecordField {
             local: chain.local,
@@ -3193,6 +3587,7 @@ impl FuncBuilder<'_> {
                 Expr::CovHookParam { param, field, index: Some(Box::new(index)) }
             }
             other @ (Expr::Literal { .. }
+            | Expr::StringLiteral(_)
             | Expr::WideLiteral(_)
             | Expr::Local(_)
             // The global cycle counter / error counter — framework
@@ -3235,9 +3630,13 @@ impl FuncBuilder<'_> {
     pub(crate) fn expr_type(&self, e: &Expr) -> Option<IrType> {
         match e {
             Expr::Literal { ty, .. } => Some(ty.clone()),
+            Expr::StringLiteral(_) => Some(IrType::String),
             Expr::WideLiteral(words) => Some(IrType::UInt(Some(wide_literal_bits(words)))),
             Expr::Local(l) => Some(self.local_type(*l).clone()),
-            Expr::Port(p) => p.width.map(|w| IrType::UInt(Some(w))),
+            Expr::Port(p) => p
+                .value_type
+                .clone()
+                .or_else(|| p.width.map(|w| IrType::UInt(Some(w)))),
             Expr::Binary(op, a, b) => match op {
                 BinOp::Eq
                 | BinOp::Ne
@@ -3282,8 +3681,12 @@ impl FuncBuilder<'_> {
                 query: crate::ir::DynamicListQuery::Empty,
                 ..
             } => Some(IrType::Bool),
+            Expr::TbQueueQuery { query, .. }
+            | Expr::TransactorStateQueueQuery { query, .. }
+            | Expr::ComponentQueueQuery { query, .. } => query.value_type(),
             Expr::TbField(field) => self.ctx.tb_scalar_fields.get(field).cloned(),
             Expr::ComponentField { base, field } => self.component_field_value_type(base, field),
+            Expr::ComponentValue { base } => self.component_base_id(base).map(IrType::Component),
             Expr::TransactorState { instance, field } => {
                 let kind = if instance.is_empty() {
                     self.target_state_fields.get(field)
@@ -3314,7 +3717,8 @@ impl FuncBuilder<'_> {
                         self.record_path_value_type(*record, path, mid_indices, index.is_some())
                     }
                     crate::ir::StateFieldKind::FixedVec { ty }
-                        if path.is_empty() && index.is_some() => {
+                        if path.is_empty() && index.is_some() =>
+                    {
                         let mut selected = ty;
                         for _ in 0..=mid_indices.len() {
                             let IrType::FixedVec { elem, .. } = selected else {
@@ -3340,8 +3744,7 @@ impl FuncBuilder<'_> {
                         }
                         _ => None,
                     }),
-                crate::ir::ScoreboardQuery::QueueSize { .. } => Some(IrType::UInt(None)),
-                crate::ir::ScoreboardQuery::QueueEmpty { .. } => Some(IrType::Bool),
+                query => query.value_type(),
             },
             // A record-field chain types as its leaf: the leaf field's own
             // scalar/record type, or the element type when the leaf `Vec`
@@ -3467,11 +3870,7 @@ impl FuncBuilder<'_> {
                 + usize::from(i + 1 == path.len() && leaf_indexed);
             let indexed = selection_count != 0;
             if i + 1 == path.len() {
-                return selected_record_leaf_type(
-                    member.vec_len,
-                    &member.ty,
-                    selection_count,
-                );
+                return selected_record_leaf_type(member.vec_len, &member.ty, selection_count);
             }
             match member.ty {
                 IrType::Record(next)
@@ -3811,11 +4210,152 @@ impl FuncBuilder<'_> {
         }
     }
 
-    /// Lower `sb.<queue>.size()` / `sb.<queue>.empty()` into an
+    fn check_queue_pop_value_context(
+        &self,
+        what: &str,
+        args: &[CallArg],
+    ) -> Result<(), LowerError> {
+        super::stmts::queue_pop_takes_no_arguments(what, args)?;
+        if self.in_fmt_args {
+            return Err(unsupported(
+                &format!("{what}.pop() inside a message"),
+                "log/fail messages evaluate lazily; hoist the pop into a `let` first",
+            ));
+        }
+        Ok(())
+    }
+
+    fn queue_pop_result(&mut self, elem: crate::ir::QueueElem) -> LocalId {
+        let dest = self.fresh_temp();
+        self.set_local_type(dest, elem.ir_type());
+        dest
+    }
+
+    /// Lower every value-producing queue call through one ordered seam.
+    /// A source occurrence is resolved exactly once: `pop` emits one
+    /// mutating statement, while `size`, `empty`, and `front` remain pure
+    /// query expressions and therefore re-evaluate at each source use.
+    pub(crate) fn lower_queue_value_call(
+        &mut self,
+        callee: &AstExpr,
+        args: &[CallArg],
+    ) -> Result<Option<Expr>, LowerError> {
+        if let Some(value) = self.lower_queue_pop_value(callee, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.lower_tb_queue_query_call(callee, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.lower_scoreboard_query_call(callee, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.lower_component_queue_query(callee, args)? {
+            return Ok(Some(value));
+        }
+        if let ExprKind::Field { target, .. } = &*callee.kind {
+            self.reject_inactive_target_state_root(target)?;
+        }
+        if let Some(value) = self.lower_state_queue_query(callee, args)? {
+            return Ok(Some(value));
+        }
+        self.lower_test_state_queue_query(callee, args)
+    }
+
+    /// Materialize an eager queue pop into one exactly typed temporary.
+    /// Lazy boolean and ternary callers place this statement in the selected
+    /// CFG branch; `wait until` rejects effectful preludes before lowering.
+    fn lower_queue_pop_value(
+        &mut self,
+        callee: &AstExpr,
+        args: &[CallArg],
+    ) -> Result<Option<Expr>, LowerError> {
+        if let Some((field, method)) = self.as_tb_queue_call(callee) {
+            if method == "pop" {
+                let what = format!("testbench queue `{field}`");
+                self.check_queue_pop_value_context(&what, args)?;
+                let elem = self.tb_queue_elem(&field)?;
+                let dest = self.queue_pop_result(elem);
+                self.push(Stmt::TbQueuePop { field, dest });
+                return Ok(Some(Expr::Local(dest)));
+            }
+        }
+
+        if let Some((sb, field, queue, method, nested_path)) = self.as_scoreboard_queue_call(callee)
+        {
+            if method == "pop" {
+                let what = format!("scoreboard queue `{field}.{queue}`");
+                self.check_queue_pop_value_context(&what, args)?;
+                let elem = self.scoreboard_queue_elem(sb, &queue)?;
+                let dest = self.queue_pop_result(elem);
+                self.push(Stmt::ScoreboardOp {
+                    sb,
+                    field,
+                    op: crate::ir::ScoreboardOp::QueuePop { queue, dest },
+                    nested_path,
+                });
+                return Ok(Some(Expr::Local(dest)));
+            }
+        }
+
+        if let Some((base, queue, method)) = self.as_component_queue_call(callee)? {
+            if method == "pop" {
+                let what = format!("component queue `{queue}`");
+                self.check_queue_pop_value_context(&what, args)?;
+                let elem = self.component_queue_elem(&base, &queue)?;
+                let dest = self.queue_pop_result(elem);
+                self.push(Stmt::ComponentQueuePop { base, queue, dest });
+                return Ok(Some(Expr::Local(dest)));
+            }
+        }
+
+        if let Some((field, method)) = self.as_state_queue_call(callee) {
+            if method == "pop" {
+                let ExprKind::Field { target, .. } = &*callee.kind else {
+                    unreachable!("state queue call is a field callee");
+                };
+                self.reject_inactive_target_state_root(target)?;
+                let what = format!("target-state queue `{field}`");
+                self.check_queue_pop_value_context(&what, args)?;
+                let crate::ir::StateFieldKind::Queue { elem } =
+                    self.target_state_fields[&field].clone()
+                else {
+                    unreachable!("state queue resolver guarantees a queue field");
+                };
+                let dest = self.queue_pop_result(elem);
+                self.push(Stmt::TransactorStateQueuePop {
+                    instance: String::new(),
+                    field,
+                    dest,
+                });
+                return Ok(Some(Expr::Local(dest)));
+            }
+        }
+
+        if let ExprKind::Field { target, name } = &*callee.kind {
+            if name.name == "pop" {
+                if let Some((instance, field, crate::ir::StateFieldKind::Queue { elem })) =
+                    self.as_transactor_state_any(target)
+                {
+                    let what = format!("target-state queue `{instance}.{field}`");
+                    self.check_queue_pop_value_context(&what, args)?;
+                    let dest = self.queue_pop_result(elem);
+                    self.push(Stmt::TransactorStateQueuePop {
+                        instance,
+                        field,
+                        dest,
+                    });
+                    return Ok(Some(Expr::Local(dest)));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Lower `sb.<queue>.size()` / `.empty()` / `.front()` into an
     /// `Expr::ScoreboardQuery`, or `None` when `callee` is not a
-    /// scoreboard queue method access. A `pop()` reaching here (deeper
-    /// than a `let`/assign RHS) is rejected — it mutates and must be a
-    /// statement.
+    /// scoreboard queue method access. Effectful `pop()` calls are claimed by
+    /// `lower_queue_pop_value` before this query-only resolver.
     fn lower_scoreboard_query_call(
         &self,
         callee: &AstExpr,
@@ -3832,16 +4372,11 @@ impl FuncBuilder<'_> {
             "empty" => crate::ir::ScoreboardQuery::QueueEmpty {
                 queue: queue.clone(),
             },
-            "pop" => {
-                // Validate the receiver before issuing the queue-specific
-                // expression-position advice. A scoreboard list has no
-                // `.pop()` member in v1's std::vector storage, so telling a
-                // list user to bind the result and retry v1 is a dead end.
-                self.scoreboard_queue_field(sb, &queue)?;
-                return Err(queue_pop_in_expression_position(&format!(
-                    "scoreboard `{field}.{queue}.pop()`"
-                )));
-            }
+            "front" => crate::ir::ScoreboardQuery::QueueFront {
+                queue: queue.clone(),
+                elem: self.scoreboard_queue_elem(sb, &queue)?,
+            },
+            "pop" => return Ok(None),
             other => {
                 return Err(queue_method_in_expression_position(
                     &format!("scoreboard queue method `{field}.{queue}.{other}(...)`"),
@@ -3854,7 +4389,9 @@ impl FuncBuilder<'_> {
                 "scoreboard `{field}.{queue}.{method}()` takes no arguments"
             )));
         }
-        self.scoreboard_container_field(sb, &queue)?;
+        if method != "front" {
+            self.scoreboard_container_field(sb, &queue)?;
+        }
         Ok(Some(Expr::ScoreboardQuery {
             sb,
             field,
@@ -3863,7 +4400,8 @@ impl FuncBuilder<'_> {
         }))
     }
 
-    /// Lower `_tb.pending.size()` / `.empty()` on a testbench-owned queue.
+    /// Lower `_tb.pending.size()` / `.empty()` / `.front()` on a
+    /// testbench-owned queue.
     /// The queue's field identity is explicit in the IR so backend and
     /// verifier ownership cannot be confused with scoreboard state.
     fn lower_tb_queue_query_call(
@@ -3886,11 +4424,11 @@ impl FuncBuilder<'_> {
             "empty" => crate::ir::ScoreboardQuery::QueueEmpty {
                 queue: field.clone(),
             },
-            "pop" => {
-                return Err(queue_pop_in_expression_position(&format!(
-                    "testbench queue `{field}.pop()`"
-                )));
-            }
+            "front" => crate::ir::ScoreboardQuery::QueueFront {
+                queue: field.clone(),
+                elem: self.tb_queue_elem(&field)?,
+            },
+            "pop" => return Ok(None),
             other => {
                 return Err(queue_method_in_expression_position(
                     &format!("testbench queue method `{field}.{other}(...)`"),
@@ -3901,11 +4439,10 @@ impl FuncBuilder<'_> {
         Ok(Some(Expr::TbQueueQuery { field, query }))
     }
 
-    /// Lower `<recv>.<queue>.size()` / `.empty()` on a composite-component
+    /// Lower `<recv>.<queue>.size()` / `.empty()` / `.front()` on a composite-component
     /// `queue<T>` field into an `Expr::ComponentQueueQuery`, or `None` when
-    /// `callee` is not a component-queue method access. A `pop()` reaching
-    /// here (deeper than a `let`/assign RHS) is rejected — it mutates and
-    /// must be a statement. Mirrors `lower_scoreboard_query_call`.
+    /// `callee` is not a component-queue method access. Effectful `pop()`
+    /// calls are claimed by `lower_queue_pop_value` first.
     fn lower_component_queue_query(
         &self,
         callee: &AstExpr,
@@ -3921,11 +4458,11 @@ impl FuncBuilder<'_> {
             "empty" => crate::ir::ScoreboardQuery::QueueEmpty {
                 queue: queue.clone(),
             },
-            "pop" => {
-                return Err(queue_pop_in_expression_position(&format!(
-                    "component `{queue}.pop()`"
-                )));
-            }
+            "front" => crate::ir::ScoreboardQuery::QueueFront {
+                queue: queue.clone(),
+                elem: self.component_queue_elem(&base, &queue)?,
+            },
+            "pop" => return Ok(None),
             other => {
                 return Err(queue_method_in_expression_position(
                     &format!("component queue method `{queue}.{other}(...)`"),
@@ -3941,13 +4478,12 @@ impl FuncBuilder<'_> {
         Ok(Some(Expr::ComponentQueueQuery { base, query }))
     }
 
-    /// Lower `<field>.size()` / `<field>.empty()` on a bound-to target
+    /// Lower `<field>.size()` / `.empty()` / `.front()` on a bound-to target
     /// transactor's persistent `queue<T>` state field (a bare field name
     /// inside a responder body) into an `Expr::TransactorStateQueueQuery`,
     /// or `None` when `callee` is not a state-queue method access. The
-    /// `instance` is a placeholder filled at test-binding. A `pop()`
-    /// reaching here (deeper than a `let`/assign RHS) is rejected — it
-    /// mutates and must be a statement. Mirrors `lower_component_queue_query`.
+    /// `instance` is a placeholder filled at test-binding. Effectful `pop()`
+    /// calls are claimed by `lower_queue_pop_value` first.
     fn lower_state_queue_query(
         &self,
         callee: &AstExpr,
@@ -3972,6 +4508,10 @@ impl FuncBuilder<'_> {
         }
         let field = id.name.clone();
         let method = name.name.clone();
+        let elem = match &self.target_state_fields[&field] {
+            crate::ir::StateFieldKind::Queue { elem } => elem.clone(),
+            _ => unreachable!("state queue resolver guarantees a queue field"),
+        };
         let query = match method.as_str() {
             "size" => crate::ir::ScoreboardQuery::QueueSize {
                 queue: field.clone(),
@@ -3979,11 +4519,11 @@ impl FuncBuilder<'_> {
             "empty" => crate::ir::ScoreboardQuery::QueueEmpty {
                 queue: field.clone(),
             },
-            "pop" => {
-                return Err(queue_pop_in_expression_position(&format!(
-                    "target-state `{field}.pop()`"
-                )));
-            }
+            "front" => crate::ir::ScoreboardQuery::QueueFront {
+                queue: field.clone(),
+                elem,
+            },
+            "pop" => return Ok(None),
             other => {
                 return Err(queue_method_in_expression_position(
                     &format!("target-state queue method `{field}.{other}(...)`"),
@@ -4016,9 +4556,10 @@ impl FuncBuilder<'_> {
                     cur = target;
                 }
                 ExprKind::Ident(root) => {
-                    // The DUT field itself, or — inside an inlined
-                    // helper — a parameter bound to the DUT. Either way
-                    // the `PortRef` is rooted at the caller's DUT field.
+                    // The DUT field itself, a canonical testbench-method
+                    // module parameter, or an inline-helper alias bound to
+                    // either one. Preserve the canonical receiver name so
+                    // out-of-line emission can select the exact typed handle.
                     // A declared local SHADOWS the DUT name (a method
                     // param or `let` named like the DUT field is host
                     // state, not the DUT — v1 surfaces such shadowing
@@ -4026,11 +4567,23 @@ impl FuncBuilder<'_> {
                     // access would silently mis-lower to a DutWrite/
                     // DutRead). DUT-bound inline-helper params are not
                     // declared as locals, so they pass through.
-                    if self.lookup(&root.name).is_none() && self.is_dut_name(&root.name) {
+                    if self.lookup(&root.name).is_none() {
+                        let Some(dut_receiver) = self.resolved_dut_name(&root.name) else {
+                            return Ok(None);
+                        };
                         if segments.is_empty() {
                             return Ok(None);
                         }
                         segments.reverse();
+                        if segments.len() == 1
+                            && self.ctx.partial_probe_names.contains(&segments[0])
+                        {
+                            self.record_error_span(e.span);
+                            return Err(LowerError::Invalid(format!(
+                                "shared DUT access `{}.{}` names a probe that is not declared identically by every test in the suite; declare the same probe type, path, and force capability on every testbench that can use this shared method",
+                                root.name, segments[0]
+                            )));
+                        }
                         // A single-segment `dut.<name>` whose name was
                         // declared as a `probe` on `let dut` is a DUT-
                         // internal access, not a top-level port: it lowers
@@ -4038,25 +4591,34 @@ impl FuncBuilder<'_> {
                         // capable) `PortRef` so the tbir backend routes it
                         // through the SV bind-stub accessor. Ordinary ports
                         // keep `Port`. See docs/probe-signals.md.
-                        let (access, width) = match self.ctx.probes.get(&segments[0]) {
-                            Some(meta) => {
-                                let access = if meta.force {
-                                    PortAccess::Force
-                                } else {
-                                    PortAccess::Probe
-                                };
-                                (access, meta.width)
-                            }
-                            None => (PortAccess::Port, None),
-                        };
+                        let (access, width, value_type, probe) =
+                            match self.ctx.probes.get(&segments[0]) {
+                                Some(meta) => {
+                                    let access = if meta.force {
+                                        PortAccess::Force
+                                    } else {
+                                        PortAccess::Probe
+                                    };
+                                    (
+                                        access,
+                                        scalar_ir_width(&meta.ty),
+                                        Some(meta.ty.clone()),
+                                        Some(meta.id),
+                                    )
+                                }
+                                None => (PortAccess::Port, None, None, None),
+                            };
                         return Ok(Some(PortRef {
-                            testbench_field: self.ctx.dut_field.clone(),
+                            testbench_field: dut_receiver,
+                            origin: crate::ir::PortOrigin::Dut,
                             port_path: segments,
                             aggregate_path: true,
                             deferred_bus_binding: None,
                             direction: None,
                             width,
+                            value_type,
                             access,
+                            probe,
                             lane: None,
                         }));
                     }
@@ -4221,6 +4783,7 @@ impl FuncBuilder<'_> {
         // source name here, as it does for component predicates.
         let (CallArg::Expr(n_expr) | CallArg::Named { value: n_expr, .. }) = &args[0];
         let n = self.lower_expr_no_ports(n_expr)?;
+        self.validate_numeric_expr(&n, "idle cycle count")?;
         let storage = if self.ctx.transactor_fields.contains_key(&field) {
             self.ctx
                 .heartbeat_transactor_fields
@@ -4561,13 +5124,13 @@ impl FuncBuilder<'_> {
         .then(|| (instance, name.name.clone()))
     }
 
-    /// Recognize a test-scope `target.<queue>.size()` / `.empty()` read
+    /// Recognize a test-scope `target.<queue>.size()` / `.empty()` /
+    /// `.front()` read
     /// on a bound-to responder's persistent `queue<T>` state field (fully
     /// resolved: `instance` is the bound test field). Returns the built
     /// `Expr::TransactorStateQueueQuery`, or `None` for a non-matching
-    /// shape. A `.pop()` reaching here (nested deeper than a `let`/assign
-    /// RHS) is rejected — it mutates and must be a statement. Mirrors
-    /// `lower_scoreboard_query_call` for the test-scope target-state path.
+    /// shape. Effectful `.pop()` calls are claimed by
+    /// `lower_queue_pop_value` before this query-only resolver.
     pub(crate) fn lower_test_state_queue_query(
         &self,
         callee: &AstExpr,
@@ -4581,9 +5144,9 @@ impl FuncBuilder<'_> {
         let Some((instance, field, kind)) = self.as_transactor_state_any(target) else {
             return Ok(None);
         };
-        if !matches!(kind, crate::ir::StateFieldKind::Queue { .. }) {
+        let crate::ir::StateFieldKind::Queue { elem } = kind else {
             return Ok(None);
-        }
+        };
         let method = name.name.clone();
         let query = match method.as_str() {
             "size" => crate::ir::ScoreboardQuery::QueueSize {
@@ -4592,11 +5155,11 @@ impl FuncBuilder<'_> {
             "empty" => crate::ir::ScoreboardQuery::QueueEmpty {
                 queue: field.clone(),
             },
-            "pop" => {
-                return Err(queue_pop_in_expression_position(&format!(
-                    "target-state `{instance}.{field}.pop()`"
-                )));
-            }
+            "front" => crate::ir::ScoreboardQuery::QueueFront {
+                queue: field.clone(),
+                elem,
+            },
+            "pop" => return Ok(None),
             other => {
                 return Err(queue_method_in_expression_position(
                     &format!("target-state queue method `{instance}.{field}.{other}(...)`"),
@@ -4687,8 +5250,7 @@ impl FuncBuilder<'_> {
             return Ok(None);
         }
         raw_indices.reverse();
-        let Some((instance, field, mut selected_ty)) =
-            self.as_transactor_state_fixed_vec(base)
+        let Some((instance, field, mut selected_ty)) = self.as_transactor_state_fixed_vec(base)
         else {
             return Ok(None);
         };
@@ -4937,7 +5499,11 @@ impl FuncBuilder<'_> {
         };
         port.lane = Some(match self.const_eval_index(index) {
             Some(lane) => crate::ir::LaneIndex::Const(lane),
-            None => crate::ir::LaneIndex::Var(Box::new(self.lower_expr(index)?)),
+            None => {
+                let index = self.lower_expr(index)?;
+                self.validate_numeric_expr(&index, "DUT lane index")?;
+                crate::ir::LaneIndex::Var(Box::new(index))
+            }
         });
         Ok(Some(port))
     }
@@ -4949,7 +5515,7 @@ impl FuncBuilder<'_> {
             ExprKind::Int(s) => parse_int_literal(s),
             ExprKind::Paren(inner) => self.const_eval_index(inner),
             ExprKind::Ident(id) if self.lookup(&id.name).is_none() => {
-                self.ctx.consts.get(&id.name).copied()
+                self.ctx.consts.get(&id.name).map(|value| value.bits)
             }
             _ => None,
         }
@@ -5008,6 +5574,11 @@ impl FuncBuilder<'_> {
                 "index the list before resizing",
                 V1Status::EmitsUncompilable,
             ));
+        }
+        if matches!(self.expr_type(&inner), Some(IrType::String)) {
+            return Err(LowerError::Invalid(format!(
+                "`.{kind_name}<N>()` is not defined for `String` values"
+            )));
         }
         Ok(Expr::WidthCast {
             kind,
@@ -5114,8 +5685,7 @@ impl FuncBuilder<'_> {
                     ty: IrType::FixedVec { elem, .. },
                 } = kind
                 {
-                    return (path.is_empty() && index.is_some())
-                        .then(|| (**elem).clone());
+                    return (path.is_empty() && index.is_some()).then(|| (**elem).clone());
                 }
                 let crate::ir::StateFieldKind::Record { record } = kind else {
                     return None;
@@ -5585,8 +6155,13 @@ impl FuncBuilder<'_> {
                 Some(if v == 0 { 1 } else { 64 - v.leading_zeros() })
             }
             ExprKind::Ident(id) => {
-                let local = self.lookup(&id.name)?;
-                self.let_widths.get(&local).copied()
+                if let Some(local) = self.lookup(&id.name) {
+                    return self.let_widths.get(&local).copied();
+                }
+                self.ctx
+                    .consts
+                    .get(&id.name)
+                    .and_then(|value| value.declared_width())
             }
             _ => None,
         }
@@ -5863,8 +6438,8 @@ fn parse_wide_sized_decimal_literal(s: &str) -> Option<Vec<u32>> {
     if words.len() <= 2 {
         return None;
     }
-    let value_bits = (words.len() as u64 - 1) * 32
-        + u64::from(32 - words.last().copied()?.leading_zeros());
+    let value_bits =
+        (words.len() as u64 - 1) * 32 + u64::from(32 - words.last().copied()?.leading_zeros());
     (value_bits <= u64::from(width)).then_some(words)
 }
 
@@ -6036,6 +6611,9 @@ pub(crate) fn check_literal_component_vec_index_bounds(
 }
 
 fn port_temp_type(p: &PortRef, hint: Option<&IrType>) -> Option<IrType> {
+    if let Some(ty) = &p.value_type {
+        return Some(ty.clone());
+    }
     if let Some(w) = p.width {
         return Some(IrType::UInt(Some(w)));
     }
@@ -6044,6 +6622,14 @@ fn port_temp_type(p: &PortRef, hint: Option<&IrType>) -> Option<IrType> {
             Some(IrType::UInt(Some(*w)))
         }
         Some(IrType::Bool) => Some(IrType::Bool),
+        _ => None,
+    }
+}
+
+fn scalar_ir_width(ty: &IrType) -> Option<u32> {
+    match ty {
+        IrType::Bool => Some(1),
+        IrType::UInt(width) | IrType::SInt(width) => *width,
         _ => None,
     }
 }
@@ -6224,10 +6810,9 @@ where
     F: Fn(&str) -> bool,
 {
     match e {
-        Expr::Call(
-            crate::ir::CallTarget::TransactorMethod { bus_field, .. },
-            _,
-        ) => is_bound(bus_field),
+        Expr::Call(crate::ir::CallTarget::TransactorMethod { bus_field, .. }, _) => {
+            is_bound(bus_field)
+        }
         Expr::Call(crate::ir::CallTarget::TransactorSelfMethod { .. }, _) => false,
         Expr::Call(_, args) => args
             .iter()
@@ -6247,13 +6832,6 @@ where
             expr_has_bound_transactor_edge(n, is_bound)
         }
         Expr::SeqIndex { index, .. } => expr_has_bound_transactor_edge(index, is_bound),
-        // A transactor call nested in a fixed-vector element INDEX
-        // (`mem[xt.idx()]` / `sb.v[xt.idx()]`) reaches a `wait until`
-        // predicate wrapped in a vec node, not bare. Without recursing
-        // here the predicate scanner misses a bound-instance call: its
-        // honest refusal is skipped and the un-hoistable call surfaces
-        // later as a verifier `BadTransactorCall` instead. A sibling call
-        // is deliberately admitted and re-evaluated.
         Expr::TbFieldVecElement {
             index, inner_index, ..
         }

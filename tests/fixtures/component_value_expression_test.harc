@@ -1,0 +1,289 @@
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+struct Result
+    value : uint<32> default 0
+    opcode : uint<4> default 0
+    bytes : Vec<uint<8>, 2>
+end struct Result
+
+function add_values(a: uint<32>, b: uint<32>) -> uint<32>
+    return a + b
+end function add_values
+
+scoreboard QueueValues
+    pending : queue<uint<8>>
+    records : queue<Result>
+end scoreboard QueueValues
+
+agent CounterModel
+    value : uint<32> = 0
+    record_reads : uint<32> = 0
+    pending : queue<uint<8>>
+    popped : uint<8> = 0
+    function step(tag: uint<8>) -> uint<32>
+        value = value * 10 + tag
+        return value
+    end function step
+    function peek() -> uint<32>
+        return value
+    end function peek
+    function latest_write_id() -> uint<64>
+        return value
+    end function latest_write_id
+    function combine(a: uint<32>, b: uint<32>) -> uint<32>
+        return a * 1000 + b
+    end function combine
+    function make(v: uint<32>) -> Result
+        let r : Result
+        r.value = v
+        return r
+    end function make
+    function current_instruction(event_id: uint<8>) -> Result
+        record_reads = record_reads + 1
+        let r : Result
+        r.opcode = event_id.trunc<4>()
+        r.bytes[0] = event_id
+        r.bytes[1] = event_id + 1
+        return r
+    end function current_instruction
+    function enqueue(v: uint<8>)
+        pending.push(v)
+    end function enqueue
+    function pop_return() -> uint<8>
+        return pending.pop()
+    end function pop_return
+    function pop_to_field() -> uint<8>
+        popped = pending.pop()
+        return popped
+    end function pop_to_field
+end agent CounterModel
+
+agent Harness
+    inner : CounterModel
+    ordered_args : CounterModel
+    parameter_args : CounterModel
+    scalar : uint<32> = 0
+    record : Result
+    function step_inner(tag: uint<8>) -> uint<32>
+        return inner.step(tag)
+    end function step_inner
+    function step_param(model: CounterModel, tag: uint<8>) -> uint<32>
+        return model.step(tag)
+    end function step_param
+    function step_param_from_inner(tag: uint<8>) -> uint<32>
+        return step_param(inner, tag)
+    end function step_param_from_inner
+    function combine_model(snapshot: CounterModel, latest: uint<32>) -> uint<32>
+        return snapshot.peek() * 1000 + latest
+    end function combine_model
+    function combine_result(snapshot: Result, latest: uint<32>) -> uint<32>
+        return snapshot.value * 1000 + latest
+    end function combine_result
+    function ordered_component_value() -> uint<32>
+        let seed = ordered_args.step(1)
+        assert seed == 1 else fail("ordered component seed")
+        return combine_model(ordered_args, ordered_args.step(2))
+    end function ordered_component_value
+    function direct_component_value() -> uint<32>
+        return combine_model(ordered_args, 99)
+    end function direct_component_value
+    function ordered_component_parameter(model: CounterModel) -> uint<32>
+        let seed = model.step(1)
+        assert seed == 1 else fail("ordered component parameter seed")
+        return combine_model(model, model.step(2))
+    end function ordered_component_parameter
+    function ordered_component_parameter_from_inner() -> uint<32>
+        return ordered_component_parameter(parameter_args)
+    end function ordered_component_parameter_from_inner
+    function direct_component_parameter(model: CounterModel) -> uint<32>
+        return combine_model(model, 99)
+    end function direct_component_parameter
+    function direct_component_parameter_from_inner() -> uint<32>
+        return direct_component_parameter(parameter_args)
+    end function direct_component_parameter_from_inner
+    function pending_matches(count: uint<8>) -> uint<1>
+        if inner.pending.size() != count.zext<64>()
+            return 0
+        end if
+        return 1
+    end function pending_matches
+    function pending_size_twice() -> uint<64>
+        return inner.pending.size() + inner.pending.size()
+    end function pending_size_twice
+    function front_then_pop() -> uint<16>
+        return inner.pending.front().zext<16>() + inner.pending.pop().zext<16>()
+    end function front_then_pop
+end agent Harness
+
+testbench ComponentValueTb
+    dut : Top
+    model : CounterModel
+    args : CounterModel
+    manual : CounterModel
+    shared_record_effect : CounterModel
+    lexical_record_effect : CounterModel
+    lexical_scalar_effect : CounterModel
+    harness : Harness
+    own_pending : queue<uint<8>>
+    queue_values : QueueValues
+    shared_record : Result
+end testbench ComponentValueTb
+
+impl ComponentValueExpressionTest for ComponentValueTb
+    clock clk = SysDomain
+    run
+        dut.rst = 1
+        dut.en = 0
+        wait 1 cycles
+        dut.rst = 0
+        let first : uint<32> = model.step(1)
+        let second = model.step(2)
+        let assigned : uint<32> = 0
+        assigned = model.step(3)
+        harness.scalar = model.step(4)
+        let made : Result = model.make(77)
+        harness.record.value = model.step(5)
+        assert first == 1 else fail("direct typed let")
+        assert second == 12 else fail("direct inferred let")
+        assert assigned == 123 else fail("direct assignment")
+        assert harness.scalar == 1234 else fail("scalar field assignment")
+        assert made.value == 77 else fail("record return")
+        assert harness.record.value == 12345 else fail("record field assignment")
+        harness.inner.enqueue(51)
+        assert harness.pending_matches(1) else fail("self-subcomponent queue size in condition")
+        assert harness.pending_size_twice() == 2 else fail("repeated queue size source evaluations")
+        let ordered_front_pop : uint<16> = harness.front_then_pop()
+        assert ordered_front_pop == 102 else fail("queue front must be sampled before the following pop")
+        assert harness.inner.pending.empty() else fail("self-subcomponent queue cleanup")
+        own_pending.push(61)
+        let own_front = own_pending.front()
+        assert own_front == 61 else fail("testbench queue front value")
+        assert own_pending.size() == 1 else fail("testbench queue front removed an element")
+        let lazy_front = false ? own_pending.front() : 7
+        assert lazy_front == 7 else fail("unselected testbench queue front")
+        own_pending.front()
+        assert own_pending.pop() == 61 else fail("testbench queue front changed FIFO order")
+        queue_values.pending.push(71)
+        let scoreboard_front = queue_values.pending.front()
+        let nested_front_sum = add_values(queue_values.pending.front().zext<32>(), scoreboard_front.zext<32>())
+        assert nested_front_sum == 142 else fail("scoreboard queue front in nested arguments")
+        assert queue_values.pending.size() == 1 else fail("scoreboard queue front removed an element")
+        assert queue_values.pending.pop() == 71 else fail("scoreboard queue front changed FIFO order")
+        let queued_result : Result
+        queued_result.opcode = 3
+        queue_values.records.push(queued_result)
+        let front_opcode = queue_values.records.front().opcode.zext<8>()
+        assert front_opcode == 3 else fail("record queue front field chain")
+        assert queue_values.records.size() == 1 else fail("record queue front removed an element")
+        let popped_result : Result = queue_values.records.pop()
+        assert popped_result.opcode == 3 else fail("record queue front changed FIFO order")
+        let self_value = harness.step_inner(6)
+        let param_value = harness.step_param_from_inner(6)
+        assert self_value == 6 else fail("self sub-component receiver")
+        assert param_value == 66 else fail("component parameter receiver")
+        assert harness.inner.value == 6 else fail("component parameter must be by-value")
+        let ordered = model.value + model.step(7)
+        assert ordered == 135802 else fail("left value was not sampled before right call")
+        let nested_component = args.combine(args.step(1), args.step(2))
+        assert nested_component == 1012 else fail("nested component arguments reordered")
+        let ordered_component_value = harness.ordered_component_value()
+        assert ordered_component_value == 1012
+            else fail("component value argument was not sampled before later mutation: got=${ordered_component_value}")
+        let direct_component_value = harness.direct_component_value()
+        assert direct_component_value == 12099 else fail("component value argument copy control")
+        let local_model : CounterModel
+        let local_seed = local_model.step(1)
+        assert local_seed == 1 else fail("ordered component local seed")
+        let ordered_component_local = harness.combine_model(local_model, local_model.step(2))
+        assert ordered_component_local == 1012
+            else fail("component local argument was not sampled before later mutation: got=${ordered_component_local}")
+        let direct_component_local = harness.combine_model(local_model, 99)
+        assert direct_component_local == 12099 else fail("component local argument copy control")
+        let ordered_component_parameter = harness.ordered_component_parameter_from_inner()
+        assert ordered_component_parameter == 1012
+            else fail("component parameter argument was not sampled before later mutation: got=${ordered_component_parameter}")
+        let direct_component_parameter = harness.direct_component_parameter_from_inner()
+        assert direct_component_parameter == 99 else fail("component parameter argument copy control")
+        shared_record.value = 1
+        let ordered_shared_record = harness.combine_result(shared_record, shared_record_effect.step(2))
+        assert ordered_shared_record == 1002 else fail("shared record snapshot control")
+        let direct_shared_record = harness.combine_result(shared_record, 99)
+        assert direct_shared_record == 1099 else fail("shared record copy control")
+        let lexical_record : Result
+        lexical_record.value = 7
+        let lexical_record_value = harness.combine_result(lexical_record, lexical_record_effect.step(2))
+        assert lexical_record_value == 7002 else fail("lexical record stability control")
+        let lexical_scalar : uint<32> = 7
+        let lexical_scalar_value = add_values(lexical_scalar, lexical_scalar_effect.step(3))
+        assert lexical_scalar_value == 10 else fail("lexical scalar stability control")
+        let manual_a = manual.step(1)
+        let manual_b = manual.step(2)
+        let manual_component = manual.combine(manual_a, manual_b)
+        assert nested_component == manual_component else fail("nested and temporary-bound component calls differ")
+        let nested_helper = add_values(args.step(3), args.step(4))
+        assert nested_helper == 1357 else fail("nested helper arguments reordered")
+        let manual_c = manual.step(3)
+        let manual_d = manual.step(4)
+        let manual_helper = add_values(manual_c, manual_d)
+        assert nested_helper == manual_helper else fail("nested and temporary-bound helper calls differ")
+        let shifted_id : uint<64> = (args.latest_write_id() << 32)
+        assert (shifted_id >> 32) == 1234 else fail("component call in shift operand")
+        let event_id : uint<8> = 5
+        let opcode : uint<8> = 5
+        let opcode_matches = model.current_instruction(event_id).opcode.zext<8>() == opcode
+        assert opcode_matches else fail("record-return call field width chain")
+        let selected_byte : uint<16> = model.current_instruction(9).bytes[1].zext<16>()
+        assert selected_byte == 10 else fail("record-return call indexed field width chain")
+        assert model.record_reads == 2 else fail("record-return calls were not evaluated exactly once")
+        model.enqueue(21)
+        let popped_return = model.pop_return()
+        assert popped_return == 21 else fail("component queue pop in direct return")
+        model.enqueue(22)
+        let popped_field = model.pop_to_field()
+        assert popped_field == 22 else fail("component queue pop in component-field assignment")
+        assert model.popped == 22 else fail("component queue pop did not update the field")
+        model.enqueue(31)
+        let skipped_pop = false && model.pending.pop() == 31
+        assert !skipped_pop else fail("false && queue pop result")
+        assert model.pending.size() == 1 else fail("short-circuited queue pop executed")
+        let taken_pop = true && model.pending.pop() == 31
+        assert taken_pop else fail("taken queue pop did not execute")
+        assert model.pending.empty() else fail("taken queue pop did not consume one element")
+        model.enqueue(41)
+        let skipped_pop_ternary = false ? model.pending.pop() : 7
+        assert skipped_pop_ternary == 7 else fail("unselected queue-pop ternary value")
+        assert model.pending.size() == 1 else fail("unselected queue-pop ternary executed")
+        let taken_pop_ternary = true ? model.pending.pop() : 0
+        assert taken_pop_ternary == 41 else fail("selected queue-pop ternary did not execute")
+        assert model.pending.empty() else fail("selected queue-pop ternary did not consume one element")
+        let lazy_and = false && harness.inner.step(3) != 0
+        let lazy_or = true || harness.inner.step(4) != 0
+        assert !lazy_and else fail("false && result")
+        assert lazy_or else fail("true || result")
+        assert harness.inner.value == 6 else fail("short-circuit branch executed")
+        let ternary_false = false ? harness.inner.step(5) : harness.inner.peek()
+        assert ternary_false == 6 else fail("false ternary selected wrong branch")
+        let ternary_true = true ? harness.inner.step(6) : harness.inner.step(7)
+        assert ternary_true == 66 else fail("true ternary selected wrong branch")
+        assert harness.inner.value == 66 else fail("unselected ternary branch executed")
+        let nested_lazy = false || (true && harness.inner.step(8) == 668)
+        assert nested_lazy else fail("nested lazy expression")
+        assert harness.inner.value == 668 else fail("nested lazy call count")
+        if harness.inner.step(9) == 6689
+            harness.scalar = harness.inner.peek()
+        end if
+        assert harness.scalar == 6689 else fail("component call in if condition")
+        let loops : uint<8> = 0
+        while harness.inner.peek() < 66891
+            harness.inner.step(1)
+            loops = loops + 1
+        end while
+        assert loops == 1 else fail("component call in while condition")
+        assert harness.inner.peek() == 66891 else fail("component call in assertion")
+        assert true else fail("untaken diagnostic call=${harness.inner.step(2)}")
+        assert harness.inner.value == 66891 else fail("successful assertion evaluated its message")
+        log(info, "component value expressions passed")
+    end run
+end impl ComponentValueExpressionTest

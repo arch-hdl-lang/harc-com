@@ -1,0 +1,40 @@
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+extern function ref_string_choice(key: String, choices: String, default_index: uint<32>, required: uint<1>) -> uint<32>
+extern function ref_string_bytes(value: String) -> uint<32>
+
+function identity(value: String) -> String
+  return value
+end function identity
+
+function choose_text(select_first: uint<1>, first: String, second: String) -> String
+  let selected: String = select_first ? first : second
+  return selected
+end function choose_text
+
+function runtime_choice(key: String, choices: String, default_index: uint<32>, required: uint<1>) -> uint<32>
+  return ref_string_choice(key, choices, default_index, required)
+end function runtime_choice
+
+test StringExternArgsTest
+  let dut : Top
+  clock clk = SysDomain
+
+  run
+    dut.rst = 1
+    dut.en = 0
+    wait 2 cycles
+    dut.rst = 0
+    wait 1 cycle
+
+    let key: String = identity("policy")
+    let choices: String
+    choices = choose_text(1, "zero,one,two", "wrong")
+    let choice = runtime_choice(key, choices, 0, 0)
+    assert choice == 1 else fail("string arguments did not reach the extern function")
+    let escaped: String = identity("quote:\" slash:\\ newline:\n carriage:\r tab:\t nul:\0Z literal:\\n unknown:\q")
+    assert ref_string_bytes(escaped) == 1 else fail("string escape values changed")
+  end run
+end test StringExternArgsTest

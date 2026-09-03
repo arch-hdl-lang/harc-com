@@ -1316,6 +1316,10 @@ impl super::FuncBuilder<'_> {
             ir::CallTarget::TransactorMethod {
                 bus_field: helper_field.to_string(),
                 method: method.to_string(),
+                target: ir::TransactorMethodTarget::Callable {
+                    transactor: xid,
+                    function: m.function,
+                },
             },
             args,
         ))

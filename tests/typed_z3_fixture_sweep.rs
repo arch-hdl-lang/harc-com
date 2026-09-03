@@ -249,6 +249,7 @@ fn classifies_axi_agent_spec_sketch_lowering_gap() {
     let path = Path::new("tests/fixtures/axi_agent.harc");
     let source = TypedSolverProblemSource::TransactionTemplate {
         transaction: "AxiTxn".to_string(),
+        source_id: Default::default(),
         span: Default::default(),
     };
     let reason = expected_lower_error_reason(path, &source, &[]).expect("classified");
@@ -261,6 +262,7 @@ fn classifies_axi_agent_spec_sketch_lowering_gap() {
         transaction: "AxiTxn".to_string(),
         blocking: false,
         has_with_body: false,
+        source_id: Default::default(),
         span: Default::default(),
     };
     assert!(expected_lower_error_reason(path, &site, &[]).is_some());
@@ -271,6 +273,7 @@ fn classifies_axi_agent_spec_sketch_lowering_gap() {
         transaction: "OtherTxn".to_string(),
         blocking: false,
         has_with_body: false,
+        source_id: Default::default(),
         span: Default::default(),
     };
     assert!(expected_lower_error_reason(path, &unrelated_site, &[]).is_none());

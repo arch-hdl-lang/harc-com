@@ -55,11 +55,6 @@ static void _harc_eval_posedge(DUT* dut) {
     dut->eval();
 }
 
-static harc_rt::random::HarcRng harc_rng;
-static inline uint64_t harc_rng_next() {
-    return harc_rng.next();
-}
-
 struct CountCov {
     struct {
         uint64_t low = 0;
@@ -72,7 +67,7 @@ struct CountCov {
     } cp_en;
     uint64_t _cross_2_cp_count__cp_en[6] = {};
 
-    void report() const {
+    void report(harc_rt::log::HarcLogContext& log_ctx) const {
         uint64_t _total = 5; uint64_t _hit = 0;
         if (cp_count.low > 0) _hit++;
         if (cp_count.mid > 0) _hit++;
@@ -80,34 +75,34 @@ struct CountCov {
         if (cp_en.en0 > 0) _hit++;
         if (cp_en.en1 > 0) _hit++;
         harc_rt::log::harc_print_covergroup_summary("CountCov", _hit, _total);
-        harc_rt::log::harc_cov_json_summary("CountCov", _hit, _total);
+        harc_rt::log::harc_cov_json_summary(log_ctx.coverage_json, "CountCov", _hit, _total);
         harc_rt::log::harc_print_covergroup_bin("cp_count", "low", cp_count.low);
-        harc_rt::log::harc_cov_json_bin("CountCov", "cp_count", "low", cp_count.low);
+        harc_rt::log::harc_cov_json_bin(log_ctx.coverage_json, "CountCov", "cp_count", "low", cp_count.low);
         harc_rt::log::harc_print_covergroup_bin("cp_count", "mid", cp_count.mid);
-        harc_rt::log::harc_cov_json_bin("CountCov", "cp_count", "mid", cp_count.mid);
+        harc_rt::log::harc_cov_json_bin(log_ctx.coverage_json, "CountCov", "cp_count", "mid", cp_count.mid);
         harc_rt::log::harc_print_covergroup_bin("cp_count", "high", cp_count.high);
-        harc_rt::log::harc_cov_json_bin("CountCov", "cp_count", "high", cp_count.high);
+        harc_rt::log::harc_cov_json_bin(log_ctx.coverage_json, "CountCov", "cp_count", "high", cp_count.high);
         harc_rt::log::harc_print_covergroup_bin("cp_en", "en0", cp_en.en0);
-        harc_rt::log::harc_cov_json_bin("CountCov", "cp_en", "en0", cp_en.en0);
+        harc_rt::log::harc_cov_json_bin(log_ctx.coverage_json, "CountCov", "cp_en", "en0", cp_en.en0);
         harc_rt::log::harc_print_covergroup_bin("cp_en", "en1", cp_en.en1);
-        harc_rt::log::harc_cov_json_bin("CountCov", "cp_en", "en1", cp_en.en1);
+        harc_rt::log::harc_cov_json_bin(log_ctx.coverage_json, "CountCov", "cp_en", "en1", cp_en.en1);
         {
             uint64_t _cross_hit = 0;
             uint64_t _cross_missing = 0;
             for (size_t _i = 0; _i < 6; ++_i) if (_cross_2_cp_count__cp_en[_i] > 0) _cross_hit++;
             harc_rt::log::harc_print_covergroup_cross_summary("CountCov", "cross", "cp_count x cp_en", _cross_hit, 6);
-            harc_rt::log::harc_cov_json_cross_summary("CountCov", "cross", "cp_count x cp_en", _cross_hit, 6);
-            harc_rt::log::harc_cov_json_cross_bin("CountCov", "cross", "cp_count x cp_en", "cp_count.low x cp_en.en0", _cross_2_cp_count__cp_en[0]);
+            harc_rt::log::harc_cov_json_cross_summary(log_ctx.coverage_json, "CountCov", "cross", "cp_count x cp_en", _cross_hit, 6);
+            harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, "CountCov", "cross", "cp_count x cp_en", "cp_count.low x cp_en.en0", _cross_2_cp_count__cp_en[0]);
             if (_cross_2_cp_count__cp_en[0] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_count.low x cp_en.en0"); _cross_missing++; }
-            harc_rt::log::harc_cov_json_cross_bin("CountCov", "cross", "cp_count x cp_en", "cp_count.low x cp_en.en1", _cross_2_cp_count__cp_en[1]);
+            harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, "CountCov", "cross", "cp_count x cp_en", "cp_count.low x cp_en.en1", _cross_2_cp_count__cp_en[1]);
             if (_cross_2_cp_count__cp_en[1] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_count.low x cp_en.en1"); _cross_missing++; }
-            harc_rt::log::harc_cov_json_cross_bin("CountCov", "cross", "cp_count x cp_en", "cp_count.mid x cp_en.en0", _cross_2_cp_count__cp_en[2]);
+            harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, "CountCov", "cross", "cp_count x cp_en", "cp_count.mid x cp_en.en0", _cross_2_cp_count__cp_en[2]);
             if (_cross_2_cp_count__cp_en[2] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_count.mid x cp_en.en0"); _cross_missing++; }
-            harc_rt::log::harc_cov_json_cross_bin("CountCov", "cross", "cp_count x cp_en", "cp_count.mid x cp_en.en1", _cross_2_cp_count__cp_en[3]);
+            harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, "CountCov", "cross", "cp_count x cp_en", "cp_count.mid x cp_en.en1", _cross_2_cp_count__cp_en[3]);
             if (_cross_2_cp_count__cp_en[3] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_count.mid x cp_en.en1"); _cross_missing++; }
-            harc_rt::log::harc_cov_json_cross_bin("CountCov", "cross", "cp_count x cp_en", "cp_count.high x cp_en.en0", _cross_2_cp_count__cp_en[4]);
+            harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, "CountCov", "cross", "cp_count x cp_en", "cp_count.high x cp_en.en0", _cross_2_cp_count__cp_en[4]);
             if (_cross_2_cp_count__cp_en[4] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_count.high x cp_en.en0"); _cross_missing++; }
-            harc_rt::log::harc_cov_json_cross_bin("CountCov", "cross", "cp_count x cp_en", "cp_count.high x cp_en.en1", _cross_2_cp_count__cp_en[5]);
+            harc_rt::log::harc_cov_json_cross_bin(log_ctx.coverage_json, "CountCov", "cross", "cp_count x cp_en", "cp_count.high x cp_en.en1", _cross_2_cp_count__cp_en[5]);
             if (_cross_2_cp_count__cp_en[5] == 0) { if (_cross_missing < 16) harc_rt::log::harc_print_covergroup_missing_bin("cp_count.high x cp_en.en1"); _cross_missing++; }
             harc_rt::log::harc_print_covergroup_more_missing(_cross_missing, 16, "cross");
         }
@@ -122,6 +117,7 @@ struct CovCrossTb {
 };
 
 struct HarcTestContext {
+    VerilatedContext verilated;
     VTop* dut = nullptr;
 #if HARC_TRACE_ENABLED
     HarcTraceC* tfp = nullptr;
@@ -133,15 +129,16 @@ struct HarcTestContext {
     int cycle_count = 0;
     harc_rt::trace::HarcTraceWriter trace;
     harc_rt::log::HarcLogContext log_ctx;
+    harc_rt::random::HarcRng rng;
     std::vector<std::function<void()>> _checkers;
     std::vector<std::function<void()>> _post_eval_services;
     std::vector<std::function<void()>> _auto_cov_reports;
 };
 
 int run_CovCrossBinsTest(int argc, char** argv) {
-    Verilated::commandArgs(argc, argv);
     HarcTestContext ctx;
-    ctx.dut = new VTop;
+    ctx.verilated.commandArgs(argc, argv);
+    ctx.dut = harc_rt::log::harc_make_dut<VTop>(&ctx.verilated);
     auto* dut = ctx.dut;
 #if HARC_TRACE_ENABLED
     auto* tfp = ctx.tfp;
@@ -153,6 +150,8 @@ int run_CovCrossBinsTest(int argc, char** argv) {
     auto& cycle_count = ctx.cycle_count;
     auto& trace = ctx.trace;
     auto& log_ctx = ctx.log_ctx;
+    auto& harc_rng = ctx.rng;
+    auto harc_rng_next = [&]() { return harc_rng.next(); };
     auto& _checkers = ctx._checkers;
     auto& _post_eval_services = ctx._post_eval_services;
     auto& _auto_cov_reports = ctx._auto_cov_reports;
@@ -237,7 +236,7 @@ int run_CovCrossBinsTest(int argc, char** argv) {
     // scheduler tick — same semantics as `log(fatal, ...)`. Emitted
     // verbatim by both codegens so the two traces stay diffable.
     harc_rt::HarcQueueFatalScope _queue_fatal_scope([&]() {
-        sim_log_line("FATAL", "pop() on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed");
+        sim_log_line("FATAL", "queue front/pop on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed");
         ctx.errors++;
         _fatal = true;
     });
@@ -336,7 +335,7 @@ int run_CovCrossBinsTest(int argc, char** argv) {
             while (!__done) {
                 switch (__bb) {
                 case 0: {
-                    _tb.cov.report();
+                    _tb.cov.report(log_ctx);
                     if (!((_tb.cov.cp_count.low > 0))) {
                         sim_log_line("FAIL", "low range bin hole");
                         ctx.errors++;
@@ -402,8 +401,12 @@ int run_CovCrossBinsTest(int argc, char** argv) {
 
 
     for (auto& _r : _auto_cov_reports) _r();
+    _auto_cov_reports.clear();
+    _post_eval_services.clear();
+    _checkers.clear();
+    harc_rt::harc_destroy_scheduler_threads(sched);
     dut->final();
-    HARC_RT_WRITE_COVERAGE(Verilated::threadContextp()->coveragep());
+    HARC_RT_WRITE_COVERAGE(ctx.verilated.coveragep());
     HARC_RT_CLOSE_WAVE_TRACE(tfp);
     delete dut;
 

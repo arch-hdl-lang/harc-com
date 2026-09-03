@@ -1,6 +1,6 @@
 //! Runtime randomize boundary guardrail.
 //!
-//! This is a migration tripwire for Phase 5: every fixture that emits a
+//! Every fixture that emits a
 //! runtime randomization problem table must route generated randomize sites
 //! through the runtime call-site setup, solve, and status-handling boundary.
 
@@ -36,13 +36,29 @@ fn randomize_fixtures_use_runtime_boundary() {
         };
         emitted += 1;
 
+        for forbidden in [
+            "thread_local",
+            "static harc_rt::random::HarcRng",
+            "static harc_rt::random::HarcRuntimeCallSite",
+            "static harc_rt::random::HarcUniqueHistory",
+            "static harc_rt::random::HarcAutoCovState",
+            "static uint64_t _cov_",
+            "Verilated::threadContextp()",
+        ] {
+            if cpp.contains(forbidden) {
+                failures.push(format!(
+                    "[run-state] {name}: generated mutable or ambient state `{forbidden}`"
+                ));
+            }
+        }
+
         if !cpp.contains("_harc_runtime_random_problem_table_entries[]") {
             continue;
         }
         runtime_randomize += 1;
 
         let mut missing = Vec::new();
-        if !cpp.contains("_harc_runtime_random_problem_table_prepare_call(") {
+        if !cpp.contains("harc_prepare_randomize_call(") {
             missing.push("generated prepare-call wrapper");
         }
         if !cpp.contains("harc_rt::random::harc_prepare_randomize_call(") {
@@ -50,7 +66,7 @@ fn randomize_fixtures_use_runtime_boundary() {
         }
 
         let has_generated_call =
-            cpp.contains("auto _harc_rt_call = _harc_runtime_random_problem_table_prepare_call(");
+            cpp.contains("auto _harc_rt_call = harc_prepare_randomize_call(ctx,");
         if has_generated_call {
             runtime_call_sites += 1;
             if !cpp.contains("harc_rt::random::harc_solve_constrained(")
