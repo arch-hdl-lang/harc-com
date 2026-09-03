@@ -1504,6 +1504,11 @@ const SEQUENTIAL_REGISTRY: &str = r#"#include "sequence__suite_api.hpp"
 #include <fstream>
 #include <iterator>
 #include <string>
+#if !defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#include <climits>
+#endif
 #ifdef HARC_TEST_VALIDATE_FST
 #include "gtkwave/fstapi.h"
 #endif
@@ -1638,12 +1643,31 @@ static int invoke_body(
 
 static bool artifact_is_closed(const std::filesystem::path& expected) {
     std::error_code error;
+#if defined(__linux__)
     for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd", error)) {
         auto target = std::filesystem::read_symlink(entry.path(), error);
         if (!error && target == expected) return false;
         error.clear();
     }
     return !error;
+#else
+    // Platforms without /proc/self/fd (e.g. macOS): enumerate this
+    // process's open descriptors via fcntl(F_GETPATH) and compare
+    // canonical paths, so the descriptor-isolation assertion still runs.
+    auto want = std::filesystem::weakly_canonical(expected, error);
+    if (error) { want = expected; error.clear(); }
+    int maxfd = getdtablesize();
+    if (maxfd <= 0 || maxfd > 65536) maxfd = 4096;
+    char buf[PATH_MAX];
+    for (int fd = 0; fd < maxfd; ++fd) {
+        if (::fcntl(fd, F_GETPATH, buf) == 0) {
+            std::error_code ec;
+            auto target = std::filesystem::weakly_canonical(std::filesystem::path(buf), ec);
+            if (!ec && target == want) return false;
+        }
+    }
+    return true;
+#endif
 }
 
 static bool finalized_artifacts(
