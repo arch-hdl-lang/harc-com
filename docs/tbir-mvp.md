@@ -10281,6 +10281,13 @@ former `transaction` group lives in
      do not prove a first iteration. The inventory remains 115 textual matches
      (114 constructors plus the helper definition).
 
+227. **Two-way runtime-if paths to named-clock waits (2026-09-02).**
+
+     A runtime `if` with no `elsif` clauses now proves guaranteed entry when
+     both its `then` and required `else` blocks begin on a named-clock wait.
+     A missing `else` or either open arm remains conservative. The inventory
+     remains 115 textual matches (114 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
