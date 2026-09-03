@@ -33026,6 +33026,47 @@ end test T"#;
 }
 
 #[test]
+fn a_runtime_if_with_two_named_wait_arms_reports_v1_recursion() {
+    let src = r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on true
+            if dut.rst == 1
+                wait 1 cycle on aux
+            else
+                wait 2 cycles on aux
+            end if
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("both runtime-if paths guarantee a named-clock wait"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively firing"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits both recursive if arms");
+    assert!(v1.contains("if (harc_rt::harc_read(dut->rst) == 1)"), "{v1}");
+    assert_eq!(v1.matches("while (clocks_[1].rising_count < _target").count(), 2, "{v1}");
+
+    let missing_else = src.replace(
+        "            else\n                wait 2 cycles on aux\n",
+        "",
+    );
+    assert_unsupported(
+        &lower_src(&missing_else).expect_err("a missing else keeps the fallback path"),
+    );
+    let open_then = src.replace(
+        "                wait 1 cycle on aux",
+        "                log(info, \"open\")",
+    );
+    assert_unsupported(&lower_src(&open_then).expect_err("an open then arm keeps the fallback"));
+}
+
+#[test]
 fn an_untimed_wait_until_inside_an_on_handler_is_uncompilable_in_v1() {
     let src = r#"test T
     let dut : Top
