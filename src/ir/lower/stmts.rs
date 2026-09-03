@@ -7269,7 +7269,7 @@ fn block_entry_guarantees_named_wait(block: &crate::ast::Block) -> bool {
         StmtKind::Wait { clock: Some(_), .. } => true,
         StmtKind::If(s) => literal_if_taken_block(s)
             .is_some_and(block_entry_guarantees_named_wait)
-            || simple_if_all_paths_guarantee_named_wait(s),
+            || if_all_paths_guarantee_named_wait(s),
         StmtKind::Repeat(s) if positive_int_literal(&s.count) => {
             block_entry_guarantees_named_wait(&s.body)
         }
@@ -7284,9 +7284,12 @@ fn block_entry_guarantees_named_wait(block: &crate::ast::Block) -> bool {
     }
 }
 
-fn simple_if_all_paths_guarantee_named_wait(stmt: &crate::ast::IfStmt) -> bool {
-    stmt.elsifs.is_empty()
-        && block_entry_guarantees_named_wait(&stmt.then_block)
+fn if_all_paths_guarantee_named_wait(stmt: &crate::ast::IfStmt) -> bool {
+    block_entry_guarantees_named_wait(&stmt.then_block)
+        && stmt
+            .elsifs
+            .iter()
+            .all(|(_, block)| block_entry_guarantees_named_wait(block))
         && stmt
             .else_block
             .as_ref()

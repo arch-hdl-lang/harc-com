@@ -10288,6 +10288,14 @@ former `transaction` group lives in
      A missing `else` or either open arm remains conservative. The inventory
      remains 115 textual matches (114 constructors plus the helper definition).
 
+228. **Exhaustive runtime-elsif paths to named-clock waits (2026-09-02).**
+
+     The all-path named-wait proof now covers `if`/`elsif` chains when the
+     `then`, every `elsif`, and the required `else` block each guarantee named
+     wait entry. Any open arm or missing `else` remains conservative. The
+     inventory remains 115 textual matches (114 constructors plus the helper
+     definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
