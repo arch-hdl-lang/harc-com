@@ -32955,12 +32955,43 @@ end test T"#;
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive elsif arm");
     assert!(v1.contains("else if (true)"), "{v1}");
-    assert!(v1.contains("while (clocks_[1].rising_count < _target)"), "{v1}");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
 
     let runtime_first = src.replace("            elsif false\n", "            elsif dut.rst == 1\n");
     assert_unsupported(
         &lower_src(&runtime_first).expect_err("an earlier runtime elsif keeps the fallback"),
     );
+}
+
+#[test]
+fn a_literal_true_while_reaches_named_clock_handler_wait() {
+    let src = r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on true
+            while (true)
+                wait 1 cycle on aux
+            end while
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("a literal-true while guarantees its first iteration"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively firing"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive while body");
+    assert!(v1.contains("while ((true))"), "{v1}");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
+
+    let runtime = src.replace("            while (true)\n", "            while dut.rst == 1\n");
+    assert_unsupported(&lower_src(&runtime).expect_err("a runtime while keeps the fallback"));
+    let never = src.replace("            while (true)\n", "            while false\n");
+    assert_unsupported(&lower_src(&never).expect_err("a false while keeps the fallback"));
 }
 
 #[test]

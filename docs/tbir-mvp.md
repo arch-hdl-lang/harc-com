@@ -10264,6 +10264,15 @@ former `transaction` group lives in
      The inventory remains 92 textual matches (91 constructors plus the helper
      definition).
 
+225. **Literal-true while paths to named-clock waits (2026-09-02).**
+
+     The guaranteed named-wait proof now enters a `while` body when its
+     condition is literal true, including parenthesized spellings. Runtime and
+     literal-false conditions remain conservative because they do not prove a
+     first iteration. Following the upstream common-object merge, the
+     inventory is 115 textual matches (114 constructors plus the helper
+     definition); this semantic refinement does not remove a constructor.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

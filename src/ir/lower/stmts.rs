@@ -7273,6 +7273,9 @@ fn block_entry_guarantees_named_wait(block: &crate::ast::Block) -> bool {
             block_entry_guarantees_named_wait(&s.body)
         }
         StmtKind::Loop(body) => block_entry_guarantees_named_wait(body),
+        StmtKind::While { cond, body, .. } if literal_bool_value(cond) == Some(true) => {
+            block_entry_guarantees_named_wait(body)
+        }
         _ => false,
     }
 }
