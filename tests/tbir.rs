@@ -32995,6 +32995,37 @@ end test T"#;
 }
 
 #[test]
+fn a_nonempty_literal_for_reaches_named_clock_handler_wait() {
+    let src = r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on true
+            for i in 0 .. 2
+                wait 1 cycle on aux
+            end for
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("a nonempty literal range guarantees its first iteration"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively firing"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive for body");
+    assert!(v1.contains("for (int64_t i = 0; i <= 2; i++)"), "{v1}");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
+
+    let empty = src.replace("for i in 0 .. 2", "for i in 2 .. 0");
+    assert_unsupported(&lower_src(&empty).expect_err("an empty range keeps the fallback"));
+    let runtime = src.replace("for i in 0 .. 2", "for i in 0 .. dut.count");
+    assert_unsupported(&lower_src(&runtime).expect_err("a runtime range keeps the fallback"));
+}
+
+#[test]
 fn an_untimed_wait_until_inside_an_on_handler_is_uncompilable_in_v1() {
     let src = r#"test T
     let dut : Top

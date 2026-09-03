@@ -10273,6 +10273,14 @@ former `transaction` group lives in
      inventory is 115 textual matches (114 constructors plus the helper
      definition); this semantic refinement does not remove a constructor.
 
+226. **Nonempty literal-for paths to named-clock waits (2026-09-02).**
+
+     The guaranteed named-wait proof now enters an inclusive literal-range
+     `for` body when its lower bound is no greater than its upper bound.
+     Empty, runtime, and non-range iterators remain conservative because they
+     do not prove a first iteration. The inventory remains 115 textual matches
+     (114 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

@@ -7276,6 +7276,9 @@ fn block_entry_guarantees_named_wait(block: &crate::ast::Block) -> bool {
         StmtKind::While { cond, body, .. } if literal_bool_value(cond) == Some(true) => {
             block_entry_guarantees_named_wait(body)
         }
+        StmtKind::For(s) if literal_range_non_empty(&s.iter) => {
+            block_entry_guarantees_named_wait(&s.body)
+        }
         _ => false,
     }
 }
@@ -7310,6 +7313,26 @@ fn positive_int_literal(expr: &AstExpr) -> bool {
         ExprKind::Paren(inner) => positive_int_literal(inner),
         _ => false,
     }
+}
+
+fn literal_range_non_empty(expr: &AstExpr) -> bool {
+    fn value(expr: &AstExpr) -> Option<u64> {
+        match &*expr.kind {
+            ExprKind::Int(s) => super::exprs::parse_int_literal_expr(expr)
+                .or_else(|| super::exprs::parse_sized_int_literal(s)),
+            ExprKind::Paren(inner) => value(inner),
+            _ => None,
+        }
+    }
+
+    let ExprKind::RangeLit {
+        lo: Some(lo),
+        hi: Some(hi),
+    } = &*expr.kind
+    else {
+        return false;
+    };
+    matches!((value(lo), value(hi)), (Some(lo), Some(hi)) if lo <= hi)
 }
 
 fn entry_has_false_positive_timed_wait(f: &crate::ir::TbFunction) -> bool {
