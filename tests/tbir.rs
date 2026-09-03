@@ -32927,6 +32927,43 @@ end test T"#;
 }
 
 #[test]
+fn a_literal_true_elsif_reaches_named_clock_handler_wait() {
+    let src = r#"test T
+    let dut : Top
+    clock clk = 10ns
+    clock aux = 4ns
+    run
+        on true
+            if false
+                log(info, "unreachable")
+            elsif false
+                log(info, "also unreachable")
+            elsif true
+                wait 1 cycle on aux
+            else
+                log(info, "not reached")
+            end if
+        end on
+        wait 2 cycles
+    end run
+end test T"#;
+    let msg = assert_not_implemented(
+        &lower_src(src).expect_err("the first literal-true elsif is guaranteed"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("recursively firing"), "got: {msg}");
+
+    let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive elsif arm");
+    assert!(v1.contains("else if (true)"), "{v1}");
+    assert!(v1.contains("while (clocks_[1].rising_count < _target)"), "{v1}");
+
+    let runtime_first = src.replace("            elsif false\n", "            elsif dut.rst == 1\n");
+    assert_unsupported(
+        &lower_src(&runtime_first).expect_err("an earlier runtime elsif keeps the fallback"),
+    );
+}
+
+#[test]
 fn an_untimed_wait_until_inside_an_on_handler_is_uncompilable_in_v1() {
     let src = r#"test T
     let dut : Top

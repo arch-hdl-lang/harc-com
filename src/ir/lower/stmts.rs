@@ -7267,25 +7267,28 @@ fn block_entry_guarantees_named_wait(block: &crate::ast::Block) -> bool {
     };
     match &first.kind {
         StmtKind::Wait { clock: Some(_), .. } => true,
-        StmtKind::If(s) if literal_bool_value(&s.cond) == Some(true) => {
-            block_entry_guarantees_named_wait(&s.then_block)
-        }
-        StmtKind::If(s)
-            if literal_bool_value(&s.cond) == Some(false)
-                && s.elsifs
-                    .iter()
-                    .all(|(cond, _)| literal_bool_value(cond) == Some(false)) =>
-        {
-            s.else_block
-                .as_ref()
-                .is_some_and(block_entry_guarantees_named_wait)
-        }
+        StmtKind::If(s) => literal_if_taken_block(s)
+            .is_some_and(block_entry_guarantees_named_wait),
         StmtKind::Repeat(s) if positive_int_literal(&s.count) => {
             block_entry_guarantees_named_wait(&s.body)
         }
         StmtKind::Loop(body) => block_entry_guarantees_named_wait(body),
         _ => false,
     }
+}
+
+fn literal_if_taken_block(stmt: &crate::ast::IfStmt) -> Option<&crate::ast::Block> {
+    match literal_bool_value(&stmt.cond)? {
+        true => return Some(&stmt.then_block),
+        false => {}
+    }
+    for (cond, block) in &stmt.elsifs {
+        match literal_bool_value(cond)? {
+            true => return Some(block),
+            false => {}
+        }
+    }
+    stmt.else_block.as_ref()
 }
 
 fn literal_bool_value(expr: &AstExpr) -> Option<bool> {
