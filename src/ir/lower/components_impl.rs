@@ -4591,26 +4591,24 @@ impl super::FuncBuilder<'_> {
     ) -> Result<crate::ir::QueueElem, LowerError> {
         let cid = match base {
             ComponentBase::SelfField => self.self_component.ok_or_else(|| {
-                unsupported(
-                    &format!("a self-relative queue `{queue}` outside a component body"),
-                    "",
-                )
+                LowerError::Invalid(format!(
+                    "internal error: self-relative queue `{queue}` outside a component body"
+                ))
             })?,
             ComponentBase::Path(path) => {
                 if path.first().map(String::as_str) == Some("self") {
                     let self_cid = self.self_component.ok_or_else(|| {
-                        unsupported(
-                            &format!("a self-relative queue `{queue}` outside a component body"),
-                            "",
-                        )
+                        LowerError::Invalid(format!(
+                            "internal error: self-relative queue `{queue}` outside a component body"
+                        ))
                     })?;
                     self.resolve_component_recv(self_cid, &path[1..])?
                 } else {
                     let head_cid = *self.ctx.component_fields.get(&path[0]).ok_or_else(|| {
-                        unsupported(
-                            &format!("`{}` is not a component-typed test field", path[0]),
-                            "",
-                        )
+                        LowerError::Invalid(format!(
+                            "internal error: component queue root `{}` is not a component-typed test field",
+                            path[0]
+                        ))
                     })?;
                     self.resolve_component_recv(head_cid, &path[1..])?
                 }
@@ -4618,19 +4616,18 @@ impl super::FuncBuilder<'_> {
             // A component-typed method-param local never owns a queue
             // field access (only method dispatch reaches a `Local` base).
             ComponentBase::Local(_) => {
-                return Err(unsupported(
-                    &format!("a queue `{queue}` on a component-typed parameter"),
-                    "",
-                ));
+                return Err(LowerError::Invalid(format!(
+                    "internal error: queue `{queue}` resolved on a component-typed parameter"
+                )));
             }
         };
         let comp = &self.ctx.components[cid.index()];
         match comp.field(queue).map(|f| &f.kind) {
             Some(ComponentFieldKind::Queue { elem }) => Ok(elem.clone()),
-            _ => Err(unsupported(
-                &format!("`{queue}` is not a queue field of `{}`", comp.name),
-                "",
-            )),
+            _ => Err(LowerError::Invalid(format!(
+                "internal error: `{queue}` resolved as a queue but is not a queue field of `{}`",
+                comp.name
+            ))),
         }
     }
 
