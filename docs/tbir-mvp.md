@@ -10417,6 +10417,14 @@ former `transaction` group lives in
      record dependency ordering. The raw textual `unsupported(` inventory
      remains at 104 matches.
 
+242. **Common-layout sequences of fixed vectors (2026-09-04).**
+
+     Split-layout validation now admits `TSeq<Vec<T, N>>` locals when the
+     fixed-vector leaves are supported scalar or declared-record values. The
+     existing `std::vector<std::array<...>>` ABI is shared with monolithic
+     emission. This removes a code-generation-only gate; the raw lowering
+     inventory remains at 104 textual matches.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
