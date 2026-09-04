@@ -3258,7 +3258,12 @@ fn resolve_sub_path(
             }
         }
     }
-    cid.ok_or_else(|| unsupported("an empty `connect` sub-component path", ""))
+    cid.ok_or_else(|| {
+        // Callers retain an owning component or reject a missing testbench
+        // prefix before entering this walker. An empty slice is therefore a
+        // resolver invariant, not a source construct supported by v1.
+        LowerError::Invalid("internal error: empty `connect` sub-component path".to_string())
+    })
 }
 
 /// Flatten `a.b.c` (Field nodes over an Ident root) into a dotted path,
@@ -6223,6 +6228,28 @@ mod tests {
         let err = resolve_testbench_path(&roots, &[], &[]).unwrap_err();
         assert!(
             matches!(err, LowerError::Invalid(ref msg) if msg.contains("empty testbench `connect` component path")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn empty_subcomponent_connect_path_is_an_internal_invariant() {
+        let owner = ComponentSchema {
+            name: "Owner".to_string(),
+            kind: crate::ir::ComponentKindTag::Env,
+            instance_mode_policy: crate::ir::ComponentInstanceModePolicy::Standard,
+            fields: Vec::new(),
+            methods: Vec::new(),
+            connects: Vec::new(),
+            on_handlers: Vec::new(),
+            periodic_handlers: Vec::new(),
+            cycle_handlers: Vec::new(),
+            watchdog: None,
+            bound_bus: None,
+        };
+        let err = resolve_sub_path(&owner, std::slice::from_ref(&owner), &[]).unwrap_err();
+        assert!(
+            matches!(err, LowerError::Invalid(ref msg) if msg.contains("empty `connect` sub-component path")),
             "{err:?}"
         );
     }
