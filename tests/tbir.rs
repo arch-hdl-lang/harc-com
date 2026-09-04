@@ -41021,10 +41021,11 @@ end impl MTest"#;
         assert!(msg.contains("return type must be `TSeq<T>`"), "`-> {ret}`: {msg}");
     }
 
-    // A parser-valid TSeq aggregate that the current element decoder cannot
-    // represent is still a backend subset boundary, not malformed source.
-    let record_vec = SRC.replace(DECL, "tseq Gen(n: int) -> TSeq<Vec<Req, 2>>");
-    let msg = assert_unsupported(&lower_src(&record_vec).unwrap_err());
+    // A parser-valid TSeq container element that the value-sequence model
+    // cannot represent is still a backend subset boundary, not malformed
+    // source. Record-leaf fixed vectors are supported separately below.
+    let queue_elem = SRC.replace(DECL, "tseq Gen(n: int) -> TSeq<queue<uint<8>>>");
+    let msg = assert_unsupported(&lower_src(&queue_elem).unwrap_err());
     assert!(msg.contains("element type"), "{msg}");
 
     // The two remaining builtin scalar spellings use v1's uint64_t
@@ -41145,6 +41146,43 @@ end impl FixedVectorTseqTest"#;
     wrong_loop_elem.functions[caller].locals[loop_elem.index()].ty = ir::IrType::UInt(Some(8));
     verify::verify_program(&wrong_loop_elem)
         .expect_err("sequence index element must agree with the loop local");
+
+    let record_leaf = r#"transaction Beat
+    value : uint<8> default 0
+end transaction Beat
+
+struct Row
+    data : Vec<Beat, 2>
+end struct Row
+
+tseq Rows() -> TSeq<Vec<Beat, 2>>
+    let row : Row
+    let beat : Beat
+    row.data[0] = beat
+    row.data[1] = beat
+    yield row.data
+end tseq Rows
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl RecordVectorTseqTest for Tb
+    run
+        let rows = Rows()
+        for row in rows
+            wait 0 cycles
+        end for
+        wait 1 cycle
+    end run
+end impl RecordVectorTseqTest"#;
+    let prog = lower_src(record_leaf).expect("record-leaf fixed-vector tseq lowers");
+    verify::verify_program(&prog).expect("record-leaf fixed-vector tseq verifies");
+    let cpp = emit_cpp_src(record_leaf);
+    assert!(
+        cpp.contains("std::vector<std::array<Beat, 2>>"),
+        "record identity must survive the tseq aggregate carrier:\n{cpp}"
+    );
 }
 
 /// The record-element twin of the scalar-element yield check above: a

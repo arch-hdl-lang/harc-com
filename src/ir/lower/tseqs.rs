@@ -77,12 +77,17 @@ fn tseq_element_name(decl: &TseqDecl) -> Option<String> {
 /// The value element `IrType` of a `tseq`'s `-> TSeq<T>` return when the
 /// inner type is a primitive scalar or scalar-leaf fixed vector. `None` for a named
 /// record element or a non-`TSeq` return.
-fn tseq_scalar_element(decl: &TseqDecl) -> Option<IrType> {
+fn tseq_scalar_element(
+    decl: &TseqDecl,
+    record_ids: &HashMap<String, RecordId>,
+) -> Option<IrType> {
     let args = tseq_args(decl)?;
     let TypeArg::Type(inner) = args.first()? else {
         return None;
     };
-    if let Some(fixed) = super::components::fixed_vec_elem_ir_type(inner) {
+    if let Some(fixed) =
+        super::components::fixed_vec_ir_type_with_records(inner, record_ids)
+    {
         return Some(fixed);
     }
     if let TypeExpr::Builtin { name, .. } = inner {
@@ -160,7 +165,7 @@ pub(crate) fn collect_tseq_records(
                 "String sequence elements and nested String containers are not supported",
             ));
         }
-        let elem = if let Some(scalar) = tseq_scalar_element(decl) {
+        let elem = if let Some(scalar) = tseq_scalar_element(decl, record_ids) {
             TseqElem::Scalar(scalar)
         } else if let Some(name) = tseq_element_name(decl) {
             let Some(&rid) = record_ids.get(&name) else {
