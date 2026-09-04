@@ -10296,6 +10296,15 @@ former `transaction` group lives in
      inventory remains 115 textual matches (114 constructors plus the helper
      definition).
 
+229. **Inert passive bound-driver instances (2026-09-03).**
+
+     A passive instance of a bound event-driven transactor that declares only
+     an active driver is now accepted as an inert typed binding. The passive
+     mode registers neither the active request consumer nor any absent monitor
+     or target half, matching v1's no-op behavior. This removes one dedicated
+     fallback and leaves 114 textual `unsupported(` matches (113 constructors
+     plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

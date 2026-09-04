@@ -2304,14 +2304,14 @@ fn bound_monitor_handshake_handlers_lower_passive() {
 }
 
 /// A `passive` bound instance of a PURE-DRIVER transactor (no monitor
-/// half) is inert and must be rejected precisely (the driver lives under
-/// `when active`; a passive instance would observe nothing).
+/// half) is a valid inert binding. The driver lives under `when active`,
+/// so neither backend registers its request consumer for this instance.
 #[test]
-fn passive_bound_instance_without_monitor_rejected() {
+fn passive_bound_instance_without_monitor_is_inert() {
     let prog = lower_with_stdlib_bus("transactor_active_test.harc", "BusAxiLite.arch");
     // transactor_active_test binds `active`, so it lowers — sanity that
-    // the fixture itself is fine; the rejection is exercised by the unit
-    // source below (active fixture mutated to passive).
+    // the fixture itself is fine; the inert case is exercised by the unit
+    // source below.
     assert!(prog.is_ok());
     let src = r#"bus B
     handshake_channel ch: send kind: valid_ready
@@ -2333,13 +2333,15 @@ test T
     let b : B = bind dut
     let drv : Drv passive = bind b
     run
+        wait 1 cycle
     end run
 end test T"#;
-    let err = lower_src(src).expect_err("passive pure-driver must be rejected");
-    let msg = format!("{err}");
+    let prog = lower_src(src).expect("passive pure-driver binding lowers as inert");
+    verify::verify_program(&prog).expect("inert passive binding verifies");
+    let cpp = emit_cpp_src(src);
     assert!(
-        msg.contains("passive") && msg.contains("no monitor half"),
-        "rejection should name the inert passive-no-monitor case: {msg}"
+        !cpp.contains("drv.req.push_back"),
+        "passive instance must not register the active request consumer:\n{cpp}"
     );
 }
 
