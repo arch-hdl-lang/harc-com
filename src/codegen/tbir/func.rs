@@ -5396,12 +5396,11 @@ fn declare_locals_except(
                 );
                 writeln!(out, "{pad}{cty} {n}{{}}; (void){n};").ok();
             }
-            // A scalar-element transaction-sequence local —
-            // `std::vector<T>` over the scalar C++ type. v1's tseq scalar
-            // accumulator / call-result shape.
-            IrType::Seq(scalar) => {
-                let cty = super::field_scalar_cty(scalar);
-                writeln!(out, "{pad}std::vector<{cty}> {n}{{}}; (void){n};").ok();
+            // A value-element transaction-sequence local. The shared callable
+            // renderer preserves fixed-vector record leaves recursively.
+            IrType::Seq(_) => {
+                let cty = callable_value_cty(prog, ty)?;
+                writeln!(out, "{pad}{cty} {n}{{}}; (void){n};").ok();
             }
             IrType::Component(c) => {
                 let component = prog.components.get(c.index()).ok_or_else(|| {
@@ -5481,13 +5480,7 @@ pub(super) fn declare_method_slot(
 ) -> Result<(), EmitError> {
     let func = prog.function(m.function);
     let ret_ty = match func.ret.and_then(|ret| func.locals.get(ret.index())) {
-        Some(local) => match &local.ty {
-            IrType::Record(r) => prog.records[r.index()].name.clone(),
-            IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
-            IrType::Seq(scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
-            ty @ IrType::FixedVec { .. } => super::aggregate_value_cty(ty, &prog.records),
-            ty => super::local_scalar_cty(ty).to_string(),
-        },
+        Some(local) => callable_value_cty(prog, &local.ty)?,
         None => "void".to_string(),
     };
     let mut param_tys: Vec<String> = Vec::new();
@@ -5500,13 +5493,11 @@ pub(super) fn declare_method_slot(
             super::runtime::unbound_state_struct_ref(prog, transactor)
         ));
     }
-    param_tys.extend((0..func.params.len()).map(|i| match func.locals[i].ty {
-        IrType::Record(r) => prog.records[r.index()].name.clone(),
-        IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
-        IrType::Seq(ref scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
-        ref ty @ IrType::FixedVec { .. } => super::aggregate_value_cty(ty, &prog.records),
-        ref ty => super::local_scalar_cty(ty).to_string(),
-    }));
+    param_tys.extend(
+        (0..func.params.len())
+            .map(|i| callable_value_cty(prog, &func.locals[i].ty))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     let params = param_tys.join(", ");
     let pad = INDENT.repeat(depth);
     writeln!(
@@ -5584,13 +5575,7 @@ pub(super) fn emit_method(
     let pad3 = INDENT.repeat(depth + 3);
 
     let ret_ty = match func.ret.and_then(|ret| func.locals.get(ret.index())) {
-        Some(local) => match &local.ty {
-            IrType::Record(r) => prog.records[r.index()].name.clone(),
-            IrType::RecordSeq(r) => format!("std::vector<{}>", prog.records[r.index()].name),
-            IrType::Seq(scalar) => format!("std::vector<{}>", super::field_scalar_cty(scalar)),
-            ty @ IrType::FixedVec { .. } => super::aggregate_value_cty(ty, &prog.records),
-            ty => super::local_scalar_cty(ty).to_string(),
-        },
+        Some(local) => callable_value_cty(prog, &local.ty)?,
         None => "void".to_string(),
     };
     // A record-typed param (`send(t: RegOp)`) is taken by value as the
@@ -5609,19 +5594,13 @@ pub(super) fn emit_method(
         names[..nparams]
             .iter()
             .enumerate()
-            .map(|(i, n)| match func.locals[i].ty {
-                IrType::Record(r) => format!("{} {n}", prog.records[r.index()].name),
-                IrType::RecordSeq(r) => {
-                    format!("std::vector<{}> {n}", prog.records[r.index()].name)
-                }
-                IrType::Seq(ref scalar) => {
-                    format!("std::vector<{}> {n}", super::field_scalar_cty(scalar))
-                }
-                ref ty @ IrType::FixedVec { .. } => {
-                    format!("{} {n}", super::aggregate_value_cty(ty, &prog.records))
-                }
-                ref ty => format!("{} {n}", super::local_scalar_cty(ty)),
-            }),
+            .map(|(i, n)| {
+                Ok(format!(
+                    "{} {n}",
+                    callable_value_cty(prog, &func.locals[i].ty)?
+                ))
+            })
+            .collect::<Result<Vec<_>, EmitError>>()?,
     );
     let params = param_list.join(", ");
     writeln!(

@@ -428,7 +428,7 @@ fn cover_scalar_type(ty: &IrType) -> bool {
 fn helper_abi_type_valid(ty: &IrType, record_count: usize) -> bool {
     match ty {
         IrType::RecordSeq(record) => record.index() < record_count,
-        IrType::Seq(elem) => sequence_elem_valid(elem),
+        IrType::Seq(elem) => sequence_elem_valid(elem, record_count),
         IrType::FixedVec { elem, .. } => helper_fixed_vec_elem_valid(elem, record_count),
         IrType::String => true,
         other => cover_scalar_type(other),
@@ -436,12 +436,21 @@ fn helper_abi_type_valid(ty: &IrType, record_count: usize) -> bool {
 }
 
 /// Element types admitted by the typed `Seq` ABI. Fixed-vector sequence
-/// elements intentionally use the scalar-leaf decoder; record-leaf vectors
-/// require record-aware C++ rendering that this sequence ABI does not expose.
-fn sequence_elem_valid(ty: &IrType) -> bool {
+/// elements retain scalar or declared-record leaves through the shared
+/// recursive aggregate carrier.
+fn sequence_elem_valid(ty: &IrType, record_count: usize) -> bool {
     match ty {
-        IrType::FixedVec { .. } => fixed_vec_elem_valid(ty),
+        IrType::FixedVec { .. } => helper_fixed_vec_elem_valid(ty, record_count),
         scalar => matches!(scalar, IrType::UInt(_) | IrType::SInt(_) | IrType::Bool),
+    }
+}
+
+fn callable_aggregate_type_valid(ty: &IrType, record_count: usize) -> bool {
+    match ty {
+        IrType::RecordSeq(record) => record.index() < record_count,
+        IrType::Seq(elem) => sequence_elem_valid(elem, record_count),
+        IrType::FixedVec { .. } => component_fixed_vec_elem_valid(ty, record_count),
+        _ => true,
     }
 }
 
@@ -1080,6 +1089,14 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                         ),
                     });
                 }
+                if !callable_aggregate_type_valid(ty, prog.records.len()) {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "testbench type tbt{type_index} method `{}` parameter {index} has invalid aggregate schema {ty:?}",
+                            method.name
+                        ),
+                    });
+                }
                 if method
                     .module_param_types
                     .get(index)
@@ -1103,6 +1120,18 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     what: format!(
                         "testbench type tbt{type_index} method `{}` return metadata does not match fn{}",
                         method.name, method.function.0
+                    ),
+                });
+            }
+            if method
+                .ret_ty
+                .as_ref()
+                .is_some_and(|ty| !callable_aggregate_type_valid(ty, prog.records.len()))
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "testbench type tbt{type_index} method `{}` has invalid aggregate return schema {:?}",
+                        method.name, method.ret_ty
                     ),
                 });
             }
@@ -1450,7 +1479,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     IrType::FixedVec { .. } => {
                         !component_fixed_vec_elem_valid(ty, prog.records.len())
                     }
-                    IrType::Seq(elem) => !sequence_elem_valid(elem),
+                    IrType::Seq(elem) => !sequence_elem_valid(elem, prog.records.len()),
                     _ => false,
                 };
                 if invalid_aggregate {
@@ -1546,7 +1575,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     }
                 }
                 if let Some(IrType::Seq(elem)) = &method.ret_ty {
-                    if !sequence_elem_valid(elem) {
+                    if !sequence_elem_valid(elem, prog.records.len()) {
                         errs.push(VerifyError::BadProgramRef {
                             what: format!(
                                 "component c{ci} `{}` method `{}` has invalid sequence return schema {:?}",
@@ -1962,12 +1991,10 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
         }
         for (member, method) in x.methods.iter().enumerate() {
             for (index, ty) in method.param_tys.iter().enumerate() {
-                if matches!(ty, IrType::FixedVec { .. })
-                    && !component_fixed_vec_elem_valid(ty, prog.records.len())
-                {
+                if !callable_aggregate_type_valid(ty, prog.records.len()) {
                     errs.push(VerifyError::BadProgramRef {
                         what: format!(
-                            "transactor x{xi} method `{}` parameter {index} has invalid fixed-vector schema {ty:?}",
+                            "transactor x{xi} method `{}` parameter {index} has invalid aggregate schema {ty:?}",
                             method.name
                         ),
                     });
@@ -2059,15 +2086,17 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     ),
                 });
             }
-            if let Some(ty @ IrType::FixedVec { .. }) = &method.ret_ty {
-                if !component_fixed_vec_elem_valid(ty, prog.records.len()) {
-                    errs.push(VerifyError::BadProgramRef {
-                        what: format!(
-                            "transactor x{xi} method `{}` has invalid fixed-vector return type {ty:?}",
-                            method.name
-                        ),
-                    });
-                }
+            if method
+                .ret_ty
+                .as_ref()
+                .is_some_and(|ty| !callable_aggregate_type_valid(ty, prog.records.len()))
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "transactor x{xi} method `{}` has invalid aggregate return type {:?}",
+                        method.name, method.ret_ty
+                    ),
+                });
             }
         }
         for (target_member, method) in x.target_methods.iter().enumerate() {
@@ -2122,6 +2151,28 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     what: format!(
                         "transactor x{xi} target method `{}` ABI schema disagrees with fn{}",
                         method.name, method.function.0
+                    ),
+                });
+            }
+            for (index, ty) in method.param_tys.iter().enumerate() {
+                if !callable_aggregate_type_valid(ty, prog.records.len()) {
+                    errs.push(VerifyError::BadProgramRef {
+                        what: format!(
+                            "transactor x{xi} target method `{}` parameter {index} has invalid aggregate schema {ty:?}",
+                            method.name
+                        ),
+                    });
+                }
+            }
+            if method
+                .ret_ty
+                .as_ref()
+                .is_some_and(|ty| !callable_aggregate_type_valid(ty, prog.records.len()))
+            {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "transactor x{xi} target method `{}` has invalid aggregate return schema {:?}",
+                        method.name, method.ret_ty
                     ),
                 });
             }
