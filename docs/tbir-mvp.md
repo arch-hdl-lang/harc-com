@@ -10332,6 +10332,15 @@ former `transaction` group lives in
      leaves 111 textual `unsupported(` matches (110 constructors plus the
      helper definition).
 
+233. **Empty nested-connect resolver paths are internal errors (2026-09-03).**
+
+     The nested component walker is likewise entered only after a nonempty
+     receiver prefix has been established. Its empty-path backstop now reports
+     `Invalid` as an internal resolver invariant, with a direct unit test,
+     rather than suggesting the retiring backend. This removes one constructor
+     and leaves 110 textual `unsupported(` matches (109 constructors plus the
+     helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
