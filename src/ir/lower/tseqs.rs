@@ -193,6 +193,12 @@ pub(crate) fn collect_tseq_records(
                 ));
             };
             TseqElem::Record(rid)
+        } else if tseq_args(decl).is_some_and(|args| args.is_empty()) {
+            // A bare `-> TSeq` is distinct from having no return annotation.
+            // v1's return renderer falls back to `int64_t` for this spelling,
+            // so preserve that working legacy default instead of sending the
+            // user to the backend being retired.
+            TseqElem::Scalar(IrType::SInt(Some(64)))
         } else if decl.return_ty.is_none() {
             // No `-> TSeq<T>` at all: default the element to a signed
             // 64-bit scalar, which is exactly what v1 does — it emits
