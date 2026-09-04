@@ -10341,6 +10341,16 @@ former `transaction` group lives in
      and leaves 110 textual `unsupported(` matches (109 constructors plus the
      helper definition).
 
+234. **Component-queue metadata mismatches are internal errors (2026-09-03).**
+
+     Queue value lowering resolves the receiver and verifies the field kind
+     before asking for its element schema. The five defensive failures inside
+     that final metadata lookup—missing self context, missing test root,
+     parameter receiver, and non-queue field—now report `Invalid` internal
+     invariants instead of advertising v1. This removes five constructors and
+     leaves 105 textual `unsupported(` matches (104 constructors plus the
+     helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
