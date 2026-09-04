@@ -10387,6 +10387,15 @@ former `transaction` group lives in
      The shared residual aggregate-element diagnostic remains in place, so the
      raw inventory is unchanged at 105 textual matches.
 
+239. **Duplicate synthetic test scopes are malformed IR (2026-09-04).**
+
+     The parser rejects legacy `scope` syntax at the first token, while the
+     canonical inline lifecycle path synthesizes at most one `TestItem::Scope`.
+     The lowering guard for a second synthetic scope now classifies that
+     malformed/internal AST state as `Invalid` instead of advertising the
+     retiring v1 backend. This removes one constructor and leaves 104 textual
+     `unsupported(` matches in `src/ir/lower`.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
