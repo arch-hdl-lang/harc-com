@@ -10369,6 +10369,15 @@ former `transaction` group lives in
      C++ emission. The residual element diagnostic also covers other shapes,
      so the raw inventory remains 105 textual matches.
 
+237. **Record-vector tseq callable ABIs (2026-09-03).**
+
+     The shared `TSeq<T>` callable decoder now uses the same record-aware
+     fixed-vector schema as generator collection. Pure and inlined helpers,
+     reusable testbench methods, component methods, transactor methods, typed
+     locals, and call slots can therefore carry `TSeq<Vec<Record, N>>` without
+     erasing record identity. The generic unsupported callable constructor
+     remains for other element shapes, so the raw inventory is unchanged.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

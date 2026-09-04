@@ -100,6 +100,30 @@ fn emit_cpp_src(src: &str) -> String {
     tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits")
 }
 
+fn assert_cpp_typechecks(name: &str, cpp: &str) {
+    let dir = std::env::temp_dir().join(format!("harc_tbir_{name}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create C++ compile directory");
+    let path = dir.join("emitted.cpp");
+    std::fs::write(&path, cpp).expect("write emitted C++");
+    let output = std::process::Command::new("c++")
+        .args(["-std=gnu++20", "-fcoroutines", "-fsyntax-only"])
+        .arg("-I")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime"))
+        .arg("-I")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vstub"))
+        .arg(&path)
+        .output()
+        .expect("spawn C++ compiler");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "emitted C++ must typecheck\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn v1_user_symbol(cpp: &str, kind: &str, source_name: &str) -> String {
     let prefix = format!("harc_user_{kind}_{source_name}_");
     cpp.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
@@ -24445,7 +24469,7 @@ fn uninitialized_tseq_locals_start_as_typed_empty_sequences() {
         "fixed-vector sequences retain their aggregate element carrier"
     );
 
-    for bad in ["Missing", "Vec<Beat, 2>"] {
+    for bad in ["Missing"] {
         let malformed = src.replace("TSeq<uint<8>>", &format!("TSeq<{bad}>"));
         let error = match lower_src(&malformed) {
             Err(error) => error,
@@ -24733,13 +24757,13 @@ end impl FixedVectorTseqSignatureTest"#;
 
     let mut record_leaf = prog.clone();
     let bad = ir::IrType::Seq(Box::new(ir::IrType::FixedVec {
-        elem: Box::new(ir::IrType::Record(ir::RecordId(0))),
+        elem: Box::new(ir::IrType::Record(ir::RecordId(999))),
         len: 2,
     }));
     record_leaf.functions[helper_id].params[0].ty = bad.clone();
     record_leaf.functions[helper_id].locals[0].ty = bad;
     let errors = verify::verify_program(&record_leaf)
-        .expect_err("a valid record ID still cannot enter the scalar-leaf sequence ABI");
+        .expect_err("a record-vector sequence ABI requires a valid record ID");
     assert!(errors.iter().any(|error| error
         .to_string()
         .contains("param 0 must use the scalar, fixed-vector, or TSeq helper ABI")));
@@ -24818,13 +24842,13 @@ end impl FixedVectorTseqSignatureTest"#;
 }
 
 #[test]
-fn record_leaf_fixed_vector_tseq_callable_signatures_keep_the_unsupported_fence() {
+fn record_leaf_fixed_vector_tseq_callable_signatures_lower() {
     let pure = r#"transaction Beat
     value : uint<8> default 0
 end transaction Beat
 
-function bad(items: TSeq<Vec<Beat, 2>>) -> uint<8>
-    return 0
+function bad(items: TSeq<Vec<Beat, 2>>) -> TSeq<Vec<Beat, 2>>
+    return items
 end function bad
 
 testbench Tb
@@ -24833,11 +24857,23 @@ end testbench Tb
 
 impl PureRecordLeafTseq for Tb
     run
+        let items : TSeq<Vec<Beat, 2>>
+        let echoed = bad(items)
+        for pair in echoed
+            wait 0 cycles
+        end for
         wait 1 cycle
     end run
 end impl PureRecordLeafTseq"#;
-    let msg = assert_unsupported(&lower_src(pure).expect_err("pure helper ABI must reject it"));
-    assert!(msg.contains("parameter `items` of helper `bad`"), "{msg}");
+    let prog = lower_src(pure).expect("pure helper record-vector sequence ABI lowers");
+    verify::verify_program(&prog).expect("pure helper record-vector sequence ABI verifies");
+    let pure_cpp = emit_cpp_src(pure);
+    assert!(
+        pure_cpp.contains("std::vector<std::array<Beat, 2>> items{};")
+            && pure_cpp.contains("std::vector<std::array<Beat, 2>> echoed{};"),
+        "callable ABI preserves record-vector locals:\n{pure_cpp}"
+    );
+    assert_cpp_typechecks("record_vector_tseq_pure", &pure_cpp);
 
     let inlined = r#"transaction Beat
     value : uint<8> default 0
@@ -24857,9 +24893,9 @@ impl InlinedRecordLeafTseq for Tb
         wait 1 cycle
     end run
 end impl InlinedRecordLeafTseq"#;
-    let msg =
-        assert_unsupported(&lower_src(inlined).expect_err("inlined helper ABI must reject it"));
-    assert!(msg.contains("parameter `items` of helper `bad`"), "{msg}");
+    let inlined = inlined.replace("        let ignored = bad(dut, 0)\n", "");
+    let prog = lower_src(&inlined).expect("inlined helper record-vector sequence ABI lowers");
+    verify::verify_program(&prog).expect("inlined helper record-vector sequence ABI verifies");
 
     let testbench_method = r#"transaction Beat
     value : uint<8> default 0
@@ -24879,13 +24915,24 @@ impl TestbenchMethodRecordLeafTseq for Tb
         wait 1 cycle
     end run
 end impl TestbenchMethodRecordLeafTseq"#;
-    let msg = assert_unsupported(
-        &lower_src(testbench_method).expect_err("testbench method ABI must reject it"),
-    );
-    assert!(
-        msg.contains("parameter `items` of testbench method `bad`"),
-        "{msg}"
-    );
+    let testbench_method = testbench_method.replace("        let ignored = bad(0)\n", "");
+    let prog = lower_src(&testbench_method)
+        .expect("testbench method record-vector sequence ABI lowers");
+    verify::verify_program(&prog).expect("testbench method record-vector sequence ABI verifies");
+    let mut bad_tb = prog.clone();
+    let function = bad_tb.testbench_types[0].methods[0].function;
+    let bad = ir::IrType::Seq(Box::new(ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::Record(ir::RecordId(999))),
+        len: 2,
+    }));
+    bad_tb.testbench_types[0].methods[0].param_tys[0] = bad.clone();
+    bad_tb.functions[function.index()].params[0].ty = bad.clone();
+    bad_tb.functions[function.index()].locals[0].ty = bad;
+    let errors = verify::verify_program(&bad_tb)
+        .expect_err("testbench callable rejects an unknown record-vector leaf");
+    assert!(errors.iter().any(|error| error
+        .to_string()
+        .contains("invalid aggregate schema")));
 
     let component_method = r#"transaction Beat
     value : uint<8> default 0
@@ -24907,13 +24954,77 @@ impl ComponentMethodRecordLeafTseq for Tb
         wait 1 cycle
     end run
 end impl ComponentMethodRecordLeafTseq"#;
-    let msg = assert_unsupported(
-        &lower_src(component_method).expect_err("component method ABI must reject it"),
-    );
+    let prog = lower_src(component_method)
+        .expect("component method record-vector sequence ABI lowers");
+    verify::verify_program(&prog).expect("component method record-vector sequence ABI verifies");
+
+    let transactor_method = r#"transaction Beat
+    value : uint<8> default 0
+end transaction Beat
+
+transactor Relay
+    dut : Top
+    when active
+        hookable bad(items: TSeq<Vec<Beat, 2>>) -> TSeq<Vec<Beat, 2>>
+            return items
+        end bad
+    end when
+end transactor Relay
+
+testbench Tb
+    dut : Top
+    relay : Relay active
+end testbench Tb
+
+impl TransactorRecordLeafTseq for Tb
+    run
+        let items : TSeq<Vec<Beat, 2>>
+        let echoed = relay.bad(items)
+        for pair in echoed
+            wait 0 cycles
+        end for
+        wait 1 cycle
+    end run
+end impl TransactorRecordLeafTseq"#;
+    let prog = lower_src(transactor_method)
+        .expect("transactor method record-vector sequence ABI lowers");
+    verify::verify_program(&prog).expect("transactor method record-vector sequence ABI verifies");
+    let transactor_cpp = emit_cpp_src(transactor_method);
     assert!(
-        msg.contains("parameter `items` of component method `Relay.bad`"),
-        "{msg}"
+        transactor_cpp.matches("std::vector<std::array<Beat, 2>>").count() >= 4,
+        "transactor method slot, definition, argument, and result preserve record identity:\n{transactor_cpp}"
     );
+    assert_cpp_typechecks("record_vector_tseq_transactor", &transactor_cpp);
+    let mut bad_transactor = prog.clone();
+    let function = bad_transactor.transactors[0].methods[0].function;
+    let bad = ir::IrType::Seq(Box::new(ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::Record(ir::RecordId(999))),
+        len: 2,
+    }));
+    bad_transactor.transactors[0].methods[0].param_tys[0] = bad.clone();
+    bad_transactor.functions[function.index()].params[0].ty = bad.clone();
+    bad_transactor.functions[function.index()].locals[0].ty = bad;
+    let errors = verify::verify_program(&bad_transactor)
+        .expect_err("transactor callable rejects an unknown record-vector leaf");
+    assert!(errors.iter().any(|error| error
+        .to_string()
+        .contains("invalid aggregate schema")));
+
+    let mut bad_target = lower_src(&fixture("tlm_target_thread_test.harc"))
+        .expect("target-method mutation control lowers");
+    let function = bad_target.transactors[0].target_methods[0].function;
+    let bad = ir::IrType::Seq(Box::new(ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::Record(ir::RecordId(999))),
+        len: 2,
+    }));
+    bad_target.transactors[0].target_methods[0].param_tys[0] = bad.clone();
+    bad_target.functions[function.index()].params[0].ty = bad.clone();
+    bad_target.functions[function.index()].locals[0].ty = bad;
+    let errors = verify::verify_program(&bad_target)
+        .expect_err("target callable rejects an unknown record-vector leaf");
+    assert!(errors.iter().any(|error| error
+        .to_string()
+        .contains("invalid aggregate schema")));
 }
 
 #[test]

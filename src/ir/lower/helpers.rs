@@ -1097,8 +1097,9 @@ pub(crate) fn ir_type_of(ty: Option<&TypeExpr>) -> IrType {
 }
 
 /// `TSeq<T>` as an `IrType` — `RecordSeq(r)` for a declared record
-/// element, `Seq(scalar)` for a scalar one, `Unknown` for an element
-/// this compiler cannot name. `None` when `ty` is not a `TSeq` at all.
+/// element, `Seq(value)` for a scalar or fixed-vector value (including
+/// declared-record leaves), and `Unknown` for an element this compiler cannot
+/// name. `None` when `ty` is not a `TSeq` at all.
 ///
 /// Shared by the component-method schema (which types the sequence a
 /// `hookable`/`function` parameter or return declares) and by the slot
@@ -1133,7 +1134,8 @@ pub(crate) fn tseq_ir_type(
         if let ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool) = ir_type_of(Some(inner)) {
             return Some(IrType::Seq(Box::new(ty)));
         }
-        if let Some(ty @ IrType::FixedVec { .. }) = super::components::fixed_vec_elem_ir_type(inner)
+        if let Some(ty @ IrType::FixedVec { .. }) =
+            super::components::fixed_vec_ir_type_with_records(inner, record_ids)
         {
             return Some(IrType::Seq(Box::new(ty)));
         }
@@ -1153,7 +1155,7 @@ pub(crate) fn callable_tseq_ir_type(
     match tseq_ir_type(ty, record_ids) {
         Some(IrType::Unknown) => Err(unsupported(
             &construct(),
-            "callable TSeq values support records, scalars, and scalar-leaf fixed vectors",
+            "callable TSeq values support records, scalars, and fixed vectors with scalar or declared-record leaves",
         )),
         other => Ok(other),
     }
