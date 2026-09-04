@@ -10378,6 +10378,15 @@ former `transaction` group lives in
      erasing record identity. The generic unsupported callable constructor
      remains for other element shapes, so the raw inventory is unchanged.
 
+238. **Bare `TSeq` generator returns (2026-09-03).**
+
+     A generator declared with `-> TSeq` and no element argument now uses an
+     explicit signed 64-bit element in TBIR, matching v1's working
+     `std::vector<int64_t>` fallback and the behavior of omitting the return
+     annotation entirely.
+     The shared residual aggregate-element diagnostic remains in place, so the
+     raw inventory is unchanged at 105 textual matches.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

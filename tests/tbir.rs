@@ -41154,6 +41154,25 @@ end impl MTest"#;
         );
     }
 
+    // A bare TSeq annotation takes v1's signed int64_t element fallback,
+    // just like omitting the whole return annotation.
+    let bare = SRC
+        .replace(DECL, "tseq Gen(n: int) -> TSeq")
+        .replace(
+            "        let t : Req\n        t.a = i\n        yield t\n",
+            "        yield i\n",
+        );
+    let bare_cpp = emit_cpp_src(&bare);
+    assert!(
+        bare_cpp.contains("-> std::vector<int64_t>"),
+        "TBIR must retain v1's bare-TSeq fallback:\n{bare_cpp}"
+    );
+    let bare_v1 = cpp_tb::emit(&merged_src(&bare)).expect("v1 emits a bare TSeq return");
+    assert!(
+        bare_v1.contains("-> std::vector<int64_t>"),
+        "v1 is the measured oracle for the fallback:\n{bare_v1}"
+    );
+
     // The default still applies where it is safe: an unannotated tseq
     // whose body yields scalars.
     let scalar = SRC.replace(DECL, "tseq Gen(n: int)").replace(
