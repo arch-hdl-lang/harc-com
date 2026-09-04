@@ -3046,9 +3046,12 @@ fn resolve_testbench_path(
     path: &[String],
 ) -> Result<ComponentId, LowerError> {
     let Some((root, tail)) = path.split_first() else {
-        return Err(unsupported(
-            "an empty testbench `connect` component path",
-            "",
+        // `resolve_one_connect` only calls this after splitting a dotted
+        // endpoint into its nonempty component prefix and final port name.
+        // An empty path therefore signals an internal resolver invariant,
+        // not a source form for which v1 is a useful fallback.
+        return Err(LowerError::Invalid(
+            "internal error: empty testbench `connect` component path".to_string(),
         ));
     };
     let cid = roots.get(root).copied().ok_or_else(|| {
@@ -6208,4 +6211,19 @@ fn path_str(p: &crate::ast::Path) -> String {
         .map(|s| s.name.clone())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_testbench_connect_path_is_an_internal_invariant() {
+        let roots = HashMap::new();
+        let err = resolve_testbench_path(&roots, &[], &[]).unwrap_err();
+        assert!(
+            matches!(err, LowerError::Invalid(ref msg) if msg.contains("empty testbench `connect` component path")),
+            "{err:?}"
+        );
+    }
 }

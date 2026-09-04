@@ -10323,6 +10323,15 @@ former `transaction` group lives in
      testbench decoder loses one constructor, leaving 112 textual
      `unsupported(` matches (111 constructors plus the helper definition).
 
+232. **Empty testbench-connect resolver paths are internal errors (2026-09-03).**
+
+     The testbench connect resolver is only entered with a nonempty component
+     prefix split from a dotted endpoint. Its defensive empty-path guard now
+     reports `Invalid` as an internal invariant instead of recommending v1 for
+     a source form that cannot reach it. This removes one constructor and
+     leaves 111 textual `unsupported(` matches (110 constructors plus the
+     helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
