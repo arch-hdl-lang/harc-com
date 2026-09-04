@@ -10447,12 +10447,20 @@ former `transaction` group lives in
      now an invalid type argument, not a TBIR capability gap. The diagnostic
      names the owning component field. This removes one constructor and leaves
      102 textual `unsupported(` matches in `src/ir/lower`.
+
 246. **Event value-expression type arguments (2026-09-04).**
 
      A parser-valid value expression in the payload position of `event<T>` is
      now an invalid type argument, not a TBIR capability gap. The diagnostic
      names the owning component field. This removes one constructor and leaves
      101 textual `unsupported(` matches in `src/ir/lower`.
+247. **Non-component receiver path segments (2026-09-04).**
+
+     Component member and method paths that traverse a scalar or other
+     non-subcomponent field now report an invalid receiver path. The separate
+     placement-dependent `connect` diagnostics remain unsupported. This
+     removes two constructors and leaves 99 textual `unsupported(` matches in
+     `src/ir/lower`.
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

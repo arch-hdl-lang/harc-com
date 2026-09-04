@@ -5300,10 +5300,10 @@ impl super::FuncBuilder<'_> {
             match comp.field(seg).map(|f| &f.kind) {
                 Some(ComponentFieldKind::Sub { component, .. }) => cid = *component,
                 _ => {
-                    return Err(unsupported(
-                        &format!("`{seg}` is not a sub-component of `{}`", comp.name),
-                        "",
-                    ));
+                    return Err(LowerError::Invalid(format!(
+                        "`{seg}` is not a sub-component of `{}`",
+                        comp.name
+                    )));
                 }
             }
         }
@@ -5341,7 +5341,7 @@ impl super::FuncBuilder<'_> {
             crate::ir::resolve_component_path_mode(&self.ctx.components, head, inherited, segs)
                 .map_err(|err| match err {
                     crate::ir::ComponentPathResolutionError::NotSubcomponent { .. } => {
-                        unsupported(&err.to_string(), "")
+                        LowerError::Invalid(err.to_string())
                     }
                     _ => LowerError::Invalid(err.to_string()),
                 })?;
