@@ -4435,6 +4435,31 @@ end impl AggregateQueueTest
     }
 }
 
+#[test]
+fn untyped_queue_fields_use_the_legacy_widthless_scalar_element() {
+    let src = r#"scoreboard Sb
+    values : queue
+end scoreboard Sb
+
+testbench Tb
+    dut : Top
+    pending : queue
+    sb : Sb
+end testbench Tb
+
+impl T for Tb
+    run
+        pending.push(7)
+        sb.values.push(pending.pop())
+        assert sb.values.front() == 7 else fail("untyped queue")
+    end run
+end impl T"#;
+    let prog = lower_src(src).expect("legacy untyped queues lower");
+    verify::verify_program(&prog).expect("legacy untyped queues verify");
+    let cpp = emit_cpp_src(src);
+    assert_eq!(cpp.matches("harc_rt::HarcQueue<uint64_t>").count(), 2, "{cpp}");
+}
+
 /// Fixed-vector queue elements retain their aggregate value type instead of
 /// falling through the old scalar-only queue fence. The shared queue schema
 /// serves every owner, while this surface proves nested-array C++ storage,
