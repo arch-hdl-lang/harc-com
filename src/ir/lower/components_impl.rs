@@ -3421,11 +3421,9 @@ pub(crate) fn lower_queue_elem(
                 }
                 return Err(reject_named(&id.name));
             }
-            Err(unsupported(
-                &format!("a non-identifier queue element on `{comp}.{fname}`"),
-                "use a scalar, declared transaction/struct record, fully specified \
-                 `Vec<scalar-or-record, N>`, or `list<scalar-or-record>` element type",
-            ))
+            Err(LowerError::Invalid(format!(
+                "queue element on `{comp}.{fname}` must be a type, not a value expression"
+            )))
         }
         Some(TypeArg::Named { name, .. }) => Err(reject_named(&name.name)),
         // v1's payload mapper defaults an omitted queue element to its

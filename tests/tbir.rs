@@ -48610,6 +48610,25 @@ end impl T"#;
 }
 
 #[test]
+fn queue_value_expression_element_is_invalid() {
+    let src = r#"
+scoreboard BadQueue
+    pending : queue<1 + 2>
+end scoreboard BadQueue
+
+test BadQueueType
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test BadQueueType
+"#;
+    let message = assert_invalid(&lower_src(src).expect_err("queue value expression is not a type"));
+    assert!(message.contains("BadQueue.pending"), "{message}");
+    assert!(message.contains("must be a type"), "{message}");
+}
+
+#[test]
 fn component_fixed_vec_whole_value_rules_and_metadata_are_checked() {
     let src = r#"scoreboard Table
     words : Vec<uint<64>, 4>

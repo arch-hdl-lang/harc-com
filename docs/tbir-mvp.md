@@ -10440,6 +10440,12 @@ former `transaction` group lives in
      feature. The diagnostic names the handle path and required test DUT.
      This removes one constructor and leaves 103 textual `unsupported(`
      matches in `src/ir/lower`.
+245. **Queue value-expression type arguments (2026-09-04).**
+
+     A parser-valid value expression in the element position of `queue<T>` is
+     now an invalid type argument, not a TBIR capability gap. The diagnostic
+     names the owning component field. This removes one constructor and leaves
+     102 textual `unsupported(` matches in `src/ir/lower`.
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
