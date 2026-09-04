@@ -41017,9 +41017,15 @@ end impl MTest"#;
         "Req", "uint<8>",
     ] {
         let src = SRC.replace(DECL, &format!("tseq Gen(n: int) -> {ret}"));
-        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
-        assert!(msg.contains("element type"), "`-> {ret}`: {msg}");
+        let msg = assert_invalid(&lower_src(&src).unwrap_err());
+        assert!(msg.contains("return type must be `TSeq<T>`"), "`-> {ret}`: {msg}");
     }
+
+    // A parser-valid TSeq aggregate that the current element decoder cannot
+    // represent is still a backend subset boundary, not malformed source.
+    let record_vec = SRC.replace(DECL, "tseq Gen(n: int) -> TSeq<Vec<Req, 2>>");
+    let msg = assert_unsupported(&lower_src(&record_vec).unwrap_err());
+    assert!(msg.contains("element type"), "{msg}");
 
     // The two remaining builtin scalar spellings use v1's uint64_t
     // sequence storage rather than falling into the signed default.

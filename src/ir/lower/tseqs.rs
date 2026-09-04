@@ -204,17 +204,16 @@ pub(crate) fn collect_tseq_records(
             // different input classes.
             TseqElem::Scalar(IrType::SInt(Some(64)))
         } else {
-            // A `-> TSeq<...>` that is PRESENT but names neither a
-            // supported value nor a declared record — `TSeq<int>` or
-            // `TSeq<time>`. The default above must not swallow these: v1
-            // renders each as `vector<uint64_t>`,
-            // so defaulting them to `int64_t` would silently change the
-            // element type rather than close a gap.
-            //
-            // Reached whenever `return_ty` is PRESENT but unusable —
-            // including a non-`TSeq` return like `-> Req`, which also
-            // has no `TSeq` args and would otherwise fall into the
-            // default arm.
+            // A present NON-`TSeq` return such as `-> Req` or `-> uint<8>`
+            // is malformed declaration shape. A residual `TSeq<...>` is
+            // different: record-leaf vectors and other aggregate elements can
+            // reach this arm and remain an honest typed-IR subset boundary.
+            if tseq_args(decl).is_none() {
+                return Err(LowerError::Invalid(format!(
+                    "`tseq {}` return type must be `TSeq<T>` with a declared record, primitive scalar (`uint<N>`/`sint<N>`/`bool`), or scalar-leaf fixed-vector element",
+                    decl.name.name
+                )));
+            }
             return Err(unsupported(
                 &format!("`tseq {}` element type", decl.name.name),
                 "a `-> TSeq<T>` must name a declared `transaction`/`struct` record, a \
