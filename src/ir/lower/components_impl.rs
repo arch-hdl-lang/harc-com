@@ -1628,18 +1628,37 @@ fn lower_field(
                     ));
                 }
             };
-            let len = match args.get(1) {
-                Some(TypeArg::Expr(e)) => match &*e.kind {
-                    ExprKind::Int(s) => s.replace('_', "").parse::<usize>().ok(),
-                    _ => None,
-                },
-                _ => None,
+            let len_expr = match args.get(1) {
+                Some(TypeArg::Expr(expr)) => expr,
+                _ => {
+                    return Err(LowerError::Invalid(format!(
+                        "fixed-vector field `{comp}.{fname}` requires a compile-time length"
+                    )))
+                }
+            };
+            let folded = super::fold_const(len_expr, consts, "").map_err(|error| match error {
+                super::ConstFoldErr::Unsupported(detail) => unsupported(
+                    &format!("fixed-vector field `{comp}.{fname}` with an unsupported length"),
+                    format!("the length must be a compile-time integer expression: {detail}"),
+                ),
+                super::ConstFoldErr::Invalid(detail) => LowerError::Invalid(format!(
+                    "fixed-vector field `{comp}.{fname}` has an invalid length: {detail}"
+                )),
+            })?;
+            if const_expr_has_boolean_result(len_expr, consts) {
+                return Err(LowerError::Invalid(format!(
+                    "fixed-vector field `{comp}.{fname}` length must be an integer expression, not a boolean"
+                )));
             }
-            .ok_or_else(|| {
-                unsupported(
-                    &format!("fixed-vector field `{comp}.{fname}` with an invalid length"),
-                    "the length must be a decimal compile-time literal",
-                )
+            if folded.is_negative() {
+                return Err(LowerError::Invalid(format!(
+                    "fixed-vector field `{comp}.{fname}` has a negative length"
+                )));
+            }
+            let len = usize::try_from(folded.bits).map_err(|_| {
+                LowerError::Invalid(format!(
+                    "fixed-vector field `{comp}.{fname}` length does not fit the host index size"
+                ))
             })?;
             Ok(ComponentFieldKind::FixedVec(FixedVecSchema { elem, len }))
         }
@@ -1821,6 +1840,52 @@ fn lower_field(
                  sub-components are lowered",
             ))
         }
+    }
+}
+
+fn const_expr_has_boolean_result(
+    expr: &crate::ast::Expr,
+    consts: &HashMap<String, super::ConstVal>,
+) -> bool {
+    use crate::ast::{BinaryOp, UnaryOp};
+
+    match &*expr.kind {
+        ExprKind::Bool(_) => true,
+        ExprKind::Ident(id) => consts
+            .get(&id.name)
+            .is_some_and(|value| matches!(value.value_type(), IrType::Bool)),
+        ExprKind::Paren(inner) => const_expr_has_boolean_result(inner, consts),
+        ExprKind::Unary {
+            op: UnaryOp::Not | UnaryOp::NotKw,
+            ..
+        } => true,
+        ExprKind::Unary {
+            op: UnaryOp::BitNot,
+            expr,
+        } => const_expr_has_boolean_result(expr, consts),
+        ExprKind::Binary {
+            op: BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor,
+            lhs,
+            rhs,
+        } => {
+            const_expr_has_boolean_result(lhs, consts)
+                && const_expr_has_boolean_result(rhs, consts)
+        }
+        ExprKind::Binary {
+            op:
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+                | BinaryOp::AndAnd
+                | BinaryOp::OrOr
+                | BinaryOp::AndKw
+                | BinaryOp::OrKw,
+            ..
+        } => true,
+        _ => false,
     }
 }
 
