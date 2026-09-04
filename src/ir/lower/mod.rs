@@ -4509,24 +4509,13 @@ fn lower_test(
                     ));
                 }
                 let simple = type_simple_name(l.ty.as_ref()).unwrap();
-                let cid_probe = component_ids[simple];
-                let has_monitor = prog.components[cid_probe.index()]
-                    .cycle_handlers
-                    .iter()
-                    .any(|ch| matches!(ch.activation, ir::Activation::Always));
-                let has_always_target = prog.transactors.iter().any(|x| {
-                    x.name == simple
-                        && x.target_methods
-                            .iter()
-                            .any(|m| matches!(m.activation, ir::Activation::Always))
-                });
                 // Mode rules:
                 //   * `active`  — the `on <ev>` driver (under `when active`)
                 //     fires on `emit <inst>.<ev>`. Always permitted.
-                //   * `passive` — no driver; only always-on cycle/handshake
-                //     monitor observers fire. Valid only when the transactor
-                //     declares such a monitor (a pure driver has nothing for
-                //     a passive instance to do).
+                //   * `passive` — no driver. Always-on cycle/handshake
+                //     observers and target responders still register when
+                //     present; without either half the instance is simply
+                //     inert, matching v1's binding semantics.
                 let instance_active = match l.ty.as_ref() {
                     Some(TypeExpr::Named {
                         mode: Some(TransactorMode::Active),
@@ -4535,22 +4524,7 @@ fn lower_test(
                     Some(TypeExpr::Named {
                         mode: Some(TransactorMode::Passive),
                         ..
-                    }) => {
-                        if !has_monitor && !has_always_target {
-                            return Err(unsupported(
-                                &format!(
-                                    "passive bound-to event-driven transactor instance `let {} : \
-                                     {simple} passive` with no monitor half",
-                                    l.name.name
-                                ),
-                                "a `passive` instance only runs always-on cycle/handshake \
-                                 observers and always-present target responders; this transactor \
-                                 declares neither, so a passive instance is inert — annotate it \
-                                 `active`",
-                            ));
-                        }
-                        false
-                    }
+                    }) => false,
                     _ => {
                         return Err(LowerError::Invalid(format!(
                             "bound-to event-driven transactor instance `let {} : {simple}` \
