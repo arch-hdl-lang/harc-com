@@ -10351,6 +10351,16 @@ former `transaction` group lives in
      leaves 105 textual `unsupported(` matches (104 constructors plus the
      helper definition).
 
+235. **Non-sequence tseq return annotations are source errors (2026-09-03).**
+
+     A `tseq` declaration whose explicit return is not `TSeq<T>` now reports
+     `Invalid`. Valid `TSeq` scalar, record, and fixed-vector elements—and
+     unresolved element names with their measured v1 verdict—are handled
+     earlier. Residual parser-valid aggregate elements retain their existing
+     `Unsupported` boundary; only the non-`TSeq` half is reclassified. The raw
+     inventory therefore remains 105 textual `unsupported(` matches (104
+     constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
