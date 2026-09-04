@@ -10314,6 +10314,15 @@ former `transaction` group lives in
      one constructor and leaves 113 textual `unsupported(` matches (112
      constructors plus the helper definition).
 
+231. **Legacy untyped queue fields (2026-09-03).**
+
+     A field declared as bare `queue` now receives the explicit TBIR element
+     type `uint<64>`, matching v1's `HarcQueue<uint64_t>` fallback. Queue
+     operations therefore retain normal scalar typing instead of rejecting a
+     spelling the legacy backend runs. The shared component/scoreboard/
+     testbench decoder loses one constructor, leaving 112 textual
+     `unsupported(` matches (111 constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

@@ -3355,11 +3355,12 @@ pub(crate) fn lower_queue_elem(
             ))
         }
         Some(TypeArg::Named { name, .. }) => Err(reject_named(&name.name)),
-        None => Err(unsupported(
-            &format!("a `queue` with no element type on `{comp}.{fname}`"),
-            "declare the element type: `queue<uint<W>>`, `queue<Record>`, \
-             `queue<Vec<scalar-or-record, N>>`, or `queue<list<scalar-or-record>>`",
-        )),
+        // v1's payload mapper defaults an omitted queue element to its
+        // widthless host scalar carrier (`uint64_t`). Preserve that legacy
+        // spelling while retaining an explicit element type in TBIR.
+        None => Ok(QueueElem::Scalar {
+            ty: IrType::UInt(Some(64)),
+        }),
     }
 }
 
