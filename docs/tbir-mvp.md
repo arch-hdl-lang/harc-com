@@ -10425,6 +10425,14 @@ former `transaction` group lives in
      emission. This removes a code-generation-only gate; the raw lowering
      inventory remains at 104 textual matches.
 
+243. **Common-layout fixed-vector event payloads (2026-09-04).**
+
+     Split-layout validation now accepts local event channels carrying fixed
+     vectors with supported scalar or declared-record leaves. It reuses the
+     same callback-list ABI and aggregate renderer as monolithic TBIR output.
+     This removes a code-generation-only gate; the raw lowering inventory
+     remains at 104 textual matches.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
