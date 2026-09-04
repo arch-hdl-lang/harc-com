@@ -21375,6 +21375,43 @@ end impl CovTest
 }
 
 #[test]
+fn malformed_covergroup_bin_paths_are_invalid() {
+    let src = |read: &str| {
+        format!(
+            r#"covergroup Cov @(posedge dut.clk)
+    cp_mode : cover dut.mode
+        bins
+            idle = {{0}}
+        end bins
+end covergroup Cov
+
+testbench Tb
+    dut : Top
+    cov : Cov
+end testbench Tb
+
+impl CovTest for Tb
+    run
+        wait 1 cycle
+    end run
+    check
+        assert {read} > 0 else fail("hole")
+    end check
+end impl CovTest"#
+        )
+    };
+
+    for read in ["cov.cp_mode", "cov.cp_mode.idle.extra"] {
+        let err = lower_src(&src(read)).expect_err("malformed bin path must be rejected");
+        let msg = assert_invalid(&err);
+        assert!(
+            msg.contains("must have the form `cov.<point>.<bin>`"),
+            "{read}: {msg}"
+        );
+    }
+}
+
+#[test]
 fn verifier_rejects_a_stale_covergroup_bin_identity() {
     let src = r#"
 covergroup Cov @(posedge dut.clk)

@@ -10305,6 +10305,15 @@ former `transaction` group lives in
      fallback and leaves 114 textual `unsupported(` matches (113 constructors
      plus the helper definition).
 
+230. **Malformed covergroup-bin paths are source errors (2026-09-03).**
+
+     Check-phase covergroup reads must name exactly
+     `<instance>.<point>.<bin>`. Missing or additional path segments now
+     report `Invalid`, alongside the existing unknown-point and unknown-bin
+     diagnostics, instead of advertising v1 for malformed source. This removes
+     one constructor and leaves 113 textual `unsupported(` matches (112
+     constructors plus the helper definition).
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

@@ -4884,13 +4884,11 @@ impl FuncBuilder<'_> {
         let covgroup = self.ctx.cov_fields[&field];
         let schema = &self.ctx.covgroups[covgroup.index()];
         let [point, bin] = rest.as_slice() else {
-            return Err(unsupported(
-                &format!(
-                    "covergroup field access `{field}.{}` (expected `{field}.<point>.<bin>`)",
-                    rest.join(".")
-                ),
-                "",
-            ));
+            return Err(LowerError::Invalid(format!(
+                "covergroup field access `{field}.{}` must have the form \
+                 `{field}.<point>.<bin>`",
+                rest.join(".")
+            )));
         };
         let Some(p) = schema.points.iter().find(|p| p.name == *point) else {
             return Err(LowerError::Invalid(format!(
