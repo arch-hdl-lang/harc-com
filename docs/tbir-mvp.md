@@ -10361,6 +10361,14 @@ former `transaction` group lives in
      inventory therefore remains 105 textual `unsupported(` matches (104
      constructors plus the helper definition).
 
+236. **Record-leaf fixed-vector tseq elements (2026-09-03).**
+
+     Tseq return collection now resolves record identities inside fixed-vector
+     elements, so `TSeq<Vec<Record, N>>` uses the existing recursive fixed-array
+     value carrier through yield, call results, iteration, verification, and
+     C++ emission. The residual element diagnostic also covers other shapes,
+     so the raw inventory remains 105 textual matches.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
