@@ -1282,6 +1282,83 @@ fn native_lifecycle_enabled() -> bool {
 /// Lower a merged source file (post `merge_for_sim`) into a verified-
 /// shape `TbProgram`. Callers should run `verify::verify_program` on
 /// the result before emission.
+/// Reject by-value recursive records (`struct Node { next: Node }`) directly
+/// off the AST, without lowering (#483).
+///
+/// `harc check` is deliberately lowering-free — it must accept files with no
+/// `test` declaration and files that reference externally-defined or
+/// codegen-unsupported field types (a covergroup shape, an out-of-file enum,
+/// an unsupported leaf) that only `arch sim`/`arch build` resolve. So the cycle
+/// check reads only the record-reference graph: `struct`/`transaction`
+/// declarations and the fields that lower to a by-value nested record — a
+/// *bare* record name, or a fixed `Vec<Record, N>` (an inline `std::array`,
+/// also by-value). `list`/`queue`-of-record are heap-indirect and are not
+/// edges, and every other field type is ignored — never resolved — so nothing
+/// here rejects a program the codegen paths would accept.
+/// The cycle DFS and its diagnostic are shared with `check_no_record_cycles`,
+/// the lowering-time check, so the two agree.
+pub fn check_record_cycles(file: &SourceFile) -> Result<(), LowerError> {
+    use crate::ast::Item;
+    // Assign a stable index to every `transaction` then `struct`, file order —
+    // the same set `lower_program` treats as records. A duplicate name is a
+    // real error, but the codegen paths report it; the cycle check just keeps
+    // the first binding so a collision cannot mask a cycle here.
+    let mut record_ids: HashMap<String, RecordId> = HashMap::new();
+    let mut record_items: Vec<&Item> = Vec::new();
+    for it in &file.items {
+        if let Item::Transaction(t) = it {
+            if !record_ids.contains_key(&t.name.name) {
+                record_ids.insert(t.name.name.clone(), RecordId(record_items.len() as u32));
+                record_items.push(it);
+            }
+        }
+    }
+    for it in &file.items {
+        if let Item::Struct(s) = it {
+            if !record_ids.contains_key(&s.name.name) {
+                record_ids.insert(s.name.name.clone(), RecordId(record_items.len() as u32));
+                record_items.push(it);
+            }
+        }
+    }
+    let names: Vec<&str> = record_items
+        .iter()
+        .map(|it| match it {
+            Item::Transaction(t) => t.name.name.as_str(),
+            Item::Struct(s) => s.name.name.as_str(),
+            _ => unreachable!("record_items holds only transactions and structs"),
+        })
+        .collect();
+    // A struct holds `Field`s directly; a transaction holds them as
+    // `TxnBodyItem::Field` in its body. A field is a by-value cycle edge iff its
+    // type is a bare record name (`named_record_id`) OR a fixed `Vec<Record, N>`
+    // (`fixed_vec_record_id`) — both lower to `IrType::Record`, which the
+    // lowering-time `check_no_record_cycles` follows. `list`/`queue`-of-record
+    // are heap-indirect (never `IrType::Record` fields) and every other type is
+    // not a record, so neither is an edge — matching the lowering side exactly.
+    let edge = |f: &crate::ast::Field| {
+        records::named_record_id(&f.ty, &record_ids)
+            .or_else(|| records::fixed_vec_record_id(&f.ty, &record_ids))
+            .map(|rid| (f.name.name.clone(), rid.index()))
+    };
+    let edges: Vec<Vec<(String, usize)>> = record_items
+        .iter()
+        .map(|it| match it {
+            Item::Struct(s) => s.fields.iter().filter_map(edge).collect(),
+            Item::Transaction(t) => t
+                .body
+                .iter()
+                .filter_map(|bi| match bi {
+                    crate::ast::TxnBodyItem::Field(f) => edge(f),
+                    _ => None,
+                })
+                .collect(),
+            _ => unreachable!(),
+        })
+        .collect();
+    records::detect_record_cycle(&names, &edges)
+}
+
 pub fn lower_program(file: &SourceFile) -> Result<TbProgram, LowerError> {
     lower_program_impl(file, LowerDiagnosticRecorder::default())
 }

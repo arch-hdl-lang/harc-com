@@ -6485,6 +6485,12 @@ fn flatten_txn_body_field_infos_inner(
     }
 }
 
+// TODO(#483): by-value recursive record would stack-overflow here
+// (infinite C++ struct). Front-end now rejects via `check_no_record_cycles`
+// in `harc check`/`tbir::lower`, so this path is not reached for the
+// self-cycle case. v1's direct `emit_record_struct` path has the same
+// risk but is intentionally not fixed — v1 is phasing out and `harc check`
+// is the single source of truth for this diagnostic.
 fn flatten_record_field_infos(
     fields: &[Field],
     record_fields: &std::collections::HashMap<String, Vec<Field>>,
