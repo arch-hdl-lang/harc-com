@@ -5635,6 +5635,35 @@ end test FixedVectorSequence
 }
 
 #[test]
+fn common_layout_emits_fixed_vector_event_locals() {
+    let source = parse_source(
+        r#"
+test FixedVectorEvent
+    let dut : CommonReg
+    clock clk = 10ns
+    run
+        let observed : event<Vec<uint<8>, 2>>
+        wait 1 cycle
+    end run
+end test FixedVectorEvent
+"#,
+    )
+    .expect("fixed-vector event source parses");
+    let program = lower::lower_program(&source).expect("fixed-vector event source lowers");
+    verify::verify_program(&program).expect("fixed-vector event program verifies");
+    let mut opts = cpp_tb::EmitOpts::default();
+    opts.dut_port_widths = HashMap::from([("clk".to_string(), 1)]);
+    set_clock_interface_for_program(&program, &mut opts);
+
+    let plan = tbir::common::plan_common_tests(&program, &opts, "suite__")
+        .expect("fixed-vector events are valid common-layout input");
+    let capsule = tbir::common::emit_common_capsule(&plan, 0).expect("capsule emits");
+    assert!(capsule.contains(
+        "std::vector<std::function<void(std::array<uint64_t, 2>)>> observed;"
+    ), "{capsule}");
+}
+
+#[test]
 fn common_plan_orders_and_owns_all_ticket04_structural_types() {
     let (program, opts) = structural_program();
     let plan = tbir::common::plan_common_tests(&program, &opts, "suite__").expect("plans");

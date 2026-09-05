@@ -5046,7 +5046,9 @@ fn validate_common_local_type(prog: &TbProgram, ty: &IrType) -> Result<(), (Stri
                 }
             }
             ir::EventPayload::FixedVec { .. } => {
-                Err(("fixed-vector event payload".into(), "ticket 06"))
+                validate_common_fixed_value_type(prog, &payload.value_ir_type()).map_err(
+                    |feature| (format!("fixed-vector event payload with {feature}"), "ticket 06"),
+                )
             }
         },
     }
