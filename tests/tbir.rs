@@ -41229,6 +41229,10 @@ end impl MTest"#;
     let msg = assert_unsupported(&lower_src(&queue_elem).unwrap_err());
     assert!(msg.contains("element type"), "{msg}");
 
+    let value_elem = SRC.replace(DECL, "tseq Gen(n: int) -> TSeq<1 + 2>");
+    let msg = assert_invalid(&lower_src(&value_elem).unwrap_err());
+    assert!(msg.contains("element argument must be a type"), "{msg}");
+
     // The two remaining builtin scalar spellings use v1's uint64_t
     // sequence storage rather than falling into the signed default.
     for ret in ["TSeq<int>", "TSeq<time>"] {

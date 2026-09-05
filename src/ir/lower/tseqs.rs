@@ -217,6 +217,18 @@ pub(crate) fn collect_tseq_records(
                     decl.name.name
                 )));
             }
+            if matches!(
+                tseq_args(decl).and_then(|args| args.first()),
+                Some(TypeArg::Expr(expr)) if !matches!(&*expr.kind, ExprKind::Ident(_))
+            ) || matches!(
+                tseq_args(decl).and_then(|args| args.first()),
+                Some(TypeArg::Named { .. })
+            ) {
+                return Err(LowerError::Invalid(format!(
+                    "`tseq {}` element argument must be a type, not a value expression or named generic",
+                    decl.name.name
+                )));
+            }
             return Err(unsupported(
                 &format!("`tseq {}` element type", decl.name.name),
                 "a `-> TSeq<T>` must name a declared `transaction`/`struct` record, a \

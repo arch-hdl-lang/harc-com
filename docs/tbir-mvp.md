@@ -10531,6 +10531,13 @@ former `transaction` group lives in
      backend limitation merely because v1 emitted an undeclared C++ type. The
      textual unsupported count remains 95.
 
+257. **TSeq value-expression element arguments (2026-09-04).**
+
+     Parser-valid value expressions and named generic arguments in the element
+     slot of `TSeq<T>` are now invalid type arguments. Supported and genuinely
+     unsupported type-shaped elements retain their existing paths. The textual
+     unsupported count remains 95.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
