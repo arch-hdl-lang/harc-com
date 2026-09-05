@@ -50,8 +50,7 @@ use crate::ir::{
 
 use super::helpers::{ir_type_of, HelperRegistry};
 use super::{
-    not_implemented, unsupported, FuncBuilder, LowerCtx, LowerDiagnosticRecorder, LowerError,
-    SideTables, V1Status,
+    unsupported, FuncBuilder, LowerCtx, LowerDiagnosticRecorder, LowerError, SideTables,
 };
 
 /// The element name of a `tseq`'s `-> TSeq<T>` return type when `T` is a
@@ -80,21 +79,24 @@ fn tseq_element_name(decl: &TseqDecl) -> Option<String> {
 fn tseq_scalar_element(
     decl: &TseqDecl,
     record_ids: &HashMap<String, RecordId>,
-) -> Option<IrType> {
-    let args = tseq_args(decl)?;
-    let TypeArg::Type(inner) = args.first()? else {
-        return None;
+    consts: &HashMap<String, super::ConstVal>,
+) -> Result<Option<IrType>, LowerError> {
+    let Some(args) = tseq_args(decl) else {
+        return Ok(None);
     };
-    if let Some(fixed) =
-        super::components::fixed_vec_ir_type_with_records(inner, record_ids)
-    {
-        return Some(fixed);
+    let Some(TypeArg::Type(inner)) = args.first() else {
+        return Ok(None);
+    };
+    if let Some(fixed) = super::components::fixed_vec_ir_type_with_records_and_consts(
+        inner, record_ids, consts,
+    )? {
+        return Ok(Some(fixed));
     }
     if let TypeExpr::Builtin { name, .. } = inner {
         match name {
             // v1's tseq return renderer maps both to `uint64_t` storage.
-            BuiltinTy::Int => return Some(IrType::UInt(Some(32))),
-            BuiltinTy::Time => return Some(IrType::UInt(Some(64))),
+            BuiltinTy::Int => return Ok(Some(IrType::UInt(Some(32)))),
+            BuiltinTy::Time => return Ok(Some(IrType::UInt(Some(64)))),
             _ => {}
         }
     }
@@ -102,9 +104,9 @@ fn tseq_scalar_element(
         // `ir_type_of` returns `Unknown` for a `Named` (record) inner —
         // those are handled by the record-element path, not here.
         ty @ (IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::FixedVec { .. }) => {
-            Some(ty)
+            Ok(Some(ty))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -139,6 +141,7 @@ pub(crate) type TseqTable = HashMap<String, (FunctionId, TseqElem, Vec<String>, 
 pub(crate) fn collect_tseq_records(
     file: &SourceFile,
     record_ids: &HashMap<String, RecordId>,
+    consts: &HashMap<String, super::ConstVal>,
     diagnostics: &LowerDiagnosticRecorder,
     first_function: FunctionId,
 ) -> Result<TseqTable, LowerError> {
@@ -165,7 +168,7 @@ pub(crate) fn collect_tseq_records(
                 "String sequence elements and nested String containers are not supported",
             ));
         }
-        let elem = if let Some(scalar) = tseq_scalar_element(decl, record_ids) {
+        let elem = if let Some(scalar) = tseq_scalar_element(decl, record_ids, consts)? {
             TseqElem::Scalar(scalar)
         } else if let Some(name) = tseq_element_name(decl) {
             let Some(&rid) = record_ids.get(&name) else {
@@ -180,17 +183,10 @@ pub(crate) fn collect_tseq_records(
                 // PRESENT but unresolvable one makes it emit the bad name.
                 // Absent and invalid are different input classes even
                 // though one code path handles both.
-                return Err(not_implemented(
-                    &format!("`tseq {}` element type `{name}`", decl.name.name),
-                    format!(
-                        "only declared `transaction`/`struct` records, primitive scalars \
-                         (`uint<N>`/`sint<N>`/`bool`), and scalar-leaf fixed vectors are lowered as tseq \
-                         element types; v1 \
-                         emits the name verbatim as `std::vector<{name}>`, which does not \
-                         compile"
-                    ),
-                    V1Status::EmitsUncompilable,
-                ));
+                return Err(LowerError::Invalid(format!(
+                    "`tseq {}` element type `{name}` is not declared as a `transaction` or `struct`",
+                    decl.name.name
+                )));
             };
             TseqElem::Record(rid)
         } else if tseq_args(decl).is_some_and(|args| args.is_empty()) {
@@ -222,6 +218,18 @@ pub(crate) fn collect_tseq_records(
             if tseq_args(decl).is_none() {
                 return Err(LowerError::Invalid(format!(
                     "`tseq {}` return type must be `TSeq<T>` with a declared record, primitive scalar (`uint<N>`/`sint<N>`/`bool`), or scalar-leaf fixed-vector element",
+                    decl.name.name
+                )));
+            }
+            if matches!(
+                tseq_args(decl).and_then(|args| args.first()),
+                Some(TypeArg::Expr(expr)) if !matches!(&*expr.kind, ExprKind::Ident(_))
+            ) || matches!(
+                tseq_args(decl).and_then(|args| args.first()),
+                Some(TypeArg::Named { .. })
+            ) {
+                return Err(LowerError::Invalid(format!(
+                    "`tseq {}` element argument must be a type, not a value expression or named generic",
                     decl.name.name
                 )));
             }

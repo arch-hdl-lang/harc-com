@@ -10471,6 +10471,81 @@ former `transaction` group lives in
      This removes one constructor and leaves 98 textual `unsupported(` matches
      in `src/ir/lower`.
 
+249. **Fixed-vector value-expression element arguments (2026-09-04).**
+
+     A parser-valid value expression in the element position of `Vec<T, N>` is
+     now an invalid type argument, matching the queue and event diagnostics.
+     The diagnostic names the owning component field. This removes one
+     constructor and leaves 97 textual `unsupported(` matches in
+     `src/ir/lower`.
+
+250. **Nested fixed-vector constant lengths (2026-09-04).**
+
+     Persistent component and transactor fields now fold file constants and
+     integer constant expressions at every nested `Vec<T, N>` layer, matching
+     the already-supported outer length. Preserving unsupported nested
+     constant-fold operations adds one precise constructor, so the textual
+     unsupported count is 98.
+
+251. **Nested fixed-vector constant lengths in locals (2026-09-04).**
+
+     Fixed-vector local declarations and aggregate-return annotations now fold
+     constant expressions at every nested vector layer. This matches the field
+     support and keeps aggregate type agreement exact. The textual unsupported
+     count remains 98.
+
+252. **Nested fixed-vector constant lengths in TSeq declarations (2026-09-04).**
+
+     `TSeq<Vec<...>>` declarations now use the file constant environment while
+     decoding nested fixed-vector element lengths, matching persistent fields
+     and locals. The textual unsupported count remains 98.
+
+253. **Unknown explicit testbench fields (2026-09-04).**
+
+     An explicit `_tb.<name>` path that resolves to no scalar, record,
+     scoreboard, covergroup, transactor, or component field is now an invalid
+     source reference. This removes one constructor and leaves 97 textual
+     `unsupported(` matches in `src/ir/lower`.
+
+254. **Null DUT-handle defaults (2026-09-04).**
+
+     A module-typed transactor field may now explicitly use the integer literal
+     `default 0`, the same null value it otherwise receives before test
+     binding. Nonzero and computed/boolean defaults are invalid pointer
+     initializers. This removes one
+     constructor and leaves 96 textual `unsupported(` matches in
+     `src/ir/lower`.
+
+255. **Unknown regblock binding helpers (2026-09-04).**
+
+     A regblock bind whose `via` target resolves to neither a transactor
+     instance nor a bus binding is now an invalid source reference. The real
+     bus-bound helper gap retains the backend diagnostic. The textual
+     unsupported count remains 96 because the constructor is still used by
+     that genuine bus-binding branch.
+
+256. **Unknown TSeq element names (2026-09-04).**
+
+     A `TSeq<Name>` return whose element name is not a declared transaction or
+     struct is now an invalid type reference. It no longer masquerades as a
+     backend limitation merely because v1 emitted an undeclared C++ type. The
+     textual unsupported count remains 96.
+
+257. **TSeq value-expression element arguments (2026-09-04).**
+
+     Parser-valid value expressions and named generic arguments in the element
+     slot of `TSeq<T>` are now invalid type arguments. Supported and genuinely
+     unsupported type-shaped elements retain their existing paths. The textual
+     unsupported count remains 96.
+
+258. **Unknown callable TSeq element names (2026-09-04).**
+
+     Callable and local `TSeq<Name>` boundaries now diagnose an element name
+     that is not a declared value-record as an invalid type reference. Container
+     shapes outside the callable ABI remain genuine compiler gaps. Sharing the
+     classifier with uninitialized sequence locals removes one constructor and
+     leaves 95 textual `unsupported(` matches in `src/ir/lower`.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

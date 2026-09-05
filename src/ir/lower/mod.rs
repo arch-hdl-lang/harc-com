@@ -1921,6 +1921,7 @@ fn lower_program_impl(
     let tseq_records = tseqs::collect_tseq_records(
         &file,
         &record_ids,
+        &consts,
         &diagnostics,
         FunctionId(helper_registry.pure_count() as u32),
     )?;
@@ -5492,14 +5493,15 @@ fn lower_test(
             )));
         }
         let Some(&xid) = transactor_field_ids.get(helper_field.as_str()) else {
-            return Err(unsupported(
-                &format!(
-                    "regblock binding `{binding}` via `{helper_field}` (not an active \
-                     transactor field of the testbench)"
-                ),
-                "the `via` helper must be a `transactor` instance that pokes the DUT; the \
-                 bus-bound helper form is a follow-up slice",
-            ));
+            if bus_binding_decls.contains_key(helper_field) {
+                return Err(unsupported(
+                    &format!("regblock binding `{binding}` via bus binding `{helper_field}`"),
+                    "the bus-bound helper form is a follow-up slice",
+                ));
+            }
+            return Err(LowerError::Invalid(format!(
+                "regblock binding `{binding}` names unknown `via` helper `{helper_field}`"
+            )));
         };
         // Validate the frontdoor methods exist at the expected arity so
         // a malformed helper fails at lowering, not at C++ compile.

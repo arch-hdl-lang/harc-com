@@ -168,13 +168,31 @@ fn lower_unbound_item<'a>(
                 if record_ctx.record_ids.contains_key(simple) {
                     return push_state(f);
                 }
-                if f.default.is_some() {
-                    return Err(not_implemented(
-                        &format!("a default value on the DUT-handle field `{tname}.{fname}`"),
-                        "the DUT handle is bound by the test; v1 pastes the literal into \
-                         `VTop* <f> = <lit>;`, which only compiles when it is `0`",
-                        V1Status::EmitsUncompilable,
-                    ));
+                if let Some(default) = &f.default {
+                    if !matches!(
+                        &*super::exprs::unparen_expr(default).kind,
+                        crate::ast::ExprKind::Int(_)
+                    ) {
+                        return Err(LowerError::Invalid(format!(
+                            "DUT-handle field `{tname}.{fname}` default must be the integer null literal 0"
+                        )));
+                    }
+                    let folded = super::fold_const(default, &record_ctx.consts, "").map_err(
+                        |error| {
+                            let detail = match error {
+                                super::ConstFoldErr::Unsupported(detail)
+                                | super::ConstFoldErr::Invalid(detail) => detail,
+                            };
+                            LowerError::Invalid(format!(
+                                "DUT-handle field `{tname}.{fname}` default must be the null value 0: {detail}"
+                            ))
+                        },
+                    )?;
+                    if folded.is_negative() || folded.bits != 0 {
+                        return Err(LowerError::Invalid(format!(
+                            "DUT-handle field `{tname}.{fname}` default must be the integer null literal 0"
+                        )));
+                    }
                 }
                 if let Some((first, _)) = dut.as_ref() {
                     // v1 emits `V<Name>* <field> = nullptr;` for every
@@ -1917,9 +1935,33 @@ fn lower_state_field(
     // A fixed-vector state field uses the same recursive resolver as
     // component fields and method parameters.  Keep the complete type so
     // state element accesses retain nested-vector/record leaf metadata.
-    if let Some(ty @ IrType::FixedVec { .. }) =
-        super::components::fixed_vec_ir_type_with_records(&f.ty, record_ids)
+    if let TypeExpr::Builtin {
+        name: crate::ast::BuiltinTy::Vec,
+        args,
+        ..
+    } = &f.ty
     {
+        if matches!(args.first(), Some(crate::ast::TypeArg::Expr(expr)) if !matches!(&*expr.kind, crate::ast::ExprKind::Ident(_)))
+        {
+            return Err(LowerError::Invalid(format!(
+                "fixed-vector field `{tname}.{fname}` element must be a type, not a value expression"
+            )));
+        }
+        let Some(ty @ IrType::FixedVec { .. }) =
+            super::components::fixed_vec_ir_type_with_records_and_consts(
+                &f.ty,
+                record_ids,
+                &record_ctx.consts,
+            )?
+        else {
+            return Err(not_implemented(
+                &format!(
+                    "{who} `{tname}` state field `{fname}` with an unsupported fixed-vector type"
+                ),
+                "a fixed-vector element must be a supported scalar, declared value-record, or nested fixed vector",
+                V1Status::SilentlyMisLowers,
+            ));
+        };
         if f.default.is_some() {
             return Err(not_implemented(
                 &format!("{who} `{tname}` fixed-vector state field `{fname}` with a default"),

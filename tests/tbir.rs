@@ -17468,21 +17468,35 @@ end impl T"#
         "the `apply` item leaves v1's output byte-identical"
     );
 
-    // The DUT-handle default: `0` is a null pointer constant and
-    // compiles, every other literal does not, so the arm takes the
-    // worse of the two.
-    for lit in ["0", "1", "5"] {
+    // A second module-typed field remains unsupported independently of
+    // whether its initializer is the null pointer constant.
+    for src in both("    other : Top default 0") {
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
+    }
+    for lit in ["1", "5"] {
         for src in both(&format!("    other : Top default {lit}")) {
-            assert_not_implemented(
-                &lower_src(&src).unwrap_err(),
-                lower::V1Status::EmitsUncompilable,
-            );
+            let msg = assert_invalid(&lower_src(&src).unwrap_err());
+            assert!(msg.contains("integer null literal 0"), "{msg}");
         }
     }
     for (lit, init) in [("0", "VTop* dut = 0;"), ("1", "VTop* dut = 1;")] {
         let src = drv(&format!("    dut : Top default {lit}"), "", poke);
         let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
         assert!(v1.contains(init), "`default {lit}` pastes `{init}`: {v1}");
+    }
+
+    let null_default = drv("    dut : Top default 0", "", poke);
+    lower_src(&null_default).expect("a null DUT-handle default lowers");
+    let nonnull_default = drv("    dut : Top default 1", "", poke);
+    let msg = assert_invalid(&lower_src(&nonnull_default).unwrap_err());
+    assert!(msg.contains("integer null literal 0"), "{msg}");
+    for bad in ["false", "1 == 2", "1 - 1"] {
+        let source = drv(&format!("    dut : Top default {bad}"), "", poke);
+        let msg = assert_invalid(&lower_src(&source).unwrap_err());
+        assert!(msg.contains("integer null literal 0"), "`{bad}`: {msg}");
     }
 }
 
@@ -24522,9 +24536,9 @@ fn uninitialized_tseq_locals_start_as_typed_empty_sequences() {
             Err(error) => error,
             Ok(_) => panic!("unsupported TSeq element `{bad}` must not lower"),
         };
-        let message = assert_unsupported(&error);
+        let message = assert_invalid(&error);
         assert!(
-            message.contains("unsupported element type"),
+            message.contains("not declared as a transaction or struct"),
             "{bad}: {message}"
         );
     }
@@ -40827,15 +40841,13 @@ fn coverpoint_value_expression_corruption_is_rejected_before_codegen() {
     );
 }
 
-/// `tseqs.rs` has two rejection sites four lines apart that look
-/// interchangeable and classify OPPOSITELY.
+/// Missing and unknown `tseq` element annotations are distinct inputs.
 ///
 /// The difference is whether the element-type annotation is ABSENT or
 /// PRESENT-but-unresolvable. An absent one makes v1 substitute a working
 /// default — so TB-IR now substitutes the same one and the gap is
 /// CLOSED. A bad one makes v1 print the name verbatim into a type
-/// position, which does not compile. One code path handled both, which
-/// is exactly how they came to share a classification.
+/// position, but is still an invalid source type rather than a backend gap.
 #[test]
 fn an_absent_tseq_element_type_is_not_a_bad_one() {
     let fixture = fixture("tseq_scalar_test.harc");
@@ -40874,11 +40886,9 @@ fn an_absent_tseq_element_type_is_not_a_bad_one() {
     // PRESENT AND BAD: v1 prints the name into the return type, naming a
     // type nothing declares.
     let bad = fixture.replace(DECL, "tseq Squares(n: int) -> TSeq<NoSuchType>");
-    let msg = assert_not_implemented(
-        &lower_src(&bad).unwrap_err(),
-        lower::V1Status::EmitsUncompilable,
-    );
+    let msg = assert_invalid(&lower_src(&bad).unwrap_err());
     assert!(msg.contains("`NoSuchType`"), "{msg}");
+    assert!(msg.contains("is not declared"), "{msg}");
     assert!(
         cpp_tb::emit(&merged_src(&bad))
             .expect("v1 emits a bad element type")
@@ -40956,6 +40966,19 @@ fn a_regblock_width_outside_the_value_model_is_a_program_error() {
     // no-op — but a field with no access site emits nothing at all, so
     // that is not what this fixture can show.)
     cpp_tb::emit(&merged_src(&with_field("uint<0>"))).expect("v1 accepts a zero-width field");
+}
+
+#[test]
+fn an_unknown_regblock_binding_helper_is_invalid() {
+    let src = fixture("regblock_subset_test.harc").replace(
+        "let regs : DmaRegs = bind h",
+        "let regs : DmaRegs = bind missing",
+    );
+    let message = assert_invalid(&lower_src(&src).expect_err("unknown via helper is invalid"));
+    assert!(
+        message.contains("names unknown `via` helper `missing`"),
+        "{message}"
+    );
 }
 
 /// The regblock and addrmap ACCESS catch-alls. v1 has no gate at either:
@@ -41210,6 +41233,10 @@ end impl MTest"#;
     let queue_elem = SRC.replace(DECL, "tseq Gen(n: int) -> TSeq<queue<uint<8>>>");
     let msg = assert_unsupported(&lower_src(&queue_elem).unwrap_err());
     assert!(msg.contains("element type"), "{msg}");
+
+    let value_elem = SRC.replace(DECL, "tseq Gen(n: int) -> TSeq<1 + 2>");
+    let msg = assert_invalid(&lower_src(&value_elem).unwrap_err());
+    assert!(msg.contains("element argument must be a type"), "{msg}");
 
     // The two remaining builtin scalar spellings use v1's uint64_t
     // sequence storage rather than falling into the signed default.
@@ -48687,6 +48714,216 @@ end test BadEventType
 }
 
 #[test]
+fn fixed_vector_value_expression_element_is_invalid() {
+    let src = r#"
+transactor BadVector
+    dut : Top
+    values : Vec<1 + 2, 4>
+    when active
+        hookable inspect()
+        end inspect
+    end when
+end transactor BadVector
+
+test BadVectorType
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test BadVectorType
+"#;
+    let message =
+        assert_invalid(&lower_src(src).expect_err("fixed-vector value expression is not a type"));
+    assert!(message.contains("BadVector.values"), "{message}");
+    assert!(message.contains("must be a type"), "{message}");
+}
+
+#[test]
+fn unknown_explicit_testbench_field_is_invalid() {
+    let src = r#"
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl UnknownField for Tb
+    run
+        let value = _tb.nope
+        log(info, "value={{}}", value)
+    end run
+end impl UnknownField
+"#;
+    let message = assert_invalid(&lower_src(src).expect_err("unknown testbench field is invalid"));
+    assert!(message.contains("unknown testbench field `_tb.nope`"), "{message}");
+}
+
+#[test]
+fn persistent_nested_fixed_vector_lengths_fold_constants() {
+    let src = r#"
+const INNER : uint<8> = 1 + 1
+const OUTER : uint<8> = INNER + 1
+
+transactor NestedState
+    dut : Top
+    values : Vec<Vec<uint<8>, INNER>, OUTER>
+    when active
+        hookable inspect()
+        end inspect
+    end when
+end transactor NestedState
+
+testbench Tb
+    dut : Top
+    state : NestedState active
+end testbench Tb
+
+impl T for Tb
+    run
+        state.values[2][1] = 7
+        wait 1 cycle
+    end run
+end impl T
+"#;
+    let program = lower_src(src).expect("nested fixed-vector constant lengths lower");
+    verify::verify_program(&program).expect("nested fixed-vector constants verify");
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::array<std::array<uint64_t, 2>, 3> values{};"),
+        "{cpp}"
+    );
+}
+
+#[test]
+fn local_nested_fixed_vector_lengths_fold_constants() {
+    let src = r#"
+const INNER : uint<8> = 1 + 1
+
+test LocalNestedVector
+    let dut : Top
+    run
+        let values : Vec<Vec<uint<8>, INNER>, 3>
+        wait 1 cycle
+    end run
+end test LocalNestedVector
+"#;
+    let program = lower_src(src).expect("nested local fixed-vector constants lower");
+    verify::verify_program(&program).expect("nested local fixed-vector constants verify");
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::array<std::array<uint64_t, 2>, 3> values{};"),
+        "{cpp}"
+    );
+
+    let body = harc::parser::parse_source_named(
+        "nested_body.harc",
+        &src.replace("const INNER : uint<8> = 1 + 1\n\n", ""),
+    )
+    .expect("body source parses");
+    let constants = harc::parser::parse_source_named(
+        "nested_constants.harc",
+        "const INNER : uint<8> = 1 + 1",
+    )
+    .expect("constant source parses");
+    let merged = merge::merge_for_sim(vec![body, constants], None).expect("sources merge");
+    let program = lower::lower_program(&merged)
+        .expect("type positions see constants from the complete merged source set");
+    verify::verify_program(&program).expect("cross-file nested vector constants verify");
+}
+
+#[test]
+fn invalid_nested_fixed_vector_lengths_keep_precise_diagnostics() {
+    let sources = |length: &str| {
+        [
+            format!(
+                r#"
+test BadNestedVector
+    let dut : Top
+    run
+        let values : Vec<Vec<uint<8>, {length}>, 2>
+        wait 1 cycle
+    end run
+end test BadNestedVector
+"#
+            ),
+            format!(
+                r#"
+transactor BadNestedState
+    dut : Top
+    values : Vec<Vec<uint<8>, {length}>, 2>
+    when active
+        hookable inspect()
+        end inspect
+    end when
+end transactor BadNestedState
+
+test BadNestedStateTest
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test BadNestedStateTest
+"#
+            ),
+            format!(
+                r#"
+tseq BadRows() -> TSeq<Vec<Vec<uint<8>, {length}>, 2>>
+    yield 0
+end tseq BadRows
+
+test BadNestedTseq
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test BadNestedTseq
+"#
+            ),
+        ]
+    };
+    for (length, expected) in [
+        ("true", "not a boolean"),
+        ("-1", "negative"),
+        ("MISSING", "not a `const`"),
+    ] {
+        for source in sources(length) {
+            let message = assert_invalid(&lower_src(&source).unwrap_err());
+            assert!(message.contains(expected), "length `{length}`: {message}");
+        }
+    }
+    for source in sources("18446744073709551616") {
+        let overflow = lower_src(&source).unwrap_err();
+        let message = assert_unsupported(&overflow);
+        assert!(message.contains("64-bit constant-evaluation domain"), "{message}");
+    }
+}
+
+#[test]
+fn tseq_nested_fixed_vector_lengths_fold_constants() {
+    let src = r#"
+const INNER : uint<8> = 1 + 1
+
+tseq Rows() -> TSeq<Vec<Vec<uint<8>, INNER>, 3>>
+    let row : Vec<Vec<uint<8>, INNER>, 3>
+    yield row
+end tseq Rows
+
+test NestedRows
+    let dut : Top
+    run
+        let rows = Rows()
+        wait 1 cycle
+    end run
+end test NestedRows
+"#;
+    let program = lower_src(src).expect("nested TSeq fixed-vector constants lower");
+    verify::verify_program(&program).expect("nested TSeq fixed-vector constants verify");
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::vector<std::array<std::array<uint64_t, 2>, 3>>"),
+        "{cpp}"
+    );
+}
+
+#[test]
 fn component_fixed_vec_whole_value_rules_and_metadata_are_checked() {
     let src = r#"scoreboard Table
     words : Vec<uint<64>, 4>
@@ -53412,9 +53649,9 @@ impl SeqTest for SeqTb
     end run
 end impl SeqTest
 "#;
-    let err = lower_src(src).expect_err("unsupported transactor TSeq element must be rejected");
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("unsupported TSeq element type"), "{msg}");
+    let err = lower_src(src).expect_err("unknown transactor TSeq element must be rejected");
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("not declared as a transaction or struct"), "{msg}");
 }
 
 #[test]

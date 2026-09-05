@@ -17,7 +17,8 @@ mod implementation;
 pub(crate) use implementation::{
     bound_transactor_is_component, connect_delivery_is_faithful, connect_payload_matches_ir_type,
     dotted_path, endpoint_label, event_payloads_agree_in_shape, field_scalar_width_ok,
-    fixed_vec_elem_ir_type, fixed_vec_ir_type_with_records, fold_field_default, is_event_field,
+    fixed_vec_elem_ir_type, fixed_vec_ir_type_with_records,
+    fixed_vec_ir_type_with_records_and_consts, fold_field_default, is_event_field,
     lower_component_bodies, lower_component_schema, lower_event_payload, lower_queue_elem,
     queue_fixed_vec_elem_ir_type, resolve_connects, resolve_testbench_connects,
     scalar_field_ir_type, scalar_width, scoreboard_is_component, testbench_method_param_ir_type,

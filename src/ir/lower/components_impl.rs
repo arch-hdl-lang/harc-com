@@ -1598,15 +1598,14 @@ fn lower_field(
                 ));
             }
             let decoded = match args.first() {
-                Some(TypeArg::Type(ty)) => queue_fixed_vec_elem_ir_type(ty, record_ids),
+                Some(TypeArg::Type(ty)) => {
+                    fixed_vec_elem_ir_type_with_records_and_consts(ty, record_ids, consts)?
+                }
                 Some(TypeArg::Expr(expr)) => {
                     let ExprKind::Ident(id) = &*expr.kind else {
-                        return Err(unsupported(
-                            &format!(
-                                "fixed-vector field `{comp}.{fname}` with an unsupported element type"
-                            ),
-                            "a fixed-vector element is a scalar, a declared record, or another fixed vector over those",
-                        ));
+                        return Err(LowerError::Invalid(format!(
+                            "fixed-vector field `{comp}.{fname}` element must be a type, not a value expression"
+                        )));
                     };
                     record_ids.get(&id.name).copied().map(IrType::Record)
                 }
@@ -1783,11 +1782,29 @@ fn lower_field(
             // On a transactor, an unknown named type is the module-typed
             // DUT handle (`dut : AxiLiteRegs`) the `on` handler pokes.
             if is_transactor {
-                if f.default.is_some() {
-                    return Err(unsupported(
-                        &format!("a default value on DUT-handle field `{comp}.{fname}`"),
-                        "the DUT handle is bound by the test (`<inst>.<dut> = dut`)",
-                    ));
+                if let Some(default) = &f.default {
+                    if !matches!(
+                        &*super::exprs::unparen_expr(default).kind,
+                        ExprKind::Int(_)
+                    ) {
+                        return Err(LowerError::Invalid(format!(
+                            "DUT-handle field `{comp}.{fname}` default must be the integer null literal 0"
+                        )));
+                    }
+                    let folded = super::fold_const(default, consts, "").map_err(|error| {
+                        let detail = match error {
+                            super::ConstFoldErr::Unsupported(detail)
+                            | super::ConstFoldErr::Invalid(detail) => detail,
+                        };
+                        LowerError::Invalid(format!(
+                            "DUT-handle field `{comp}.{fname}` default must be the null value 0: {detail}"
+                        ))
+                    })?;
+                    if folded.is_negative() || folded.bits != 0 {
+                        return Err(LowerError::Invalid(format!(
+                            "DUT-handle field `{comp}.{fname}` default must be the integer null literal 0"
+                        )));
+                    }
                 }
                 return Ok(ComponentFieldKind::Dut {
                     dut_type: simple.to_string(),
@@ -3686,6 +3703,93 @@ pub(crate) fn fixed_vec_ir_type_with_records(
     record_ids: &HashMap<String, RecordId>,
 ) -> Option<IrType> {
     fixed_vec_elem_ir_type_with_records(t, record_ids)
+}
+
+/// Decode a fixed-vector value type while folding every nested length with
+/// the file-scope constant environment. The literal-only entry point remains
+/// available for contexts that do not carry constants.
+pub(crate) fn fixed_vec_ir_type_with_records_and_consts(
+    t: &TypeExpr,
+    record_ids: &HashMap<String, RecordId>,
+    consts: &HashMap<String, super::ConstVal>,
+) -> Result<Option<IrType>, LowerError> {
+    fixed_vec_elem_ir_type_with_records_and_consts(t, record_ids, consts)
+}
+
+fn fixed_vec_elem_ir_type_with_records_and_consts(
+    t: &TypeExpr,
+    record_ids: &HashMap<String, RecordId>,
+    consts: &HashMap<String, super::ConstVal>,
+) -> Result<Option<IrType>, LowerError> {
+    if let TypeExpr::Builtin {
+        name: BuiltinTy::Vec,
+        args,
+        ..
+    } = t
+    {
+        let elem = match args.first() {
+            Some(TypeArg::Type(inner)) => {
+                let Some(elem) =
+                    fixed_vec_elem_ir_type_with_records_and_consts(inner, record_ids, consts)?
+                else {
+                    return Ok(None);
+                };
+                elem
+            }
+            Some(TypeArg::Expr(expr)) => {
+                let ExprKind::Ident(id) = &*expr.kind else {
+                    return Ok(None);
+                };
+                let Some(record) = record_ids.get(&id.name) else {
+                    return Ok(None);
+                };
+                IrType::Record(*record)
+            }
+            _ => return Ok(None),
+        };
+        let len_expr = match args.get(1) {
+            Some(TypeArg::Expr(expr)) => expr,
+            _ => return Ok(None),
+        };
+        if const_expr_has_boolean_result(len_expr, consts) {
+            return Err(LowerError::Invalid(
+                "nested fixed-vector length must be an integer expression, not a boolean"
+                    .to_string(),
+            ));
+        }
+        let folded = super::fold_const(len_expr, consts, "").map_err(|error| match error {
+            super::ConstFoldErr::Unsupported(detail) => unsupported(
+                "a nested fixed-vector length outside the constant-expression subset",
+                detail,
+            ),
+            super::ConstFoldErr::Invalid(detail) => LowerError::Invalid(format!(
+                "nested fixed-vector length is invalid: {detail}"
+            )),
+        })?;
+        if folded.is_negative() {
+            return Err(LowerError::Invalid(
+                "nested fixed-vector length is negative".to_string(),
+            ));
+        }
+        let len = usize::try_from(folded.bits).map_err(|_| {
+            LowerError::Invalid(
+                "nested fixed-vector length does not fit the host index size".to_string(),
+            )
+        })?;
+        return Ok(Some(IrType::FixedVec {
+            elem: Box::new(elem),
+            len,
+        }));
+    }
+    if let Some(name) = type_arg_simple_name(t) {
+        if let Some(record) = record_ids.get(name) {
+            return Ok(Some(IrType::Record(*record)));
+        }
+    }
+    Ok(vec_elem_scalar_ir_type(t).filter(|ty| {
+        matches!(ty, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 0)
+            || matches!(ty, IrType::Bool)
+    }))
 }
 
 fn fixed_vec_elem_ir_type_with_records(

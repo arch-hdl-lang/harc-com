@@ -1307,9 +1307,15 @@ impl FuncBuilder<'_> {
             // as real aggregate values. Initialize them explicitly at the
             // source `let` so whole-value calls and copies observe a defined,
             // default-constructed std::array value.
-            if let Some(ty @ IrType::FixedVec { .. }) = l.ty.as_ref().and_then(|ty| {
-                super::components::fixed_vec_ir_type_with_records(ty, &self.ctx.record_ids)
-            }) {
+            let fixed_ty = match l.ty.as_ref() {
+                Some(ty) => super::components::fixed_vec_ir_type_with_records_and_consts(
+                    ty,
+                    &self.ctx.record_ids,
+                    &self.ctx.consts,
+                )?,
+                None => None,
+            };
+            if let Some(ty @ IrType::FixedVec { .. }) = fixed_ty {
                 let id = self.declare(&l.name.name);
                 self.set_local_type(id, ty);
                 self.push(Stmt::AggregateInit(id));
@@ -1319,20 +1325,17 @@ impl FuncBuilder<'_> {
             // empty dynamic sequence. This is the local analogue of a tseq
             // accumulator/return slot and therefore uses AggregateInit rather
             // than the scalar zero initializer below.
-            if let Some(seq) = super::helpers::tseq_ir_type(l.ty.as_ref(), &self.ctx.record_ids) {
+            if let Some(seq) = super::helpers::callable_tseq_ir_type(
+                || format!("uninitialized `let {} : TSeq<...>`", l.name.name),
+                l.ty.as_ref(),
+                &self.ctx.record_ids,
+            )? {
                 if matches!(seq, IrType::RecordSeq(_) | IrType::Seq(_)) {
                     let id = self.declare(&l.name.name);
                     self.set_local_type(id, seq);
                     self.push(Stmt::AggregateInit(id));
                     return Ok(());
                 }
-                return Err(unsupported(
-                    &format!(
-                        "uninitialized `let {} : TSeq<...>` with an unsupported element type",
-                        l.name.name
-                    ),
-                    "a TSeq element must be a declared transaction/struct record or a scalar uint/sint/bool type",
-                ));
             }
             // Uninitialized scalar `let x: uint<N>;` — the declare-then-
             // assign-in-loop idiom. The local is hoisted as `<cty> x = 0;`
@@ -1613,9 +1616,15 @@ impl FuncBuilder<'_> {
         // Classification matches the neighbouring #734 checks: a
         // well-formed program under neither backend is `Invalid`.
         if let Some(ret) = &helper_aggregate_ty {
-            if let Some(declared) = l.ty.as_ref().and_then(|ty| {
-                super::components::fixed_vec_ir_type_with_records(ty, &self.ctx.record_ids)
-            }) {
+            let declared_fixed = match l.ty.as_ref() {
+                Some(ty) => super::components::fixed_vec_ir_type_with_records_and_consts(
+                    ty,
+                    &self.ctx.record_ids,
+                    &self.ctx.consts,
+                )?,
+                None => None,
+            };
+            if let Some(declared) = declared_fixed {
                 if &declared != ret {
                     return Err(LowerError::Invalid(format!(
                         "`let {}` fixed-vector annotation does not match the helper return",
@@ -6677,9 +6686,15 @@ impl FuncBuilder<'_> {
         if let Some(rid) = ret_record {
             self.set_local_type(id, IrType::Record(rid));
         } else if let Some(ty) = ret_fixed {
-            if let Some(declared) = l.ty.as_ref().and_then(|ty| {
-                super::components::fixed_vec_ir_type_with_records(ty, &self.ctx.record_ids)
-            }) {
+            let declared_fixed = match l.ty.as_ref() {
+                Some(ty) => super::components::fixed_vec_ir_type_with_records_and_consts(
+                    ty,
+                    &self.ctx.record_ids,
+                    &self.ctx.consts,
+                )?,
+                None => None,
+            };
+            if let Some(declared) = declared_fixed {
                 if declared != ty {
                     return Err(LowerError::Invalid(format!(
                         "`let {}` fixed-vector annotation does not match the testbench method return",
