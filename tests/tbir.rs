@@ -48712,6 +48712,20 @@ end test BadVectorType
 }
 
 #[test]
+fn unknown_bare_statement_call_is_invalid() {
+    let src = r#"
+test UnknownCall
+    let dut : Top
+    run
+        nosuch(1)
+    end run
+end test UnknownCall
+"#;
+    let message = assert_invalid(&lower_src(src).expect_err("unknown call must be rejected"));
+    assert!(message.contains("unknown callable `nosuch`"), "{message}");
+}
+
+#[test]
 fn persistent_nested_fixed_vector_lengths_fold_constants() {
     let src = r#"
 const INNER : uint<8> = 1 + 1

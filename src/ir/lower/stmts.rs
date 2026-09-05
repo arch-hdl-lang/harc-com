@@ -868,7 +868,10 @@ impl FuncBuilder<'_> {
                                 }
                                 return Ok(());
                             }
-                            format!("helper call `{}(...)`", id.name)
+                            return Err(LowerError::Invalid(format!(
+                                "unknown callable `{}` in statement position",
+                                id.name
+                            )));
                         }
                         ExprKind::Field { name, .. } => {
                             format!("method call `.{}(...)`", name.name)

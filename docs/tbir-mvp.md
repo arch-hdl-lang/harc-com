@@ -10486,6 +10486,14 @@ former `transaction` group lives in
      the already-supported outer length. The textual unsupported count remains
      97; this closes a real subset hidden behind the shared element-type gate.
 
+251. **Unknown bare statement calls (2026-09-04).**
+
+     A bare call in statement position that resolves to no testbench method,
+     transactor self-method, or helper is now an invalid source reference. The
+     remaining method-shaped fallback is reserved for receiver forms whose
+     backend support can genuinely vary. The textual unsupported count remains
+     97 because that shared fallback still handles those receiver forms.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
