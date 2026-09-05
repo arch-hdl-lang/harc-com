@@ -1765,6 +1765,12 @@ impl FuncBuilder<'_> {
                 // local emits `int64_t y = x.foo;` — a member access on
                 // an integer, which the C++ compiler rejects.
                 self.reject_indexed_component_record_path(e, "a read through")?;
+                if matches!(&*target.kind, ExprKind::Ident(root) if root.name == "_tb") {
+                    return Err(LowerError::Invalid(format!(
+                        "unknown testbench field `_tb.{}`",
+                        name.name
+                    )));
+                }
                 Err(not_implemented(
                     &format!("field access on a non-DUT value ending in `.{}`", name.name),
                     "",
@@ -4693,10 +4699,10 @@ impl FuncBuilder<'_> {
                         {
                             return Ok(None);
                         }
-                        return Err(unsupported(
-                            &format!("testbench field access `_tb.{}`", segments.last().unwrap()),
-                            "",
-                        ));
+                        return Err(LowerError::Invalid(format!(
+                            "unknown testbench field `_tb.{}`",
+                            segments.last().unwrap()
+                        )));
                     }
                     return Ok(None);
                 }

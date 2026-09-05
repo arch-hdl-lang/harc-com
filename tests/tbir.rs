@@ -48742,6 +48742,24 @@ end test UnknownValueCall
 }
 
 #[test]
+fn unknown_explicit_testbench_field_is_invalid() {
+    let src = r#"
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl UnknownField for Tb
+    run
+        let value = _tb.nope
+        log(info, "value={{}}", value)
+    end run
+end impl UnknownField
+"#;
+    let message = assert_invalid(&lower_src(src).expect_err("unknown testbench field is invalid"));
+    assert!(message.contains("unknown testbench field `_tb.nope`"), "{message}");
+}
+
+#[test]
 fn persistent_nested_fixed_vector_lengths_fold_constants() {
     let src = r#"
 const INNER : uint<8> = 1 + 1

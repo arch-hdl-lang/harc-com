@@ -10501,6 +10501,13 @@ former `transaction` group lives in
      intrinsic is now an invalid source reference. Receiver-method expressions
      retain the backend-gap fallback. The textual unsupported count remains 97.
 
+253. **Unknown explicit testbench fields (2026-09-04).**
+
+     An explicit `_tb.<name>` path that resolves to no scalar, record,
+     scoreboard, covergroup, transactor, or component field is now an invalid
+     source reference. This removes one constructor and leaves 96 textual
+     `unsupported(` matches in `src/ir/lower`.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
