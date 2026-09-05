@@ -5596,6 +5596,45 @@ end test FixedVectorLocal
 }
 
 #[test]
+fn common_layout_emits_sequences_of_fixed_vectors() {
+    let source = parse_source(
+        r#"
+test FixedVectorSequence
+    let dut : CommonReg
+    clock clk = 10ns
+    run
+        let rows : TSeq<Vec<uint<8>, 2>>
+        wait 1 cycle
+    end run
+end test FixedVectorSequence
+"#,
+    )
+    .expect("fixed-vector sequence source parses");
+    let program = lower::lower_program(&source).expect("fixed-vector sequence source lowers");
+    verify::verify_program(&program).expect("fixed-vector sequence program verifies");
+    let mut opts = cpp_tb::EmitOpts::default();
+    opts.dut_port_widths = HashMap::from([("clk".to_string(), 1)]);
+    set_clock_interface_for_program(&program, &mut opts);
+
+    let plan = tbir::common::plan_common_tests(&program, &opts, "suite__")
+        .expect("fixed-vector sequences are valid common-layout input");
+    let capsule = tbir::common::emit_common_capsule(&plan, 0).expect("capsule emits");
+    assert!(capsule.contains("std::vector<std::array<uint64_t, 2>> rows{};"));
+
+    let mut malformed = program.clone();
+    let rows = malformed
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.locals)
+        .find(|local| local.name == "rows")
+        .expect("rows local exists");
+    rows.ty = harc::ir::IrType::Seq(Box::new(harc::ir::IrType::Record(harc::ir::RecordId(0))));
+    let error = tbir::common::plan_common_tests(&malformed, &opts, "suite__")
+        .expect_err("direct Seq<Record> is malformed; RecordSeq is canonical");
+    assert!(error.0.contains("sequence element with record type"), "{error}");
+}
+
+#[test]
 fn common_plan_orders_and_owns_all_ticket04_structural_types() {
     let (program, opts) = structural_program();
     let plan = tbir::common::plan_common_tests(&program, &opts, "suite__").expect("plans");

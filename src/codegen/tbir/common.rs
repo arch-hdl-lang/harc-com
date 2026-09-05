@@ -5014,8 +5014,11 @@ fn validate_common_local_type(prog: &TbProgram, ty: &IrType) -> Result<(), (Stri
                 Err((format!("missing record r{}", record.0), "ticket 04"))
             }
         }
-        IrType::Seq(elem) => validate_common_scalar_type(elem)
-            .map_err(|feature| (format!("sequence element with {feature}"), "ticket 04")),
+        IrType::Seq(elem) => match elem.as_ref() {
+            IrType::FixedVec { .. } => validate_common_fixed_value_type(prog, elem),
+            _ => validate_common_scalar_type(elem),
+        }
+        .map_err(|feature| (format!("sequence element with {feature}"), "ticket 04")),
         IrType::String => Ok(()),
         IrType::FixedVec { .. } => validate_common_fixed_value_type(prog, ty)
             .map_err(|feature| (format!("fixed-vector local with {feature}"), "ticket 04")),
