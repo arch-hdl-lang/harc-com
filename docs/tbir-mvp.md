@@ -10396,6 +10396,17 @@ former `transaction` group lives in
      retiring v1 backend. This removes one constructor and leaves 104 textual
      `unsupported(` matches in `src/ir/lower`.
 
+240. **Constant-expression component vector lengths (2026-09-04).**
+
+     The outer length of persistent component `Vec<T, N>` fields now folds file
+     constants and integer constant expressions through the shared evaluator
+     instead of requiring a decimal literal. Boolean-valued, malformed,
+     negative, and non-constant lengths receive precise diagnostics; nested
+     vector lengths remain on their separately tracked literal-only decoder.
+     The folded cardinality drives the verified `FixedVecSchema` and emitted
+     `std::array`. The residual diagnostic constructor remains, so the raw
+     inventory stays at 104 textual matches.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

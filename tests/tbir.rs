@@ -48564,6 +48564,41 @@ end impl T"#;
         msg.contains("default value on fixed-vector field `Table.words`"),
         "{msg}"
     );
+
+    let const_len = base
+        .replacen(
+            "scoreboard Table",
+            "const LANES : uint<8> = 1\nscoreboard Table",
+            1,
+        )
+        .replace("Vec<uint<8>, 2>", "Vec<uint<8>, LANES + 1>")
+        .replace("table.words[2] = 1", "table.words[1] = 1");
+    let prog = lower_src(&const_len).expect("constant-expression vector length lowers");
+    let table = prog.components.iter().find(|c| c.name == "Table").unwrap();
+    assert!(matches!(
+        &table.field("words").unwrap().kind,
+        ir::ComponentFieldKind::FixedVec(v) if v.len == 2
+    ));
+    assert!(
+        emit_cpp_src(&const_len).contains("std::array<uint64_t, 2> words{};"),
+        "folded length drives TBIR storage"
+    );
+
+    let bad_len = |prefix: &str, len: &str| {
+        let source = base
+            .replacen("scoreboard Table", &format!("{prefix}\nscoreboard Table"), 1)
+            .replace("Vec<uint<8>, 2>", &format!("Vec<uint<8>, {len}>"));
+        lower_src(&source)
+        .expect_err("invalid fixed-vector length must be rejected")
+        .to_string()
+    };
+    assert!(bad_len("", "-1").contains("negative length"));
+    assert!(bad_len("", "true").contains("integer expression"));
+    assert!(bad_len("", "1 == 1").contains("integer expression"));
+    assert!(bad_len("", "true | false").contains("integer expression"));
+    assert!(bad_len("", "~true").contains("integer expression"));
+    assert!(bad_len("const FLAG : bool = true", "FLAG").contains("integer expression"));
+    assert!(bad_len("", "MISSING").contains("not a `const`"));
 }
 
 #[test]
