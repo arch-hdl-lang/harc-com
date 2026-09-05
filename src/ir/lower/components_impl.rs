@@ -4767,19 +4767,16 @@ impl super::FuncBuilder<'_> {
             _ => false,
         };
         if !is_dut {
-            return Err(unsupported(
-                &format!(
-                    "binding event-driven transactor DUT handle `{}` to something other \
-                     than the test DUT",
+            return Err(LowerError::Invalid(format!(
+                "binding event-driven transactor DUT handle `{}` to something other \
+                 than the test DUT",
                     recv_prefix
                         .iter()
                         .chain(tail.iter())
                         .cloned()
                         .collect::<Vec<_>>()
                         .join(".")
-                ),
-                "",
-            ));
+            )));
         }
         Ok(true)
     }

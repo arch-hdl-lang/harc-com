@@ -2229,6 +2229,14 @@ fn event_driven_transactor_fixture_lowers() {
     assert_eq!(comp.on_handlers.len(), 1);
 }
 
+#[test]
+fn event_driven_transactor_dut_bind_requires_the_test_dut() {
+    let source = fixture("axilite_seqdrv_test.harc").replace("drv.dut = dut", "drv.dut = 5");
+    let message = assert_invalid(&lower_src(&source).expect_err("non-DUT handle bind is invalid"));
+    assert!(message.contains("drv.dut"), "{message}");
+    assert!(message.contains("something other than the test DUT"), "{message}");
+}
+
 /// The *bound-to* event-driven transactor (`transactor X bound to
 /// BusAxiLite` + `req : in event` + `on req` driving the bound bus's
 /// handshake channels) now lowers: it routes to the composite-component

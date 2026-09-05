@@ -10433,6 +10433,13 @@ former `transaction` group lives in
      This removes a code-generation-only gate; the raw lowering inventory
      remains at 104 textual matches.
 
+244. **Event-transactor DUT bind type errors (2026-09-04).**
+
+     Assigning a non-DUT value to an event-driven transactor's DUT handle is
+     now classified as an invalid source binding rather than a missing TBIR
+     feature. The diagnostic names the handle path and required test DUT.
+     This removes one constructor and leaves 103 textual `unsupported(`
+     matches in `src/ir/lower`.
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
