@@ -24842,6 +24842,31 @@ end impl FixedVectorTseqSignatureTest"#;
 }
 
 #[test]
+fn legacy_test_scope_is_parser_rejected_before_duplicate_guard() {
+    let src = r#"test DuplicateScope
+    let dut : Top
+    scope sim
+        run
+            wait 1 cycle
+        end run
+    end scope
+    scope sim
+        run
+            wait 1 cycle
+        end run
+    end scope
+end test DuplicateScope"#;
+    let msg = format!(
+        "{:?}",
+        parse_source(src).expect_err("legacy scope syntax must reject in the parser")
+    );
+    assert!(
+        msg.contains("legacy `scope sim` block was removed"),
+        "{msg}"
+    );
+}
+
+#[test]
 fn record_leaf_fixed_vector_tseq_callable_signatures_lower() {
     let pure = r#"transaction Beat
     value : uint<8> default 0

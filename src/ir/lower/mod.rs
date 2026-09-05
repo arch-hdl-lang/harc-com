@@ -4847,7 +4847,10 @@ fn lower_test(
             TestItem::Clock(c) => clocks.push(c),
             TestItem::Scope(s) => {
                 if scope.is_some() {
-                    return Err(unsupported("multiple `scope` blocks in one test", ""));
+                    return Err(LowerError::Invalid(format!(
+                        "test `{}` declares multiple `scope` blocks; exactly one is allowed",
+                        t.name.name
+                    )));
                 }
                 scope = Some(s);
                 // Everything in `bare_stmts` so far precedes the scope.
