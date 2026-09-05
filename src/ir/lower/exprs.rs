@@ -2241,15 +2241,58 @@ impl FuncBuilder<'_> {
                 // Fixed-vector locals and dynamic sequences share the same
                 // emitted `<local>[index]` shape. The verifier recovers the
                 // exact element type from the receiver local.
+                if let ExprKind::Index {
+                    target: inner_target,
+                    index: outer_index,
+                } = &*target.kind
+                {
+                    if let ExprKind::Ident(id) = &*inner_target.kind {
+                        if let Some(local) = self.lookup(&id.name) {
+                            if let IrType::FixedVec { len, elem } = self.local_type(local) {
+                                if let IrType::FixedVec {
+                                    len: inner_len,
+                                    elem: inner_elem,
+                                } = &**elem
+                                {
+                                    if !matches!(**inner_elem, IrType::FixedVec { .. }) {
+                                        let len = *len;
+                                        let inner_len = *inner_len;
+                                        let outer = self.lower_expr(outer_index)?;
+                                        self.validate_numeric_expr(
+                                            &outer,
+                                            "outer local `Vec` index",
+                                        )?;
+                                        check_literal_vec_index_bounds(&id.name, &outer, len)?;
+                                        let inner = self.lower_expr(index)?;
+                                        self.validate_numeric_expr(
+                                            &inner,
+                                            "inner local `Vec` index",
+                                        )?;
+                                        check_literal_vec_index_bounds(
+                                            &id.name, &inner, inner_len,
+                                        )?;
+                                        return Ok(Expr::SeqIndex {
+                                            seq: local,
+                                            index: Box::new(outer),
+                                            inner_index: Some(Box::new(inner)),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if let ExprKind::Ident(id) = &*target.kind {
                     if let Some(local) = self.lookup(&id.name) {
                         if let IrType::FixedVec { len, .. } = self.local_type(local) {
                             let len = *len;
                             let index = self.lower_expr(index)?;
+                            self.validate_numeric_expr(&index, "local `Vec` index")?;
                             check_literal_vec_index_bounds(&id.name, &index, len)?;
                             return Ok(Expr::SeqIndex {
                                 seq: local,
                                 index: Box::new(index),
+                                inner_index: None,
                             });
                         }
                     }
@@ -3202,9 +3245,33 @@ impl FuncBuilder<'_> {
     }
 
     pub(crate) fn validate_numeric_expr(&self, e: &Expr, context: &str) -> Result<(), LowerError> {
+        if matches!(self.expr_type(e), Some(IrType::FixedVec { .. })) {
+            return Err(LowerError::Invalid(format!(
+                "{context} must be an integer value, not a fixed vector"
+            )));
+        }
+        if matches!(
+            self.expr_type(e),
+            Some(IrType::Seq(_) | IrType::RecordSeq(_))
+        ) {
+            return Err(LowerError::Invalid(format!(
+                "{context} must be an integer value, not a dynamic sequence"
+            )));
+        }
         if matches!(self.expr_type(e), Some(IrType::String)) {
             return Err(LowerError::Invalid(format!(
                 "{context} must be an integer value, not `String`"
+            )));
+        }
+        if let Some(record) = self.record_id_of_expr(e) {
+            let name = &self.ctx.records[record.index()].name;
+            return Err(LowerError::Invalid(format!(
+                "{context} must be an integer value, not record `{name}`"
+            )));
+        }
+        if matches!(self.expr_type(e), Some(IrType::Component(_))) {
+            return Err(LowerError::Invalid(format!(
+                "{context} must be an integer value, not a component"
             )));
         }
         Ok(())
@@ -3511,11 +3578,19 @@ impl FuncBuilder<'_> {
                     n: Box::new(n),
                 }
             }
-            Expr::SeqIndex { seq, index } => {
+            Expr::SeqIndex {
+                seq,
+                index,
+                inner_index,
+            } => {
                 let index = self.hoist_ports_with_hint(*index, None, exact_untyped_ports);
+                let inner_index = inner_index.map(|index| {
+                    Box::new(self.hoist_ports_with_hint(*index, None, exact_untyped_ports))
+                });
                 Expr::SeqIndex {
                     seq,
                     index: Box::new(index),
+                    inner_index,
                 }
             }
             Expr::ComponentVecElement { base, field, index_pos, index, inner_index } => {
@@ -3784,6 +3859,18 @@ impl FuncBuilder<'_> {
                 }
                 None
             }
+            Expr::SeqIndex {
+                seq, inner_index, ..
+            } => match self.local_type(*seq) {
+                IrType::RecordSeq(record) => Some(IrType::Record(*record)),
+                IrType::Seq(elem) => Some((**elem).clone()),
+                IrType::FixedVec { elem, .. } => match (inner_index, &**elem) {
+                    (Some(_), IrType::FixedVec { elem, .. }) => Some((**elem).clone()),
+                    (None, elem) => Some(elem.clone()),
+                    _ => None,
+                },
+                _ => None,
+            },
             Expr::ComponentVecElement {
                 base,
                 field,
@@ -4143,11 +4230,18 @@ impl FuncBuilder<'_> {
                     n: Box::new(n),
                 }
             }
-            Expr::SeqIndex { seq, index } => {
+            Expr::SeqIndex {
+                seq,
+                index,
+                inner_index,
+            } => {
                 let index = self.hoist_transactor_calls(*index);
+                let inner_index =
+                    inner_index.map(|index| Box::new(self.hoist_transactor_calls(*index)));
                 Expr::SeqIndex {
                     seq,
                     index: Box::new(index),
+                    inner_index,
                 }
             }
             Expr::ComponentVecElement {
@@ -6837,7 +6931,16 @@ where
         Expr::ComponentIdle { n, .. } | Expr::TransactorIdle { n, .. } => {
             expr_has_bound_transactor_edge(n, is_bound)
         }
-        Expr::SeqIndex { index, .. } => expr_has_bound_transactor_edge(index, is_bound),
+        Expr::SeqIndex {
+            index,
+            inner_index,
+            ..
+        } => {
+            expr_has_bound_transactor_edge(index, is_bound)
+                || inner_index
+                    .as_deref()
+                    .is_some_and(|inner| expr_has_bound_transactor_edge(inner, is_bound))
+        }
         Expr::TbFieldVecElement {
             index, inner_index, ..
         }

@@ -79,8 +79,18 @@ pub fn try_visit_expr_children<E>(
             try_visit_port_lane_expr(port, visit)?;
             visit(index)
         }
-        Expr::SeqIndex { index, .. }
-        | Expr::ComponentIdle { n: index, .. }
+        Expr::SeqIndex {
+            index,
+            inner_index,
+            ..
+        } => {
+            visit(index)?;
+            if let Some(inner) = inner_index {
+                visit(inner)?;
+            }
+            Ok(())
+        }
+        Expr::ComponentIdle { n: index, .. }
         | Expr::TransactorIdle { n: index, .. } => visit(index),
         Expr::CovHookParam {
             index: Some(index), ..
@@ -163,8 +173,17 @@ pub fn visit_expr_children_mut(expr: &mut Expr, visit: &mut impl FnMut(&mut Expr
             visit_port_lane_expr_mut(port, visit);
             visit(index);
         }
-        Expr::SeqIndex { index, .. }
-        | Expr::ComponentIdle { n: index, .. }
+        Expr::SeqIndex {
+            index,
+            inner_index,
+            ..
+        } => {
+            visit(index);
+            if let Some(inner) = inner_index {
+                visit(inner);
+            }
+        }
+        Expr::ComponentIdle { n: index, .. }
         | Expr::TransactorIdle { n: index, .. } => visit(index),
         Expr::CovHookParam {
             index: Some(index), ..
@@ -242,6 +261,12 @@ pub fn try_visit_stmt_exprs<E>(
             visit(value)
         }
         Stmt::TbFieldVecElementWrite {
+            index,
+            inner_index,
+            value,
+            ..
+        }
+        | Stmt::LocalVecElementWrite {
             index,
             inner_index,
             value,
@@ -346,6 +371,12 @@ pub fn visit_stmt_exprs_mut(stmt: &mut Stmt, visit: &mut impl FnMut(&mut Expr)) 
             visit(value);
         }
         Stmt::TbFieldVecElementWrite {
+            index,
+            inner_index,
+            value,
+            ..
+        }
+        | Stmt::LocalVecElementWrite {
             index,
             inner_index,
             value,

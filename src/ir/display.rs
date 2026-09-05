@@ -773,6 +773,18 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
                 expr_str(func, value)
             )
         }
+        Stmt::LocalVecElementWrite {
+            local,
+            index,
+            inner_index,
+            value,
+        } => {
+            let mut member = format!("{}[{}]", local_str(func, *local), expr_str(func, index));
+            if let Some(inner) = inner_index {
+                member = format!("{member}[{}]", expr_str(func, inner));
+            }
+            format!("LocalVecElementWrite({member}, {})", expr_str(func, value))
+        }
         Stmt::TbQueuePush { field, value } => {
             format!("TbQueuePush(_tb.{field}, {})", expr_str(func, value))
         }
@@ -1527,12 +1539,16 @@ pub(crate) fn expr_str(func: &TbFunction, e: &Expr) -> String {
         },
         Expr::CovHookArg { param } => format!("CovHookArg({param})"),
         Expr::SeqLen(l) => format!("SeqLen({})", local_str(func, *l)),
-        Expr::SeqIndex { seq, index } => {
-            format!(
-                "SeqIndex({}, {})",
-                local_str(func, *seq),
-                expr_str(func, index)
-            )
+        Expr::SeqIndex {
+            seq,
+            index,
+            inner_index,
+        } => {
+            let mut member = format!("{}[{}]", local_str(func, *seq), expr_str(func, index));
+            if let Some(inner) = inner_index {
+                member = format!("{member}[{}]", expr_str(func, inner));
+            }
+            format!("SeqIndex({member})")
         }
         Expr::Call(target, args) => {
             let t = match target {

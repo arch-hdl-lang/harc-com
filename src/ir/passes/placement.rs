@@ -418,6 +418,12 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                 inner_index,
                 value,
                 ..
+            }
+            | Stmt::LocalVecElementWrite {
+                index,
+                inner_index,
+                value,
+                ..
             } => {
                 host_service_only = false;
                 visit_expr(index, &mut accesses, &mut transactor);

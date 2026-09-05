@@ -4691,7 +4691,9 @@ fn common_plan_shares_unbound_active_transactor_methods() {
     dut : CommonReg
     last : uint<8> default 0
     hookable reset_state()
-        last = 0
+        let scratch : Vec<uint<8>, 2>
+        scratch[0] = 1
+        last = scratch[0]
     end reset_state
     when active
         hookable step(value: uint<8>)
@@ -5556,6 +5558,10 @@ test FixedVectorLocal
     clock clk = 10ns
     run
         let lanes : Vec<Vec<Lane, 2>, 3>
+        let lane : Lane
+        lane.value = 9
+        lanes[1][0] = lane
+        let selected = lanes[1][0]
         let copy = keep_grid(lanes)
         wait 1 cycle
     end run
@@ -5563,7 +5569,34 @@ end test FixedVectorLocal
 "#,
     )
     .expect("fixed-vector local source parses");
-    let program = lower::lower_program(&source).expect("fixed-vector local source lowers");
+    let mut program = lower::lower_program(&source).expect("fixed-vector local source lowers");
+    let helper = program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "keep_grid")
+        .expect("keep_grid helper");
+    let probe = harc::ir::LocalId(helper.locals.len() as u32);
+    helper.locals.push(harc::ir::TypedLocal {
+        name: "probe".to_string(),
+        ty: harc::ir::IrType::Record(harc::ir::RecordId(0)),
+    });
+    helper.blocks[0].stmts.insert(
+        0,
+        harc::ir::Stmt::Assign(
+            probe,
+            harc::ir::Expr::SeqIndex {
+                seq: harc::ir::LocalId(0),
+                index: Box::new(harc::ir::Expr::Literal {
+                    value: 0,
+                    ty: harc::ir::IrType::Unknown,
+                }),
+                inner_index: Some(Box::new(harc::ir::Expr::Literal {
+                    value: 0,
+                    ty: harc::ir::IrType::Unknown,
+                })),
+            },
+        ),
+    );
     verify::verify_program(&program).expect("fixed-vector local program verifies");
     let mut opts = cpp_tb::EmitOpts::default();
     opts.dut_port_widths = HashMap::from([("clk".to_string(), 1)]);
@@ -5571,10 +5604,18 @@ end test FixedVectorLocal
 
     let plan = tbir::common::plan_common_tests(&program, &opts, "suite__")
         .expect("fixed-vector locals are valid common-layout input");
+    let runtime = plan
+        .publication()
+        .expect("fixed-vector local publication")
+        .runtime()
+        .expect("fixed-vector local runtime");
     let capsule = tbir::common::emit_common_capsule(&plan, 0).expect("capsule emits");
     assert!(capsule.contains("std::array<std::array<Lane, 2>, 3> lanes{};"));
     assert!(capsule.contains("lanes = decltype(lanes){};"));
     assert!(capsule.contains("harc_helper_keep_grid(lanes)"));
+    assert!(runtime.contains("probe = values[0][0];"), "{runtime}");
+    assert!(capsule.contains("lanes[1][0] = lane;"));
+    assert!(capsule.contains("selected = lanes[1][0];"));
 
     let mut malformed = program.clone();
     let lanes = malformed

@@ -4037,7 +4037,14 @@ impl Checker<'_> {
         self.check_expr(expr, ports_ok, context);
         if matches!(
             self.aggregate_assignment_expr_type(expr),
-            Some(IrType::String | IrType::Record(_) | IrType::Seq(_) | IrType::FixedVec { .. })
+            Some(
+                IrType::String
+                    | IrType::Record(_)
+                    | IrType::RecordSeq(_)
+                    | IrType::Seq(_)
+                    | IrType::FixedVec { .. }
+                    | IrType::Component(_)
+            )
         ) || self.contains_invalid_record_composition(expr)
         {
             self.errs.push(VerifyError::BadProgramRef {
@@ -5230,9 +5237,16 @@ impl Checker<'_> {
                 .and_then(|tb| tb.scalar_fields.iter().find(|f| f.name == *field))
                 .map(|field| field.ty.clone())
                 .or(Some(IrType::Unknown)),
-            Expr::SeqIndex { seq, .. } => match self.func.locals.get(seq.index()).map(|l| &l.ty) {
+            Expr::SeqIndex {
+                seq, inner_index, ..
+            } => match self.func.locals.get(seq.index()).map(|l| &l.ty) {
                 Some(IrType::RecordSeq(record)) => Some(IrType::Record(*record)),
                 Some(IrType::Seq(scalar)) => Some((**scalar).clone()),
+                Some(IrType::FixedVec { elem, .. }) => match (inner_index, &**elem) {
+                    (Some(_), IrType::FixedVec { elem, .. }) => Some((**elem).clone()),
+                    (None, elem) => Some(elem.clone()),
+                    _ => Some(IrType::Unknown),
+                },
                 _ => Some(IrType::Unknown),
             },
             Expr::ComponentValue { base } => self
@@ -5408,11 +5422,24 @@ impl Checker<'_> {
             Expr::WidthCast { inner, .. }
             | Expr::ComponentIdle { n: inner, .. }
             | Expr::TransactorIdle { n: inner, .. }
-            | Expr::SeqIndex { index: inner, .. } => {
+            => {
                 matches!(
                     self.aggregate_assignment_expr_type(inner),
                     Some(IrType::Record(_) | IrType::FixedVec { .. } | IrType::Seq(_))
                 ) || self.contains_invalid_record_composition(inner)
+            }
+            Expr::SeqIndex {
+                index,
+                inner_index,
+                ..
+            } => {
+                let bad = |inner: &Expr| {
+                    matches!(
+                        self.aggregate_assignment_expr_type(inner),
+                        Some(IrType::Record(_) | IrType::FixedVec { .. } | IrType::Seq(_))
+                    ) || self.contains_invalid_record_composition(inner)
+                };
+                bad(index) || inner_index.as_deref().is_some_and(bad)
             }
             _ => false,
         }
@@ -7034,6 +7061,26 @@ impl Checker<'_> {
                         "TbFieldVecElementWrite",
                     );
                 }
+                Stmt::LocalVecElementWrite {
+                    local,
+                    index,
+                    inner_index,
+                    value,
+                } => {
+                    self.check_local(*local);
+                    let vec_ty = self
+                        .func
+                        .locals
+                        .get(local.index())
+                        .map(|local| local.ty.clone());
+                    self.check_fixed_vec_element_write(
+                        vec_ty,
+                        index,
+                        inner_index.as_ref(),
+                        value,
+                        "LocalVecElementWrite",
+                    );
+                }
                 Stmt::ComponentEmit {
                     base,
                     subpath,
@@ -8125,14 +8172,10 @@ impl Checker<'_> {
     }
 
     /// Bounds- and structure-check a fixed-vector element write whose
-    /// receiver is a plain `IrType::FixedVec` — a testbench host field
-    /// (`_tb.mem[i] = x`). The testbench-field decoder gate admits only
-    /// scalar (or nested-`FixedVec`) elements, so there is no
-    /// component-field / dotted-path indirection and no record elements to
-    /// reject; this mirrors the scalar path of `ComponentVecElementWrite`.
-    /// The value's scalar coercion is an established lowering contract, so
-    /// (as on the component path) only the index bounds are enforced here
-    /// beyond the structural `check_expr` walks.
+    /// receiver is a plain `IrType::FixedVec` — a testbench host field or a
+    /// fixed-vector local. The value's scalar coercion is an established
+    /// lowering contract; record elements additionally require exact record
+    /// identity so malformed IR cannot substitute a different aggregate.
     fn check_fixed_vec_element_write(
         &mut self,
         vec_ty: Option<IrType>,
@@ -8142,6 +8185,28 @@ impl Checker<'_> {
         what: &'static str,
     ) {
         self.check_expr(value, false, what);
+        let selected = match vec_ty.as_ref() {
+            Some(IrType::FixedVec { elem, .. }) => match (inner_index, elem.as_ref()) {
+                (Some(_), IrType::FixedVec { elem, .. }) => Some(elem.as_ref()),
+                (None, elem) => Some(elem),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let (Some(expected), Some(actual)) =
+            (selected, self.aggregate_assignment_expr_type(value))
+        {
+            let aggregate_boundary = matches!(expected, IrType::Record(_))
+                || matches!(actual, IrType::Record(_) | IrType::FixedVec { .. } | IrType::Seq(_));
+            if aggregate_boundary && !aggregate_assignment_compatible(expected, &actual) {
+                self.errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "fn{} b{} {what}: element type {expected:?} is written from incompatible type {actual:?}",
+                        self.fid.0, self.bid.0
+                    ),
+                });
+            }
+        }
         self.check_fixed_vec_element_indices(vec_ty, index, inner_index, false, what, what);
     }
 
@@ -8172,11 +8237,17 @@ impl Checker<'_> {
         context: &'static str,
         what: &'static str,
     ) {
-        self.check_non_string_expr(index, ports_ok, context);
+        self.check_scalar_value_expr(index, ports_ok, context);
         if let Some(inner) = inner_index {
-            self.check_non_string_expr(inner, ports_ok, context);
+            self.check_scalar_value_expr(inner, ports_ok, context);
         }
         let Some(IrType::FixedVec { elem, len }) = vec_ty else {
+            self.errs.push(VerifyError::BadProgramRef {
+                what: format!(
+                    "fn{} b{} {what}: receiver is not a fixed vector",
+                    self.fid.0, self.bid.0
+                ),
+            });
             return;
         };
         if len == 0 || matches!(index, Expr::Literal { value, .. } if *value as usize >= len) {
@@ -9391,20 +9462,61 @@ impl Checker<'_> {
             // Sequence element read (`seq[i]`): the seq local must resolve;
             // the index follows the same port rules as the surrounding
             // context.
-            Expr::SeqIndex { seq, index } => {
+            Expr::SeqIndex {
+                seq,
+                index,
+                inner_index,
+            } => {
                 self.check_local(*seq);
-                if !matches!(
-                    self.func.locals.get(seq.index()).map(|local| &local.ty),
-                    Some(IrType::RecordSeq(_) | IrType::Seq(_) | IrType::FixedVec { .. })
-                ) {
-                    self.errs.push(VerifyError::BadProgramRef {
-                        what: format!(
-                            "fn{} b{} sequence/fixed-vector index receiver %{} is not indexable",
-                            self.fid.0, self.bid.0, seq.0
-                        ),
-                    });
+                let receiver = self
+                    .func
+                    .locals
+                    .get(seq.index())
+                    .map(|local| local.ty.clone());
+                match receiver {
+                    Some(ty @ IrType::FixedVec { .. }) => {
+                        self.check_fixed_vec_element_read(
+                            Some(ty),
+                            index,
+                            inner_index.as_deref(),
+                            ports_ok,
+                            "sequence index",
+                            "SeqIndex",
+                        );
+                    }
+                    Some(IrType::RecordSeq(_) | IrType::Seq(_)) => {
+                        self.check_scalar_value_expr(index, ports_ok, "sequence index");
+                        if let Some(inner) = inner_index {
+                            self.check_scalar_value_expr(
+                                inner,
+                                ports_ok,
+                                "inner sequence index",
+                            );
+                            self.errs.push(VerifyError::BadProgramRef {
+                                what: format!(
+                                    "fn{} b{} nested fixed-vector index receiver %{} is not nested",
+                                    self.fid.0, self.bid.0, seq.0
+                                ),
+                            });
+                        }
+                    }
+                    _ => {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!(
+                                "fn{} b{} sequence/fixed-vector index receiver %{} is not indexable",
+                                self.fid.0, self.bid.0, seq.0
+                            ),
+                        });
+                        self.check_scalar_value_expr(index, ports_ok, "sequence index");
+                        if let Some(inner) = inner_index {
+                            self.check_scalar_value_expr(
+                                inner,
+                                ports_ok,
+                                "inner sequence index",
+                            );
+                        }
+                    }
                 }
-                self.check_non_string_expr(index, ports_ok, "sequence index");
             }
             Expr::Call(
                 CallTarget::Helper {
@@ -10425,10 +10537,16 @@ fn expr_type_with(
         Expr::WideLiteral(words) => Some(IrType::UInt(Some(wide_literal_bits(words)))),
         Expr::Local(local) => local_type(*local),
         Expr::Port(port) | Expr::PortSnapshotLane { port, .. } => port_type(port),
-        Expr::SeqIndex { seq, .. } => match local_type(*seq) {
+        Expr::SeqIndex {
+            seq, inner_index, ..
+        } => match local_type(*seq) {
             Some(IrType::RecordSeq(record)) => Some(IrType::Record(record)),
             Some(IrType::Seq(elem)) => Some(*elem),
-            Some(IrType::FixedVec { elem, .. }) => Some(*elem),
+            Some(IrType::FixedVec { elem, .. }) => match (inner_index, *elem) {
+                (Some(_), IrType::FixedVec { elem, .. }) => Some(*elem),
+                (None, elem) => Some(elem),
+                _ => None,
+            },
             _ => None,
         },
         Expr::BitSlice { hi, lo, .. } => Some(IrType::UInt(Some(hi - lo + 1))),
@@ -11014,6 +11132,25 @@ fn check_def_before_use(
                     value,
                     ..
                 } => {
+                    check_e(index, &defined, errs);
+                    if let Some(inner) = inner_index {
+                        check_e(inner, &defined, errs);
+                    }
+                    check_e(value, &defined, errs);
+                }
+                Stmt::LocalVecElementWrite {
+                    local,
+                    index,
+                    inner_index,
+                    value,
+                } => {
+                    if local.index() < nlocals && !bit_get(&defined, local.index()) {
+                        errs.push(VerifyError::LocalUseBeforeDef {
+                            func: fid,
+                            block: bid,
+                            local: *local,
+                        });
+                    }
                     check_e(index, &defined, errs);
                     if let Some(inner) = inner_index {
                         check_e(inner, &defined, errs);

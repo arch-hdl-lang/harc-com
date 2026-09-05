@@ -2631,6 +2631,9 @@ fn validate_shared_callable(
                         )));
                     }
                 }
+                Stmt::AggregateInit(local) => {
+                    validate_local(function, *local)?;
+                }
                 Stmt::RecordFieldWrite {
                     local,
                     mid_indices,
@@ -2644,6 +2647,19 @@ fn validate_shared_callable(
                     }
                     if let Some(expr) = index {
                         validate_shared_expr(prog, function, block_index, expr, surface)?;
+                    }
+                    validate_shared_expr(prog, function, block_index, value, surface)?;
+                }
+                Stmt::LocalVecElementWrite {
+                    local,
+                    index,
+                    inner_index,
+                    value,
+                } => {
+                    validate_local(function, *local)?;
+                    validate_shared_expr(prog, function, block_index, index, surface)?;
+                    if let Some(inner) = inner_index {
+                        validate_shared_expr(prog, function, block_index, inner, surface)?;
                     }
                     validate_shared_expr(prog, function, block_index, value, surface)?;
                 }
@@ -3368,26 +3384,18 @@ fn validate_shared_expr(
             Ok(())
         }
         Expr::DynamicListQuery { target, .. } => recur(target),
-        Expr::SeqLen(local)
-            if matches!(
-                surface,
-                SharedCallableSurface::Tseq
-                    | SharedCallableSurface::TestbenchMethod
-                    | SharedCallableSurface::ComponentMethod
-            ) =>
-        {
-            validate_local(function, *local)
-        }
-        Expr::SeqIndex { seq, index }
-            if matches!(
-                surface,
-                SharedCallableSurface::Tseq
-                    | SharedCallableSurface::TestbenchMethod
-                    | SharedCallableSurface::ComponentMethod
-            ) =>
-        {
+        Expr::SeqLen(local) => validate_local(function, *local),
+        Expr::SeqIndex {
+            seq,
+            index,
+            inner_index,
+        } => {
             validate_local(function, *seq)?;
-            recur(index)
+            recur(index)?;
+            if let Some(inner) = inner_index {
+                recur(inner)?;
+            }
+            Ok(())
         }
         Expr::CycleCount | Expr::ErrorCount
             if matches!(
@@ -4055,6 +4063,19 @@ fn validate_stmt(
             value,
             ..
         } => {
+            validate_expr(opts, test, function, block, index)?;
+            if let Some(inner) = inner_index {
+                validate_expr(opts, test, function, block, inner)?;
+            }
+            validate_expr(opts, test, function, block, value)
+        }
+        Stmt::LocalVecElementWrite {
+            local,
+            index,
+            inner_index,
+            value,
+        } => {
+            validate_local(function, *local)?;
             validate_expr(opts, test, function, block, index)?;
             if let Some(inner) = inner_index {
                 validate_expr(opts, test, function, block, inner)?;
@@ -4811,9 +4832,17 @@ fn validate_expr(
         Expr::ComponentQueueQuery { base, .. } => validate_component_base(function, base),
         Expr::DynamicListQuery { target, .. } => validate_expr(opts, test, function, block, target),
         Expr::SeqLen(local) => validate_local(function, *local),
-        Expr::SeqIndex { seq, index } => {
+        Expr::SeqIndex {
+            seq,
+            index,
+            inner_index,
+        } => {
             validate_local(function, *seq)?;
-            validate_expr(opts, test, function, block, index)
+            validate_expr(opts, test, function, block, index)?;
+            if let Some(inner) = inner_index {
+                validate_expr(opts, test, function, block, inner)?;
+            }
+            Ok(())
         }
         Expr::Call(ir::CallTarget::Helper { .. } | ir::CallTarget::Tseq { .. }, args) => {
             for arg in args {
@@ -5302,6 +5331,7 @@ fn stmt_kind(stmt: &Stmt) -> &'static str {
         Stmt::RecordWriteCb { .. } => "RAL write callback",
         Stmt::TbFieldWrite { .. } => "testbench-state write",
         Stmt::TbFieldVecElementWrite { .. } => "testbench-vector write",
+        Stmt::LocalVecElementWrite { .. } => "local-vector write",
         Stmt::TbQueuePush { .. } | Stmt::TbQueuePop { .. } => "testbench queue operation",
         Stmt::TransactorStateWrite { .. }
         | Stmt::TransactorStateRecordFieldWrite { .. }
@@ -5340,6 +5370,7 @@ fn stmt_ticket(stmt: &Stmt) -> &'static str {
         Stmt::RecordInit(_, _)
         | Stmt::AggregateInit(_)
         | Stmt::RecordFieldWrite { .. }
+        | Stmt::LocalVecElementWrite { .. }
         | Stmt::ScoreboardOp { .. }
         | Stmt::SeqPush { .. } => "ticket 04",
         Stmt::RecordRead { .. }

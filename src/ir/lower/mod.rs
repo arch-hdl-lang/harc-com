@@ -9238,6 +9238,14 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 } => in_expr(index)
                     .or_else(|| inner_index.as_ref().and_then(in_expr))
                     .or_else(|| in_expr(value)),
+                ir::Stmt::LocalVecElementWrite {
+                    index,
+                    inner_index,
+                    value,
+                    ..
+                } => in_expr(index)
+                    .or_else(|| inner_index.as_ref().and_then(in_expr))
+                    .or_else(|| in_expr(value)),
                 ir::Stmt::ComponentEmit { args, .. } => args.iter().find_map(in_expr),
                 ir::Stmt::ComponentCall { args, .. } => args.iter().find_map(in_expr),
                 // tseq bodies never appear in a bound-to responder body
@@ -9332,7 +9340,16 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
             ir::Expr::ComponentIdle { n, .. } | ir::Expr::TransactorIdle { n, .. } => {
                 fill_expr(n, instance)
             }
-            ir::Expr::SeqIndex { index, .. } => fill_expr(index, instance),
+            ir::Expr::SeqIndex {
+                index,
+                inner_index,
+                ..
+            } => {
+                fill_expr(index, instance);
+                if let Some(inner) = inner_index {
+                    fill_expr(inner, instance);
+                }
+            }
             ir::Expr::RecordField {
                 mid_indices, index, ..
             } => {
@@ -9505,6 +9522,12 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                     inner_index,
                     value,
                     ..
+                }
+                | ir::Stmt::LocalVecElementWrite {
+                    index,
+                    inner_index,
+                    value,
+                    ..
                 } => {
                     fill_expr(index, instance);
                     if let Some(inner) = inner_index {
@@ -9665,8 +9688,15 @@ fn fill_visit_expr(
                 fill_visit_expr(a, placeholder, binding, remap, rewrite, conflict);
             }
         }
-        Expr::SeqIndex { index, .. } => {
-            fill_visit_expr(index, placeholder, binding, remap, rewrite, conflict)
+        Expr::SeqIndex {
+            index,
+            inner_index,
+            ..
+        } => {
+            fill_visit_expr(index, placeholder, binding, remap, rewrite, conflict);
+            if let Some(inner) = inner_index {
+                fill_visit_expr(inner, placeholder, binding, remap, rewrite, conflict);
+            }
         }
         Expr::RecordField {
             mid_indices, index, ..
@@ -9904,6 +9934,12 @@ fn fill_initiator_bus_prefix(
                         ..
                     }
                     | Stmt::TbFieldVecElementWrite {
+                        index,
+                        inner_index,
+                        value,
+                        ..
+                    }
+                    | Stmt::LocalVecElementWrite {
                         index,
                         inner_index,
                         value,
