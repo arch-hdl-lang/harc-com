@@ -4988,6 +4988,20 @@ fn validate_common_scalar_type(ty: &IrType) -> Result<(), String> {
     }
 }
 
+fn validate_common_fixed_value_type(prog: &TbProgram, ty: &IrType) -> Result<(), String> {
+    match ty {
+        IrType::Record(record) => {
+            if prog.records.get(record.index()).is_some() {
+                Ok(())
+            } else {
+                Err(format!("missing record r{}", record.0))
+            }
+        }
+        IrType::FixedVec { elem, .. } => validate_common_fixed_value_type(prog, elem),
+        _ => validate_common_scalar_type(ty),
+    }
+}
+
 fn validate_common_local_type(prog: &TbProgram, ty: &IrType) -> Result<(), (String, &'static str)> {
     match ty {
         IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::Unknown => {
@@ -5003,7 +5017,8 @@ fn validate_common_local_type(prog: &TbProgram, ty: &IrType) -> Result<(), (Stri
         IrType::Seq(elem) => validate_common_scalar_type(elem)
             .map_err(|feature| (format!("sequence element with {feature}"), "ticket 04")),
         IrType::String => Ok(()),
-        IrType::FixedVec { .. } => Err(("fixed-vector local type".into(), "ticket 04")),
+        IrType::FixedVec { .. } => validate_common_fixed_value_type(prog, ty)
+            .map_err(|feature| (format!("fixed-vector local with {feature}"), "ticket 04")),
         IrType::Component(component) => {
             if prog.components.get(component.index()).is_some() {
                 Ok(())

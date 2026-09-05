@@ -5540,6 +5540,62 @@ end test NestedRecordContainer
 }
 
 #[test]
+fn common_layout_emits_fixed_vector_test_locals() {
+    let source = parse_source(
+        r#"
+transaction Lane
+    value : uint<8> default 0
+end transaction Lane
+
+function keep_grid(values: Vec<Vec<Lane, 2>, 3>) -> Vec<Vec<Lane, 2>, 3>
+    return values
+end function keep_grid
+
+test FixedVectorLocal
+    let dut : CommonReg
+    clock clk = 10ns
+    run
+        let lanes : Vec<Vec<Lane, 2>, 3>
+        let copy = keep_grid(lanes)
+        wait 1 cycle
+    end run
+end test FixedVectorLocal
+"#,
+    )
+    .expect("fixed-vector local source parses");
+    let program = lower::lower_program(&source).expect("fixed-vector local source lowers");
+    verify::verify_program(&program).expect("fixed-vector local program verifies");
+    let mut opts = cpp_tb::EmitOpts::default();
+    opts.dut_port_widths = HashMap::from([("clk".to_string(), 1)]);
+    set_clock_interface_for_program(&program, &mut opts);
+
+    let plan = tbir::common::plan_common_tests(&program, &opts, "suite__")
+        .expect("fixed-vector locals are valid common-layout input");
+    let capsule = tbir::common::emit_common_capsule(&plan, 0).expect("capsule emits");
+    assert!(capsule.contains("std::array<std::array<Lane, 2>, 3> lanes{};"));
+    assert!(capsule.contains("lanes = decltype(lanes){};"));
+    assert!(capsule.contains("harc_helper_keep_grid(lanes)"));
+
+    let mut malformed = program.clone();
+    let lanes = malformed
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.locals)
+        .find(|local| local.name == "lanes")
+        .expect("lanes local exists");
+    lanes.ty = harc::ir::IrType::FixedVec {
+        elem: Box::new(harc::ir::IrType::FixedVec {
+            elem: Box::new(harc::ir::IrType::Record(harc::ir::RecordId(999))),
+            len: 2,
+        }),
+        len: 3,
+    };
+    let error = tbir::common::plan_common_tests(&malformed, &opts, "suite__")
+        .expect_err("missing nested record leaf fails closed");
+    assert!(error.0.contains("missing record r999"), "{error}");
+}
+
+#[test]
 fn common_plan_orders_and_owns_all_ticket04_structural_types() {
     let (program, opts) = structural_program();
     let plan = tbir::common::plan_common_tests(&program, &opts, "suite__").expect("plans");

@@ -1303,6 +1303,18 @@ impl FuncBuilder<'_> {
             }
         }
         let Some(value) = &l.value else {
+            // Unlike the retiring v1 emitter, TBIR carries fixed-vector locals
+            // as real aggregate values. Initialize them explicitly at the
+            // source `let` so whole-value calls and copies observe a defined,
+            // default-constructed std::array value.
+            if let Some(ty @ IrType::FixedVec { .. }) = l.ty.as_ref().and_then(|ty| {
+                super::components::fixed_vec_ir_type_with_records(ty, &self.ctx.record_ids)
+            }) {
+                let id = self.declare(&l.name.name);
+                self.set_local_type(id, ty);
+                self.push(Stmt::AggregateInit(id));
+                return Ok(());
+            }
             // An explicitly typed transaction-sequence local begins as an
             // empty dynamic sequence. This is the local analogue of a tseq
             // accumulator/return slot and therefore uses AggregateInit rather
@@ -1346,28 +1358,6 @@ impl FuncBuilder<'_> {
                 };
                 self.push(Stmt::Assign(id, initial));
                 return Ok(());
-            }
-            // A fixed-vector `let m : Vec<T, N>` with no initializer. This
-            // is NOT a false `--codegen v1` promise: v1 sizes the local
-            // from a SCALAR fallback (`int64_t m = 0;`) and then subscripts
-            // it (`m[i] = ...`), which g++ rejects — the local is a scalar,
-            // not an array (measured). Host a fixed vector on the testbench
-            // instead, where both backends emit a real `std::array`.
-            if l.ty.as_ref().is_some_and(|t| {
-                matches!(
-                    super::components::fixed_vec_elem_ir_type(t),
-                    Some(IrType::FixedVec { .. })
-                )
-            }) {
-                return Err(not_implemented(
-                    &format!(
-                        "a test-scope `let {} : Vec<...>` fixed-vector local",
-                        l.name.name
-                    ),
-                    "v1 declares it as a scalar (`int64_t m = 0;`) and subscripts it, which does \
-                     not compile — host the fixed vector on the testbench (`mem : Vec<T, N>`)",
-                    V1Status::EmitsUncompilable,
-                ));
             }
             if l.ty.is_none() {
                 // v1 emits no declaration for an untyped, uninitialized

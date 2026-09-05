@@ -50581,10 +50581,11 @@ end impl T"#
 }
 
 /// The refusals a testbench fixed-vector field inherits, each graded on
-/// MEASURED v1 behaviour. A `default` and a test-scope `let Vec` both make
-/// v1 emit C++ that does not compile, so they are `NotImplemented`
-/// (EmitsUncompilable), never a `--codegen v1` promise; an out-of-range
-/// literal index is a program error (Invalid) under every backend.
+/// MEASURED v1 behaviour. A field `default` makes v1 emit C++ that does not
+/// compile, so it is `NotImplemented` (EmitsUncompilable), never a
+/// `--codegen v1` promise; an out-of-range literal index is a program error
+/// (Invalid) under every backend. TBIR deliberately supports test-scope
+/// fixed-vector locals even though the retiring v1 emitter mishandles them.
 #[test]
 fn a_testbench_fixed_vector_field_refuses_what_v1_cannot_lower() {
     let mk = |field: &str, body: &str| {
@@ -50618,25 +50619,32 @@ end impl T"#
         assert!(msg.contains("out of range"), "{msg}");
     }
 
-    // A test-scope `let m : Vec<T, N>`: v1 declares it as a scalar
-    // (`int64_t m = 0;`) and subscripts it — uncompilable (measured). The
-    // message must NOT falsely promise `--codegen v1` works.
-    let letv = r#"testbench Tb
+    // A test-scope `let m : Vec<T, N>` is a TBIR-native aggregate local.
+    // v1 declares it as a scalar and generates uncompilable C++, but TBIR is
+    // now the product path and must not inherit that bug.
+    let letv = r#"function echo_local(values: Vec<uint<8>, 4>) -> Vec<uint<8>, 4>
+    return values
+end function echo_local
+
+testbench Tb
     dut : Top
 end testbench Tb
 impl T for Tb
     run
         let m : Vec<uint<8>, 4>
-        m[0] = 5
+        let copy = echo_local(m)
         wait 1 cycle
     end run
 end impl T"#;
-    let err = lower_src(letv).expect_err("a test-scope let Vec is refused");
-    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
-    assert!(
-        !msg.contains("re-run with `--codegen v1`"),
-        "let-Vec message must not promise --codegen v1 works: {msg}"
-    );
+    let prog = lower_src(letv).expect("a test-scope fixed-vector local lowers in TBIR");
+    verify::verify_program(&prog).expect("a test-scope fixed-vector local verifies");
+    assert!(prog.functions.iter().any(|function| function.blocks.iter().any(|block| {
+        block.stmts.iter().any(|stmt| matches!(stmt, ir::Stmt::AggregateInit(_)))
+    })));
+    let cpp = emit_cpp_src(letv);
+    assert!(cpp.contains("std::array<uint64_t, 4> m{};"), "{cpp}");
+    assert!(cpp.contains("m = decltype(m){};"), "{cpp}");
+    assert!(cpp.contains("harc_helper_echo_local(m)"), "{cpp}");
 }
 
 /// A value-returning transactor method call in a fixed-vector

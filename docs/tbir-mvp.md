@@ -10407,6 +10407,16 @@ former `transaction` group lives in
      `std::array`. The residual diagnostic constructor remains, so the raw
      inventory stays at 104 textual matches.
 
+241. **Common-layout fixed-vector locals (2026-09-04).**
+
+     TBIR now lowers uninitialized fixed-vector locals as real default-valued
+     aggregates and explicitly initializes them at their source position for
+     whole-value calls and copies. Indexed local mutation remains a separate
+     lowering gap. The optional split C++ layout accepts scalar/record leaves
+     and nested fixed vectors, reusing the existing `std::array` renderer and
+     record dependency ordering. The raw textual `unsupported(` inventory
+     remains at 104 matches.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
