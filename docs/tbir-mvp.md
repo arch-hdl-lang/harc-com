@@ -10454,6 +10454,7 @@ former `transaction` group lives in
      now an invalid type argument, not a TBIR capability gap. The diagnostic
      names the owning component field. This removes one constructor and leaves
      101 textual `unsupported(` matches in `src/ir/lower`.
+
 247. **Non-component receiver path segments (2026-09-04).**
 
      Component member and method paths that traverse a scalar or other
@@ -10461,6 +10462,15 @@ former `transaction` group lives in
      placement-dependent `connect` diagnostics remain unsupported. This
      removes two constructors and leaves 99 textual `unsupported(` matches in
      `src/ir/lower`.
+
+248. **Unknown addrmap frontdoor helpers (2026-09-04).**
+
+     An addrmap binding whose `bind` target does not name an active transactor
+     field of the testbench now reports an invalid source binding rather than a
+     TBIR backend gap. The diagnostic names both the addrmap binding and helper.
+     This removes one constructor and leaves 98 textual `unsupported(` matches
+     in `src/ir/lower`.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

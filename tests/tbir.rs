@@ -17223,6 +17223,21 @@ fn a_bind_needs_a_bare_name_and_a_regblock_needs_a_bind() {
     }
 }
 
+#[test]
+fn addrmap_bind_requires_a_declared_transactor_helper() {
+    let source = fixture("regblock_addrmap_test.harc").replace(
+        "let chip   : Soc = bind helper",
+        "let chip   : Soc = bind missing_helper",
+    );
+    let message = assert_invalid(
+        &lower_with_stdlib_bus_src(&source)
+            .expect_err("an unknown addrmap frontdoor helper is invalid"),
+    );
+    assert!(message.contains("chip"), "{message}");
+    assert!(message.contains("missing_helper"), "{message}");
+    assert!(message.contains("active transactor field"), "{message}");
+}
+
 /// The unbound-transactor item arms, from BOTH declaration positions.
 ///
 /// These were two copies of the same 120-line match — the always-on

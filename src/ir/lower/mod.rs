@@ -5584,13 +5584,11 @@ fn lower_test(
             )));
         }
         let Some(&xid) = transactor_field_ids.get(helper_field.as_str()) else {
-            return Err(unsupported(
-                &format!(
-                    "addrmap binding `{binding}` via `{helper_field}` (not an active \
-                     transactor field of the testbench)"
-                ),
-                "the `via` helper must be a `transactor` instance that pokes the DUT",
-            ));
+            return Err(LowerError::Invalid(format!(
+                "addrmap binding `{binding}` via `{helper_field}` does not name an active \
+                 transactor field of the testbench; the `via` helper must be a transactor \
+                 instance that pokes the DUT"
+            )));
         };
         let xschema = &prog.transactors[xid.index()];
         for (m, n) in [("write", 2usize), ("read", 1usize)] {
