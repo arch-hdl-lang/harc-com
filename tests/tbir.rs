@@ -40967,6 +40967,19 @@ fn a_regblock_width_outside_the_value_model_is_a_program_error() {
     cpp_tb::emit(&merged_src(&with_field("uint<0>"))).expect("v1 accepts a zero-width field");
 }
 
+#[test]
+fn an_unknown_regblock_binding_helper_is_invalid() {
+    let src = fixture("regblock_subset_test.harc").replace(
+        "let regs : DmaRegs = bind h",
+        "let regs : DmaRegs = bind missing",
+    );
+    let message = assert_invalid(&lower_src(&src).expect_err("unknown via helper is invalid"));
+    assert!(
+        message.contains("names unknown `via` helper `missing`"),
+        "{message}"
+    );
+}
+
 /// The regblock and addrmap ACCESS catch-alls. v1 has no gate at either:
 /// it prints the access path straight into the C++, so an unknown
 /// register becomes a non-member and a method call becomes an undeclared

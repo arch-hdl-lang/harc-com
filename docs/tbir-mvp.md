@@ -10516,6 +10516,14 @@ former `transaction` group lives in
      constructor and leaves 95 textual `unsupported(` matches in
      `src/ir/lower`.
 
+255. **Unknown regblock binding helpers (2026-09-04).**
+
+     A regblock bind whose `via` target resolves to neither a transactor
+     instance nor a bus binding is now an invalid source reference. The real
+     bus-bound helper gap retains the backend diagnostic. The textual
+     unsupported count remains 95 because the constructor is still used by
+     that genuine bus-binding branch.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
