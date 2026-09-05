@@ -1513,7 +1513,11 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
         // `<seq>[<index>]` — record value at `index` in a RecordSeq local
         // (v1's `txns[i]` subscript). Record-valued; used as the RHS of the
         // `for t in <seq>` loop-variable copy.
-        Expr::SeqIndex { seq, index } => {
+        Expr::SeqIndex {
+            seq,
+            index,
+            inner_index,
+        } => {
             let name = cx.names.get(seq.index()).cloned().ok_or_else(|| {
                 EmitError(format!(
                     "tbir: dangling local %{} in {}",
@@ -1521,7 +1525,11 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                 ))
             })?;
             let idx = expr_cpp(cx, index)?;
-            format!("{name}[{idx}]")
+            let mut rendered = format!("{name}[{idx}]");
+            if let Some(inner) = inner_index {
+                rendered = format!("{rendered}[{}]", expr_cpp(cx, inner)?);
+            }
+            rendered
         }
         Expr::Call(target, args) => {
             let mut rendered = Vec::with_capacity(args.len() + 1);
@@ -2417,13 +2425,18 @@ pub(super) fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
         | Expr::ScoreboardQuery { query, .. } => {
             query.value_type().as_ref().and_then(ir_type_width)
         }
-        Expr::SeqIndex { seq, .. } => cx
+        Expr::SeqIndex {
+            seq, inner_index, ..
+        } => cx
             .func
             .locals
             .get(seq.index())
             .and_then(|local| match &local.ty {
                 crate::ir::IrType::RecordSeq(record) => Some(crate::ir::IrType::Record(*record)),
                 crate::ir::IrType::Seq(element) => Some((**element).clone()),
+                crate::ir::IrType::FixedVec { .. } => {
+                    fixed_vec_ir_elem(&local.ty, inner_index.is_some())
+                }
                 _ => None,
             })
             .as_ref()
@@ -2658,12 +2671,17 @@ pub(super) fn expr_is_signed(cx: &ECx<'_>, e: &Expr) -> bool {
         | Expr::ScoreboardQuery { query, .. } => query
             .value_type()
             .is_some_and(|ty| matches!(ty, crate::ir::IrType::SInt(_))),
-        Expr::SeqIndex { seq, .. } => cx
+        Expr::SeqIndex {
+            seq, inner_index, ..
+        } => cx
             .func
             .locals
             .get(seq.index())
             .and_then(|local| match &local.ty {
                 crate::ir::IrType::Seq(element) => Some((**element).clone()),
+                crate::ir::IrType::FixedVec { .. } => {
+                    fixed_vec_ir_elem(&local.ty, inner_index.is_some())
+                }
                 _ => None,
             })
             .is_some_and(|ty| matches!(ty, crate::ir::IrType::SInt(_))),

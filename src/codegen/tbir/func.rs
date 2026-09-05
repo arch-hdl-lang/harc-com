@@ -1068,7 +1068,14 @@ fn expr_reaches_frame_local(e: &Expr) -> bool {
             expr_reaches_frame_local(index)
                 || inner_index.as_deref().is_some_and(expr_reaches_frame_local)
         }
-        Expr::SeqIndex { index, .. } => expr_reaches_frame_local(index),
+        Expr::SeqIndex {
+            index,
+            inner_index,
+            ..
+        } => {
+            expr_reaches_frame_local(index)
+                || inner_index.as_deref().is_some_and(expr_reaches_frame_local)
+        }
         Expr::PortSnapshotLane { index, .. } => expr_reaches_frame_local(index),
         // A DUT port read is `dut->…` (safe), but a runtime lane subscript is
         // an arbitrary expression that may reach a frame local.
@@ -3391,6 +3398,27 @@ fn emit_stmt(
                 "{}.{field}[{idx}]",
                 required_testbench_receiver(cx, "testbench vector write")?
             );
+            if let Some(inner) = inner_index {
+                member = format!("{member}[{}]", expr_cpp(cx, inner)?);
+            }
+            writeln!(out, "{pad}{member} = {value};").ok();
+        }
+        Stmt::LocalVecElementWrite {
+            local,
+            index,
+            inner_index,
+            value,
+        } => {
+            let name = names.get(local.index()).ok_or_else(|| {
+                EmitError(format!("tbir: dangling local %{} in {}", local.0, cx.func.name))
+            })?;
+            let destination = Expr::SeqIndex {
+                seq: *local,
+                index: Box::new(index.clone()),
+                inner_index: inner_index.clone().map(Box::new),
+            };
+            let value = scalar_sink_expr_cpp(cx, value, scalar_shape_type(cx, &destination))?;
+            let mut member = format!("{name}[{}]", expr_cpp(cx, index)?);
             if let Some(inner) = inner_index {
                 member = format!("{member}[{}]", expr_cpp(cx, inner)?);
             }

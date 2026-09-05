@@ -20472,6 +20472,7 @@ end impl FmtAggregateTest
             value: 0,
             ty: ir::IrType::Unknown,
         }),
+        inner_index: None,
     };
     let errs = verify::verify_program(&broken_seq_element)
         .expect_err("record sequence element format arg must not verify");
@@ -20505,6 +20506,7 @@ end impl FmtAggregateTest
             value: 0,
             ty: ir::IrType::Unknown,
         }),
+        inner_index: None,
     };
     verify::verify_program(&malformed_seq)
         .expect_err("SeqIndex over scalar must not verify as Unknown scalar");
@@ -25924,6 +25926,7 @@ end impl GatedSeqIdxTest
                 probe: None,
                 lane: None,
             })),
+            inner_index: None,
         },
     ));
     let err = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).unwrap_err();
@@ -50955,6 +50958,11 @@ impl T for Tb
     run
         let m : Vec<uint<8>, 4>
         let copy = echo_local(m)
+        m[2] = 5
+        let scalar = m[2]
+        let nested : Vec<Vec<uint<8>, 2>, 4>
+        nested[2][1] = scalar
+        let nested_scalar = nested[2][1]
         wait 1 cycle
     end run
 end impl T"#;
@@ -50967,6 +50975,186 @@ end impl T"#;
     assert!(cpp.contains("std::array<uint64_t, 4> m{};"), "{cpp}");
     assert!(cpp.contains("m = decltype(m){};"), "{cpp}");
     assert!(cpp.contains("harc_helper_echo_local(m)"), "{cpp}");
+    assert!(cpp.contains("m[2] = 5;"), "{cpp}");
+    assert!(cpp.contains("nested[2][1] = scalar;"), "{cpp}");
+    assert!(cpp.contains("nested[2][1]"), "{cpp}");
+}
+
+#[test]
+fn fixed_vector_locals_support_scalar_record_nested_and_dynamic_element_access() {
+    let src = r#"transaction Beat
+    data : uint<8>
+end transaction Beat
+
+testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        let i : uint<8> = 1
+        let scalar : Vec<uint<8>, 4>
+        scalar[i] = 7
+        let got = scalar[i]
+        let beat : Beat
+        beat.data = got
+        let records : Vec<Beat, 2>
+        records[i] = beat
+        let copied = records[i]
+        let nested : Vec<Vec<uint<8>, 2>, 4>
+        nested[i][i] = copied.data
+        let nested_got = nested[i][i]
+        assert nested_got == 7
+        wait 1 cycle
+    end run
+end impl T"#;
+
+    let prog = lower_src(src).expect("fixed-vector local element access lowers");
+    verify::verify_program(&prog).expect("fixed-vector local element access verifies");
+    let cpp = emit_cpp_src(src);
+    for expected in [
+        "scalar[i] = 7;",
+        "records[i] = beat;",
+        "nested[i][i] = copied.data;",
+        "nested[i][i]",
+    ] {
+        assert!(cpp.contains(expected), "missing `{expected}` in:\n{cpp}");
+    }
+
+    let out_of_bounds = src.replace("scalar[i] = 7", "scalar[4] = 7");
+    let err = lower_src(&out_of_bounds).expect_err("literal local index is bounds checked");
+    assert!(assert_invalid(&err).contains("out of range"), "{err}");
+
+    let record_index = src.replace(
+        "let got = scalar[i]",
+        "let index_beat : Beat\n        let got = scalar[index_beat]",
+    );
+    let err = lower_src(&record_index).expect_err("a record is not a numeric local index");
+    assert!(err.to_string().contains("integer value"), "{err}");
+
+    let mut malformed = prog.clone();
+    let run = malformed.tests[0].run;
+    let function = &mut malformed.functions[run.index()];
+    let scalar_local = function
+        .locals
+        .iter()
+        .position(|local| local.name == "scalar")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("scalar vector local");
+    function.locals[scalar_local.index()].ty = ir::IrType::UInt(Some(8));
+    let errors = verify::verify_program(&malformed)
+        .expect_err("a LocalVecElementWrite receiver must remain a fixed vector");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.to_string().contains("receiver is not a fixed vector")),
+        "{errors:?}"
+    );
+
+    let mut wrong_record = prog.clone();
+    wrong_record.records.push(ir::RecordSchema {
+        name: "Other".to_string(),
+        fields: vec![],
+        keeps: vec![],
+    });
+    let run = wrong_record.tests[0].run;
+    let function = &mut wrong_record.functions[run.index()];
+    let other = ir::LocalId(function.locals.len() as u32);
+    function.locals.push(ir::TypedLocal {
+        name: "other".to_string(),
+        ty: ir::IrType::Record(ir::RecordId(1)),
+    });
+    let write = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find(|stmt| matches!(stmt, ir::Stmt::LocalVecElementWrite { local, .. } if *local != scalar_local))
+        .expect("record vector write");
+    let ir::Stmt::LocalVecElementWrite { value, .. } = write else {
+        unreachable!()
+    };
+    *value = ir::Expr::Local(other);
+    let errors = verify::verify_program(&wrong_record)
+        .expect_err("record-vector writes require the declared record identity");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("element type Record(RecordId(0)) is written from incompatible type Record(RecordId(1))")),
+        "{errors:?}"
+    );
+
+    let mut scalar_into_record = prog.clone();
+    let run = scalar_into_record.tests[0].run;
+    let write = scalar_into_record.functions[run.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find(|stmt| matches!(stmt, ir::Stmt::LocalVecElementWrite { value: ir::Expr::Local(_), .. }))
+        .expect("record vector write");
+    let ir::Stmt::LocalVecElementWrite { value, .. } = write else {
+        unreachable!()
+    };
+    *value = ir::Expr::Literal {
+        value: 0,
+        ty: ir::IrType::UInt(Some(8)),
+    };
+    let errors = verify::verify_program(&scalar_into_record)
+        .expect_err("a scalar cannot enter a record-vector slot");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.to_string().contains("written from incompatible type UInt")),
+        "{errors:?}"
+    );
+
+    let mut malformed_inner = prog.clone();
+    let run = malformed_inner.tests[0].run;
+    let function = &mut malformed_inner.functions[run.index()];
+    let nested = function
+        .locals
+        .iter()
+        .position(|local| local.name == "nested")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("nested vector local");
+    function.locals[nested.index()].ty = ir::IrType::FixedVec {
+        elem: Box::new(ir::IrType::UInt(Some(8))),
+        len: 4,
+    };
+    let errors = verify::verify_program(&malformed_inner)
+        .expect_err("an inner index requires a nested fixed vector");
+    assert!(
+        errors.iter().any(|error| error
+            .to_string()
+            .contains("nested index whose element is not a fixed vector")),
+        "{errors:?}"
+    );
+
+    let mut malformed_read_index = prog.clone();
+    let run = malformed_read_index.tests[0].run;
+    let function = &mut malformed_read_index.functions[run.index()];
+    let beat = function
+        .locals
+        .iter()
+        .position(|local| local.name == "beat")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("record local");
+    let read = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(_, ir::Expr::SeqIndex { index, .. }) => Some(index),
+            _ => None,
+        })
+        .expect("fixed-vector local read");
+    *read = Box::new(ir::Expr::Local(beat));
+    let errors = verify::verify_program(&malformed_read_index)
+        .expect_err("fixed-vector read indices must remain scalar");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.to_string().contains("sequence index is not a scalar value")),
+        "{errors:?}"
+    );
 }
 
 /// A value-returning transactor method call in a fixed-vector

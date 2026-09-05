@@ -2704,6 +2704,13 @@ pub enum Stmt {
         inner_index: Option<Expr>,
         value: Expr,
     },
+    /// `local[i] = value` (or `local[i][j] = value`) on a fixed-vector local.
+    LocalVecElementWrite {
+        local: LocalId,
+        index: Expr,
+        inner_index: Option<Expr>,
+        value: Expr,
+    },
     /// `_tb.<field>.push(value)` on a testbench-owned typed FIFO.
     TbQueuePush {
         field: String,
@@ -3596,13 +3603,17 @@ pub enum Expr {
     /// upper bound of a `for t in <seq>` loop. Lowers to `uint64_t`
     /// (emitted as `<seq>.size()`).
     SeqLen(LocalId),
-    /// `<seq>[<index>]` — the record value at `index` in a `RecordSeq`
-    /// local. Record-valued (allowed wherever a record `Local` is —
-    /// notably the `Stmt::Assign` that binds the `for t in <seq>` loop
-    /// variable). Emitted as `<seq>[<index>]`.
+    /// `<seq>[<index>]` — an element of a dynamic sequence or fixed-vector
+    /// local. Record-valued sequence elements are allowed wherever a record
+    /// `Local` is — notably the `Stmt::Assign` that binds a sequence loop
+    /// variable. `inner_index` selects the second dimension of a nested
+    /// fixed vector. Emitted as ordinary C++ subscripts.
     SeqIndex {
         seq: LocalId,
         index: Box<Expr>,
+        /// Second index when `seq` is a nested fixed-vector local.
+        /// Dynamic transaction sequences remain single-dimensional.
+        inner_index: Option<Box<Expr>>,
     },
     Call(CallTarget, Vec<Expr>),
     /// A register-level frontdoor READ on a regblock binding in a

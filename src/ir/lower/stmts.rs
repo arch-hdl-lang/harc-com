@@ -3539,6 +3539,99 @@ impl FuncBuilder<'_> {
         // depth (`s.a.b[i] = v`). Resolve the field chain, then lower the
         // index and value into an indexed `RecordFieldWrite`.
         if let ExprKind::Index { target: it, index } = &*target.kind {
+            // `local[i][j] = value` on a nested fixed-vector local.
+            if let ExprKind::Index {
+                target: inner_target,
+                index: outer_index,
+            } = &*it.kind
+            {
+                if let ExprKind::Ident(id) = &*inner_target.kind {
+                    if let Some(local) = self.lookup(&id.name) {
+                        if let IrType::FixedVec { len, elem } = self.local_type(local).clone() {
+                            if let IrType::FixedVec {
+                                len: inner_len,
+                                elem: inner_elem,
+                            } = *elem
+                            {
+                                if !matches!(*inner_elem, IrType::FixedVec { .. }) {
+                                    let outer = self.lower_expr_no_ports(outer_index)?;
+                                    self.validate_numeric_expr(&outer, "outer local `Vec` index")?;
+                                    super::exprs::check_literal_vec_index_bounds(
+                                        &id.name, &outer, len,
+                                    )?;
+                                    let inner = self.lower_expr_no_ports(index)?;
+                                    self.validate_numeric_expr(&inner, "inner local `Vec` index")?;
+                                    super::exprs::check_literal_vec_index_bounds(
+                                        &id.name, &inner, inner_len,
+                                    )?;
+                                    let value = self.lower_expr_no_ports(value)?;
+                                    if let IrType::Record(expected) = *inner_elem {
+                                        if self.record_id_of_expr(&value) != Some(expected) {
+                                            return Err(self.record_assign_mismatch(
+                                                &value,
+                                                expected,
+                                                format!(
+                                                    "element of nested fixed-vector local `{}`",
+                                                    id.name
+                                                ),
+                                                "assign a value of the vector element's record type",
+                                            ));
+                                        }
+                                    } else {
+                                        self.reject_record_into_scalar(
+                                            &value,
+                                            &format!(
+                                                "element of nested fixed-vector local `{}`",
+                                                id.name
+                                            ),
+                                        )?;
+                                    }
+                                    self.push(Stmt::LocalVecElementWrite {
+                                        local,
+                                        index: outer,
+                                        inner_index: Some(inner),
+                                        value,
+                                    });
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // `local[i] = value` on a fixed-vector local.
+            if let ExprKind::Ident(id) = &*it.kind {
+                if let Some(local) = self.lookup(&id.name) {
+                    if let IrType::FixedVec { len, elem } = self.local_type(local).clone() {
+                        let index = self.lower_expr_no_ports(index)?;
+                        self.validate_numeric_expr(&index, "local `Vec` index")?;
+                        super::exprs::check_literal_vec_index_bounds(&id.name, &index, len)?;
+                        let value = self.lower_expr_no_ports(value)?;
+                        if let IrType::Record(expected) = *elem {
+                            if self.record_id_of_expr(&value) != Some(expected) {
+                                return Err(self.record_assign_mismatch(
+                                    &value,
+                                    expected,
+                                    format!("element of fixed-vector local `{}`", id.name),
+                                    "assign a value of the vector element's record type",
+                                ));
+                            }
+                        } else {
+                            self.reject_record_into_scalar(
+                                &value,
+                                &format!("element of fixed-vector local `{}`", id.name),
+                            )?;
+                        }
+                        self.push(Stmt::LocalVecElementWrite {
+                            local,
+                            index,
+                            inner_index: None,
+                            value,
+                        });
+                        return Ok(());
+                    }
+                }
+            }
             if let Some(selected) = self.as_transactor_state_fixed_vec_element(target)? {
                 let mid_indices = selected
                     .mid_indices

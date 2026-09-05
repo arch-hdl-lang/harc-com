@@ -235,6 +235,7 @@ impl FuncBuilder<'_> {
             Expr::SeqIndex {
                 seq,
                 index: Box::new(Expr::Local(counter)),
+                inner_index: None,
             },
         );
         self.lower_counted_loop_with_prologue(cond, step, bind, None, &f.body)?;
