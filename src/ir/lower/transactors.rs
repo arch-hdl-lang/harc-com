@@ -168,13 +168,23 @@ fn lower_unbound_item<'a>(
                 if record_ctx.record_ids.contains_key(simple) {
                     return push_state(f);
                 }
-                if f.default.is_some() {
-                    return Err(not_implemented(
-                        &format!("a default value on the DUT-handle field `{tname}.{fname}`"),
-                        "the DUT handle is bound by the test; v1 pastes the literal into \
-                         `VTop* <f> = <lit>;`, which only compiles when it is `0`",
-                        V1Status::EmitsUncompilable,
-                    ));
+                if let Some(default) = &f.default {
+                    let folded = super::fold_const(default, &record_ctx.consts, "").map_err(
+                        |error| {
+                            let detail = match error {
+                                super::ConstFoldErr::Unsupported(detail)
+                                | super::ConstFoldErr::Invalid(detail) => detail,
+                            };
+                            LowerError::Invalid(format!(
+                                "DUT-handle field `{tname}.{fname}` default must be the null value 0: {detail}"
+                            ))
+                        },
+                    )?;
+                    if folded.is_negative() || folded.bits != 0 {
+                        return Err(LowerError::Invalid(format!(
+                            "DUT-handle field `{tname}.{fname}` default must be the null value 0"
+                        )));
+                    }
                 }
                 if let Some((first, _)) = dut.as_ref() {
                     // v1 emits `V<Name>* <field> = nullptr;` for every

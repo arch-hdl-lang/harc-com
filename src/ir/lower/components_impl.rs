@@ -1782,11 +1782,21 @@ fn lower_field(
             // On a transactor, an unknown named type is the module-typed
             // DUT handle (`dut : AxiLiteRegs`) the `on` handler pokes.
             if is_transactor {
-                if f.default.is_some() {
-                    return Err(unsupported(
-                        &format!("a default value on DUT-handle field `{comp}.{fname}`"),
-                        "the DUT handle is bound by the test (`<inst>.<dut> = dut`)",
-                    ));
+                if let Some(default) = &f.default {
+                    let folded = super::fold_const(default, consts, "").map_err(|error| {
+                        let detail = match error {
+                            super::ConstFoldErr::Unsupported(detail)
+                            | super::ConstFoldErr::Invalid(detail) => detail,
+                        };
+                        LowerError::Invalid(format!(
+                            "DUT-handle field `{comp}.{fname}` default must be the null value 0: {detail}"
+                        ))
+                    })?;
+                    if folded.is_negative() || folded.bits != 0 {
+                        return Err(LowerError::Invalid(format!(
+                            "DUT-handle field `{comp}.{fname}` default must be the null value 0"
+                        )));
+                    }
                 }
                 return Ok(ComponentFieldKind::Dut {
                     dut_type: simple.to_string(),

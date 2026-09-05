@@ -17468,15 +17468,18 @@ end impl T"#
         "the `apply` item leaves v1's output byte-identical"
     );
 
-    // The DUT-handle default: `0` is a null pointer constant and
-    // compiles, every other literal does not, so the arm takes the
-    // worse of the two.
-    for lit in ["0", "1", "5"] {
+    // A second module-typed field remains unsupported independently of
+    // whether its initializer is the null pointer constant.
+    for src in both("    other : Top default 0") {
+        assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::EmitsUncompilable,
+        );
+    }
+    for lit in ["1", "5"] {
         for src in both(&format!("    other : Top default {lit}")) {
-            assert_not_implemented(
-                &lower_src(&src).unwrap_err(),
-                lower::V1Status::EmitsUncompilable,
-            );
+            let msg = assert_invalid(&lower_src(&src).unwrap_err());
+            assert!(msg.contains("default must be the null value 0"), "{msg}");
         }
     }
     for (lit, init) in [("0", "VTop* dut = 0;"), ("1", "VTop* dut = 1;")] {
@@ -17484,6 +17487,12 @@ end impl T"#
         let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
         assert!(v1.contains(init), "`default {lit}` pastes `{init}`: {v1}");
     }
+
+    let null_default = drv("    dut : Top default 0", "", poke);
+    lower_src(&null_default).expect("a null DUT-handle default lowers");
+    let nonnull_default = drv("    dut : Top default 1", "", poke);
+    let msg = assert_invalid(&lower_src(&nonnull_default).unwrap_err());
+    assert!(msg.contains("default must be the null value 0"), "{msg}");
 }
 
 /// The `on <event>(arg)` subscription arms in `components.rs`.

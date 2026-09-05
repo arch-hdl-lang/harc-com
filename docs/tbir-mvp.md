@@ -10508,6 +10508,14 @@ former `transaction` group lives in
      source reference. This removes one constructor and leaves 96 textual
      `unsupported(` matches in `src/ir/lower`.
 
+254. **Null DUT-handle defaults (2026-09-04).**
+
+     A module-typed transactor field may now explicitly use `default 0`, the
+     same null value it otherwise receives before test binding. Nonzero and
+     nonconstant defaults are invalid pointer initializers. This removes one
+     constructor and leaves 95 textual `unsupported(` matches in
+     `src/ir/lower`.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
