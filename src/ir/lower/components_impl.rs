@@ -1598,7 +1598,9 @@ fn lower_field(
                 ));
             }
             let decoded = match args.first() {
-                Some(TypeArg::Type(ty)) => queue_fixed_vec_elem_ir_type(ty, record_ids),
+                Some(TypeArg::Type(ty)) => {
+                    fixed_vec_elem_ir_type_with_records_and_consts(ty, record_ids, consts)
+                }
                 Some(TypeArg::Expr(expr)) => {
                     let ExprKind::Ident(id) = &*expr.kind else {
                         return Err(LowerError::Invalid(format!(
@@ -3683,6 +3685,68 @@ pub(crate) fn fixed_vec_ir_type_with_records(
     record_ids: &HashMap<String, RecordId>,
 ) -> Option<IrType> {
     fixed_vec_elem_ir_type_with_records(t, record_ids)
+}
+
+/// Decode a fixed-vector value type while folding every nested length with
+/// the file-scope constant environment. The literal-only entry point remains
+/// available for contexts that do not carry constants.
+pub(crate) fn fixed_vec_ir_type_with_records_and_consts(
+    t: &TypeExpr,
+    record_ids: &HashMap<String, RecordId>,
+    consts: &HashMap<String, super::ConstVal>,
+) -> Option<IrType> {
+    fixed_vec_elem_ir_type_with_records_and_consts(t, record_ids, consts)
+}
+
+fn fixed_vec_elem_ir_type_with_records_and_consts(
+    t: &TypeExpr,
+    record_ids: &HashMap<String, RecordId>,
+    consts: &HashMap<String, super::ConstVal>,
+) -> Option<IrType> {
+    if let TypeExpr::Builtin {
+        name: BuiltinTy::Vec,
+        args,
+        ..
+    } = t
+    {
+        let elem = match args.first() {
+            Some(TypeArg::Type(inner)) => {
+                fixed_vec_elem_ir_type_with_records_and_consts(inner, record_ids, consts)?
+            }
+            Some(TypeArg::Expr(expr)) => {
+                let ExprKind::Ident(id) = &*expr.kind else {
+                    return None;
+                };
+                IrType::Record(*record_ids.get(&id.name)?)
+            }
+            _ => return None,
+        };
+        let len_expr = match args.get(1) {
+            Some(TypeArg::Expr(expr)) => expr,
+            _ => return None,
+        };
+        if const_expr_has_boolean_result(len_expr, consts) {
+            return None;
+        }
+        let folded = super::fold_const(len_expr, consts, "").ok()?;
+        if folded.is_negative() {
+            return None;
+        }
+        let len = usize::try_from(folded.bits).ok()?;
+        return Some(IrType::FixedVec {
+            elem: Box::new(elem),
+            len,
+        });
+    }
+    if let Some(name) = type_arg_simple_name(t) {
+        if let Some(record) = record_ids.get(name) {
+            return Some(IrType::Record(*record));
+        }
+    }
+    vec_elem_scalar_ir_type(t).filter(|ty| {
+        matches!(ty, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 0)
+            || matches!(ty, IrType::Bool)
+    })
 }
 
 fn fixed_vec_elem_ir_type_with_records(

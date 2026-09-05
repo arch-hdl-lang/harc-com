@@ -10479,6 +10479,13 @@ former `transaction` group lives in
      constructor and leaves 97 textual `unsupported(` matches in
      `src/ir/lower`.
 
+250. **Nested fixed-vector constant lengths (2026-09-04).**
+
+     Persistent component and transactor fields now fold file constants and
+     integer constant expressions at every nested `Vec<T, N>` layer, matching
+     the already-supported outer length. The textual unsupported count remains
+     97; this closes a real subset hidden behind the shared element-type gate.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

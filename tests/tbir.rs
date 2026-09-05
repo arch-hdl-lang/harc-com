@@ -48712,6 +48712,42 @@ end test BadVectorType
 }
 
 #[test]
+fn persistent_nested_fixed_vector_lengths_fold_constants() {
+    let src = r#"
+const INNER : uint<8> = 1 + 1
+const OUTER : uint<8> = INNER + 1
+
+transactor NestedState
+    dut : Top
+    values : Vec<Vec<uint<8>, INNER>, OUTER>
+    when active
+        hookable inspect()
+        end inspect
+    end when
+end transactor NestedState
+
+testbench Tb
+    dut : Top
+    state : NestedState active
+end testbench Tb
+
+impl T for Tb
+    run
+        state.values[2][1] = 7
+        wait 1 cycle
+    end run
+end impl T
+"#;
+    let program = lower_src(src).expect("nested fixed-vector constant lengths lower");
+    verify::verify_program(&program).expect("nested fixed-vector constants verify");
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::array<std::array<uint64_t, 2>, 3> values{};"),
+        "{cpp}"
+    );
+}
+
+#[test]
 fn component_fixed_vec_whole_value_rules_and_metadata_are_checked() {
     let src = r#"scoreboard Table
     words : Vec<uint<64>, 4>

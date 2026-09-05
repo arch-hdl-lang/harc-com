@@ -1930,7 +1930,11 @@ fn lower_state_field(
             )));
         }
         let Some(ty @ IrType::FixedVec { .. }) =
-            super::components::fixed_vec_ir_type_with_records(&f.ty, record_ids)
+            super::components::fixed_vec_ir_type_with_records_and_consts(
+                &f.ty,
+                record_ids,
+                &record_ctx.consts,
+            )
         else {
             return Err(not_implemented(
                 &format!(
