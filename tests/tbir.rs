@@ -6316,6 +6316,30 @@ end test MonTest
     assert!(msg.contains("activate"), "{msg}");
 }
 
+#[test]
+fn scalar_component_path_segment_is_invalid_receiver() {
+    let src = format!(
+        r#"{}
+env Wrap
+    relay : ModeRelay active
+    count : uint<32> default 0
+end env Wrap
+
+test InvalidReceiver
+    let dut : Top
+    let wrap : Wrap
+    run
+        wrap.count.activate()
+    end run
+end test InvalidReceiver
+"#,
+        mode_relay_src()
+    );
+    let message = assert_invalid(&lower_src(&src).expect_err("scalar receiver segment is invalid"));
+    assert!(message.contains("count"), "{message}");
+    assert!(message.contains("not a sub-component"), "{message}");
+}
+
 /// A consumer whose `on` handler is active-only may be bound passive: its
 /// always-on `in event` remains emit-able, but nothing subscribes, so the
 /// fan-out over the empty vector is a legal no-op. This matches v1.
