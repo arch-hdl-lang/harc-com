@@ -48629,6 +48629,25 @@ end test BadQueueType
 }
 
 #[test]
+fn event_value_expression_payload_is_invalid() {
+    let src = r#"
+transactor BadEvent
+    observed : out event<1 + 2>
+end transactor BadEvent
+
+test BadEventType
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test BadEventType
+"#;
+    let message = assert_invalid(&lower_src(src).expect_err("event value expression is not a type"));
+    assert!(message.contains("BadEvent.observed"), "{message}");
+    assert!(message.contains("must be a type"), "{message}");
+}
+
+#[test]
 fn component_fixed_vec_whole_value_rules_and_metadata_are_checked() {
     let src = r#"scoreboard Table
     words : Vec<uint<64>, 4>

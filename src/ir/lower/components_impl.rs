@@ -3563,15 +3563,9 @@ pub(crate) fn lower_event_payload(
                 }
                 return Err(reject_named(&id.name));
             }
-            Err(unsupported(
-                &format!("a non-identifier event payload on `{comp}.{fname}`"),
-                format!(
-                    "only event<scalar>, recursively nested event<Vec<scalar-or-record, N>>, and \
-                     event<transaction|struct> payloads are lowered \
-                     ({})",
-                    scalar_width_detail()
-                ),
-            ))
+            Err(LowerError::Invalid(format!(
+                "event payload on `{comp}.{fname}` must be a type, not a value expression"
+            )))
         }
         // `TypeArg::Named` is a keyword-style arg (`depth=16`), never a
         // payload type reference — reject it precisely.
