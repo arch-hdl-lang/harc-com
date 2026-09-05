@@ -10471,6 +10471,14 @@ former `transaction` group lives in
      This removes one constructor and leaves 98 textual `unsupported(` matches
      in `src/ir/lower`.
 
+249. **Fixed-vector value-expression element arguments (2026-09-04).**
+
+     A parser-valid value expression in the element position of `Vec<T, N>` is
+     now an invalid type argument, matching the queue and event diagnostics.
+     The diagnostic names the owning component field. This removes one
+     constructor and leaves 97 textual `unsupported(` matches in
+     `src/ir/lower`.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —

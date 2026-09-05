@@ -1601,12 +1601,9 @@ fn lower_field(
                 Some(TypeArg::Type(ty)) => queue_fixed_vec_elem_ir_type(ty, record_ids),
                 Some(TypeArg::Expr(expr)) => {
                     let ExprKind::Ident(id) = &*expr.kind else {
-                        return Err(unsupported(
-                            &format!(
-                                "fixed-vector field `{comp}.{fname}` with an unsupported element type"
-                            ),
-                            "a fixed-vector element is a scalar, a declared record, or another fixed vector over those",
-                        ));
+                        return Err(LowerError::Invalid(format!(
+                            "fixed-vector field `{comp}.{fname}` element must be a type, not a value expression"
+                        )));
                     };
                     record_ids.get(&id.name).copied().map(IrType::Record)
                 }

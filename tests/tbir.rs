@@ -48687,6 +48687,31 @@ end test BadEventType
 }
 
 #[test]
+fn fixed_vector_value_expression_element_is_invalid() {
+    let src = r#"
+transactor BadVector
+    dut : Top
+    values : Vec<1 + 2, 4>
+    when active
+        hookable inspect()
+        end inspect
+    end when
+end transactor BadVector
+
+test BadVectorType
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test BadVectorType
+"#;
+    let message =
+        assert_invalid(&lower_src(src).expect_err("fixed-vector value expression is not a type"));
+    assert!(message.contains("BadVector.values"), "{message}");
+    assert!(message.contains("must be a type"), "{message}");
+}
+
+#[test]
 fn component_fixed_vec_whole_value_rules_and_metadata_are_checked() {
     let src = r#"scoreboard Table
     words : Vec<uint<64>, 4>

@@ -1917,9 +1917,29 @@ fn lower_state_field(
     // A fixed-vector state field uses the same recursive resolver as
     // component fields and method parameters.  Keep the complete type so
     // state element accesses retain nested-vector/record leaf metadata.
-    if let Some(ty @ IrType::FixedVec { .. }) =
-        super::components::fixed_vec_ir_type_with_records(&f.ty, record_ids)
+    if let TypeExpr::Builtin {
+        name: crate::ast::BuiltinTy::Vec,
+        args,
+        ..
+    } = &f.ty
     {
+        if matches!(args.first(), Some(crate::ast::TypeArg::Expr(expr)) if !matches!(&*expr.kind, crate::ast::ExprKind::Ident(_)))
+        {
+            return Err(LowerError::Invalid(format!(
+                "fixed-vector field `{tname}.{fname}` element must be a type, not a value expression"
+            )));
+        }
+        let Some(ty @ IrType::FixedVec { .. }) =
+            super::components::fixed_vec_ir_type_with_records(&f.ty, record_ids)
+        else {
+            return Err(not_implemented(
+                &format!(
+                    "{who} `{tname}` state field `{fname}` with an unsupported fixed-vector type"
+                ),
+                "a fixed-vector element must be a supported scalar, declared value-record, or nested fixed vector, and each nested length must currently be a decimal literal",
+                V1Status::SilentlyMisLowers,
+            ));
+        };
         if f.default.is_some() {
             return Err(not_implemented(
                 &format!("{who} `{tname}` fixed-vector state field `{fname}` with a default"),
