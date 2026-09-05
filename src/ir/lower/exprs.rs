@@ -1765,7 +1765,9 @@ impl FuncBuilder<'_> {
                 // local emits `int64_t y = x.foo;` — a member access on
                 // an integer, which the C++ compiler rejects.
                 self.reject_indexed_component_record_path(e, "a read through")?;
-                if matches!(&*target.kind, ExprKind::Ident(root) if root.name == "_tb") {
+                if matches!(&*target.kind, ExprKind::Ident(root) if root.name == "_tb")
+                    && !self.ctx.component_fields.contains_key(&name.name)
+                {
                     return Err(LowerError::Invalid(format!(
                         "unknown testbench field `_tb.{}`",
                         name.name
@@ -2000,10 +2002,7 @@ impl FuncBuilder<'_> {
                                 id.name
                             )));
                         }
-                        return Err(LowerError::Invalid(format!(
-                            "unknown callable `{}` in value position",
-                            id.name
-                        )));
+                        format!("helper call `{}(...)`", id.name)
                     }
                     ExprKind::Field { target, name } => {
                         // Width-method intrinsics: `.trunc<N>()` /

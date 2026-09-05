@@ -1599,7 +1599,7 @@ fn lower_field(
             }
             let decoded = match args.first() {
                 Some(TypeArg::Type(ty)) => {
-                    fixed_vec_elem_ir_type_with_records_and_consts(ty, record_ids, consts)
+                    fixed_vec_elem_ir_type_with_records_and_consts(ty, record_ids, consts)?
                 }
                 Some(TypeArg::Expr(expr)) => {
                     let ExprKind::Ident(id) = &*expr.kind else {
@@ -1783,6 +1783,14 @@ fn lower_field(
             // DUT handle (`dut : AxiLiteRegs`) the `on` handler pokes.
             if is_transactor {
                 if let Some(default) = &f.default {
+                    if !matches!(
+                        &*super::exprs::unparen_expr(default).kind,
+                        ExprKind::Int(_)
+                    ) {
+                        return Err(LowerError::Invalid(format!(
+                            "DUT-handle field `{comp}.{fname}` default must be the integer null literal 0"
+                        )));
+                    }
                     let folded = super::fold_const(default, consts, "").map_err(|error| {
                         let detail = match error {
                             super::ConstFoldErr::Unsupported(detail)
@@ -1794,7 +1802,7 @@ fn lower_field(
                     })?;
                     if folded.is_negative() || folded.bits != 0 {
                         return Err(LowerError::Invalid(format!(
-                            "DUT-handle field `{comp}.{fname}` default must be the null value 0"
+                            "DUT-handle field `{comp}.{fname}` default must be the integer null literal 0"
                         )));
                     }
                 }
@@ -3704,7 +3712,7 @@ pub(crate) fn fixed_vec_ir_type_with_records_and_consts(
     t: &TypeExpr,
     record_ids: &HashMap<String, RecordId>,
     consts: &HashMap<String, super::ConstVal>,
-) -> Option<IrType> {
+) -> Result<Option<IrType>, LowerError> {
     fixed_vec_elem_ir_type_with_records_and_consts(t, record_ids, consts)
 }
 
@@ -3712,7 +3720,7 @@ fn fixed_vec_elem_ir_type_with_records_and_consts(
     t: &TypeExpr,
     record_ids: &HashMap<String, RecordId>,
     consts: &HashMap<String, super::ConstVal>,
-) -> Option<IrType> {
+) -> Result<Option<IrType>, LowerError> {
     if let TypeExpr::Builtin {
         name: BuiltinTy::Vec,
         args,
@@ -3721,42 +3729,67 @@ fn fixed_vec_elem_ir_type_with_records_and_consts(
     {
         let elem = match args.first() {
             Some(TypeArg::Type(inner)) => {
-                fixed_vec_elem_ir_type_with_records_and_consts(inner, record_ids, consts)?
+                let Some(elem) =
+                    fixed_vec_elem_ir_type_with_records_and_consts(inner, record_ids, consts)?
+                else {
+                    return Ok(None);
+                };
+                elem
             }
             Some(TypeArg::Expr(expr)) => {
                 let ExprKind::Ident(id) = &*expr.kind else {
-                    return None;
+                    return Ok(None);
                 };
-                IrType::Record(*record_ids.get(&id.name)?)
+                let Some(record) = record_ids.get(&id.name) else {
+                    return Ok(None);
+                };
+                IrType::Record(*record)
             }
-            _ => return None,
+            _ => return Ok(None),
         };
         let len_expr = match args.get(1) {
             Some(TypeArg::Expr(expr)) => expr,
-            _ => return None,
+            _ => return Ok(None),
         };
         if const_expr_has_boolean_result(len_expr, consts) {
-            return None;
+            return Err(LowerError::Invalid(
+                "nested fixed-vector length must be an integer expression, not a boolean"
+                    .to_string(),
+            ));
         }
-        let folded = super::fold_const(len_expr, consts, "").ok()?;
+        let folded = super::fold_const(len_expr, consts, "").map_err(|error| match error {
+            super::ConstFoldErr::Unsupported(detail) => unsupported(
+                "a nested fixed-vector length outside the constant-expression subset",
+                detail,
+            ),
+            super::ConstFoldErr::Invalid(detail) => LowerError::Invalid(format!(
+                "nested fixed-vector length is invalid: {detail}"
+            )),
+        })?;
         if folded.is_negative() {
-            return None;
+            return Err(LowerError::Invalid(
+                "nested fixed-vector length is negative".to_string(),
+            ));
         }
-        let len = usize::try_from(folded.bits).ok()?;
-        return Some(IrType::FixedVec {
+        let len = usize::try_from(folded.bits).map_err(|_| {
+            LowerError::Invalid(
+                "nested fixed-vector length does not fit the host index size".to_string(),
+            )
+        })?;
+        return Ok(Some(IrType::FixedVec {
             elem: Box::new(elem),
             len,
-        });
+        }));
     }
     if let Some(name) = type_arg_simple_name(t) {
         if let Some(record) = record_ids.get(name) {
-            return Some(IrType::Record(*record));
+            return Ok(Some(IrType::Record(*record)));
         }
     }
-    vec_elem_scalar_ir_type(t).filter(|ty| {
+    Ok(vec_elem_scalar_ir_type(t).filter(|ty| {
         matches!(ty, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 0)
             || matches!(ty, IrType::Bool)
-    })
+    }))
 }
 
 fn fixed_vec_elem_ir_type_with_records(

@@ -17479,7 +17479,7 @@ end impl T"#
     for lit in ["1", "5"] {
         for src in both(&format!("    other : Top default {lit}")) {
             let msg = assert_invalid(&lower_src(&src).unwrap_err());
-            assert!(msg.contains("default must be the null value 0"), "{msg}");
+            assert!(msg.contains("integer null literal 0"), "{msg}");
         }
     }
     for (lit, init) in [("0", "VTop* dut = 0;"), ("1", "VTop* dut = 1;")] {
@@ -17492,7 +17492,12 @@ end impl T"#
     lower_src(&null_default).expect("a null DUT-handle default lowers");
     let nonnull_default = drv("    dut : Top default 1", "", poke);
     let msg = assert_invalid(&lower_src(&nonnull_default).unwrap_err());
-    assert!(msg.contains("default must be the null value 0"), "{msg}");
+    assert!(msg.contains("integer null literal 0"), "{msg}");
+    for bad in ["false", "1 == 2", "1 - 1"] {
+        let source = drv(&format!("    dut : Top default {bad}"), "", poke);
+        let msg = assert_invalid(&lower_src(&source).unwrap_err());
+        assert!(msg.contains("integer null literal 0"), "`{bad}`: {msg}");
+    }
 }
 
 /// The `on <event>(arg)` subscription arms in `components.rs`.
@@ -17514,8 +17519,8 @@ end impl T"#
 /// | `on 3 cycles` | lowers — a periodic handler |
 /// | `on clk` | the unresolved-name arm |
 /// | `on tagger.in_ev(t)` | the transactor/method-call arm |
-/// | `on other(t)` (a scalar field) | the unknown-callable arm |
-/// | `on nosuch(t)` | the unknown-callable arm |
+/// | `on other(t)` (a scalar field) | the helper-call arm |
+/// | `on nosuch(t)` | the helper-call arm |
 ///
 /// The two live arms split on measurement: `on in_ev()` compiles and
 /// runs (v1 synthesizes `_v` for a payload the body cannot name anyway),
@@ -17558,8 +17563,8 @@ end test T"#
     for (trigger, elsewhere) in [
         ("clk", "the unresolved name `clk`"),
         ("tagger.in_ev(t)", "transactor/method call `.in_ev(...)`"),
-        ("other(t)", "unknown callable `other`"),
-        ("nosuch(t)", "unknown callable `nosuch`"),
+        ("other(t)", "helper call `other(...)`"),
+        ("nosuch(t)", "helper call `nosuch(...)`"),
     ] {
         let msg = match lower_src(&agent(trigger, "seen = seen + 1")) {
             Ok(_) => panic!("`on {trigger}` unexpectedly lowered"),
@@ -24531,9 +24536,9 @@ fn uninitialized_tseq_locals_start_as_typed_empty_sequences() {
             Err(error) => error,
             Ok(_) => panic!("unsupported TSeq element `{bad}` must not lower"),
         };
-        let message = assert_unsupported(&error);
+        let message = assert_invalid(&error);
         assert!(
-            message.contains("unsupported element type"),
+            message.contains("not declared as a transaction or struct"),
             "{bad}: {message}"
         );
     }
@@ -48734,36 +48739,6 @@ end test BadVectorType
 }
 
 #[test]
-fn unknown_bare_statement_call_is_invalid() {
-    let src = r#"
-test UnknownCall
-    let dut : Top
-    run
-        nosuch(1)
-    end run
-end test UnknownCall
-"#;
-    let message = assert_invalid(&lower_src(src).expect_err("unknown call must be rejected"));
-    assert!(message.contains("unknown callable `nosuch`"), "{message}");
-}
-
-#[test]
-fn unknown_bare_value_call_is_invalid() {
-    let src = r#"
-test UnknownValueCall
-    let dut : Top
-    run
-        let value = nosuch(1)
-        log(info, "value={{}}", value)
-    end run
-end test UnknownValueCall
-"#;
-    let message = assert_invalid(&lower_src(src).expect_err("unknown value call must be rejected"));
-    assert!(message.contains("unknown callable `nosuch`"), "{message}");
-    assert!(message.contains("value position"), "{message}");
-}
-
-#[test]
 fn unknown_explicit_testbench_field_is_invalid() {
     let src = r#"
 testbench Tb
@@ -48813,6 +48788,137 @@ end impl T
     let cpp = emit_cpp_src(src);
     assert!(
         cpp.contains("std::array<std::array<uint64_t, 2>, 3> values{};"),
+        "{cpp}"
+    );
+}
+
+#[test]
+fn local_nested_fixed_vector_lengths_fold_constants() {
+    let src = r#"
+const INNER : uint<8> = 1 + 1
+
+test LocalNestedVector
+    let dut : Top
+    run
+        let values : Vec<Vec<uint<8>, INNER>, 3>
+        wait 1 cycle
+    end run
+end test LocalNestedVector
+"#;
+    let program = lower_src(src).expect("nested local fixed-vector constants lower");
+    verify::verify_program(&program).expect("nested local fixed-vector constants verify");
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::array<std::array<uint64_t, 2>, 3> values{};"),
+        "{cpp}"
+    );
+
+    let body = harc::parser::parse_source_named(
+        "nested_body.harc",
+        &src.replace("const INNER : uint<8> = 1 + 1\n\n", ""),
+    )
+    .expect("body source parses");
+    let constants = harc::parser::parse_source_named(
+        "nested_constants.harc",
+        "const INNER : uint<8> = 1 + 1",
+    )
+    .expect("constant source parses");
+    let merged = merge::merge_for_sim(vec![body, constants], None).expect("sources merge");
+    let program = lower::lower_program(&merged)
+        .expect("type positions see constants from the complete merged source set");
+    verify::verify_program(&program).expect("cross-file nested vector constants verify");
+}
+
+#[test]
+fn invalid_nested_fixed_vector_lengths_keep_precise_diagnostics() {
+    let sources = |length: &str| {
+        [
+            format!(
+                r#"
+test BadNestedVector
+    let dut : Top
+    run
+        let values : Vec<Vec<uint<8>, {length}>, 2>
+        wait 1 cycle
+    end run
+end test BadNestedVector
+"#
+            ),
+            format!(
+                r#"
+transactor BadNestedState
+    dut : Top
+    values : Vec<Vec<uint<8>, {length}>, 2>
+    when active
+        hookable inspect()
+        end inspect
+    end when
+end transactor BadNestedState
+
+test BadNestedStateTest
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test BadNestedStateTest
+"#
+            ),
+            format!(
+                r#"
+tseq BadRows() -> TSeq<Vec<Vec<uint<8>, {length}>, 2>>
+    yield 0
+end tseq BadRows
+
+test BadNestedTseq
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test BadNestedTseq
+"#
+            ),
+        ]
+    };
+    for (length, expected) in [
+        ("true", "not a boolean"),
+        ("-1", "negative"),
+        ("MISSING", "not a `const`"),
+    ] {
+        for source in sources(length) {
+            let message = assert_invalid(&lower_src(&source).unwrap_err());
+            assert!(message.contains(expected), "length `{length}`: {message}");
+        }
+    }
+    for source in sources("18446744073709551616") {
+        let overflow = lower_src(&source).unwrap_err();
+        let message = assert_unsupported(&overflow);
+        assert!(message.contains("64-bit constant-evaluation domain"), "{message}");
+    }
+}
+
+#[test]
+fn tseq_nested_fixed_vector_lengths_fold_constants() {
+    let src = r#"
+const INNER : uint<8> = 1 + 1
+
+tseq Rows() -> TSeq<Vec<Vec<uint<8>, INNER>, 3>>
+    let row : Vec<Vec<uint<8>, INNER>, 3>
+    yield row
+end tseq Rows
+
+test NestedRows
+    let dut : Top
+    run
+        let rows = Rows()
+        wait 1 cycle
+    end run
+end test NestedRows
+"#;
+    let program = lower_src(src).expect("nested TSeq fixed-vector constants lower");
+    verify::verify_program(&program).expect("nested TSeq fixed-vector constants verify");
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("std::vector<std::array<std::array<uint64_t, 2>, 3>>"),
         "{cpp}"
     );
 }
@@ -53543,9 +53649,9 @@ impl SeqTest for SeqTb
     end run
 end impl SeqTest
 "#;
-    let err = lower_src(src).expect_err("unsupported transactor TSeq element must be rejected");
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("unsupported TSeq element type"), "{msg}");
+    let err = lower_src(src).expect_err("unknown transactor TSeq element must be rejected");
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("not declared as a transaction or struct"), "{msg}");
 }
 
 #[test]

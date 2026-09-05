@@ -1153,10 +1153,43 @@ pub(crate) fn callable_tseq_ir_type(
     record_ids: &HashMap<String, RecordId>,
 ) -> Result<Option<IrType>, LowerError> {
     match tseq_ir_type(ty, record_ids) {
-        Some(IrType::Unknown) => Err(unsupported(
-            &construct(),
-            "callable TSeq values support records, scalars, and fixed vectors with scalar or declared-record leaves",
-        )),
+        Some(IrType::Unknown) => {
+            let malformed = match ty {
+                Some(TypeExpr::Builtin {
+                    name: BuiltinTy::TSeq,
+                    args,
+                    ..
+                }) => match args.first() {
+                    Some(TypeArg::Expr(expr)) => Some(match &*expr.kind {
+                        ExprKind::Ident(id) => format!(
+                            "TSeq element type `{}` is not declared as a transaction or struct",
+                            id.name
+                        ),
+                        _ => "TSeq element argument must be a type, not a value expression"
+                            .to_string(),
+                    }),
+                    Some(TypeArg::Type(TypeExpr::Named { name, .. })) => Some(format!(
+                        "TSeq element type `{}` is not declared as a transaction or struct",
+                        name.segments
+                            .last()
+                            .map(|segment| segment.name.as_str())
+                            .unwrap_or("<missing>")
+                    )),
+                    Some(TypeArg::Named { .. }) => {
+                        Some("TSeq element argument cannot be a named generic".to_string())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(detail) = malformed {
+                return Err(LowerError::Invalid(format!("{}: {detail}", construct())));
+            }
+            Err(unsupported(
+                &construct(),
+                "callable TSeq values support records, scalars, and fixed vectors with scalar or declared-record leaves",
+            ))
+        }
         other => Ok(other),
     }
 }

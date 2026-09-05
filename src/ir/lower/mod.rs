@@ -1921,6 +1921,7 @@ fn lower_program_impl(
     let tseq_records = tseqs::collect_tseq_records(
         &file,
         &record_ids,
+        &consts,
         &diagnostics,
         FunctionId(helper_registry.pure_count() as u32),
     )?;

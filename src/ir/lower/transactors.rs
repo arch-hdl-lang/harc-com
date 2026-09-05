@@ -169,6 +169,14 @@ fn lower_unbound_item<'a>(
                     return push_state(f);
                 }
                 if let Some(default) = &f.default {
+                    if !matches!(
+                        &*super::exprs::unparen_expr(default).kind,
+                        crate::ast::ExprKind::Int(_)
+                    ) {
+                        return Err(LowerError::Invalid(format!(
+                            "DUT-handle field `{tname}.{fname}` default must be the integer null literal 0"
+                        )));
+                    }
                     let folded = super::fold_const(default, &record_ctx.consts, "").map_err(
                         |error| {
                             let detail = match error {
@@ -182,7 +190,7 @@ fn lower_unbound_item<'a>(
                     )?;
                     if folded.is_negative() || folded.bits != 0 {
                         return Err(LowerError::Invalid(format!(
-                            "DUT-handle field `{tname}.{fname}` default must be the null value 0"
+                            "DUT-handle field `{tname}.{fname}` default must be the integer null literal 0"
                         )));
                     }
                 }
@@ -1944,13 +1952,13 @@ fn lower_state_field(
                 &f.ty,
                 record_ids,
                 &record_ctx.consts,
-            )
+            )?
         else {
             return Err(not_implemented(
                 &format!(
                     "{who} `{tname}` state field `{fname}` with an unsupported fixed-vector type"
                 ),
-                "a fixed-vector element must be a supported scalar, declared value-record, or nested fixed vector, and each nested length must currently be a decimal literal",
+                "a fixed-vector element must be a supported scalar, declared value-record, or nested fixed vector",
                 V1Status::SilentlyMisLowers,
             ));
         };
