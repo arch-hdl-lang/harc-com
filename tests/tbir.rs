@@ -40836,15 +40836,13 @@ fn coverpoint_value_expression_corruption_is_rejected_before_codegen() {
     );
 }
 
-/// `tseqs.rs` has two rejection sites four lines apart that look
-/// interchangeable and classify OPPOSITELY.
+/// Missing and unknown `tseq` element annotations are distinct inputs.
 ///
 /// The difference is whether the element-type annotation is ABSENT or
 /// PRESENT-but-unresolvable. An absent one makes v1 substitute a working
 /// default — so TB-IR now substitutes the same one and the gap is
 /// CLOSED. A bad one makes v1 print the name verbatim into a type
-/// position, which does not compile. One code path handled both, which
-/// is exactly how they came to share a classification.
+/// position, but is still an invalid source type rather than a backend gap.
 #[test]
 fn an_absent_tseq_element_type_is_not_a_bad_one() {
     let fixture = fixture("tseq_scalar_test.harc");
@@ -40883,11 +40881,9 @@ fn an_absent_tseq_element_type_is_not_a_bad_one() {
     // PRESENT AND BAD: v1 prints the name into the return type, naming a
     // type nothing declares.
     let bad = fixture.replace(DECL, "tseq Squares(n: int) -> TSeq<NoSuchType>");
-    let msg = assert_not_implemented(
-        &lower_src(&bad).unwrap_err(),
-        lower::V1Status::EmitsUncompilable,
-    );
+    let msg = assert_invalid(&lower_src(&bad).unwrap_err());
     assert!(msg.contains("`NoSuchType`"), "{msg}");
+    assert!(msg.contains("is not declared"), "{msg}");
     assert!(
         cpp_tb::emit(&merged_src(&bad))
             .expect("v1 emits a bad element type")

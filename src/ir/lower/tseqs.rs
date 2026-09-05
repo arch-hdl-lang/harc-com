@@ -50,8 +50,7 @@ use crate::ir::{
 
 use super::helpers::{ir_type_of, HelperRegistry};
 use super::{
-    not_implemented, unsupported, FuncBuilder, LowerCtx, LowerDiagnosticRecorder, LowerError,
-    SideTables, V1Status,
+    unsupported, FuncBuilder, LowerCtx, LowerDiagnosticRecorder, LowerError, SideTables,
 };
 
 /// The element name of a `tseq`'s `-> TSeq<T>` return type when `T` is a
@@ -180,17 +179,10 @@ pub(crate) fn collect_tseq_records(
                 // PRESENT but unresolvable one makes it emit the bad name.
                 // Absent and invalid are different input classes even
                 // though one code path handles both.
-                return Err(not_implemented(
-                    &format!("`tseq {}` element type `{name}`", decl.name.name),
-                    format!(
-                        "only declared `transaction`/`struct` records, primitive scalars \
-                         (`uint<N>`/`sint<N>`/`bool`), and scalar-leaf fixed vectors are lowered as tseq \
-                         element types; v1 \
-                         emits the name verbatim as `std::vector<{name}>`, which does not \
-                         compile"
-                    ),
-                    V1Status::EmitsUncompilable,
-                ));
+                return Err(LowerError::Invalid(format!(
+                    "`tseq {}` element type `{name}` is not declared as a `transaction` or `struct`",
+                    decl.name.name
+                )));
             };
             TseqElem::Record(rid)
         } else if tseq_args(decl).is_some_and(|args| args.is_empty()) {

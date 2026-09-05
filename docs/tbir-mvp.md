@@ -10524,6 +10524,13 @@ former `transaction` group lives in
      unsupported count remains 95 because the constructor is still used by
      that genuine bus-binding branch.
 
+256. **Unknown TSeq element names (2026-09-04).**
+
+     A `TSeq<Name>` return whose element name is not a declared transaction or
+     struct is now an invalid type reference. It no longer masquerades as a
+     backend limitation merely because v1 emitted an undeclared C++ type. The
+     textual unsupported count remains 95.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
