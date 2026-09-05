@@ -17505,8 +17505,8 @@ end impl T"#
 /// | `on 3 cycles` | lowers — a periodic handler |
 /// | `on clk` | the unresolved-name arm |
 /// | `on tagger.in_ev(t)` | the transactor/method-call arm |
-/// | `on other(t)` (a scalar field) | the helper-call arm |
-/// | `on nosuch(t)` | the helper-call arm |
+/// | `on other(t)` (a scalar field) | the unknown-callable arm |
+/// | `on nosuch(t)` | the unknown-callable arm |
 ///
 /// The two live arms split on measurement: `on in_ev()` compiles and
 /// runs (v1 synthesizes `_v` for a payload the body cannot name anyway),
@@ -17549,8 +17549,8 @@ end test T"#
     for (trigger, elsewhere) in [
         ("clk", "the unresolved name `clk`"),
         ("tagger.in_ev(t)", "transactor/method call `.in_ev(...)`"),
-        ("other(t)", "helper call `other(...)`"),
-        ("nosuch(t)", "helper call `nosuch(...)`"),
+        ("other(t)", "unknown callable `other`"),
+        ("nosuch(t)", "unknown callable `nosuch`"),
     ] {
         let msg = match lower_src(&agent(trigger, "seen = seen + 1")) {
             Ok(_) => panic!("`on {trigger}` unexpectedly lowered"),
@@ -48723,6 +48723,22 @@ end test UnknownCall
 "#;
     let message = assert_invalid(&lower_src(src).expect_err("unknown call must be rejected"));
     assert!(message.contains("unknown callable `nosuch`"), "{message}");
+}
+
+#[test]
+fn unknown_bare_value_call_is_invalid() {
+    let src = r#"
+test UnknownValueCall
+    let dut : Top
+    run
+        let value = nosuch(1)
+        log(info, "value={{}}", value)
+    end run
+end test UnknownValueCall
+"#;
+    let message = assert_invalid(&lower_src(src).expect_err("unknown value call must be rejected"));
+    assert!(message.contains("unknown callable `nosuch`"), "{message}");
+    assert!(message.contains("value position"), "{message}");
 }
 
 #[test]

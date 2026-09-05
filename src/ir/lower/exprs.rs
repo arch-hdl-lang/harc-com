@@ -1994,7 +1994,10 @@ impl FuncBuilder<'_> {
                                 id.name
                             )));
                         }
-                        format!("helper call `{}(...)`", id.name)
+                        return Err(LowerError::Invalid(format!(
+                            "unknown callable `{}` in value position",
+                            id.name
+                        )));
                     }
                     ExprKind::Field { target, name } => {
                         // Width-method intrinsics: `.trunc<N>()` /

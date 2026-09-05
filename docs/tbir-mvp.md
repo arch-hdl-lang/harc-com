@@ -10494,6 +10494,13 @@ former `transaction` group lives in
      backend support can genuinely vary. The textual unsupported count remains
      97 because that shared fallback still handles those receiver forms.
 
+252. **Unknown bare value calls (2026-09-04).**
+
+     A bare value-producing call that resolves to no component builtin,
+     testbench method, transactor self-method, helper, extern, or temporal
+     intrinsic is now an invalid source reference. Receiver-method expressions
+     retain the backend-gap fallback. The textual unsupported count remains 97.
+
 ## Next steps
 
 The remaining work is the plan doc's (gate redefined 2026-06-12 —
