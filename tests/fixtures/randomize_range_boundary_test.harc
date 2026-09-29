@@ -1,0 +1,62 @@
+// Compiled/executed carrier and adjacent-policy checks for issue #844.
+transaction WideRanges
+    a : uint<100> with [range(0, 7)]
+    b : uint<200> with [range(0, 7)]
+end transaction WideRanges
+
+transaction ExtremeRanges
+    high : uint<64> with [range(0x8000000000000000, 0xffffffffffffffff)]
+    low : sint<64> with [range(-9223372036854775808, -1)]
+    signed63 : sint<63> with [range(-4, 3)]
+end transaction ExtremeRanges
+
+transaction UniqueRange
+    token : uint<8> with [range(0, 3)] [unique within test]
+end transaction UniqueRange
+
+transaction ConflictRange
+    a : uint<8> with [range(0, 3)]
+    b : uint<64>
+    !expected : uint<64>
+end transaction ConflictRange
+
+testbench RangeBoundaryTb
+    dut : Top
+end testbench RangeBoundaryTb
+
+impl RangeBoundaryTest for RangeBoundaryTb
+    run
+        let wide_limit : uint<200> = 7
+        let one : uint<64> = 1
+        let seen : uint<64> = 0
+        for i in 0 .. 99
+            let wide : WideRanges
+            randomize(wide)
+            assert wide.a <= 7 and wide.b <= wide_limit else fail("wide range")
+            let edge : ExtremeRanges
+            randomize(edge)
+            assert edge.high >= 0x8000000000000000 else fail("high unsigned range")
+            assert edge.low < 0 else fail("negative full-width range")
+            assert edge.signed63 >= -4 and edge.signed63 <= 3 else fail("signed63 range")
+            let sample : UniqueRange
+            randomize(sample)
+            assert sample.token <= 3 else fail("unique range")
+            assert (seen & (one << sample.token)) == 0 else fail("unique repeated before exhaustion")
+            seen = seen | (one << sample.token)
+            if i % 4 == 3
+                assert seen == 15 else fail("unique domain not exhausted")
+                seen = 0
+            end if
+            // Vary hard constraints while a's coverage goals persist. Failed
+            // random b preferences must not label a's goals unreachable.
+            let conflict : ConflictRange
+            conflict.expected = i % 2
+            randomize(conflict) with
+                conflict.b == conflict.expected
+            end randomize
+            assert conflict.a <= 3 else fail("conflict range")
+            assert conflict.b == i % 2 else fail("hard constraint relaxed")
+        end for
+        wait 1 cycle
+    end run
+end impl RangeBoundaryTest
