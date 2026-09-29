@@ -139,3 +139,8 @@ both test-only adaptations, independently executed the integrated runtime
 regression under UBSan, and reported no outstanding findings. Repository CI
 is the remaining full current-main platform gate; the earlier full-suite
 counts above apply only to the original development base.
+
+The first current-main CI run stopped before compiling HARC: the cargo job's
+cold-cache Verilator build lacked `FlexLexer.h`. Its package installation now
+matches the existing fixture jobs' build dependencies, including `libfl-dev`.
+No checks were removed or bypassed; CI must run again with this setup fix.
