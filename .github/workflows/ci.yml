@@ -28,7 +28,13 @@ jobs:
         # absent. It also earns its keep: this job now runs the
         # Verilator-backed end-to-end tests, which share most of their
         # object code.
-        run: sudo apt-get update && sudo apt-get install -y libz3-dev ccache
+        # This job can be the first consumer of the Verilator cache. Install
+        # its source-build dependencies too (FlexLexer.h comes from libfl-dev).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libz3-dev clang ccache \
+                                  git make autoconf flex bison g++ help2man perl python3 \
+                                  numactl perl-doc libfl2 libfl-dev zlib1g zlib1g-dev
 
       - name: Cache cargo registry + target
         uses: actions/cache@v6
