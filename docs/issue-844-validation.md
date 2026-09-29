@@ -1,6 +1,8 @@
 # Issue #844 implementation and validation
 
-Base: `822006de`. Branch: `codex/844-range-preferences`.
+Original development base: `822006de`; branch: `codex/844-range-preferences`.
+These original-base results are historical. Current-main integration is
+recorded separately at the end of this report.
 
 ## Changes
 
@@ -113,3 +115,27 @@ injection was not added: the preference retry branch handles all non-SAT
 results through deferral and never declares those goals blocked. General
 constraint fallback diversity, PRNG-path range overflow/bias, and wide hard
 literal semantics remain separate work.
+
+## Current-main integration (September 29, 2026)
+
+Integration base: `d82a0c86` (GitHub main); branch: `codex/844-main-integration`.
+The production fix cherry-picked cleanly. Test-only adaptations add the new
+`source_id` constructor field and refresh common-split artifact hashes plus
+`interface_abi` (`cf7a0e061cc46270`) to account for the runtime-header changes.
+The build-profile fingerprint is unchanged.
+
+Revalidated on this base with Verilator required and learning disabled:
+
+- Code generation: 322 passed.
+- Common-split generated build/execution: 31 passed.
+- Range/runtime/both-emitter regression suite: 5 passed.
+- Typed-Z3 fixture sweep and classification guards: 4 passed.
+- Emission parity: 203 acceptance-parity, 0 divergent, 2 known exemptions,
+  0 skipped, 0 lost; 19 cases also compare solver text.
+- Fixture registration and diff whitespace checks: passed.
+
+The separate reviewer rechecked the current-main production integration and
+both test-only adaptations, independently executed the integrated runtime
+regression under UBSan, and reported no outstanding findings. Repository CI
+is the remaining full current-main platform gate; the earlier full-suite
+counts above apply only to the original development base.

@@ -376,6 +376,7 @@ fn classifies_only_the_signed_minimum_magnitude_gap() {
             assert!(expected_lower_error_reason(path, &entry.source, &wrong_value).is_none());
             let wrong_transaction = TypedSolverProblemSource::TransactionTemplate {
                 transaction: "Other".into(),
+                source_id: Default::default(),
                 span: Default::default(),
             };
             assert!(expected_lower_error_reason(path, &wrong_transaction, &errors).is_none());
