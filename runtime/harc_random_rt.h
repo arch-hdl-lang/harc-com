@@ -95,6 +95,9 @@ struct HarcAutoCovState {
     std::vector<uint8_t> point_blocked;
     std::vector<uint8_t> cross_hit;
     std::vector<uint8_t> cross_blocked;
+    // Failed attempts are skipped for one sweep, never reported unreachable.
+    std::vector<uint8_t> point_deferred;
+    std::vector<uint8_t> cross_deferred;
 };
 
 struct HarcSolverRetryPolicy {
@@ -256,6 +259,32 @@ inline harc_rt::HarcWide<N> harc_prefer_wide(
         value[N - 1] &= (uint32_t{1} << last_bits) - 1u;
     }
     return value;
+}
+
+// Inclusive interval sampling. Unsigned arithmetic handles spans crossing
+// INT64_MAX, and a zero span denotes the complete 2^64-value domain.
+// Keep this separate from legacy enum/dist helpers to preserve their streams.
+inline constexpr uint64_t harc_prefer_range_u64(
+    harc_seed seed, uint32_t salt, uint64_t lo, uint64_t hi) {
+    if (hi <= lo) return lo;
+    const uint64_t span = hi - lo + 1;
+    uint64_t draw = harc_preference_draw(seed, salt);
+    if (span == 0) return draw;
+    const uint64_t threshold = -span % span;
+    while (draw < threshold) draw = harc_splitmix64(draw);
+    return lo + draw % span;
+}
+
+inline constexpr int64_t harc_prefer_range_i64(
+    harc_seed seed, uint32_t salt, int64_t lo, int64_t hi) {
+    if (hi <= lo) return lo;
+    const uint64_t distance = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo);
+    const uint64_t bits = static_cast<uint64_t>(lo)
+        + harc_prefer_range_u64(seed, salt, 0, distance);
+    // Express the negative half without an out-of-range unsigned-to-signed
+    // conversion or overflowing signed addition (including INT64_MIN).
+    return bits <= INT64_MAX ? static_cast<int64_t>(bits)
+        : -1 - static_cast<int64_t>(UINT64_MAX - bits);
 }
 
 inline constexpr int64_t harc_prefer_range(
@@ -443,6 +472,8 @@ inline void harc_auto_cov_init(
     state.point_blocked.assign(harc_auto_cov_point_total(plan), 0);
     state.cross_hit.assign(harc_auto_cov_cross_total(plan), 0);
     state.cross_blocked.assign(harc_auto_cov_cross_total(plan), 0);
+    state.point_deferred.assign(harc_auto_cov_point_total(plan), 0);
+    state.cross_deferred.assign(harc_auto_cov_cross_total(plan), 0);
     state.initialized = true;
 }
 
@@ -498,7 +529,7 @@ inline bool harc_auto_cov_apply_point_preference(
     harc_auto_cov_init(plan, state);
     size_t base = harc_auto_cov_point_offset(plan, static_cast<size_t>(group));
     for (size_t i = 0; i < N; ++i) {
-        if (!state.point_hit[base + i] && !state.point_blocked[base + i]) {
+        if (!state.point_hit[base + i] && !state.point_blocked[base + i] && !state.point_deferred[base + i]) {
             preference = values[i];
             harc_auto_cov_select_point(selection, group, i);
             return true;
@@ -524,7 +555,7 @@ inline bool harc_auto_cov_apply_cross_preference(
     for (size_t i = 0; i < Rows; ++i) {
         for (size_t j = 0; j < Cols; ++j) {
             size_t idx = base + i * meta.cols + j;
-            if (!state.cross_hit[idx] && !state.cross_blocked[idx]) {
+            if (!state.cross_hit[idx] && !state.cross_blocked[idx] && !state.cross_deferred[idx]) {
                 a_preference = a_values[i];
                 b_preference = b_values[j];
                 harc_auto_cov_select_cross(selection, group, i, j);
@@ -533,6 +564,27 @@ inline bool harc_auto_cov_apply_cross_preference(
         }
     }
     return false;
+}
+
+// Called after all point/cross selectors. Once a sweep is exhausted, allow
+// unsteered sampling this call and retry deferred goals in the next call.
+inline void harc_auto_cov_finish_selection(
+    HarcAutoCovState& state, const HarcAutoCovSelection& selection) {
+    if (harc_auto_cov_has_preference(selection)) return;
+    for (auto& flag : state.point_deferred) flag = 0;
+    for (auto& flag : state.cross_deferred) flag = 0;
+}
+
+inline void harc_auto_cov_defer_selected(
+    const HarcAutoCovPlan& plan, HarcAutoCovState& state,
+    const HarcAutoCovSelection& selection) {
+    harc_auto_cov_init(plan, state);
+    if (selection.kind == 1) {
+        state.point_deferred[harc_auto_cov_point_offset(plan, selection.group) + selection.i] = 1;
+    } else if (selection.kind == 2) {
+        state.cross_deferred[harc_auto_cov_cross_offset(plan, selection.group)
+            + selection.i * plan.crosses[selection.group].cols + selection.j] = 1;
+    }
 }
 
 inline constexpr const char* harc_auto_cov_state(

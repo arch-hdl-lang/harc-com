@@ -1,0 +1,38 @@
+// Issue #844: legal values alone do not establish useful randomization.
+transaction NarrowRange
+    a : uint<8> with [range(0, 31)]
+    b : uint<8> with [range(0, 7)]
+    c : uint<8> with [range(0, 2)]
+    signed_value : sint<8> with [range(-4, 3)]
+end transaction NarrowRange
+
+testbench RangePreferenceTb
+    dut : Top
+end testbench RangePreferenceTb
+
+impl RangePreferenceTest for RangePreferenceTb
+    run
+        let one : uint<64> = 1
+        let seen_a : uint<64> = 0
+        let seen_b : uint<64> = 0
+        let seen_c : uint<64> = 0
+        let seen_signed : uint<64> = 0
+        for i in 0 .. 599
+            let t : NarrowRange
+            randomize(t)
+            assert t.a <= 31 else fail("a outside range")
+            assert t.b <= 7 else fail("b outside range")
+            assert t.c <= 2 else fail("c outside range")
+            assert t.signed_value >= -4 and t.signed_value <= 3 else fail("signed outside range")
+            seen_a = seen_a | (one << t.a)
+            seen_b = seen_b | (one << t.b)
+            seen_c = seen_c | (one << t.c)
+            seen_signed = seen_signed | (one << (t.signed_value + 4))
+        end for
+        assert seen_a == 0xffffffff else fail("collapsed a: ${seen_a}")
+        assert seen_b == 0xff else fail("collapsed b: ${seen_b}")
+        assert seen_c == 7 else fail("collapsed c: ${seen_c}")
+        assert seen_signed == 0xff else fail("collapsed signed: ${seen_signed}")
+        wait 1 cycle
+    end run
+end impl RangePreferenceTest

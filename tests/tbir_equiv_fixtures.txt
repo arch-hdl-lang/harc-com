@@ -406,3 +406,6 @@ fixed_vec_pure_helper_test | Top | top_counter.sv | top_counter.arch | pass
 fixed_vec_testbench_method_test | Top | top_counter.sv | top_counter.arch | pass
 nested_record_vec_schema_test | Top | top_counter.sv | - | pass
 enum_variant_scope_test | Top | top_counter.sv | top_counter.arch | pass
+
+randomize_range_preference_test | Top | top_counter.sv | top_counter.arch | pass
+randomize_range_boundary_test | Top | top_counter.sv | top_counter.arch | pass

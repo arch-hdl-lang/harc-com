@@ -206,6 +206,33 @@ fn expected_lower_error_reason(
             }
         }
     }
+    if file == "randomize_range_boundary_test.harc" {
+        let transaction = match source {
+            TypedSolverProblemSource::TransactionTemplate { transaction, .. }
+            | TypedSolverProblemSource::RandomizeSite { transaction, .. } => transaction,
+        };
+        if transaction == "ExtremeRanges" && errors.len() == 1 {
+            if let LowerError::BvLitOutOfRange {
+                width: 64,
+                value,
+                span,
+            } = &errors[0]
+            {
+                let fixture_source = fs::read_to_string(path).ok()?;
+                if *value == 1u128 << 63
+                    && fixture_source.get(span.start_usize()..span.end_usize())
+                        == Some("9223372036854775808")
+                    && fixture_source.get(span.start_usize().checked_sub(1)?..span.start_usize())
+                        == Some("-")
+                {
+                    return Some(
+                        "INT64_MIN is valid in both executed simulator backends; the staged typed Z3 \
+                         lowerer rejects its positive magnitude before applying unary negation",
+                    );
+                }
+            }
+        }
+    }
     if file == "uint64_unique_randomize_test.harc" {
         let fixture_source = fs::read_to_string(path).ok()?;
         if let TypedSolverProblemSource::RandomizeSite {
@@ -324,4 +351,41 @@ fn classifies_uint64_randomize_with_lowering_gap() {
         span: Default::default(),
     }];
     assert!(expected_lower_error_reason(path, &entry.source, &wrong_span).is_none());
+}
+
+#[test]
+fn classifies_only_the_signed_minimum_magnitude_gap() {
+    let path = Path::new("tests/fixtures/randomize_range_boundary_test.harc");
+    let parsed = parse_source(&fs::read_to_string(path).unwrap()).unwrap();
+    let table = build_typed_solver_problem_table(&parsed);
+    let mut classified = 0;
+    for entry in table.entries {
+        if let TypedSolverProblemBuild::LowerError(errors) = entry.build {
+            assert!(expected_lower_error_reason(path, &entry.source, &errors).is_some());
+            classified += 1;
+            let wrong_span = [LowerError::BvLitOutOfRange {
+                width: 64,
+                value: 1u128 << 63,
+                span: Default::default(),
+            }];
+            assert!(expected_lower_error_reason(path, &entry.source, &wrong_span).is_none());
+            let mut wrong_value = errors.clone();
+            if let LowerError::BvLitOutOfRange { value, .. } = &mut wrong_value[0] {
+                *value = 1;
+            }
+            assert!(expected_lower_error_reason(path, &entry.source, &wrong_value).is_none());
+            let wrong_transaction = TypedSolverProblemSource::TransactionTemplate {
+                transaction: "Other".into(),
+                span: Default::default(),
+            };
+            assert!(expected_lower_error_reason(path, &wrong_transaction, &errors).is_none());
+            let mut additional_error = errors.clone();
+            additional_error.extend(wrong_span);
+            assert!(expected_lower_error_reason(path, &entry.source, &additional_error).is_none());
+        }
+    }
+    assert_eq!(
+        classified, 2,
+        "template and randomize site should expose the gap"
+    );
 }

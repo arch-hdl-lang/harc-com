@@ -903,7 +903,9 @@ The static checker rejects multi-field constraints in Phase 1a with a clear erro
 
 - `randomize(t)` on a transaction with `keep`s emits the full Z3 solver block, with each `keep` expression added as a constraint alongside per-field width bounds.
 - `randomize(t) with <user-body>` merges `<user-body>` with the transaction's keeps; the solver finds a satisfying assignment over the combined constraint set.
-- `randomize(t)` on a transaction with **no** keeps stays on the fast PRNG path (per-field uniform sampling).
+- `randomize(t)` on a transaction with **no** keeps can still use the solver when automatic coverage steering is active. Otherwise it can use the fast PRNG path.
+- Solver preferences sample supported literal `[range]` intervals directly, using deterministic rejection sampling. Coverage steering can override these preferences; arbitrary additional constraints can still cause fallback to a solver model. This is not a uniform sampler over constrained solution spaces. Existing seeds produce different stimulus for these range fields after this change.
+- A failed preferred tuple does not establish that a coverage goal is unreachable. Failed goals are temporarily deferred while other goals are attempted, then retried after an unsteered call. Unproven goals remain unblocked, including goals that may be unreachable in practice.
 
 The Phase 1a/1b distinction is preserved as a design intent (single-field constants-only could in principle compile without Z3), but v0 collapses both phases into the always-Z3 path now that the solver is linked. The simplification keeps a single code path for correctness; the per-attribute fast paths (`[range]`, `[dist]`) remain available for users who want to express stimulus shape at field-declaration time rather than via `keep`.
 

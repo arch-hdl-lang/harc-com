@@ -232,6 +232,8 @@ The resolver checks CLI flags first, then `HARC_Z3_INCLUDE_DIR` / `HARC_Z3_LIB_D
 | `axilite_bus_send_test.harc` | `AxiLiteRegs.sv` | typed bus binding + `bus.<ch>.send/recv` |
 | `axilite_bound_mon_test.harc` | `AxiLiteRegs.sv` | bound monitor (`on bus.<ch>.handshake(t)`) |
 | `axilite_constraint_test.harc` | `AxiLiteRegs.sv` | `randomize(t) with …` through Z3 |
+| `randomize_range_boundary_test.harc` | `top_counter.sv` | wide/signed range carriers, uniqueness recycling, changing constraints |
+| `randomize_range_preference_test.harc` | `top_counter.sv` | seeded range diversity and signed bounds (issue #844) |
 | `soft_constraint_randomize_test.harc` | `top_counter.sv` | weighted soft `randomize(t) with` overlays |
 | `dma_engine_tlm_target_test.harc` | `dma_engine_tlm_mem.sv` + `dma_engine.sv` | target responder TLM memory BFM serving an SV DMA initiator |
 | `dma_engine_tlm_mem_model_test.harc` | `dma_engine_tlm_mem.sv` + `dma_engine.sv` | stateful target-side TLM memory model with final copied-data checks |

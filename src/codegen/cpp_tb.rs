@@ -7065,6 +7065,74 @@ fn natural_auto_coverage_endpoints(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
     }
 }
 
+/// A mathematical literal interval whose values agree with the emitted
+/// bit-vector comparisons. Do not reinterpret unsigned literals as negative
+/// signed bounds, or optimize expressions whose constant value is unknown.
+fn literal_range_preference(f: &TxnFieldInfo, salt: usize, solver_width: u32) -> Option<String> {
+    fn bound(e: &Expr, solver_width: u32) -> Option<i128> {
+        match &*e.kind {
+            ExprKind::Int(s) => {
+                let value = parse_int_str(s)?;
+                // Wide constraint literals currently pass through an int64_t
+                // carrier and sign-extend. Do not optimize a different interval.
+                if solver_width > 64 && value > i64::MAX as u64 {
+                    return None;
+                }
+                Some(i128::from(value))
+            }
+            ExprKind::Paren(inner) => bound(inner, solver_width),
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                expr,
+            } => bound(expr, solver_width)?.checked_neg(),
+            _ => None,
+        }
+    }
+    fn signed_literal(v: i128) -> String {
+        if v == i64::MIN as i128 {
+            "(-9223372036854775807LL - 1)".to_string()
+        } else {
+            format!("{v}LL")
+        }
+    }
+    let (lo, hi) = field_attr_range(f)?;
+    let (lo, hi) = (bound(lo, solver_width)?, bound(hi, solver_width)?);
+    if f.width == 0 {
+        return None;
+    }
+    if f.signed {
+        if f.width > 64 || lo < i64::MIN as i128 || hi > i64::MAX as i128 {
+            return None;
+        }
+        let half = 1i128 << (f.width - 1);
+        let (lo, hi) = (lo.max(-half), hi.min(half - 1));
+        if lo > hi {
+            return None;
+        }
+        Some(format!(
+            "harc_rt::random::harc_prefer_range_i64(_harc_rt_seed, {salt}, {}, {})",
+            signed_literal(lo),
+            signed_literal(hi)
+        ))
+    } else {
+        if lo < 0 || hi > u64::MAX as i128 {
+            return None;
+        }
+        let max = if f.width >= 64 {
+            u64::MAX as i128
+        } else {
+            (1i128 << f.width) - 1
+        };
+        let hi = hi.min(max);
+        if lo > hi {
+            return None;
+        }
+        Some(format!(
+            "harc_rt::random::harc_prefer_range_u64(_harc_rt_seed, {salt}, {lo}ULL, {hi}ULL)"
+        ))
+    }
+}
+
 fn auto_coverage_values(f: &TxnFieldInfo) -> Vec<AutoCoverageValue> {
     let mut values = Vec::new();
     if let Some(n) = f.enum_variants {
@@ -17606,6 +17674,15 @@ impl Emitter {
                     n.saturating_sub(1)
                 )
                 .ok();
+            } else if let Some(expr) = literal_range_preference(f, pref_idx, solver_width) {
+                let value_ty = if f.signed {
+                    "int64_t".to_string()
+                } else if f.width <= 64 {
+                    "uint64_t".to_string()
+                } else {
+                    txn_field_solver_c_type(f)
+                };
+                writeln!(self.out, "{value_ty} _pref_{cache_tag}_{c_name} = static_cast<{value_ty}>({expr});").ok();
             } else if f.signed && f.width > 0 && f.width <= 64 {
                 if f.width == 63 {
                     writeln!(
@@ -17712,6 +17789,11 @@ impl Emitter {
             )
             .ok();
         }
+        if !auto_goals.is_empty() {
+            let cov_state = self.auto_cov_state_ref(&cache_tag);
+            self.pad(depth + 1);
+            writeln!(self.out, "harc_rt::random::harc_auto_cov_finish_selection({cov_state}, _auto_cov_selection_{cache_tag});").ok();
+        }
         self.pad(depth + 1);
         writeln!(
             self.out,
@@ -17767,24 +17849,13 @@ impl Emitter {
             "if (harc_rt::random::harc_retry_without_preferences(_harc_rt_retry_policy, _r == z3::sat)) {{"
         )
         .ok();
+        // A failed preferred tuple does not prove any coverage goal unreachable.
+        // History and call-dependent hard constraints also make persistent
+        // BLOCKED inference unsafe. Leave unproven goals available for retry.
         if !auto_goals.is_empty() {
             let cov_state = self.auto_cov_state_ref(&cache_tag);
-            for (group, (_a, _b)) in auto_crosses.iter().enumerate() {
-                self.pad(depth + 2);
-                writeln!(
-                    self.out,
-                    "harc_rt::random::harc_auto_cov_mark_selected_cross_blocked(_auto_cov_plan_{cache_tag}, {cov_state}, _auto_cov_selection_{cache_tag}, {group});"
-                )
-                .ok();
-            }
-            for (group, _goal) in auto_goals.iter().enumerate() {
-                self.pad(depth + 2);
-                writeln!(
-                    self.out,
-                    "harc_rt::random::harc_auto_cov_mark_selected_point_blocked(_auto_cov_plan_{cache_tag}, {cov_state}, _auto_cov_selection_{cache_tag}, {group});"
-                )
-                .ok();
-            }
+            self.pad(depth + 2);
+            writeln!(self.out, "harc_rt::random::harc_auto_cov_defer_selected(_auto_cov_plan_{cache_tag}, {cov_state}, _auto_cov_selection_{cache_tag});").ok();
         }
         self.pad(depth + 2);
         writeln!(self.out, "_s.pop();").ok();
