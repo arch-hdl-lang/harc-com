@@ -19306,6 +19306,43 @@ end test FmtTest
     );
 }
 
+/// The capability check for an immediate diagnostic must not lower the lazy
+/// capture speculatively. The outer assertion branch has to be the entry edge;
+/// otherwise a speculative short-circuit merge can return before the real
+/// assertion is evaluated.
+#[test]
+fn conditional_message_preflight_does_not_mutate_the_cfg() {
+    let src = r#"
+function peek(d: Top) -> uint<8>
+    return d.rd_data
+end function peek
+
+test FmtPreflightTest
+    let dut : Top
+    run
+        assert false else fail("lazy=${true || peek(dut) == 0}")
+    end run
+end test FmtPreflightTest
+"#;
+    let prog = lower_src(src).expect("conditional diagnostic helper lowers lazily");
+    verify::verify_program(&prog).expect("conditional diagnostic CFG verifies");
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        matches!(
+            run.blocks[run.entry.index()].terminator,
+            ir::Terminator::Branch(
+                ir::Expr::Literal {
+                    value: 0,
+                    ty: ir::IrType::Bool,
+                },
+                _,
+                _
+            )
+        ),
+        "the outer `assert false` branch must be the entry terminator:\n{run}"
+    );
+}
+
 /// A dynamic packed-port selector may itself be an impure call. The packed
 /// target is a value operand, so it must be sampled before that call can write
 /// the same DUT signal.
@@ -35289,6 +35326,29 @@ end impl T"#,
         cpp.contains("harc_rt::harc_read(dut->a)")
             && cpp.contains("harc_printf_ll(_harc_runtime_cells.callback_capture_run_n2_lo)"),
         "both captures render inside the closure:\n{cpp}"
+    );
+
+    let effectful = r#"function peek(d: Top) -> uint<8>
+    return d.a
+end function peek
+
+testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        assert past(dut.a) == 0 else fail("a=${peek(dut)}")
+        wait 1 cycle
+    end run
+end impl T"#;
+    let message = assert_unsupported(
+        &lower_src(effectful)
+            .expect_err("a concurrent message cannot materialize an effectful helper call"),
+    );
+    assert!(
+        message.contains("DUT/sync-touching helper call `peek(...)`")
+            && message.contains("inside a message"),
+        "the concurrent path retains the honest shared lazy-message diagnostic: {message}"
     );
 }
 

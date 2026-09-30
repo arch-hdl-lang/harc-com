@@ -5667,10 +5667,9 @@ impl super::FuncBuilder<'_> {
             )));
         }
         if self.in_fmt_args {
-            return Err(unsupported(
-                &format!("component method call `.{method}(...)` inside a message"),
-                "log/fail messages evaluate lazily; hoist the call into a `let` first",
-            ));
+            return Err(super::stmts::lazy_message_call_error(&format!(
+                "component method call `.{method}(...)`"
+            )));
         }
 
         let owner = format!("`{}.{method}`", self.ctx.components[component.index()].name);

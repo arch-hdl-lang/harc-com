@@ -12,9 +12,9 @@ such sites in `src/codegen/tbir`. That raw count is an inventory, not a work
 queue: some sites cover several source shapes, and some diagnostics were
 incorrectly classified as gaps even though v1 rejects the same source.
 
-The refreshed 2026-09-29 inventory is recorded in
+The refreshed 2026-09-30 inventory is recorded in
 [`tbir-migration-manifest.md`](tbir-migration-manifest.md). Current main has
-94 executable constructors (95 textual matches including the helper
+89 executable constructors (90 textual matches including the helper
 definition); the manifest separates positive runtime controls from diagnostic
 and deliberately deferred shapes.
 
@@ -169,7 +169,7 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 94 remaining constructor call sites (95 textual matches including
+Treat the 89 remaining constructor call sites (90 textual matches including
 the `unsupported` helper definition) as an inventory, not 116 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
