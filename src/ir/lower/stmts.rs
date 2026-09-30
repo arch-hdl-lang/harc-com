@@ -875,7 +875,19 @@ impl FuncBuilder<'_> {
                         }
                         _ => "an expression statement".to_string(),
                     },
-                    _ => "an expression statement".to_string(),
+                    _ => {
+                        // A side-effect-free value in statement position is
+                        // still evaluated by v1 and discarded. Preserve that
+                        // evaluation in an unread temporary so port reads and
+                        // arithmetic keep their source ordering.
+                        let value = self.lower_expr_no_ports(e)?;
+                        let value = self.hoist_ports(value);
+                        let ty = self.expr_type(&value).unwrap_or(crate::ir::IrType::Unknown);
+                        let discard = self.fresh_temp();
+                        self.set_local_type(discard, ty);
+                        self.push(Stmt::Assign(discard, value));
+                        return Ok(());
+                    }
                 };
                 Err(unsupported(&what, ""))
             }

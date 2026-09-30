@@ -2147,13 +2147,19 @@ impl FuncBuilder<'_> {
                     }
                     _ => "a call expression".to_string(),
                 };
-                Err(unsupported(&what, ""))
+                Err(not_implemented(
+                    &what,
+                    "v1 emits the unresolved call verbatim, so generated C++ name/member lookup fails",
+                    V1Status::EmitsUncompilable,
+                ))
             }
-            ExprKind::ForkCall { .. } => Err(unsupported(
+            ExprKind::ForkCall { .. } => Err(not_implemented(
                 "`fork` bus-method calls in expression position",
                 "test-scope `let x = fork bus.m(...)` (initiator-side issue) IS lowered; a \
                  `fork` INSIDE a transactor responder body (target re-issuing a downstream \
-                 TLM call — fork-forwarding) is a follow-up slice",
+                 TLM call — fork-forwarding) is a follow-up slice; v1 also rejects a fork \
+                 nested anywhere other than its dedicated statement/initializer forms",
+                V1Status::Rejects,
             )),
             // `let ok = randomize(t)` — the value-producing form. v1's
             // `emit_expr` has no arm for it (it only handles the

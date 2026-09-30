@@ -9799,7 +9799,7 @@ end impl T"#
 
     // `bus` is also a legal concrete binding name; it must not alias the
     // explicit unresolved provenance state. A later instance selecting a
-    // genuinely different binding still trips the shared-body conflict gate.
+    // genuinely different binding receives a specialized callable owner.
     let split_bindings = bound_dut
         .replace(
             "let axil : BusAxiLite = bind dut",
@@ -9812,12 +9812,41 @@ end impl T"#
         .replace(
             "let mon  : AxilXactor passive = bind axil",
             "let mon  : AxilXactor passive = bind other",
-        );
-    let msg = assert_unsupported(&lower_with_stdlib_bus_src(&split_bindings).unwrap_err());
+        )
+        .replace("axil.", "bus.");
+    let split_prog = lower_with_stdlib_bus_src(&split_bindings)
+        .expect("one bound component type may specialize onto two bus bindings");
+    verify::verify_program(&split_prog).expect("split-binding component verifies");
+    let split_cpp = tbir::emit(
+        &split_prog,
+        &merged_with_stdlib_bus(&split_bindings, "BusAxiLite.arch"),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("split-binding component emits");
     assert!(
-        msg.contains("multiple bus bindings") && msg.contains("`bus`") && msg.contains("`other`"),
-        "{msg}"
+        split_cpp.contains("struct AxilXactor__AxiLiteBoundMonTest__mon")
+            && split_cpp.contains("AxilXactor__AxiLiteBoundMonTest__mon_on_h"),
+        "the second binding receives its own typed component/callable owner: {split_cpp}"
     );
+
+    let split_with_method = split_bindings.replace(
+        "last_read : uint<32> default 0",
+        "last_read : uint<32> default 0\n\n    function observe(other: AxilXactor)\n        last_read = last_read\n    end function observe",
+    );
+    let split_method_prog = lower_with_stdlib_bus_src(&split_with_method)
+        .expect("split-binding component with a self-typed method lowers");
+    verify::verify_program(&split_method_prog)
+        .expect("specialized method metadata and function ABI agree");
+    let specialized = split_method_prog
+        .components
+        .iter()
+        .position(|component| component.name == "AxilXactor__AxiLiteBoundMonTest__mon")
+        .map(|index| ir::ComponentId(index as u32))
+        .expect("specialized component");
+    let observe = split_method_prog.components[specialized.index()]
+        .method("observe")
+        .expect("specialized observe method");
+    assert_eq!(observe.param_tys, vec![ir::IrType::Component(specialized)]);
 
     // The inert member still has to name the test's DUT type: otherwise v1
     // emits an undeclared VTop pointer and TBIR must not emit the same broken
@@ -9853,6 +9882,77 @@ end impl T"#
                 .unwrap_or_else(|e| panic!("no arm calls this malformed: {e:?}"));
         }
     }
+}
+
+#[test]
+fn discarded_scalar_expression_statements_lower_without_a_v1_fallback() {
+    let src = r#"test DiscardExpr
+    let dut : Top
+    run
+        1 + 2
+        true && false
+    end run
+end test DiscardExpr"#;
+    let prog = lower_src(src).expect("discarded scalar expressions lower");
+    verify::verify_program(&prog).expect("discarded scalar expressions verify");
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter(|stmt| matches!(stmt, ir::Stmt::Assign(..)))
+            .count()
+            >= 2,
+        "both expressions must remain evaluated in unread temporaries: {run}"
+    );
+}
+
+#[test]
+fn unresolved_calls_do_not_advertise_v1_as_an_escape_hatch() {
+    let source = |body: &str| {
+        format!(
+            "test UnknownCall\n    let dut : Top\n    run\n        {body}\n    end run\nend test UnknownCall"
+        )
+    };
+    let value_src = source("let value = missing(1)");
+    let msg = assert_not_implemented(
+        &lower_src(&value_src).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("missing"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&value_src)).expect("v1 emits the unresolved call");
+    assert!(v1.contains("missing(1)"), "{v1}");
+}
+
+#[test]
+fn nested_fork_and_unmerged_extend_are_not_v1_subset_gaps() {
+    let nested_fork = r#"bus MemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus MemBus
+
+test NestedFork
+    let dut : TlmMemory
+    let mem : MemBus = bind dut
+    run
+        assert (fork mem.read(1)) == 0 else fail("nested fork")
+    end run
+end test NestedFork"#;
+    let msg = assert_not_implemented(
+        &lower_src(nested_fork).unwrap_err(),
+        lower::V1Status::Rejects,
+    );
+    assert!(msg.contains("`fork` bus-method calls"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(nested_fork)).is_err(),
+        "v1 also rejects a nested fork expression"
+    );
+
+    let unmerged = parse_source(
+        "extend Txn\n    data : uint<8>\nend extend Txn",
+    )
+    .expect("extension parses");
+    let msg = assert_invalid(&lower::lower_program(&unmerged).unwrap_err());
+    assert!(msg.contains("unmerged `extend` block"), "{msg}");
 }
 
 /// The assignment rule at the other half of the surface: a value
