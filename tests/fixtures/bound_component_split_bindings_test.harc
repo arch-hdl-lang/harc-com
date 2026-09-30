@@ -1,0 +1,67 @@
+// One event-driven bound component type instantiated on two distinct bus
+// bindings. Each monitor must retain its own concrete bus adapter and state.
+
+bus ByteStream
+    handshake_channel beat: receive kind: valid_ready
+        data: UInt<8>;
+    end handshake_channel beat
+end bus ByteStream
+
+transactor ByteMonitor bound to ByteStream
+    count : uint<8> default 0
+    last : uint<8> default 0
+
+    on bus.beat.handshake(value)
+        count = count + 1
+        last = value
+    end on
+
+end transactor ByteMonitor
+
+test BoundComponentSplitBindingsTest
+    let dut : DualByteSource
+    let left : ByteStream = bind dut
+    let right : ByteStream = bind dut
+    let left_mon : ByteMonitor passive = bind left
+    let right_mon : ByteMonitor passive = bind right
+
+    run
+        dut.rst = 1
+        left.beat.ready = 1
+        right.beat.ready = 1
+        wait 2 cycles
+        dut.rst = 0
+        wait 10 cycles
+
+        assert left_mon.count == 1
+            else fail("left monitor did not keep its binding")
+        assert right_mon.count == 1
+            else fail("right monitor did not keep its binding")
+        assert left_mon.last == 11 else fail("left monitor saw ${left_mon.last}, expected 11")
+        assert right_mon.last == 22 else fail("right monitor saw ${right_mon.last}, expected 22")
+    end run
+end test BoundComponentSplitBindingsTest
+
+// Reuse the same local instance names in a second test. Specialized component
+// and callable names must remain suite-unique in both direct and common C++.
+test BoundComponentSplitBindingsAgainTest
+    let dut : DualByteSource
+    let left : ByteStream = bind dut
+    let right : ByteStream = bind dut
+    let left_mon : ByteMonitor passive = bind left
+    let right_mon : ByteMonitor passive = bind right
+
+    run
+        dut.rst = 1
+        left.beat.ready = 1
+        right.beat.ready = 1
+        wait 2 cycles
+        dut.rst = 0
+        wait 10 cycles
+
+        assert left_mon.count == 1 else fail("second test lost left binding")
+        assert right_mon.count == 1 else fail("second test lost right binding")
+        assert left_mon.last == 11 else fail("second test left value mismatch")
+        assert right_mon.last == 22 else fail("second test right value mismatch")
+    end run
+end test BoundComponentSplitBindingsAgainTest

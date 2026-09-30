@@ -3343,6 +3343,9 @@ fn emit_test(
         let bound_bus = tb
             .bound_bus_binding(ir::BoundBusOwner::Component(component))
             .map_err(|detail| EmitError(format!("tbir: test `{}`: {detail}", test.name)))?;
+        if comp.bound_bus.is_some() && bound_bus.is_none() {
+            continue;
+        }
         func::emit_component_method(
             out,
             prog,
@@ -3363,6 +3366,9 @@ fn emit_test(
         let bound_bus = tb
             .bound_bus_binding(ir::BoundBusOwner::Component(ir::ComponentId(ci as u32)))
             .map_err(|detail| EmitError(format!("tbir: test `{}`: {detail}", test.name)))?;
+        if comp.bound_bus.is_some() && bound_bus.is_none() {
+            continue;
+        }
         for oh in &comp.on_handlers {
             func::emit_component_on_handler(
                 out,

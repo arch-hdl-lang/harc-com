@@ -607,6 +607,15 @@ not applicable before requesting review:
    Composite boolean triggers that inline an unconditional positive-literal
    synchronous helper wait now carry the same measured recursive-checker
    verdict. Uncertain trigger shapes retain the fallback; the count stays 92.
+   A bound event-driven transactor source type may now be instantiated against
+   distinct bus binding fields in one test. TB-IR specializes its component
+   schema and callable set for each additional concrete adapter, and the
+   two-prefix runtime fixture proves state and traffic remain isolated. The
+   same batch lowers discarded scalar expressions, classifies unresolved
+   value calls and nested `fork` expressions by measured v1 failure, and makes
+   unmerged `extend` a pipeline-invalid diagnostic. Four constructor sites are
+   removed across those five semantic paths, leaving 86 textual matches (85
+   executable constructors plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
