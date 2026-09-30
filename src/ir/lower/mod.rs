@@ -182,14 +182,6 @@ impl LowerDiagnosticRecorder {
         }
     }
 
-    fn checkpoint(&self) -> Option<(SourceId, crate::lexer::Span)> {
-        self.0.get()
-    }
-
-    fn restore(&self, checkpoint: Option<(SourceId, crate::lexer::Span)>) {
-        self.0.set(checkpoint);
-    }
-
     fn finish(&self, error: LowerError) -> LowerDiagnostic {
         let (source_id, span) = self.0.get().unwrap_or_default();
         LowerDiagnostic {

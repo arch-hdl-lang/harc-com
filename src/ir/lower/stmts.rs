@@ -6502,55 +6502,51 @@ impl FuncBuilder<'_> {
         msg: &str,
         assume: bool,
     ) -> Result<(), LowerError> {
-        // The first pass is only a capability probe. An Unsupported result
-        // selects the failure-side CFG lowering below, so its diagnostic must
-        // not outrank an unrelated error encountered later in the program.
-        let diagnostic_checkpoint = self.ctx.diagnostics.checkpoint();
-        match self.lower_fmt(msg) {
-            Ok(on_fail) => {
-                if assume {
-                    self.push(Stmt::AssumeCheck { cond, on_fail });
-                } else {
-                    self.push(Stmt::AssertCheck { cond, on_fail });
-                }
-                Ok(())
+        // Decide with an AST-only probe. Calling `lower_fmt` as the probe is
+        // not safe: lowering a call under `&&`/`||` or `?:` can create blocks,
+        // locals, and a merge before discovering that the capture needs the
+        // selected failure-side CFG.
+        if !self.fmt_requires_statement_materialization(msg)? {
+            let on_fail = self.lower_fmt(msg)?;
+            if assume {
+                self.push(Stmt::AssumeCheck { cond, on_fail });
+            } else {
+                self.push(Stmt::AssertCheck { cond, on_fail });
             }
-            Err(LowerError::Unsupported { .. }) => {
-                self.ctx.diagnostics.restore(diagnostic_checkpoint);
-                // A CFG Branch cannot carry raw DUT reads: unlike the inline
-                // AssertCheck emitter, control-flow terminators require every
-                // port value to be sampled into a local first. The read still
-                // occurs exactly once at the original assert/assume site.
-                let cond = self.hoist_ports(cond);
-                let success = self.new_block();
-                let failure = self.new_block();
-                self.terminate(Terminator::Branch(cond, success, failure));
-
-                self.start_block(failure);
-                let on_fail = self.lower_fmt_hoisting(msg)?;
-                let failed = Expr::Literal {
-                    value: 0,
-                    ty: IrType::Bool,
-                };
-                if assume {
-                    self.push(Stmt::AssumeCheck {
-                        cond: failed,
-                        on_fail,
-                    });
-                } else {
-                    self.push(Stmt::AssertCheck {
-                        cond: failed,
-                        on_fail,
-                    });
-                }
-                if !self.is_terminated() {
-                    self.terminate(Terminator::Jump(success));
-                }
-                self.start_block(success);
-                Ok(())
-            }
-            Err(err) => Err(err),
+            return Ok(());
         }
+
+        // A CFG Branch cannot carry raw DUT reads: unlike the inline
+        // AssertCheck emitter, control-flow terminators require every port
+        // value to be sampled into a local first. The read still occurs
+        // exactly once at the original assert/assume site.
+        let cond = self.hoist_ports(cond);
+        let success = self.new_block();
+        let failure = self.new_block();
+        self.terminate(Terminator::Branch(cond, success, failure));
+
+        self.start_block(failure);
+        let on_fail = self.lower_fmt_hoisting(msg)?;
+        let failed = Expr::Literal {
+            value: 0,
+            ty: IrType::Bool,
+        };
+        if assume {
+            self.push(Stmt::AssumeCheck {
+                cond: failed,
+                on_fail,
+            });
+        } else {
+            self.push(Stmt::AssertCheck {
+                cond: failed,
+                on_fail,
+            });
+        }
+        if !self.is_terminated() {
+            self.terminate(Terminator::Jump(success));
+        }
+        self.start_block(success);
+        Ok(())
     }
 
     fn lower_fail_msg(&mut self, msg: &crate::ast::Expr) -> Result<FmtArgs, LowerError> {
@@ -6839,6 +6835,22 @@ impl FuncBuilder<'_> {
         self.lower_fmt_impl(msg, false)
     }
 
+    /// Read-only preflight for immediate diagnostic messages. It must stay in
+    /// lockstep with `lower_fmt_impl`'s two materialization detectors, but it
+    /// deliberately performs no IR lowering or builder mutation.
+    fn fmt_requires_statement_materialization(&self, msg: &str) -> Result<bool, LowerError> {
+        let (_, captures) = crate::codegen::cpp_tb::process_interp(msg);
+        for capture in captures {
+            let parsed = parse_fmt_capture(&capture.expr)?;
+            if self.fmt_expr_has_hoistable_call(&parsed)?
+                || self.fmt_expr_has_conditional_hoistable_call(&parsed, false)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// `lower_fmt` for messages that are unconditional in the current CFG
     /// block (`log(...)`, a bare `fail(...)`, or a check's failure block):
     /// every interpolation is evaluated exactly once at the statement, so
@@ -6860,13 +6872,7 @@ impl FuncBuilder<'_> {
             // input (harc#593). The parser now rejects such a capture up
             // front, so this should be unreachable; it stays as a
             // fail-closed backstop rather than a claim about v1.
-            let parsed = crate::parser::parse_expr_fragment(&c.expr).map_err(|_| {
-                LowerError::Invalid(format!(
-                    "`${{{}}}` is not an expression; an interpolation holds one \
-                     complete expression, optionally followed by `:` and a format spec",
-                    c.expr
-                ))
-            })?;
+            let parsed = parse_fmt_capture(&c.expr)?;
             parsed_caps.push((parsed, c.wide_hex, c.expr));
         }
 
@@ -7587,7 +7593,15 @@ fn fmt_arg_type_is_scalar(ty: &IrType) -> bool {
     )
 }
 
-fn lazy_message_call_error(what: &str) -> LowerError {
+fn parse_fmt_capture(capture: &str) -> Result<AstExpr, LowerError> {
+    crate::parser::parse_expr_fragment(capture).map_err(|_| {
+        LowerError::Invalid(format!(
+            "`${{{capture}}}` is not an expression; an interpolation holds one complete expression, optionally followed by `:` and a format spec"
+        ))
+    })
+}
+
+pub(crate) fn lazy_message_call_error(what: &str) -> LowerError {
     unsupported(
         &format!("{what} inside a message"),
         "the call is conditionally evaluated; bind the lazy expression to a `let` before formatting it",
