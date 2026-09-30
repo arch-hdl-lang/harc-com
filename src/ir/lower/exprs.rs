@@ -1028,7 +1028,7 @@ impl FuncBuilder<'_> {
         matches!(&*callee.kind, ExprKind::Field { name, .. } if name.name == "front")
     }
 
-    fn is_queue_pop_call(&self, callee: &AstExpr) -> bool {
+    pub(crate) fn is_queue_pop_call(&self, callee: &AstExpr) -> bool {
         if self
             .as_tb_queue_call(callee)
             .is_some_and(|(_, method)| method == "pop")

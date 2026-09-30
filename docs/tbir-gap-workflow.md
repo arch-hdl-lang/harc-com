@@ -12,6 +12,12 @@ such sites in `src/codegen/tbir`. That raw count is an inventory, not a work
 queue: some sites cover several source shapes, and some diagnostics were
 incorrectly classified as gaps even though v1 rejects the same source.
 
+The refreshed 2026-09-29 inventory is recorded in
+[`tbir-migration-manifest.md`](tbir-migration-manifest.md). Current main has
+94 executable constructors (95 textual matches including the helper
+definition); the manifest separates positive runtime controls from diagnostic
+and deliberately deferred shapes.
+
 ## Source of truth and ordering
 
 Work the following evidence in order:
@@ -72,8 +78,10 @@ family of rejections over a one-site exception. Current implementation order:
   wait-timeout messages. Safely hoistable, unconditionally evaluated calls
   lower inside the failure or timeout CFG arm, preserving non-evaluation on
   success and source order on failure. Statement-producing calls beneath a
-  short-circuit or ternary branch and concurrent property messages remain
-  outside this CFG-based slice.
+  short-circuit or ternary branch now lower the complete capture through the
+  existing branch-local expression CFG; direct and conditional queue pops use
+  the same selected-message path. Concurrent property messages remain outside
+  this CFG-based slice.
 - [x] Scalar-element dynamic `list<T>` fields in transaction/struct records,
   including unconstrained draws and bounded `len()`/`sum(...)` constraint
   solving through the shared randomize runtime. Ordinary body-position list
@@ -139,7 +147,9 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Scalar-leaf fixed-vector `TSeq<Vec<T, N>>` values across typed empty locals,
   pure helpers, reusable testbench methods, and component methods, retaining
   exact nested `std::array` element carriers and verifier metadata.
-- [ ] Remaining state/helper gaps whose tests contain a positive v1 control.
+- [ ] Remaining state/helper gaps whose tests contain a positive v1 control;
+  use the reviewed queue in `docs/tbir-migration-manifest.md`, not the raw
+  constructor count.
 - [x] Multiple bindings of one bound target-transactor type, using the
   actor's concrete state receiver while emitting the shared responder body.
 - [x] Malformed component declarations and member uses report `Invalid`
@@ -159,7 +169,7 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 103 remaining constructor call sites (104 textual matches including
+Treat the 94 remaining constructor call sites (95 textual matches including
 the `unsupported` helper definition) as an inventory, not 116 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,

@@ -11961,11 +11961,62 @@ end impl T"#;
         "        assert false else fail(\"popped=${sb.q.pop()}\")",
         1,
     );
-    let msg = assert_unsupported(&lower_src(&message).unwrap_err());
+    let message_prog = lower_src(&message).expect("queue pop in a selected message lowers");
+    verify::verify_program(&message_prog).expect("message queue-pop CFG verifies");
+    let message_run = message_prog.function(message_prog.tests[0].run);
+    let pop_block = message_run
+        .blocks
+        .iter()
+        .position(|block| {
+            block.stmts.iter().any(|stmt| {
+                matches!(
+                    stmt,
+                    ir::Stmt::ScoreboardOp {
+                        op: ir::ScoreboardOp::QueuePop { queue, .. },
+                        ..
+                    } if queue == "q"
+                )
+            })
+        })
+        .map(|index| ir::BlockId(index as u32))
+        .expect("failure-side message block contains the queue pop");
+    assert!(message_run.blocks.iter().any(|block| matches!(
+        block.terminator,
+        ir::Terminator::Branch(_, _, failure) if failure == pop_block
+    )));
     assert!(
-        msg.contains("inside a message") && msg.contains("hoist the pop"),
-        "lazy diagnostic formatting keeps a precise queue-pop error: {msg}"
+        emit_cpp_src(&message).contains("_tb.sb.q.pop()"),
+        "the selected message emits exactly one queue pop"
     );
+
+    let lazy_message = message.replace(
+        "popped=${sb.q.pop()}",
+        "skipped=${true || sb.q.pop() == 7}",
+    );
+    let lazy_prog = lower_src(&lazy_message).expect("lazy message queue pop lowers through CFG");
+    verify::verify_program(&lazy_prog).expect("lazy message queue-pop CFG verifies");
+    let lazy_run = lazy_prog.function(lazy_prog.tests[0].run);
+    let lazy_pop = lazy_run
+        .blocks
+        .iter()
+        .position(|block| {
+            block.stmts.iter().any(|stmt| {
+                matches!(
+                    stmt,
+                    ir::Stmt::ScoreboardOp {
+                        op: ir::ScoreboardOp::QueuePop { queue, .. },
+                        ..
+                    } if queue == "q"
+                )
+            })
+        })
+        .map(|index| ir::BlockId(index as u32))
+        .expect("lazy RHS contains the queue pop");
+    assert!(lazy_run.blocks.iter().any(|block| matches!(
+        block.terminator,
+        ir::Terminator::Branch(_, taken, skipped)
+            if taken != lazy_pop && skipped == lazy_pop
+    )));
 }
 
 #[test]
@@ -19602,13 +19653,30 @@ impl LazyArgTest for LazyArgTb
     end run
 end impl LazyArgTest
 "#;
-    let msg = assert_unsupported(&lower_src(lazy_arg).expect_err(
-        "a statement-producing call in a lazy outer-call argument must not be made eager",
-    ));
-    assert!(
-        msg.contains("conditionally evaluated call argument"),
-        "{msg}"
-    );
+    let lazy_arg = lower_src(lazy_arg)
+        .expect("a statement-producing call in a lazy outer-call argument lowers through CFG");
+    verify::verify_program(&lazy_arg).expect("lazy outer-call argument CFG verifies");
+    let report = lazy_arg
+        .functions
+        .iter()
+        .find(|function| function.name.contains("report"))
+        .expect("report method lowers");
+    let write_block = report
+        .blocks
+        .iter()
+        .position(|block| {
+            block
+                .stmts
+                .iter()
+                .any(|stmt| matches!(stmt, ir::Stmt::DutWrite(..)))
+        })
+        .map(|index| ir::BlockId(index as u32))
+        .expect("the impure helper's DUT write remains in one branch");
+    assert!(report.blocks.iter().any(|block| matches!(
+        block.terminator,
+        ir::Terminator::Branch(_, taken, skipped)
+            if taken == write_block && skipped != write_block
+    )));
 }
 
 #[test]
@@ -30894,16 +30962,41 @@ fn component_call_in_message_stays_in_the_failure_branch() {
         "diagnostic component call must be reachable only through an assertion failure edge:\n{run}"
     );
 
-    let lazy = source.replace(
-        "taken diagnostic call=${harness.inner.step(2)}",
-        "illegal lazy call=${true || harness.inner.step(2) != 0}",
-    );
-    let msg =
-        assert_unsupported(&lower_src(&lazy).expect_err("lazy message call must be rejected"));
-    assert!(
-        msg.contains("inside a message") && msg.contains("hoist"),
-        "{msg}"
-    );
+    for capture in [
+        "true || harness.inner.step(2) != 0",
+        "(true ? 1 : harness.inner.step(2)):d",
+    ] {
+        let lazy = source.replace(
+            "taken diagnostic call=${harness.inner.step(2)}",
+            &format!("lazy call=${{{capture}}}"),
+        );
+        let lazy_prog = lower_src(&lazy)
+            .unwrap_or_else(|error| panic!("`{capture}` lowers through branch-local CFG: {error}"));
+        verify::verify_program(&lazy_prog)
+            .unwrap_or_else(|error| panic!("`{capture}` verifies: {error:?}"));
+        let run = lazy_prog.function(lazy_prog.tests[0].run);
+        let call_block = run
+            .blocks
+            .iter()
+            .rposition(|block| {
+                block.stmts.iter().any(|stmt| {
+                    matches!(
+                        stmt,
+                        ir::Stmt::ComponentCall { method, .. } if method == "step"
+                    )
+                })
+            })
+            .map(|index| ir::BlockId(index as u32))
+            .expect("the component call remains in the lazy RHS block");
+        assert!(
+            run.blocks.iter().any(|block| matches!(
+                block.terminator,
+                ir::Terminator::Branch(_, taken, skipped)
+                    if taken != call_block && skipped == call_block
+            )),
+            "`{capture}` must keep the component call on the unselected branch:\n{run}"
+        );
+    }
 
     let wait = fixture("component_value_expression_test.harc").replace(
         "assert true else fail(\"untaken diagnostic call=${harness.inner.step(2)}\")",
