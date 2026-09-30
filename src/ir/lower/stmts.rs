@@ -6876,7 +6876,11 @@ impl FuncBuilder<'_> {
         // would reverse their observable evaluation order at emission time.
         let ordered = hoist
             && parsed_caps.iter().try_fold(false, |found, (e, _, _)| {
-                Ok::<_, LowerError>(found || self.fmt_expr_has_hoistable_call(e)?)
+                Ok::<_, LowerError>(
+                    found
+                        || self.fmt_expr_has_hoistable_call(e)?
+                        || self.fmt_expr_has_conditional_hoistable_call(e, false)?,
+                )
             })?;
         let mut args = Vec::with_capacity(parsed_caps.len());
         for (mut parsed, wide_hex, capture) in parsed_caps {
@@ -6893,9 +6897,20 @@ impl FuncBuilder<'_> {
             //
             // Suspending bus/TLM and transactor calls take the same ordered
             // statement-position path inside this already-selected block.
-            if hoist {
-                self.hoist_fmt_calls(&mut parsed)?;
-            }
+            // A call under `&&`/`||` or a ternary branch cannot be lifted on
+            // its own. Lower the COMPLETE capture through the ordinary lazy
+            // expression CFG instead, then format its merged result local.
+            let capture_materialized = if hoist {
+                if self.fmt_expr_has_conditional_hoistable_call(&parsed, false)? {
+                    self.materialize_effectful_fmt_ast_expr(&mut parsed)?;
+                    true
+                } else {
+                    self.hoist_fmt_calls(&mut parsed)?;
+                    false
+                }
+            } else {
+                false
+            };
 
             // Ports are allowed in format args. Any call that still reaches
             // this message context lives under a lazy subexpression and must
@@ -6925,7 +6940,7 @@ impl FuncBuilder<'_> {
                     V1Status::EmitsUncompilable,
                 ));
             }
-            if ordered {
+            if ordered && !capture_materialized {
                 expr = self.hoist_fmt_ports(expr);
                 let name = self.fresh_msg_tmp_name();
                 let tmp = self.declare(&name);
@@ -6974,7 +6989,9 @@ impl FuncBuilder<'_> {
         if self.hoist_fmt_suspending_call(e)? {
             return Ok(());
         }
-        if self.fmt_call_needs_hoist(e) || self.fmt_component_call_needs_hoist(e)? {
+        let is_queue_pop = matches!(&*e.kind, ExprKind::Call { callee, .. }
+            if self.is_queue_pop_call(callee));
+        if self.fmt_call_needs_hoist(e) || self.fmt_component_call_needs_hoist(e)? || is_queue_pop {
             // Hoist the whole call once. Lower it in normal (non-fmt-args)
             // context so an impure helper emits its inline statements and a
             // method emits its call edge ahead of the message.
@@ -7069,6 +7086,7 @@ impl FuncBuilder<'_> {
                 || self.as_transactor_call(callee)?.is_some()
                 || self.fmt_self_transactor_method(callee).is_some()
                 || matches!(self.as_component_method_call(callee), Ok(Some(_)))
+                || self.is_queue_pop_call(callee)
             {
                 return Ok(true);
             }
@@ -7092,7 +7110,8 @@ impl FuncBuilder<'_> {
             || is_bus_tlm
             || self.as_transactor_call(callee)?.is_some()
             || self.fmt_self_transactor_method(callee).is_some()
-            || matches!(self.as_component_method_call(callee), Ok(Some(_))))
+            || matches!(self.as_component_method_call(callee), Ok(Some(_)))
+            || self.is_queue_pop_call(callee))
     }
 
     fn reject_lazy_fmt_call_arguments(&self, e: &AstExpr) -> Result<(), LowerError> {
@@ -7157,10 +7176,26 @@ impl FuncBuilder<'_> {
     /// impure/suspending call. Lower in message context so a call hidden in a
     /// lazy subexpression remains rejected instead of becoming eager.
     fn materialize_fmt_ast_expr(&mut self, e: &mut AstExpr) -> Result<(), LowerError> {
+        self.materialize_fmt_ast_expr_with_context(e, true)
+    }
+
+    /// Materialize a complete lazy message capture through the ordinary
+    /// expression CFG. The message statement is already in its selected
+    /// failure/log block, so branches created here preserve short-circuit and
+    /// ternary evaluation without moving the call ahead of the message edge.
+    fn materialize_effectful_fmt_ast_expr(&mut self, e: &mut AstExpr) -> Result<(), LowerError> {
+        self.materialize_fmt_ast_expr_with_context(e, false)
+    }
+
+    fn materialize_fmt_ast_expr_with_context(
+        &mut self,
+        e: &mut AstExpr,
+        in_fmt_args: bool,
+    ) -> Result<(), LowerError> {
         let original = std::mem::replace(e, AstExpr::new(ExprKind::Bool(false), e.span));
         let span = original.span;
         let was = self.in_fmt_args;
-        self.in_fmt_args = true;
+        self.in_fmt_args = in_fmt_args;
         let lowered = self.lower_expr(&original);
         self.in_fmt_args = was;
         let lowered = self.hoist_fmt_ports(lowered?);
