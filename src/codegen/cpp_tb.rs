@@ -1128,6 +1128,42 @@ fn collect_port_catalog_from_src(
             continue;
         };
         let resolved_ty = resolve_arch_port_type(&ty, &type_params).unwrap_or(&ty);
+        // Native ARCH Vec ports are unpacked C++ arrays. Keep the element
+        // width/type and array length separate, as for SV unpacked ports.
+        if let TypeExpr::Builtin {
+            name: BuiltinTy::Vec,
+            args,
+            ..
+        } = resolved_ty
+        {
+            // An array inside a packed port group needs a multidimensional
+            // shape, which the current interface catalog cannot represent.
+            if matches!(group, Some((_, GroupShape::Packed(_)))) {
+                continue;
+            }
+            let [TypeArg::Type(element), TypeArg::Expr(count)] = args.as_slice() else {
+                continue;
+            };
+            let Some(count) = eval_const_i64(count, &const_params)
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|count| *count > 0)
+            else {
+                continue;
+            };
+            let element = resolve_arch_port_type(element, &type_params).unwrap_or(element);
+            let Some(value_type) = concrete_port_ir_type_with_params(element, &const_params) else {
+                continue;
+            };
+            let width = match value_type {
+                crate::ir::IrType::Bool => 1,
+                crate::ir::IrType::UInt(Some(width)) | crate::ir::IrType::SInt(Some(width)) => width,
+                _ => unreachable!("concrete scalar element has a concrete width"),
+            };
+            out.push(DutInterfacePort::new_typed(
+                name, direction, width, value_type, None, Some(count),
+            ));
+            continue;
+        }
         if let Some(mut value_type) = concrete_port_ir_type_with_params(resolved_ty, &const_params)
         {
             let lane_value_type = value_type.clone();
