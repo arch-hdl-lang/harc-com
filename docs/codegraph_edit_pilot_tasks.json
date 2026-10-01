@@ -1,0 +1,25 @@
+{
+  "repo_sha": "c3ca30da",
+  "status": "edit_pilot_not_confirmation",
+  "tasks": [
+    {
+      "id": "user_transactor_two_fixtures",
+      "task_class": "user",
+      "prompt": "In tests/fixtures/transactor_active_test.harc and tests/fixtures/axilite_bound_mon_test.harc, add a short comment immediately above the AxilXactor transactor declaration explaining that BusAxiLite is the bound bus interface. Do not change executable behavior. Validate both fixtures with harc check.",
+      "graph_hint": "harc graph context AxilXactor --index .harcgraph --node-kind transactor --edge-kind binds_bus --limit 8 --token-budget 300",
+      "expected_files": ["tests/fixtures/transactor_active_test.harc", "tests/fixtures/axilite_bound_mon_test.harc"],
+      "checks": [
+        ["{HARC_BIN}", "check", "tests/fixtures/transactor_active_test.harc"],
+        ["{HARC_BIN}", "check", "tests/fixtures/axilite_bound_mon_test.harc"]
+      ]
+    },
+    {
+      "id": "compiler_transactor_two_layers",
+      "task_class": "compiler",
+      "prompt": "Add concise Rust doc comments to the TransactorDecl AST declaration and its parse_transactor parser entry point, explaining the bound bus type and active/passive modes without changing behavior. Check the crate compiles.",
+      "graph_hint": "harc graph dev-query transactor --index .harcdevgraph --roles ast,parser --token-budget 200",
+      "expected_files": ["src/ast.rs", "src/parser.rs"],
+      "checks": [["cargo", "check", "--offline", "--lib", "--quiet"]]
+    }
+  ]
+}
