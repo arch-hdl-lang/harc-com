@@ -5,7 +5,8 @@
 
 use crate::ast::*;
 use crate::lexer::Span;
-use crate::{codegen, ir, parser};
+use crate::{codegen, dev_graph, ir, parser};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufRead, Write};
@@ -14,6 +15,16 @@ use std::path::{Path, PathBuf};
 const FILES_JSONL: &str = "files.jsonl";
 const NODES_JSONL: &str = "nodes.jsonl";
 const EDGES_JSONL: &str = "edges.jsonl";
+const ISSUES_JSONL: &str = "issues.jsonl";
+const MANIFEST_JSON: &str = "manifest.json";
+
+#[derive(Serialize, Deserialize)]
+struct GraphManifest {
+    schema_version: u32,
+    generator: String,
+    source_revision: Option<String>,
+    sources: BTreeMap<String, String>,
+}
 
 #[derive(Debug, Default)]
 pub struct IndexStats {
@@ -21,6 +32,15 @@ pub struct IndexStats {
     pub nodes: usize,
     pub edges: usize,
     pub skipped: usize,
+    pub lowering_omissions: usize,
+    pub issues: Vec<IndexIssue>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexIssue {
+    pub kind: String,
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -171,13 +191,17 @@ pub fn index_paths(inputs: &[PathBuf], out_dir: &Path) -> std::io::Result<IndexS
     }
 
     let mut parsed = Vec::new();
-    let mut skipped = 0usize;
+    let mut issues = Vec::new();
     for path in &harc_paths {
         let display = display_path(path);
         let source = match fs::read_to_string(path) {
             Ok(s) => s,
-            Err(_) => {
-                skipped += 1;
+            Err(err) => {
+                issues.push(IndexIssue {
+                    kind: "read".to_string(),
+                    path: display,
+                    reason: err.to_string(),
+                });
                 continue;
             }
         };
@@ -187,11 +211,15 @@ pub fn index_paths(inputs: &[PathBuf], out_dir: &Path) -> std::io::Result<IndexS
                 source,
                 ast,
             }),
-            Err(_) => skipped += 1,
+            Err(err) => issues.push(IndexIssue {
+                kind: "parse".to_string(),
+                path: display,
+                reason: err.to_string(),
+            }),
         }
     }
 
-    let imported = resolve_imported_bus_files(&parsed);
+    let imported = resolve_imported_bus_files(&parsed, &mut issues);
     parsed.extend(imported);
 
     for file in &parsed {
@@ -200,7 +228,7 @@ pub fn index_paths(inputs: &[PathBuf], out_dir: &Path) -> std::io::Result<IndexS
     for file in &parsed {
         index_ast_file(&mut builder, file, true);
     }
-    index_lowered_ir(&mut builder, &parsed);
+    index_lowered_ir(&mut builder, &parsed, &mut issues);
 
     fs::create_dir_all(out_dir)?;
     write_jsonl(
@@ -215,12 +243,54 @@ pub fn index_paths(inputs: &[PathBuf], out_dir: &Path) -> std::io::Result<IndexS
         out_dir.join(EDGES_JSONL),
         builder.edges.values().map(edge_json),
     )?;
+    write_jsonl(out_dir.join(ISSUES_JSONL), issues.iter().map(issue_json))?;
+    let mut sources = BTreeMap::new();
+    for path in harc_paths.iter().chain(dut_paths.iter()) {
+        if let Ok(bytes) = fs::read(path) {
+            sources.insert(
+                path.canonicalize()?.to_string_lossy().to_string(),
+                dev_graph::digest(&bytes),
+            );
+        }
+    }
+    for file in builder.files.values() {
+        if let Some(path) = &file.abs_path {
+            sources.insert(path.clone(), dev_graph::digest(&fs::read(path)?));
+        }
+    }
+    let source_revision = harc_paths
+        .first()
+        .or_else(|| dut_paths.first())
+        .and_then(|path| path.parent())
+        .and_then(|root| std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(root).output().ok())
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+    let manifest = GraphManifest {
+        schema_version: 1,
+        generator: format!("harc {}", env!("CARGO_PKG_VERSION")),
+        source_revision,
+        sources,
+    };
+    fs::write(
+        out_dir.join(MANIFEST_JSON),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
 
+    let skipped = issues
+        .iter()
+        .filter(|issue| issue.kind == "read" || issue.kind == "parse")
+        .count();
+    let lowering_omissions = issues
+        .iter()
+        .filter(|issue| issue.kind == "lowering")
+        .count();
     Ok(IndexStats {
         files: builder.files.len(),
         nodes: builder.nodes.len(),
         edges: builder.edges.len(),
         skipped,
+        lowering_omissions,
+        issues,
     })
 }
 
@@ -239,7 +309,12 @@ pub fn query(index_dir: &Path, query: &str, limit: usize) -> std::io::Result<Str
             node.doc.as_deref().unwrap_or("")
         )
         .to_lowercase();
-        let score = score_terms(&hay, &terms);
+        let score = score_terms(&hay, &terms)
+            + if node.name.eq_ignore_ascii_case(query) {
+                100
+            } else {
+                0
+            };
         if score > 0 {
             hits.push((score, format_node_hit(node)));
         }
@@ -269,6 +344,33 @@ pub fn load_index(index_dir: &Path) -> std::io::Result<GraphIndex> {
         nodes: read_nodes(index_dir)?,
         edges: read_edges(index_dir)?,
     })
+}
+
+fn check_freshness(index_dir: &Path) -> std::io::Result<()> {
+    let path = index_dir.join(MANIFEST_JSON);
+    if !path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "graph manifest missing; rebuild with harc graph index",
+        ));
+    }
+    let manifest: GraphManifest = serde_json::from_slice(&fs::read(path)?)?;
+    if manifest.schema_version != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "graph schema changed; rebuild with harc graph index",
+        ));
+    }
+    for (path, expected) in manifest.sources {
+        let actual = fs::read(&path).map(|bytes| dev_graph::digest(&bytes));
+        if actual.as_ref().ok() != Some(&expected) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{path} changed or disappeared; rebuild with harc graph index"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn render_html(index: &GraphIndex, title: &str) -> std::io::Result<String> {
@@ -790,18 +892,98 @@ pub fn impact(
     })
 }
 
-pub fn context(index_dir: &Path, task: &str, limit: usize) -> std::io::Result<String> {
-    let mut out = Vec::new();
-    let q = query(index_dir, task, limit.max(1))?;
-    out.push("query hits:".to_string());
-    out.push(q);
-    let first_term = terms(task).into_iter().next().unwrap_or_default();
-    if !first_term.is_empty() {
-        out.push(String::new());
-        out.push("impact:".to_string());
-        out.push(impact(index_dir, &first_term, 2, limit.max(1))?);
+pub fn context(
+    index_dir: &Path,
+    task: &str,
+    limit: usize,
+    token_budget: usize,
+    node_kinds: &[String],
+    edge_kinds: &[String],
+) -> std::io::Result<String> {
+    let words: Vec<_> = terms(task)
+        .into_iter()
+        .filter(|word| {
+            ![
+                "the", "a", "an", "for", "to", "in", "of", "how", "where", "add", "change", "with",
+                "and",
+            ]
+            .contains(&word.as_str())
+        })
+        .map(|word| if word == "coverage" { "cover".into() } else { word })
+        .collect();
+    if words.is_empty() {
+        return Ok("(no search terms)".into());
     }
-    Ok(out.join("\n"))
+    let nodes = read_nodes(index_dir)?;
+    let edges = read_edges(index_dir)?;
+    let mut ranked: Vec<_> = nodes
+        .iter()
+        .filter(|node| node_kinds.is_empty() || node_kinds.iter().any(|kind| kind == &node.kind))
+        .filter_map(|node| {
+            let name = node.name.to_lowercase();
+            let kind = node.kind.to_lowercase();
+            let file = node.file.to_lowercase();
+            let matched = words.iter().filter(|word| {
+                name.contains(word.as_str()) || kind.contains(word.as_str()) || file.contains(word.as_str())
+            }).count();
+            let score: usize = words.iter().map(|word| {
+                usize::from(name.contains(word)) * 12
+                    + usize::from(kind.contains(word)) * 35
+                    + usize::from(file.contains(word)) * 2
+            }).sum();
+            (matched > 0).then_some((score + matched * 20, matched, node))
+        })
+        .collect();
+    if words.len() > 1 && ranked.iter().any(|hit| hit.1 >= 2) {
+        ranked.retain(|hit| hit.1 >= 2);
+    }
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.id.cmp(&b.2.id)));
+    let mut lines = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (_, _, node) in ranked.into_iter().take(limit.max(1)) {
+        if seen.insert(node.id.clone()) {
+            lines.push(format_node_hit(node));
+        }
+        for edge in edges
+            .iter()
+            .filter(|edge| edge.from == node.id || edge.to == node.id)
+            .filter(|edge| edge_kinds.is_empty() || edge_kinds.iter().any(|kind| kind == &edge.kind))
+            .take(3)
+        {
+            let line = format_edge_hit(edge);
+            if seen.insert(line.clone()) {
+                lines.push(format!("  {line}"));
+            }
+        }
+    }
+    if lines.is_empty() {
+        return Ok("(no matches)".into());
+    }
+    Ok(bounded_lines(lines, token_budget))
+}
+
+fn bounded_lines(lines: Vec<String>, token_budget: usize) -> String {
+    let max_chars = token_budget.max(1).saturating_mul(4);
+    let mut output = String::new();
+    for line in lines {
+        let separator = usize::from(!output.is_empty());
+        if output.len() + separator + line.len() > max_chars {
+            if output.is_empty() {
+                return format!(
+                    "{}...",
+                    line.chars()
+                        .take(max_chars.saturating_sub(3))
+                        .collect::<String>()
+                );
+            }
+            break;
+        }
+        if separator > 0 {
+            output.push('\n');
+        }
+        output.push_str(&line);
+    }
+    output
 }
 
 fn index_ast_file(builder: &mut GraphBuilder, file: &ParsedFile, relationships: bool) {
@@ -1639,7 +1821,11 @@ fn index_type(
     }
 }
 
-fn index_lowered_ir(builder: &mut GraphBuilder, parsed: &[ParsedFile]) {
+fn index_lowered_ir(
+    builder: &mut GraphBuilder,
+    parsed: &[ParsedFile],
+    issues: &mut Vec<IndexIssue>,
+) {
     if parsed.is_empty() {
         return;
     }
@@ -1667,11 +1853,27 @@ fn index_lowered_ir(builder: &mut GraphBuilder, parsed: &[ParsedFile]) {
                 asts.push(bus_file.ast.clone());
             }
         }
-        let Ok(merged) = codegen::merge::merge_for_sim(asts, None) else {
-            continue;
+        let merged = match codegen::merge::merge_for_sim(asts, None) {
+            Ok(merged) => merged,
+            Err(err) => {
+                issues.push(IndexIssue {
+                    kind: "lowering".to_string(),
+                    path: file.display.clone(),
+                    reason: format!("merge: {err}"),
+                });
+                continue;
+            }
         };
-        let Ok(program) = ir::lower::lower_program(&merged) else {
-            continue;
+        let program = match ir::lower::lower_program(&merged) {
+            Ok(program) => program,
+            Err(err) => {
+                issues.push(IndexIssue {
+                    kind: "lowering".to_string(),
+                    path: file.display.clone(),
+                    reason: err.to_string(),
+                });
+                continue;
+            }
         };
         for func in &program.functions {
             let kind = "ir_function";
@@ -1920,7 +2122,10 @@ fn collect_paths(
     Ok(())
 }
 
-fn resolve_imported_bus_files(parsed: &[ParsedFile]) -> Vec<ParsedFile> {
+fn resolve_imported_bus_files(
+    parsed: &[ParsedFile],
+    issues: &mut Vec<IndexIssue>,
+) -> Vec<ParsedFile> {
     let mut wanted = BTreeSet::new();
     for file in parsed {
         collect_use_names(&file.ast.items, &mut wanted);
@@ -1963,11 +2168,27 @@ fn resolve_imported_bus_files(parsed: &[ParsedFile]) -> Vec<ParsedFile> {
             if !seen_paths.insert(display.clone()) {
                 break;
             }
-            let Ok(source) = fs::read_to_string(&path) else {
-                break;
+            let source = match fs::read_to_string(&path) {
+                Ok(source) => source,
+                Err(err) => {
+                    issues.push(IndexIssue {
+                        kind: "read".to_string(),
+                        path: display,
+                        reason: err.to_string(),
+                    });
+                    break;
+                }
             };
-            let Ok(ast) = parser::parse_source_named(display.clone(), &source) else {
-                break;
+            let ast = match parser::parse_source_named(display.clone(), &source) {
+                Ok(ast) => ast,
+                Err(err) => {
+                    issues.push(IndexIssue {
+                        kind: "parse".to_string(),
+                        path: display,
+                        reason: err.to_string(),
+                    });
+                    break;
+                }
             };
             let SourceFile {
                 items: ast_items,
@@ -2197,6 +2418,15 @@ fn edge_json(edge: &EdgeRecord) -> String {
     format!("{{{}}}", fields.join(","))
 }
 
+fn issue_json(issue: &IndexIssue) -> String {
+    format!(
+        "{{\"kind\":\"{}\",\"path\":\"{}\",\"reason\":\"{}\"}}",
+        esc(&issue.kind),
+        esc(&issue.path),
+        esc(&issue.reason)
+    )
+}
+
 fn graph_json(index: &GraphIndex, source_root_uri: Option<&str>) -> String {
     let source_root_json = source_root_uri
         .map(|uri| format!("\"{}\"", esc(uri)))
@@ -2290,6 +2520,7 @@ fn html_escape(value: &str) -> String {
 }
 
 fn read_files(index_dir: &Path) -> std::io::Result<Vec<FileRecord>> {
+    check_freshness(index_dir)?;
     let file = fs::File::open(index_dir.join(FILES_JSONL))?;
     let reader = std::io::BufReader::new(file);
     Ok(reader
@@ -2307,6 +2538,7 @@ fn read_files(index_dir: &Path) -> std::io::Result<Vec<FileRecord>> {
 }
 
 fn read_nodes(index_dir: &Path) -> std::io::Result<Vec<NodeRecord>> {
+    check_freshness(index_dir)?;
     let file = fs::File::open(index_dir.join(NODES_JSONL))?;
     let reader = std::io::BufReader::new(file);
     Ok(reader
@@ -2328,6 +2560,7 @@ fn read_nodes(index_dir: &Path) -> std::io::Result<Vec<NodeRecord>> {
 }
 
 fn read_edges(index_dir: &Path) -> std::io::Result<Vec<EdgeRecord>> {
+    check_freshness(index_dir)?;
     let file = fs::File::open(index_dir.join(EDGES_JSONL))?;
     let reader = std::io::BufReader::new(file);
     Ok(reader
@@ -2522,5 +2755,103 @@ mod tests {
         assert_eq!(def.kind, "dut");
         assert!(builder.nodes.contains_key("dut:d.harc:D"));
         assert!(!builder.nodes.contains_key("external_module:d.harc:D"));
+    }
+
+    #[test]
+    fn curated_graph_has_relationships_and_stable_output() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixtures = [
+            "tests/fixtures/transaction_basic_test.harc",
+            "tests/fixtures/transactor_active_test.harc",
+            "tests/fixtures/scoreboard_basic_test.harc",
+            "tests/fixtures/covergroup_hook_trigger_test.harc",
+            "tests/fixtures/regblock_addrmap_test.harc",
+            "tests/fixtures/testbench_probe_dut_test.harc",
+            "tests/fixtures/tlm_bind_remap_test.harc",
+            "tests/fixtures/tlm_pairing_arch_target_test.harc",
+            "tests/dut/top_counter.sv",
+            "tests/dut/AxiLiteRegs.sv",
+            "tests/dut/TlmPairingArchTarget.sv",
+        ];
+        let inputs: Vec<_> = fixtures.iter().map(|path| root.join(path)).collect();
+        let out =
+            std::env::temp_dir().join(format!("harc-graph-acceptance-{}", std::process::id()));
+        let stats = index_paths(&inputs, &out).unwrap();
+        assert_eq!(stats.skipped, 0, "{:?}", stats.issues);
+        assert_eq!(stats.lowering_omissions, 0, "{:?}", stats.issues);
+        let edges = read_edges(&out).unwrap();
+        for kind in [
+            "binds_bus",
+            "binds_dut",
+            "calls",
+            "checks",
+            "covers",
+            "lowers_to",
+            "randomizes",
+            "samples",
+            "uses_transactor",
+        ] {
+            assert!(edges.iter().any(|edge| edge.kind == kind), "missing {kind}");
+        }
+        assert!(query(&out, "AxilXactor", 10)
+            .unwrap()
+            .contains("transactor"));
+        assert!(context(&out, "AxilXactor", 20, 100, &[], &[]).unwrap().len() <= 400);
+        assert!(context(&out, "AXI Lite transactor", 20, 300, &[], &[]).unwrap().starts_with("transactor"));
+        let focused = context(&out, "AxilXactor", 1, 100, &["transactor".into()], &["binds_bus".into()]).unwrap();
+        assert!(focused.starts_with("transactor AxilXactor"));
+        assert!(focused.contains("binds_bus"));
+        assert!(!focused.contains("calls ["));
+        let graph = load_index(&out).unwrap();
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.name == "AxilXactor" && node.span.is_some()));
+        assert!(graph.files.iter().all(|file| file.abs_path.is_some()));
+        assert!(render_html(&graph, "HARC graph")
+            .unwrap()
+            .contains("file://"));
+        let before = fs::read(out.join(EDGES_JSONL)).unwrap();
+        index_paths(&inputs, &out).unwrap();
+        assert_eq!(before, fs::read(out.join(EDGES_JSONL)).unwrap());
+        let _ = fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn malformed_input_is_recorded_with_path_and_reason() {
+        let base = std::env::temp_dir().join(format!("harc-graph-error-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        let input = base.join("broken.harc");
+        fs::write(&input, "test Broken { this is not HARC").unwrap();
+        let out = base.join("index");
+        let stats = index_paths(&[input.clone()], &out).unwrap();
+        assert_eq!(stats.skipped, 1);
+        assert!(stats.issues[0].path.contains("broken.harc"));
+        assert!(!stats.issues[0].reason.is_empty());
+        let issues = fs::read_to_string(out.join(ISSUES_JSONL)).unwrap();
+        assert!(issues.contains("broken.harc"));
+        fs::write(&input, "module Fixed kind verilator\nend module Fixed\n").unwrap();
+        assert!(query(&out, "Fixed", 5)
+            .unwrap_err()
+            .to_string()
+            .contains("rebuild"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn query_rejects_stale_source() {
+        let base = std::env::temp_dir().join(format!("harc-graph-stale-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        let input = base.join("dut.harc");
+        fs::write(&input, "module D kind verilator\nend module D\n").unwrap();
+        let out = base.join("index");
+        index_paths(&[input.clone()], &out).unwrap();
+        assert!(query(&out, "D", 5).is_ok());
+        fs::write(&input, "module E kind verilator\nend module E\n").unwrap();
+        assert!(query(&out, "D", 5)
+            .unwrap_err()
+            .to_string()
+            .contains("rebuild"));
+        let _ = fs::remove_dir_all(base);
     }
 }

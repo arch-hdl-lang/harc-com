@@ -10,6 +10,10 @@ Use this skill to produce HARC verification code and iterate it through the curr
 ## Workflow
 
 1. If HARC MCP tools are available, use them before hand-writing unfamiliar syntax:
+   - Skip graph retrieval when exact target files are already known and no cross-file relationship needs discovery.
+   - For unknown DUT/test relationships, use `harc_graph_tests_for_dut()` or token-bounded `harc_graph_context()` before broad source reads. Filter `node_kinds` and `edge_kinds` when the question is narrow.
+   - For unknown compiler ownership, use `harc_dev_graph_query()` with relevant `roles` to locate AST, parser, lowerer, IR, backend, and fixtures.
+   - Focused MCP queries refresh missing or stale indexes. Fall back to ordinary search when graph results are incomplete or ambiguous.
    - Call `harc_feature_status()` before relying on advanced or pre-1.0 features.
    - Call `harc_examples()` to retrieve shipped fixture examples for the requested pattern.
    - Call `get_harc_syntax()` for targeted syntax snippets.
