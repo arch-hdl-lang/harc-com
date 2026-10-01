@@ -3619,6 +3619,12 @@ fn cmd_sim(
         .first()
         .ok_or_else(|| miette::miette!("internal error: no generated C++ testbench emitted"))?;
     prefix_args.push(cpp_tb.display().to_string());
+    // ARCH accepts multiple C++ translation units after --tb. Resolve user
+    // references before changing to the sibling arch-com working directory.
+    for reference in &ref_src {
+        let reference_abs = fs::canonicalize(reference).into_diagnostic()?;
+        prefix_args.push(reference_abs.display().to_string());
+    }
     prefix_args.push("--outdir".into());
     prefix_args.push(outdir_abs.display().to_string());
     // Coverage passthrough: `arch sim` supports both `--coverage`

@@ -875,7 +875,19 @@ impl FuncBuilder<'_> {
                         }
                         _ => "an expression statement".to_string(),
                     },
-                    _ => "an expression statement".to_string(),
+                    _ => {
+                        // A side-effect-free value in statement position is
+                        // still evaluated by v1 and discarded. Preserve that
+                        // evaluation in an unread temporary so port reads and
+                        // arithmetic keep their source ordering.
+                        let value = self.lower_expr_no_ports(e)?;
+                        let value = self.hoist_ports(value);
+                        let ty = self.expr_type(&value).unwrap_or(crate::ir::IrType::Unknown);
+                        let discard = self.fresh_temp();
+                        self.set_local_type(discard, ty);
+                        self.push(Stmt::Assign(discard, value));
+                        return Ok(());
+                    }
                 };
                 Err(unsupported(&what, ""))
             }
@@ -6502,55 +6514,51 @@ impl FuncBuilder<'_> {
         msg: &str,
         assume: bool,
     ) -> Result<(), LowerError> {
-        // The first pass is only a capability probe. An Unsupported result
-        // selects the failure-side CFG lowering below, so its diagnostic must
-        // not outrank an unrelated error encountered later in the program.
-        let diagnostic_checkpoint = self.ctx.diagnostics.checkpoint();
-        match self.lower_fmt(msg) {
-            Ok(on_fail) => {
-                if assume {
-                    self.push(Stmt::AssumeCheck { cond, on_fail });
-                } else {
-                    self.push(Stmt::AssertCheck { cond, on_fail });
-                }
-                Ok(())
+        // Decide with an AST-only probe. Calling `lower_fmt` as the probe is
+        // not safe: lowering a call under `&&`/`||` or `?:` can create blocks,
+        // locals, and a merge before discovering that the capture needs the
+        // selected failure-side CFG.
+        if !self.fmt_requires_statement_materialization(msg)? {
+            let on_fail = self.lower_fmt(msg)?;
+            if assume {
+                self.push(Stmt::AssumeCheck { cond, on_fail });
+            } else {
+                self.push(Stmt::AssertCheck { cond, on_fail });
             }
-            Err(LowerError::Unsupported { .. }) => {
-                self.ctx.diagnostics.restore(diagnostic_checkpoint);
-                // A CFG Branch cannot carry raw DUT reads: unlike the inline
-                // AssertCheck emitter, control-flow terminators require every
-                // port value to be sampled into a local first. The read still
-                // occurs exactly once at the original assert/assume site.
-                let cond = self.hoist_ports(cond);
-                let success = self.new_block();
-                let failure = self.new_block();
-                self.terminate(Terminator::Branch(cond, success, failure));
-
-                self.start_block(failure);
-                let on_fail = self.lower_fmt_hoisting(msg)?;
-                let failed = Expr::Literal {
-                    value: 0,
-                    ty: IrType::Bool,
-                };
-                if assume {
-                    self.push(Stmt::AssumeCheck {
-                        cond: failed,
-                        on_fail,
-                    });
-                } else {
-                    self.push(Stmt::AssertCheck {
-                        cond: failed,
-                        on_fail,
-                    });
-                }
-                if !self.is_terminated() {
-                    self.terminate(Terminator::Jump(success));
-                }
-                self.start_block(success);
-                Ok(())
-            }
-            Err(err) => Err(err),
+            return Ok(());
         }
+
+        // A CFG Branch cannot carry raw DUT reads: unlike the inline
+        // AssertCheck emitter, control-flow terminators require every port
+        // value to be sampled into a local first. The read still occurs
+        // exactly once at the original assert/assume site.
+        let cond = self.hoist_ports(cond);
+        let success = self.new_block();
+        let failure = self.new_block();
+        self.terminate(Terminator::Branch(cond, success, failure));
+
+        self.start_block(failure);
+        let on_fail = self.lower_fmt_hoisting(msg)?;
+        let failed = Expr::Literal {
+            value: 0,
+            ty: IrType::Bool,
+        };
+        if assume {
+            self.push(Stmt::AssumeCheck {
+                cond: failed,
+                on_fail,
+            });
+        } else {
+            self.push(Stmt::AssertCheck {
+                cond: failed,
+                on_fail,
+            });
+        }
+        if !self.is_terminated() {
+            self.terminate(Terminator::Jump(success));
+        }
+        self.start_block(success);
+        Ok(())
     }
 
     fn lower_fail_msg(&mut self, msg: &crate::ast::Expr) -> Result<FmtArgs, LowerError> {
@@ -6839,6 +6847,22 @@ impl FuncBuilder<'_> {
         self.lower_fmt_impl(msg, false)
     }
 
+    /// Read-only preflight for immediate diagnostic messages. It must stay in
+    /// lockstep with `lower_fmt_impl`'s two materialization detectors, but it
+    /// deliberately performs no IR lowering or builder mutation.
+    fn fmt_requires_statement_materialization(&self, msg: &str) -> Result<bool, LowerError> {
+        let (_, captures) = crate::codegen::cpp_tb::process_interp(msg);
+        for capture in captures {
+            let parsed = parse_fmt_capture(&capture.expr)?;
+            if self.fmt_expr_has_hoistable_call(&parsed)?
+                || self.fmt_expr_has_conditional_hoistable_call(&parsed, false)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// `lower_fmt` for messages that are unconditional in the current CFG
     /// block (`log(...)`, a bare `fail(...)`, or a check's failure block):
     /// every interpolation is evaluated exactly once at the statement, so
@@ -6860,13 +6884,7 @@ impl FuncBuilder<'_> {
             // input (harc#593). The parser now rejects such a capture up
             // front, so this should be unreachable; it stays as a
             // fail-closed backstop rather than a claim about v1.
-            let parsed = crate::parser::parse_expr_fragment(&c.expr).map_err(|_| {
-                LowerError::Invalid(format!(
-                    "`${{{}}}` is not an expression; an interpolation holds one \
-                     complete expression, optionally followed by `:` and a format spec",
-                    c.expr
-                ))
-            })?;
+            let parsed = parse_fmt_capture(&c.expr)?;
             parsed_caps.push((parsed, c.wide_hex, c.expr));
         }
 
@@ -6876,7 +6894,11 @@ impl FuncBuilder<'_> {
         // would reverse their observable evaluation order at emission time.
         let ordered = hoist
             && parsed_caps.iter().try_fold(false, |found, (e, _, _)| {
-                Ok::<_, LowerError>(found || self.fmt_expr_has_hoistable_call(e)?)
+                Ok::<_, LowerError>(
+                    found
+                        || self.fmt_expr_has_hoistable_call(e)?
+                        || self.fmt_expr_has_conditional_hoistable_call(e, false)?,
+                )
             })?;
         let mut args = Vec::with_capacity(parsed_caps.len());
         for (mut parsed, wide_hex, capture) in parsed_caps {
@@ -6893,9 +6915,20 @@ impl FuncBuilder<'_> {
             //
             // Suspending bus/TLM and transactor calls take the same ordered
             // statement-position path inside this already-selected block.
-            if hoist {
-                self.hoist_fmt_calls(&mut parsed)?;
-            }
+            // A call under `&&`/`||` or a ternary branch cannot be lifted on
+            // its own. Lower the COMPLETE capture through the ordinary lazy
+            // expression CFG instead, then format its merged result local.
+            let capture_materialized = if hoist {
+                if self.fmt_expr_has_conditional_hoistable_call(&parsed, false)? {
+                    self.materialize_effectful_fmt_ast_expr(&mut parsed)?;
+                    true
+                } else {
+                    self.hoist_fmt_calls(&mut parsed)?;
+                    false
+                }
+            } else {
+                false
+            };
 
             // Ports are allowed in format args. Any call that still reaches
             // this message context lives under a lazy subexpression and must
@@ -6925,7 +6958,7 @@ impl FuncBuilder<'_> {
                     V1Status::EmitsUncompilable,
                 ));
             }
-            if ordered {
+            if ordered && !capture_materialized {
                 expr = self.hoist_fmt_ports(expr);
                 let name = self.fresh_msg_tmp_name();
                 let tmp = self.declare(&name);
@@ -6974,7 +7007,9 @@ impl FuncBuilder<'_> {
         if self.hoist_fmt_suspending_call(e)? {
             return Ok(());
         }
-        if self.fmt_call_needs_hoist(e) || self.fmt_component_call_needs_hoist(e)? {
+        let is_queue_pop = matches!(&*e.kind, ExprKind::Call { callee, .. }
+            if self.is_queue_pop_call(callee));
+        if self.fmt_call_needs_hoist(e) || self.fmt_component_call_needs_hoist(e)? || is_queue_pop {
             // Hoist the whole call once. Lower it in normal (non-fmt-args)
             // context so an impure helper emits its inline statements and a
             // method emits its call edge ahead of the message.
@@ -7069,6 +7104,7 @@ impl FuncBuilder<'_> {
                 || self.as_transactor_call(callee)?.is_some()
                 || self.fmt_self_transactor_method(callee).is_some()
                 || matches!(self.as_component_method_call(callee), Ok(Some(_)))
+                || self.is_queue_pop_call(callee)
             {
                 return Ok(true);
             }
@@ -7092,7 +7128,8 @@ impl FuncBuilder<'_> {
             || is_bus_tlm
             || self.as_transactor_call(callee)?.is_some()
             || self.fmt_self_transactor_method(callee).is_some()
-            || matches!(self.as_component_method_call(callee), Ok(Some(_))))
+            || matches!(self.as_component_method_call(callee), Ok(Some(_)))
+            || self.is_queue_pop_call(callee))
     }
 
     fn reject_lazy_fmt_call_arguments(&self, e: &AstExpr) -> Result<(), LowerError> {
@@ -7157,10 +7194,26 @@ impl FuncBuilder<'_> {
     /// impure/suspending call. Lower in message context so a call hidden in a
     /// lazy subexpression remains rejected instead of becoming eager.
     fn materialize_fmt_ast_expr(&mut self, e: &mut AstExpr) -> Result<(), LowerError> {
+        self.materialize_fmt_ast_expr_with_context(e, true)
+    }
+
+    /// Materialize a complete lazy message capture through the ordinary
+    /// expression CFG. The message statement is already in its selected
+    /// failure/log block, so branches created here preserve short-circuit and
+    /// ternary evaluation without moving the call ahead of the message edge.
+    fn materialize_effectful_fmt_ast_expr(&mut self, e: &mut AstExpr) -> Result<(), LowerError> {
+        self.materialize_fmt_ast_expr_with_context(e, false)
+    }
+
+    fn materialize_fmt_ast_expr_with_context(
+        &mut self,
+        e: &mut AstExpr,
+        in_fmt_args: bool,
+    ) -> Result<(), LowerError> {
         let original = std::mem::replace(e, AstExpr::new(ExprKind::Bool(false), e.span));
         let span = original.span;
         let was = self.in_fmt_args;
-        self.in_fmt_args = true;
+        self.in_fmt_args = in_fmt_args;
         let lowered = self.lower_expr(&original);
         self.in_fmt_args = was;
         let lowered = self.hoist_fmt_ports(lowered?);
@@ -7552,7 +7605,15 @@ fn fmt_arg_type_is_scalar(ty: &IrType) -> bool {
     )
 }
 
-fn lazy_message_call_error(what: &str) -> LowerError {
+fn parse_fmt_capture(capture: &str) -> Result<AstExpr, LowerError> {
+    crate::parser::parse_expr_fragment(capture).map_err(|_| {
+        LowerError::Invalid(format!(
+            "`${{{capture}}}` is not an expression; an interpolation holds one complete expression, optionally followed by `:` and a format spec"
+        ))
+    })
+}
+
+pub(crate) fn lazy_message_call_error(what: &str) -> LowerError {
     unsupported(
         &format!("{what} inside a message"),
         "the call is conditionally evaluated; bind the lazy expression to a `let` before formatting it",

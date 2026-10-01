@@ -9799,7 +9799,7 @@ end impl T"#
 
     // `bus` is also a legal concrete binding name; it must not alias the
     // explicit unresolved provenance state. A later instance selecting a
-    // genuinely different binding still trips the shared-body conflict gate.
+    // genuinely different binding receives a specialized callable owner.
     let split_bindings = bound_dut
         .replace(
             "let axil : BusAxiLite = bind dut",
@@ -9812,12 +9812,41 @@ end impl T"#
         .replace(
             "let mon  : AxilXactor passive = bind axil",
             "let mon  : AxilXactor passive = bind other",
-        );
-    let msg = assert_unsupported(&lower_with_stdlib_bus_src(&split_bindings).unwrap_err());
+        )
+        .replace("axil.", "bus.");
+    let split_prog = lower_with_stdlib_bus_src(&split_bindings)
+        .expect("one bound component type may specialize onto two bus bindings");
+    verify::verify_program(&split_prog).expect("split-binding component verifies");
+    let split_cpp = tbir::emit(
+        &split_prog,
+        &merged_with_stdlib_bus(&split_bindings, "BusAxiLite.arch"),
+        &cpp_tb::EmitOpts::default(),
+    )
+    .expect("split-binding component emits");
     assert!(
-        msg.contains("multiple bus bindings") && msg.contains("`bus`") && msg.contains("`other`"),
-        "{msg}"
+        split_cpp.contains("struct AxilXactor__AxiLiteBoundMonTest__mon")
+            && split_cpp.contains("AxilXactor__AxiLiteBoundMonTest__mon_on_h"),
+        "the second binding receives its own typed component/callable owner: {split_cpp}"
     );
+
+    let split_with_method = split_bindings.replace(
+        "last_read : uint<32> default 0",
+        "last_read : uint<32> default 0\n\n    function observe(other: AxilXactor)\n        last_read = last_read\n    end function observe",
+    );
+    let split_method_prog = lower_with_stdlib_bus_src(&split_with_method)
+        .expect("split-binding component with a self-typed method lowers");
+    verify::verify_program(&split_method_prog)
+        .expect("specialized method metadata and function ABI agree");
+    let specialized = split_method_prog
+        .components
+        .iter()
+        .position(|component| component.name == "AxilXactor__AxiLiteBoundMonTest__mon")
+        .map(|index| ir::ComponentId(index as u32))
+        .expect("specialized component");
+    let observe = split_method_prog.components[specialized.index()]
+        .method("observe")
+        .expect("specialized observe method");
+    assert_eq!(observe.param_tys, vec![ir::IrType::Component(specialized)]);
 
     // The inert member still has to name the test's DUT type: otherwise v1
     // emits an undeclared VTop pointer and TBIR must not emit the same broken
@@ -9853,6 +9882,77 @@ end impl T"#
                 .unwrap_or_else(|e| panic!("no arm calls this malformed: {e:?}"));
         }
     }
+}
+
+#[test]
+fn discarded_scalar_expression_statements_lower_without_a_v1_fallback() {
+    let src = r#"test DiscardExpr
+    let dut : Top
+    run
+        1 + 2
+        true && false
+    end run
+end test DiscardExpr"#;
+    let prog = lower_src(src).expect("discarded scalar expressions lower");
+    verify::verify_program(&prog).expect("discarded scalar expressions verify");
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        run.blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter(|stmt| matches!(stmt, ir::Stmt::Assign(..)))
+            .count()
+            >= 2,
+        "both expressions must remain evaluated in unread temporaries: {run}"
+    );
+}
+
+#[test]
+fn unresolved_calls_do_not_advertise_v1_as_an_escape_hatch() {
+    let source = |body: &str| {
+        format!(
+            "test UnknownCall\n    let dut : Top\n    run\n        {body}\n    end run\nend test UnknownCall"
+        )
+    };
+    let value_src = source("let value = missing(1)");
+    let msg = assert_not_implemented(
+        &lower_src(&value_src).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("missing"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&value_src)).expect("v1 emits the unresolved call");
+    assert!(v1.contains("missing(1)"), "{v1}");
+}
+
+#[test]
+fn nested_fork_and_unmerged_extend_are_not_v1_subset_gaps() {
+    let nested_fork = r#"bus MemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus MemBus
+
+test NestedFork
+    let dut : TlmMemory
+    let mem : MemBus = bind dut
+    run
+        assert (fork mem.read(1)) == 0 else fail("nested fork")
+    end run
+end test NestedFork"#;
+    let msg = assert_not_implemented(
+        &lower_src(nested_fork).unwrap_err(),
+        lower::V1Status::Rejects,
+    );
+    assert!(msg.contains("`fork` bus-method calls"), "{msg}");
+    assert!(
+        cpp_tb::emit(&merged_src(nested_fork)).is_err(),
+        "v1 also rejects a nested fork expression"
+    );
+
+    let unmerged = parse_source(
+        "extend Txn\n    data : uint<8>\nend extend Txn",
+    )
+    .expect("extension parses");
+    let msg = assert_invalid(&lower::lower_program(&unmerged).unwrap_err());
+    assert!(msg.contains("unmerged `extend` block"), "{msg}");
 }
 
 /// The assignment rule at the other half of the surface: a value
@@ -11961,11 +12061,62 @@ end impl T"#;
         "        assert false else fail(\"popped=${sb.q.pop()}\")",
         1,
     );
-    let msg = assert_unsupported(&lower_src(&message).unwrap_err());
+    let message_prog = lower_src(&message).expect("queue pop in a selected message lowers");
+    verify::verify_program(&message_prog).expect("message queue-pop CFG verifies");
+    let message_run = message_prog.function(message_prog.tests[0].run);
+    let pop_block = message_run
+        .blocks
+        .iter()
+        .position(|block| {
+            block.stmts.iter().any(|stmt| {
+                matches!(
+                    stmt,
+                    ir::Stmt::ScoreboardOp {
+                        op: ir::ScoreboardOp::QueuePop { queue, .. },
+                        ..
+                    } if queue == "q"
+                )
+            })
+        })
+        .map(|index| ir::BlockId(index as u32))
+        .expect("failure-side message block contains the queue pop");
+    assert!(message_run.blocks.iter().any(|block| matches!(
+        block.terminator,
+        ir::Terminator::Branch(_, _, failure) if failure == pop_block
+    )));
     assert!(
-        msg.contains("inside a message") && msg.contains("hoist the pop"),
-        "lazy diagnostic formatting keeps a precise queue-pop error: {msg}"
+        emit_cpp_src(&message).contains("_tb.sb.q.pop()"),
+        "the selected message emits exactly one queue pop"
     );
+
+    let lazy_message = message.replace(
+        "popped=${sb.q.pop()}",
+        "skipped=${true || sb.q.pop() == 7}",
+    );
+    let lazy_prog = lower_src(&lazy_message).expect("lazy message queue pop lowers through CFG");
+    verify::verify_program(&lazy_prog).expect("lazy message queue-pop CFG verifies");
+    let lazy_run = lazy_prog.function(lazy_prog.tests[0].run);
+    let lazy_pop = lazy_run
+        .blocks
+        .iter()
+        .position(|block| {
+            block.stmts.iter().any(|stmt| {
+                matches!(
+                    stmt,
+                    ir::Stmt::ScoreboardOp {
+                        op: ir::ScoreboardOp::QueuePop { queue, .. },
+                        ..
+                    } if queue == "q"
+                )
+            })
+        })
+        .map(|index| ir::BlockId(index as u32))
+        .expect("lazy RHS contains the queue pop");
+    assert!(lazy_run.blocks.iter().any(|block| matches!(
+        block.terminator,
+        ir::Terminator::Branch(_, taken, skipped)
+            if taken != lazy_pop && skipped == lazy_pop
+    )));
 }
 
 #[test]
@@ -19255,6 +19406,43 @@ end test FmtTest
     );
 }
 
+/// The capability check for an immediate diagnostic must not lower the lazy
+/// capture speculatively. The outer assertion branch has to be the entry edge;
+/// otherwise a speculative short-circuit merge can return before the real
+/// assertion is evaluated.
+#[test]
+fn conditional_message_preflight_does_not_mutate_the_cfg() {
+    let src = r#"
+function peek(d: Top) -> uint<8>
+    return d.rd_data
+end function peek
+
+test FmtPreflightTest
+    let dut : Top
+    run
+        assert false else fail("lazy=${true || peek(dut) == 0}")
+    end run
+end test FmtPreflightTest
+"#;
+    let prog = lower_src(src).expect("conditional diagnostic helper lowers lazily");
+    verify::verify_program(&prog).expect("conditional diagnostic CFG verifies");
+    let run = prog.function(prog.tests[0].run);
+    assert!(
+        matches!(
+            run.blocks[run.entry.index()].terminator,
+            ir::Terminator::Branch(
+                ir::Expr::Literal {
+                    value: 0,
+                    ty: ir::IrType::Bool,
+                },
+                _,
+                _
+            )
+        ),
+        "the outer `assert false` branch must be the entry terminator:\n{run}"
+    );
+}
+
 /// A dynamic packed-port selector may itself be an impure call. The packed
 /// target is a value operand, so it must be sampled before that call can write
 /// the same DUT signal.
@@ -19602,13 +19790,30 @@ impl LazyArgTest for LazyArgTb
     end run
 end impl LazyArgTest
 "#;
-    let msg = assert_unsupported(&lower_src(lazy_arg).expect_err(
-        "a statement-producing call in a lazy outer-call argument must not be made eager",
-    ));
-    assert!(
-        msg.contains("conditionally evaluated call argument"),
-        "{msg}"
-    );
+    let lazy_arg = lower_src(lazy_arg)
+        .expect("a statement-producing call in a lazy outer-call argument lowers through CFG");
+    verify::verify_program(&lazy_arg).expect("lazy outer-call argument CFG verifies");
+    let report = lazy_arg
+        .functions
+        .iter()
+        .find(|function| function.name.contains("report"))
+        .expect("report method lowers");
+    let write_block = report
+        .blocks
+        .iter()
+        .position(|block| {
+            block
+                .stmts
+                .iter()
+                .any(|stmt| matches!(stmt, ir::Stmt::DutWrite(..)))
+        })
+        .map(|index| ir::BlockId(index as u32))
+        .expect("the impure helper's DUT write remains in one branch");
+    assert!(report.blocks.iter().any(|block| matches!(
+        block.terminator,
+        ir::Terminator::Branch(_, taken, skipped)
+            if taken == write_block && skipped != write_block
+    )));
 }
 
 #[test]
@@ -30894,16 +31099,41 @@ fn component_call_in_message_stays_in_the_failure_branch() {
         "diagnostic component call must be reachable only through an assertion failure edge:\n{run}"
     );
 
-    let lazy = source.replace(
-        "taken diagnostic call=${harness.inner.step(2)}",
-        "illegal lazy call=${true || harness.inner.step(2) != 0}",
-    );
-    let msg =
-        assert_unsupported(&lower_src(&lazy).expect_err("lazy message call must be rejected"));
-    assert!(
-        msg.contains("inside a message") && msg.contains("hoist"),
-        "{msg}"
-    );
+    for capture in [
+        "true || harness.inner.step(2) != 0",
+        "(true ? 1 : harness.inner.step(2)):d",
+    ] {
+        let lazy = source.replace(
+            "taken diagnostic call=${harness.inner.step(2)}",
+            &format!("lazy call=${{{capture}}}"),
+        );
+        let lazy_prog = lower_src(&lazy)
+            .unwrap_or_else(|error| panic!("`{capture}` lowers through branch-local CFG: {error}"));
+        verify::verify_program(&lazy_prog)
+            .unwrap_or_else(|error| panic!("`{capture}` verifies: {error:?}"));
+        let run = lazy_prog.function(lazy_prog.tests[0].run);
+        let call_block = run
+            .blocks
+            .iter()
+            .rposition(|block| {
+                block.stmts.iter().any(|stmt| {
+                    matches!(
+                        stmt,
+                        ir::Stmt::ComponentCall { method, .. } if method == "step"
+                    )
+                })
+            })
+            .map(|index| ir::BlockId(index as u32))
+            .expect("the component call remains in the lazy RHS block");
+        assert!(
+            run.blocks.iter().any(|block| matches!(
+                block.terminator,
+                ir::Terminator::Branch(_, taken, skipped)
+                    if taken != call_block && skipped == call_block
+            )),
+            "`{capture}` must keep the component call on the unselected branch:\n{run}"
+        );
+    }
 
     let wait = fixture("component_value_expression_test.harc").replace(
         "assert true else fail(\"untaken diagnostic call=${harness.inner.step(2)}\")",
@@ -35196,6 +35426,29 @@ end impl T"#,
         cpp.contains("harc_rt::harc_read(dut->a)")
             && cpp.contains("harc_printf_ll(_harc_runtime_cells.callback_capture_run_n2_lo)"),
         "both captures render inside the closure:\n{cpp}"
+    );
+
+    let effectful = r#"function peek(d: Top) -> uint<8>
+    return d.a
+end function peek
+
+testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    run
+        assert past(dut.a) == 0 else fail("a=${peek(dut)}")
+        wait 1 cycle
+    end run
+end impl T"#;
+    let message = assert_unsupported(
+        &lower_src(effectful)
+            .expect_err("a concurrent message cannot materialize an effectful helper call"),
+    );
+    assert!(
+        message.contains("DUT/sync-touching helper call `peek(...)`")
+            && message.contains("inside a message"),
+        "the concurrent path retains the honest shared lazy-message diagnostic: {message}"
     );
 }
 

@@ -1028,7 +1028,7 @@ impl FuncBuilder<'_> {
         matches!(&*callee.kind, ExprKind::Field { name, .. } if name.name == "front")
     }
 
-    fn is_queue_pop_call(&self, callee: &AstExpr) -> bool {
+    pub(crate) fn is_queue_pop_call(&self, callee: &AstExpr) -> bool {
         if self
             .as_tb_queue_call(callee)
             .is_some_and(|(_, method)| method == "pop")
@@ -2135,13 +2135,8 @@ impl FuncBuilder<'_> {
                         // (`need_ret = true`), mirroring v1's C++ type error.
                         if self.as_transactor_call(callee)?.is_some() {
                             if self.in_fmt_args {
-                                return Err(unsupported(
-                                    &format!(
-                                        "transactor method call `.{}(...)` inside a message",
-                                        name.name
-                                    ),
-                                    "log/fail messages evaluate lazily; hoist the call into \
-                                     a `let` first",
+                                return Err(super::stmts::lazy_message_call_error(
+                                    &format!("transactor method call `.{}(...)`", name.name),
                                 ));
                             }
                             if let Some(call) = self.lower_transactor_call(callee, args, true)? {
@@ -2152,13 +2147,19 @@ impl FuncBuilder<'_> {
                     }
                     _ => "a call expression".to_string(),
                 };
-                Err(unsupported(&what, ""))
+                Err(not_implemented(
+                    &what,
+                    "v1 emits the unresolved call verbatim, so generated C++ name/member lookup fails",
+                    V1Status::EmitsUncompilable,
+                ))
             }
-            ExprKind::ForkCall { .. } => Err(unsupported(
+            ExprKind::ForkCall { .. } => Err(not_implemented(
                 "`fork` bus-method calls in expression position",
                 "test-scope `let x = fork bus.m(...)` (initiator-side issue) IS lowered; a \
                  `fork` INSIDE a transactor responder body (target re-issuing a downstream \
-                 TLM call — fork-forwarding) is a follow-up slice",
+                 TLM call — fork-forwarding) is a follow-up slice; v1 also rejects a fork \
+                 nested anywhere other than its dedicated statement/initializer forms",
+                V1Status::Rejects,
             )),
             // `let ok = randomize(t)` — the value-producing form. v1's
             // `emit_expr` has no arm for it (it only handles the
@@ -4319,10 +4320,9 @@ impl FuncBuilder<'_> {
     ) -> Result<(), LowerError> {
         super::stmts::queue_pop_takes_no_arguments(what, args)?;
         if self.in_fmt_args {
-            return Err(unsupported(
-                &format!("{what}.pop() inside a message"),
-                "log/fail messages evaluate lazily; hoist the pop into a `let` first",
-            ));
+            return Err(super::stmts::lazy_message_call_error(&format!(
+                "{what}.pop()"
+            )));
         }
         Ok(())
     }

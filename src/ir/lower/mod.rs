@@ -182,14 +182,6 @@ impl LowerDiagnosticRecorder {
         }
     }
 
-    fn checkpoint(&self) -> Option<(SourceId, crate::lexer::Span)> {
-        self.0.get()
-    }
-
-    fn restore(&self, checkpoint: Option<(SourceId, crate::lexer::Span)>) {
-        self.0.set(checkpoint);
-    }
-
     fn finish(&self, error: LowerError) -> LowerDiagnostic {
         let (source_id, span) = self.0.get().unwrap_or_default();
         LowerDiagnostic {
@@ -2300,9 +2292,9 @@ fn lower_program_impl(
             // means the merge didn't apply (e.g. dump-ir on a lone
             // extension file).
             Item::Extend(_) => {
-                return Err(unsupported(
-                    "an unmerged `extend` block",
-                    "pass the base test file alongside the extension",
+                return Err(LowerError::Invalid(
+                    "an unmerged `extend` block reached TBIR lowering; pass the base test file alongside the extension"
+                        .to_string(),
                 ));
             }
             // A `sequencer` is a composite component (analysis-source
@@ -3241,6 +3233,25 @@ fn lower_program_impl(
             },
         );
     }
+    let mut bound_component_templates = HashMap::new();
+    for (index, schema) in prog.components.iter().enumerate() {
+        if schema.bound_bus.is_none() {
+            continue;
+        }
+        let function_ids = component_function_ids(schema);
+        let functions = function_ids
+            .iter()
+            .map(|function| prog.function(*function).clone())
+            .collect();
+        bound_component_templates.insert(
+            ir::ComponentId(index as u32),
+            BoundComponentTemplate {
+                source: ir::ComponentId(index as u32),
+                schema: schema.clone(),
+                functions,
+            },
+        );
+    }
     for (item_index, it) in file.items.iter().enumerate() {
         let Item::Test(t) = it else { continue };
         let testbench_type = testbench_type_for_test[&t.name.name];
@@ -3276,6 +3287,7 @@ fn lower_program_impl(
             &shared_lifecycle_bodies,
             &mut shared_lifecycle_fns,
             &bound_initiator_templates,
+            &bound_component_templates,
             &all_probe_meta,
             &mut prog,
         )?;
@@ -4120,6 +4132,7 @@ fn lower_test(
     shared_lifecycle_bodies: &crate::codegen::cpp_tb::SharedLifecycleBodies,
     shared_lifecycle_fns: &mut HashMap<String, HashMap<crate::ast::LifecyclePhase, FunctionId>>,
     bound_initiator_templates: &HashMap<TransactorId, BoundInitiatorTemplate>,
+    bound_component_templates: &HashMap<ir::ComponentId, BoundComponentTemplate>,
     suite_probe_meta: &HashMap<String, ProbeMeta>,
     prog: &mut TbProgram,
 ) -> Result<(), LowerError> {
@@ -5296,14 +5309,14 @@ fn lower_test(
     // `bound_bus`, retain the adapter on the testbench schema, and register the
     // instance as a composite-component field so `emit xact.req(t)` and
     // `xact.<state>` read-backs resolve through the component machinery.
-    // The handler bodies are shared per component TYPE, so the subset is
-    // one bound instance per type per file — a second bind to a different
-    // binding is retained in the owning testbench schema and resolved only
-    // while rendering that instance.
+    // The first concrete binding retains the source component owner. Each
+    // additional binding gets a suite-unique specialized owner and callable
+    // set so direct and common layouts can route one adapter per typed owner.
     // Instance names of `active` bound event-driven transactors — their
     // `on <ev>` driver re-lowers into a queue-fed worker coroutine under
     // `--mt`. Carried onto each `ComponentFieldBinding` below.
-    for (instance, cid, bus_field, active) in &bound_event_component_binds {
+    let mut bound_component_specializations = HashMap::new();
+    for (instance, source_cid, bus_field, active) in &bound_event_component_binds {
         // The bound bus binding must be a `let <bus_field> : <Bus> =
         // bind dut` declared in this test, of the component's bound bus.
         let Some(binding) = bus_bindings.iter().find(|b| &b.field == bus_field) else {
@@ -5313,7 +5326,7 @@ fn lower_test(
                 t.name.name
             )));
         };
-        let cschema = &prog.components[cid.index()];
+        let cschema = &prog.components[source_cid.index()];
         for field in &cschema.fields {
             let ir::ComponentFieldKind::Dut {
                 dut_type: handle_type,
@@ -5343,22 +5356,32 @@ fn lower_test(
                 cschema.bound_bus.as_deref().unwrap_or("<none>"),
             )));
         }
-        if let Some(previous) = bound_bus_instances.iter().find(|entry| {
-            entry.owner == ir::BoundBusOwner::Component(*cid) && entry.binding != binding.id
-        }) {
-            let previous_binding = &bus_bindings[previous.binding.index()].field;
-            return Err(unsupported(
-                &format!(
-                    "bound-to event-driven transactor `{}` uses multiple bus bindings in test \
-                     `{}` (`{previous_binding}`, `{bus_field}`)",
-                    cschema.name, t.name.name
-                ),
-                "one emitted component callable set requires one concrete bus adapter per test",
-            ));
-        }
+        let source_owner = ir::BoundBusOwner::Component(*source_cid);
+        let cid = if let Some(existing) =
+            bound_component_specializations.get(&(*source_cid, binding.id))
+        {
+            *existing
+        } else if !bound_bus_instances
+            .iter()
+            .any(|entry| entry.owner == source_owner)
+        {
+            *source_cid
+        } else {
+            let template = bound_component_templates.get(source_cid).ok_or_else(|| {
+                LowerError::Invalid(format!(
+                    "internal bound-component template for `{}` is missing",
+                    cschema.name
+                ))
+            })?;
+            let specialized =
+                specialize_bound_component(prog, template, &t.name.name, instance)?;
+            bound_component_specializations.insert((*source_cid, binding.id), specialized);
+            specialized
+        };
+        bound_component_specializations.insert((*source_cid, binding.id), cid);
         bound_bus_instances.push(ir::BoundBusInstanceSchema {
             field: instance.clone(),
-            owner: ir::BoundBusOwner::Component(*cid),
+            owner: ir::BoundBusOwner::Component(cid),
             binding: binding.id,
         });
         // Register as a composite-component instance (same machinery as
@@ -5366,7 +5389,7 @@ fn lower_test(
         // `xact.<state>` reads the per-instance state.
         test_scope_components.push((
             instance.clone(),
-            *cid,
+            cid,
             Some(if *active {
                 ir::ComponentInstanceMode::Active
             } else {
@@ -9798,6 +9821,162 @@ fn retarget_transactor_self_calls(
 struct BoundInitiatorTemplate {
     schema: ir::TransactorSchema,
     functions: Vec<TbFunction>,
+}
+
+#[derive(Clone)]
+struct BoundComponentTemplate {
+    source: ir::ComponentId,
+    schema: ir::ComponentSchema,
+    functions: Vec<TbFunction>,
+}
+
+fn component_function_ids(schema: &ir::ComponentSchema) -> Vec<FunctionId> {
+    let mut ids = schema
+        .methods
+        .iter()
+        .map(|method| method.function)
+        .chain(schema.on_handlers.iter().map(|handler| handler.function))
+        .chain(
+            schema
+                .periodic_handlers
+                .iter()
+                .map(|handler| handler.function),
+        )
+        .chain(schema.cycle_handlers.iter().map(|handler| handler.function))
+        .collect::<Vec<_>>();
+    if let Some(watchdog) = &schema.watchdog {
+        ids.push(watchdog.function);
+    }
+    ids
+}
+
+fn retarget_component_type(ty: &mut IrType, source: ir::ComponentId, target: ir::ComponentId) {
+    match ty {
+        IrType::Component(component) if *component == source => *component = target,
+        IrType::Seq(elem) | IrType::FixedVec { elem, .. } => {
+            retarget_component_type(elem, source, target)
+        }
+        _ => {}
+    }
+}
+
+fn retarget_component_function(
+    func: &mut TbFunction,
+    source: ir::ComponentId,
+    target: ir::ComponentId,
+    function_ids: &HashMap<FunctionId, FunctionId>,
+) {
+    if let FunctionKind::ComponentMethod { component, .. } = &mut func.kind {
+        if *component == source {
+            *component = target;
+        }
+    }
+    for param in &mut func.params {
+        retarget_component_type(&mut param.ty, source, target);
+    }
+    for local in &mut func.locals {
+        retarget_component_type(&mut local.ty, source, target);
+    }
+    for block in &mut func.blocks {
+        for stmt in &mut block.stmts {
+            match stmt {
+                ir::Stmt::ComponentCall {
+                    component,
+                    function,
+                    ..
+                } => {
+                    if *component == source {
+                        *component = target;
+                    }
+                    if let Some(mapped) = function_ids.get(function) {
+                        *function = *mapped;
+                    }
+                }
+                ir::Stmt::ComponentInit { component, .. } if *component == source => {
+                    *component = target;
+                }
+                ir::Stmt::EventSubscribe {
+                    event: ir::EventChannelRef::Component { component, .. },
+                    ..
+                }
+                | ir::Stmt::MethodHookSubscribe {
+                    target: ir::MethodHookTarget::Component { component, .. },
+                    ..
+                } if *component == source => {
+                    *component = target;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Clone one bus-bound component schema and all of its callable bodies for an
+/// additional concrete binding in the same test. Keeping a distinct typed
+/// owner lets direct and common C++ layouts select the correct bus adapter
+/// without baking one instance's binding into another instance's callables.
+fn specialize_bound_component(
+    prog: &mut TbProgram,
+    template: &BoundComponentTemplate,
+    test_name: &str,
+    instance: &str,
+) -> Result<ir::ComponentId, LowerError> {
+    let source_id = template.source;
+    let specialized_id = ir::ComponentId(prog.components.len() as u32);
+    let mut schema = template.schema.clone();
+    schema.name = format!("{}__{test_name}__{instance}", schema.name);
+    let function_base = prog.functions.len() as u32;
+    let old_ids = component_function_ids(&schema);
+    let function_ids = old_ids
+        .iter()
+        .enumerate()
+        .map(|(index, old)| (*old, FunctionId(function_base + index as u32)))
+        .collect::<HashMap<_, _>>();
+
+    for method in &mut schema.methods {
+        method.function = function_ids[&method.function];
+        for ty in &mut method.param_tys {
+            retarget_component_type(ty, source_id, specialized_id);
+        }
+        if let Some(ty) = &mut method.ret_ty {
+            retarget_component_type(ty, source_id, specialized_id);
+        }
+    }
+    for handler in &mut schema.on_handlers {
+        handler.function = function_ids[&handler.function];
+    }
+    for handler in &mut schema.periodic_handlers {
+        handler.function = function_ids[&handler.function];
+    }
+    for handler in &mut schema.cycle_handlers {
+        handler.function = function_ids[&handler.function];
+    }
+    if let Some(watchdog) = &mut schema.watchdog {
+        watchdog.function = function_ids[&watchdog.function];
+    }
+
+    for old_id in old_ids {
+        let mut func = template
+            .functions
+            .iter()
+            .find(|func| func.id == old_id)
+            .cloned()
+            .ok_or_else(|| {
+                LowerError::Invalid(format!(
+                    "internal bound-component template `{}` is missing fn{}",
+                    template.schema.name, old_id.0
+                ))
+            })?;
+        func.id = function_ids[&old_id];
+        func.name = format!(
+            "{}__{test_name}__{instance}_fn{}",
+            template.schema.name, old_id.0
+        );
+        retarget_component_function(&mut func, source_id, specialized_id, &function_ids);
+        prog.functions.push(func);
+    }
+    prog.components.push(schema);
+    Ok(specialized_id)
 }
 
 /// Clone one bound initiator schema and its method functions for an additional

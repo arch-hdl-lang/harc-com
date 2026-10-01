@@ -3,8 +3,8 @@
 //! lower into one `ComponentSchema`, mirroring v1's uniform
 //! `emit_component_struct` + `emit_component_method` treatment:
 //!
-//!   - a `scoreboard` carrying `hookable`/`function` **methods** (a
-//!     data-only, method-less board stays on `ScoreboardSchema`);
+//!   - a `scoreboard` carrying `hookable`/`function` methods or plain
+//!     fixed-vector state (other data-only boards use `ScoreboardSchema`);
 //!   - a `transactor` used as a pure **analysis source** — `out event<T>`
 //!     port(s) + methods that `emit` on them, and NO module-typed DUT
 //!     field (the DUT-poking BFM form stays on `TransactorSchema`);
@@ -34,13 +34,55 @@ use crate::ir::{
 };
 use std::collections::HashMap;
 
-/// True when a `scoreboard` declaration carries a `hookable`/`function`
-/// method, so it must lower as a component (per-instance state) rather
-/// than the data-only `ScoreboardSchema`.
+/// Methods and fixed-vector state use the shared component representation.
+/// Field-only boards without vectors retain the data-only scoreboard path.
 pub(crate) fn scoreboard_is_component(c: &ComponentDecl) -> bool {
-    c.items
+    if c.items
         .iter()
         .any(|it| matches!(it, ComponentItem::Hookable(_)))
+    {
+        return true;
+    }
+    // Do not let vector routing admit wiring, binding, directional fields,
+    // or explicit aggregate defaults that the data-only path rejects.
+    let mut has_vector = false;
+    for item in &c.items {
+        let ComponentItem::Field(field) = item else {
+            return false;
+        };
+        if field.direction.is_some()
+            || field.bound_to.is_some()
+            || matches!(
+                field.name.name.as_str(),
+                "_last_in_cycle" | "_last_out_cycle"
+            )
+        {
+            return false;
+        }
+        // Keep this migration to scalar/vector/queue storage. Events and
+        // named aggregates need their own validated scoreboard semantics.
+        if scalar_field_ir_type(&field.ty).is_none()
+            && !matches!(
+                &field.ty,
+                TypeExpr::Builtin { name: BuiltinTy::Vec | BuiltinTy::Queue, .. }
+            )
+        {
+            return false;
+        }
+        if field.default.is_some() && scalar_field_ir_type(&field.ty).is_none() {
+            return false;
+        }
+        if matches!(
+            &field.ty,
+            TypeExpr::Builtin {
+                name: BuiltinTy::Vec,
+                ..
+            }
+        ) {
+            has_vector = true;
+        }
+    }
+    has_vector && c.params.is_empty() && c.bound_to.is_none()
 }
 
 /// Does a `bound to` transactor ALSO get a component view?
@@ -5625,10 +5667,9 @@ impl super::FuncBuilder<'_> {
             )));
         }
         if self.in_fmt_args {
-            return Err(unsupported(
-                &format!("component method call `.{method}(...)` inside a message"),
-                "log/fail messages evaluate lazily; hoist the call into a `let` first",
-            ));
+            return Err(super::stmts::lazy_message_call_error(&format!(
+                "component method call `.{method}(...)`"
+            )));
         }
 
         let owner = format!("`{}.{method}`", self.ctx.components[component.index()].name);

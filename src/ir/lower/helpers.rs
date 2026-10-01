@@ -405,10 +405,9 @@ impl FuncBuilder<'_> {
 
         // ── CFG inline ──────────────────────────────────────────────
         if self.in_fmt_args {
-            return Err(unsupported(
-                &format!("DUT/sync-touching helper call `{name}(...)` inside a message"),
-                "log/fail messages evaluate lazily; hoist the call into a `let` first",
-            ));
+            return Err(super::stmts::lazy_message_call_error(&format!(
+                "DUT/sync-touching helper call `{name}(...)`"
+            )));
         }
         if self.inline_frames.iter().any(|f| f.name == name) {
             // Only reachable for an INLINED (impure) helper — a pure one
@@ -816,10 +815,9 @@ impl FuncBuilder<'_> {
             )));
         }
         if self.in_fmt_args {
-            return Err(unsupported(
-                &format!("testbench method call `{name}(...)` inside a message"),
-                "log/fail messages evaluate lazily; hoist the call into a `let` first",
-            ));
+            return Err(super::stmts::lazy_message_call_error(&format!(
+                "testbench method call `{name}(...)`"
+            )));
         }
         let declared = decl
             .params
