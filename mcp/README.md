@@ -79,6 +79,9 @@ when querying this repository; pass `source_paths` for an external workspace.
 Developer queries default to this repository's curated feature map. Skip graph
 retrieval when the task already identifies the exact files and no relationship
 discovery is needed.
+Graph indexing and querying honor `HARC_MCP_WORKSPACE_ROOTS` for imported bus
+sources too. Add a sibling ARCH checkout to that variable when its bus
+declarations should appear in MCP graph results.
 
 When `harc_sim_emit_only` is called without `outdir`, the server writes emitted
 artifacts to a temporary directory instead of the `harc-com` checkout.

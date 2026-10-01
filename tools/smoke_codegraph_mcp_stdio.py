@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -18,9 +20,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 async def smoke(harc_bin: Path) -> None:
+    external = tempfile.TemporaryDirectory(prefix="harc-mcp-external-bus-")
+    external_bus = Path(external.name) / "BusAxiLite.arch"
+    external_bus.write_bytes((ROOT / "stdlib/BusAxiLite.arch").read_bytes())
     env = os.environ.copy()
     env["HARC_BIN"] = str(harc_bin.resolve())
     env["HARC_MCP_WORKSPACE_ROOTS"] = str(ROOT)
+    env["HARC_LIB_PATH"] = external.name
     server = StdioServerParameters(
         command=sys.executable,
         args=[str(ROOT / "mcp/harc_mcp_server.py")],
@@ -75,6 +81,37 @@ async def smoke(harc_bin: Path) -> None:
                 assert not refreshed.isError, refreshed
                 refreshed_text = "\n".join(item.text for item in refreshed.content if item.type == "text")
                 assert "CustomSecond" in refreshed_text, refreshed_text
+
+                imported_source = Path(tmp) / "import.harc"
+                imported_index = Path(tmp) / "import-index"
+                imported_source.write_text("use BusAxiLite\nmodule Importer kind verilator\nend module Importer\n")
+                imported = await session.call_tool(
+                    "harc_graph_index",
+                    {"paths": [str(imported_source)], "out": str(imported_index)},
+                )
+                assert not imported.isError, imported
+                imported_text = "\n".join(item.text for item in imported.content if item.type == "text")
+                assert "[OK]" in imported_text, imported_text
+                manifest = json.loads((imported_index / "manifest.json").read_text())
+                assert str(external_bus.resolve()) not in manifest["sources"], manifest
+
+                outside_index = Path(tmp) / "outside-index"
+                outside_env = os.environ.copy()
+                outside_env.pop("HARC_GRAPH_ALLOWED_ROOTS", None)
+                subprocess.run(
+                    [str(harc_bin.resolve()), "graph", "index", str(external_bus), "--out", str(outside_index)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=outside_env,
+                )
+                rejected = await session.call_tool(
+                    "harc_graph_query",
+                    {"query": "BusAxiLite", "index": str(outside_index)},
+                )
+                rejected_text = "\n".join(item.text for item in rejected.content if item.type == "text")
+                assert "outside allowed roots" in rejected_text, rejected_text
+    external.cleanup()
     print("MCP stdio graph smoke passed")
 
 

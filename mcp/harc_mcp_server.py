@@ -36,6 +36,7 @@ def _workspace_roots_from_env() -> list[pathlib.Path]:
 
 
 WORKSPACE_ROOTS = _workspace_roots_from_env()
+os.environ["HARC_GRAPH_ALLOWED_ROOTS"] = os.pathsep.join(str(root) for root in WORKSPACE_ROOTS)
 HARC_BIN = os.environ.get("HARC_BIN", str(PROJECT_ROOT / "target" / "release" / "harc"))
 
 _INSTRUCTIONS = (SCRIPT_DIR / "instructions.md").read_text()
