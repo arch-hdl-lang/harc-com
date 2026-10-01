@@ -58,6 +58,23 @@ async def smoke(harc_bin: Path) -> None:
                 assert not user.isError, user
                 user_text = "\n".join(item.text for item in user.content if item.type == "text")
                 assert "AxilXactor" in user_text, user_text
+
+                custom_source = Path(tmp) / "custom.harc"
+                custom_index = Path(tmp) / "custom-index"
+                custom_source.write_text("module CustomFirst kind verilator\nend module CustomFirst\n")
+                indexed = await session.call_tool(
+                    "harc_graph_index",
+                    {"paths": [str(custom_source)], "out": str(custom_index)},
+                )
+                assert not indexed.isError, indexed
+                custom_source.write_text("module CustomSecond kind verilator\nend module CustomSecond\n")
+                refreshed = await session.call_tool(
+                    "harc_graph_context",
+                    {"task": "CustomSecond", "index": str(custom_index)},
+                )
+                assert not refreshed.isError, refreshed
+                refreshed_text = "\n".join(item.text for item in refreshed.content if item.type == "text")
+                assert "CustomSecond" in refreshed_text, refreshed_text
     print("MCP stdio graph smoke passed")
 
 

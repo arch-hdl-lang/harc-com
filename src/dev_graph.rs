@@ -11,6 +11,10 @@ use syn::{ImplItem, Item};
 
 const SCHEMA_VERSION: u32 = 1;
 
+fn generator_id() -> String {
+    format!("harc {} graph {}", env!("CARGO_PKG_VERSION"), env!("HARC_GRAPH_GENERATOR_ID"))
+}
+
 #[derive(Debug, Deserialize)]
 struct FeatureMap {
     schema_version: u32,
@@ -269,7 +273,7 @@ pub fn index(root: &Path, map_path: &Path, out: &Path) -> io::Result<DevStats> {
     write_jsonl(&out.join("edges.jsonl"), edges.iter())?;
     let manifest = Manifest {
         schema_version: SCHEMA_VERSION,
-        generator: format!("harc {}", env!("CARGO_PKG_VERSION")),
+        generator: generator_id(),
         source_revision: revision(&root),
         sources,
     };
@@ -318,9 +322,9 @@ pub fn query(
     roles: &[String],
 ) -> io::Result<String> {
     let manifest: Manifest = serde_json::from_slice(&fs::read(index_dir.join("manifest.json"))?)?;
-    if manifest.schema_version != SCHEMA_VERSION {
+    if manifest.schema_version != SCHEMA_VERSION || manifest.generator != generator_id() {
         return Err(invalid(
-            "developer graph schema changed; rebuild with harc graph dev-index",
+            "developer graph schema or generator changed; rebuild with harc graph dev-index",
         ));
     }
     for (relative, expected) in &manifest.sources {
@@ -454,6 +458,15 @@ mod tests {
         assert!(!parser_only.contains("lower_transactor"));
         assert!(!parser_only.contains("mcp_guidance"));
         assert!(query(root, &out, "transactor", 20, 100, &["not_a_role".into()]).is_err());
+        let manifest_path = out.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["generator"] = "older compiler".into();
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(query(root, &out, "transactor", 20, 100, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("generator changed"));
         let _ = fs::remove_dir_all(out);
     }
 

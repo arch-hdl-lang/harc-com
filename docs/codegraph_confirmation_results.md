@@ -20,6 +20,12 @@ edit patches, and the freeze metadata are at
 unique task/repeat/condition keys, one source hash, one task hash, and no
 routing violations.
 
+An independent-review follow-up audited raw command events for all 66 runs
+that required graph discovery: every run's first completed command was a
+successful graph command. The benchmark harness now enforces that stricter
+condition for future runs. This audit did not change the frozen rubric or
+rescore the published results.
+
 ## Primary outcome
 
 The primary metric is provider-reported input plus output tokens divided by
