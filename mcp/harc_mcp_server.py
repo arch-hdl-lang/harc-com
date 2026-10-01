@@ -8,6 +8,7 @@ docs/fixtures, running the compiler, and querying the local learning store.
 from __future__ import annotations
 
 import os
+import json
 import pathlib
 import re
 import subprocess
@@ -432,12 +433,23 @@ def harc_graph_context(task: str, index: str = ".harcgraph", limit: int = 20, to
         cmd.extend(["--node-kind", kind])
     for kind in edge_kinds or []:
         cmd.extend(["--edge-kind", kind])
+    manifest = index_path / "manifest.json"
     if source_paths is not None:
         inputs = [_resolve_safe(path) for path in source_paths]
+    elif manifest.exists():
+        try:
+            saved_inputs = json.loads(manifest.read_text())["inputs"]
+            inputs = [_resolve_safe(path) for path in saved_inputs]
+        except (OSError, ValueError, KeyError, TypeError):
+            inputs = []
+        if not inputs and index_path != PROJECT_ROOT / ".harcgraph":
+            return "[ERROR] Custom graph index lacks recorded source paths; provide source_paths to rebuild it."
     elif root == PROJECT_ROOT:
         inputs = [PROJECT_ROOT / "tests/fixtures", PROJECT_ROOT / "tests/dut"]
     else:
         inputs = []
+    if not inputs and index_path == PROJECT_ROOT / ".harcgraph":
+        inputs = [PROJECT_ROOT / "tests/fixtures", PROJECT_ROOT / "tests/dut"]
     rebuild = [HARC_BIN, "graph", "index", *map(str, inputs), "--out", str(index_path)] if inputs else None
     return _graph_query_with_refresh(cmd, index_path, rebuild, timeout, root, "rebuild with harc graph index")
 

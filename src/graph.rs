@@ -23,7 +23,13 @@ struct GraphManifest {
     schema_version: u32,
     generator: String,
     source_revision: Option<String>,
+    inputs: Vec<String>,
+    discovered: Vec<String>,
     sources: BTreeMap<String, String>,
+}
+
+fn generator_id() -> String {
+    format!("harc {} graph {}", env!("CARGO_PKG_VERSION"), env!("HARC_GRAPH_GENERATOR_ID"))
 }
 
 #[derive(Debug, Default)]
@@ -161,6 +167,17 @@ pub fn index_paths(inputs: &[PathBuf], out_dir: &Path) -> std::io::Result<IndexS
     harc_paths.dedup();
     dut_paths.sort();
     dut_paths.dedup();
+    let inputs = inputs
+        .iter()
+        .map(|path| path.canonicalize().map(|path| path.to_string_lossy().to_string()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let discovered = harc_paths
+        .iter()
+        .chain(dut_paths.iter())
+        .map(|path| path.canonicalize().map(|path| path.to_string_lossy().to_string()))
+        .collect::<std::io::Result<BTreeSet<_>>>()?
+        .into_iter()
+        .collect();
 
     for path in &dut_paths {
         let display = display_path(path);
@@ -266,9 +283,11 @@ pub fn index_paths(inputs: &[PathBuf], out_dir: &Path) -> std::io::Result<IndexS
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
     let manifest = GraphManifest {
-        schema_version: 1,
-        generator: format!("harc {}", env!("CARGO_PKG_VERSION")),
+        schema_version: 2,
+        generator: generator_id(),
         source_revision,
+        inputs,
+        discovered,
         sources,
     };
     fs::write(
@@ -355,10 +374,28 @@ fn check_freshness(index_dir: &Path) -> std::io::Result<()> {
         ));
     }
     let manifest: GraphManifest = serde_json::from_slice(&fs::read(path)?)?;
-    if manifest.schema_version != 1 {
+    if manifest.schema_version != 2 || manifest.generator != generator_id() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "graph schema changed; rebuild with harc graph index",
+            "graph schema or generator changed; rebuild with harc graph index",
+        ));
+    }
+    let mut harc_paths = Vec::new();
+    let mut dut_paths = Vec::new();
+    for input in &manifest.inputs {
+        collect_paths(Path::new(input), &mut harc_paths, &mut dut_paths)?;
+    }
+    let discovered = harc_paths
+        .iter()
+        .chain(dut_paths.iter())
+        .map(|path| path.canonicalize().map(|path| path.to_string_lossy().to_string()))
+        .collect::<std::io::Result<BTreeSet<_>>>()?
+        .into_iter()
+        .collect::<Vec<_>>();
+    if discovered != manifest.discovered {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "graph source set changed; rebuild with harc graph index",
         ));
     }
     for (path, expected) in manifest.sources {
@@ -2852,6 +2889,26 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("rebuild"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn query_rejects_new_directory_source_and_old_generator() {
+        let base = std::env::temp_dir().join(format!("harc-graph-set-{}", std::process::id()));
+        let inputs = base.join("inputs");
+        fs::create_dir_all(&inputs).unwrap();
+        fs::write(inputs.join("first.harc"), "module First kind verilator\nend module First\n").unwrap();
+        let out = base.join("index");
+        index_paths(&[inputs.clone()], &out).unwrap();
+        assert!(query(&out, "First", 5).is_ok());
+        fs::write(inputs.join("second.harc"), "module Second kind verilator\nend module Second\n").unwrap();
+        assert!(query(&out, "First", 5).unwrap_err().to_string().contains("source set changed"));
+        fs::remove_file(inputs.join("second.harc")).unwrap();
+        let manifest_path = out.join(MANIFEST_JSON);
+        let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["generator"] = "older compiler".into();
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(query(&out, "First", 5).unwrap_err().to_string().contains("generator changed"));
         let _ = fs::remove_dir_all(base);
     }
 }
