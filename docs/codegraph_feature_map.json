@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "common_links": [
+    {"role": "spec", "path": "spec.md"},
+    {"role": "skill", "path": "skills/harc-programming/SKILL.md"},
+    {"role": "mcp_guidance", "path": "mcp/instructions.md"}
+  ],
+  "features": [
+    {
+      "name": "test",
+      "links": [
+        {"role": "ast", "path": "src/ast.rs", "symbol": "TestDecl"},
+        {"role": "parser", "path": "src/parser.rs", "symbol": "parse_test"},
+        {"role": "lowerer", "path": "src/ir/lower/mod.rs", "symbol": "lower_test"},
+        {"role": "ir", "path": "src/ir/mod.rs", "symbol": "TbFunction"},
+        {"role": "backend", "path": "src/codegen/tbir/mod.rs", "symbol": "emit_test"},
+        {"role": "fixture", "path": "tests/fixtures/transaction_basic_test.harc"}
+      ]
+    },
+    {
+      "name": "transaction",
+      "links": [
+        {"role": "ast", "path": "src/ast.rs", "symbol": "TransactionDecl"},
+        {"role": "parser", "path": "src/parser.rs", "symbol": "parse_transaction"},
+        {"role": "lowerer", "path": "src/ir/lower/records.rs", "symbol": "lower_transaction"},
+        {"role": "ir", "path": "src/ir/mod.rs", "symbol": "RecordSchema"},
+        {"role": "backend", "path": "src/codegen/cpp_tb.rs", "symbol": "emit_transaction"},
+        {"role": "fixture", "path": "tests/fixtures/transaction_basic_test.harc"}
+      ]
+    },
+    {
+      "name": "transactor",
+      "links": [
+        {"role": "ast", "path": "src/ast.rs", "symbol": "TransactorDecl"},
+        {"role": "parser", "path": "src/parser.rs", "symbol": "parse_transactor"},
+        {"role": "lowerer", "path": "src/ir/lower/transactors.rs", "symbol": "lower_transactor"},
+        {"role": "semantic_check", "path": "src/ir/verify.rs", "symbol": "check_transactor_call"},
+        {"role": "ir", "path": "src/ir/mod.rs", "symbol": "TransactorSchema"},
+        {"role": "backend", "path": "src/codegen/cpp_tb.rs", "symbol": "synth_component_from_transactor"},
+        {"role": "fixture", "path": "tests/fixtures/transactor_active_test.harc"}
+      ]
+    },
+    {
+      "name": "scoreboard",
+      "links": [
+        {"role": "ast", "path": "src/ast.rs", "symbol": "ComponentKind::Scoreboard"},
+        {"role": "parser", "path": "src/parser.rs", "symbol": "parse_component"},
+        {"role": "lowerer", "path": "src/ir/lower/scoreboards.rs", "symbol": "lower_scoreboard"},
+        {"role": "semantic_check", "path": "src/ir/verify.rs", "symbol": "check_scoreboard"},
+        {"role": "ir", "path": "src/ir/mod.rs", "symbol": "ScoreboardSchema"},
+        {"role": "fixture", "path": "tests/fixtures/scoreboard_basic_test.harc"}
+      ]
+    },
+    {
+      "name": "covergroup",
+      "links": [
+        {"role": "ast", "path": "src/ast.rs", "symbol": "CovergroupDecl"},
+        {"role": "parser", "path": "src/parser.rs", "symbol": "parse_covergroup"},
+        {"role": "lowerer", "path": "src/ir/lower/covergroups.rs", "symbol": "lower_covergroup"},
+        {"role": "semantic_check", "path": "src/ir/verify.rs", "symbol": "check_cover_schema"},
+        {"role": "ir", "path": "src/ir/mod.rs", "symbol": "CovgroupSchema"},
+        {"role": "backend", "path": "src/codegen/cpp_tb.rs", "symbol": "emit_covergroup_struct"},
+        {"role": "fixture", "path": "tests/fixtures/covergroup_hook_trigger_test.harc"}
+      ]
+    },
+    {
+      "name": "regblock",
+      "links": [
+        {"role": "ast", "path": "src/ast.rs", "symbol": "RegblockDecl"},
+        {"role": "parser", "path": "src/parser.rs", "symbol": "parse_regblock"},
+        {"role": "lowerer", "path": "src/ir/lower/regblock.rs", "symbol": "lower_regblock"},
+        {"role": "semantic_check", "path": "src/ir/lower/stmts.rs", "symbol": "regblock_instantiation_error"},
+        {"role": "ir", "path": "src/ir/mod.rs", "symbol": "RegblockSchema"},
+        {"role": "fixture", "path": "tests/fixtures/regblock_addrmap_test.harc"}
+      ]
+    },
+    {
+      "name": "addrmap",
+      "links": [
+        {"role": "ast", "path": "src/ast.rs", "symbol": "AddrmapDecl"},
+        {"role": "parser", "path": "src/parser.rs", "symbol": "parse_addrmap"},
+        {"role": "lowerer", "path": "src/ir/lower/addrmap.rs", "symbol": "lower_addrmap_read_expr"},
+        {"role": "semantic_check", "path": "src/ir/lower/addrmap.rs", "symbol": "reject_out_of_subset_addrmap_access"},
+        {"role": "fixture", "path": "tests/fixtures/regblock_addrmap_test.harc"}
+      ]
+    },
+    {
+      "name": "randomize",
+      "links": [
+        {"role": "lowerer", "path": "src/ir/lower/stmts.rs", "symbol": "lower_randomize"},
+        {"role": "backend", "path": "src/codegen/cpp_tb.rs", "symbol": "emit_randomize_for_site"},
+        {"role": "fixture", "path": "tests/fixtures/transaction_basic_test.harc"}
+      ]
+    },
+    {
+      "name": "bind",
+      "links": [
+        {"role": "parser", "path": "src/parser.rs", "symbol": "parse_bind_remap_entry"},
+        {"role": "lowerer", "path": "src/ir/lower/bus.rs", "symbol": "lower_bus_binding"},
+        {"role": "fixture", "path": "tests/fixtures/tlm_bind_remap_test.harc"},
+        {"role": "dut", "path": "tests/dut/top_counter.sv"}
+      ]
+    },
+    {
+      "name": "function",
+      "links": [
+        {"role": "parser", "path": "src/parser.rs", "symbol": "parse_function"},
+        {"role": "ir", "path": "src/ir/mod.rs", "symbol": "TbFunction"},
+        {"role": "backend", "path": "src/codegen/tbir/func.rs", "symbol": "emit_function"},
+        {"role": "fixture", "path": "tests/fixtures/testbench_probe_dut_test.harc"}
+      ]
+    }
+  ]
+}

@@ -1,4 +1,8 @@
 /target
+/.harcgraph/
+/.harcdevgraph/
+__pycache__/
+*.pyc
 /arch_sim_build/
 /harc_sim_build
 /harc_sim_build*/

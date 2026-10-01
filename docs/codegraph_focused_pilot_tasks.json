@@ -1,0 +1,40 @@
+{
+  "repo_sha": "c3ca30da",
+  "status": "focused_pilot_not_confirmation",
+  "tasks": [
+    {
+      "id": "user_dut_lookup_focused",
+      "task_class": "user",
+      "task_type": "lookup",
+      "prompt": "Which HARC test declares TopCounterTest for the top_counter SystemVerilog DUT? Return the test name and source path.",
+      "required": ["TopCounterTest", "tests/fixtures/top_counter_test.harc"],
+      "graph_hint": "harc graph tests-for top_counter --index .harcgraph"
+    },
+    {
+      "id": "user_transactor_impact_focused",
+      "task_class": "user",
+      "task_type": "impact",
+      "prompt": "Identify a shipped HARC fixture declaring AxilXactor and the bus type it binds. Return the fixture path and bus type.",
+      "required": ["BusAxiLite"],
+      "required_any": [["tests/fixtures/transactor_active_test.harc", "tests/fixtures/axilite_bound_mon_test.harc"]],
+      "graph_hint": "harc graph context AxilXactor --index .harcgraph --node-kind transactor --edge-kind binds_bus --limit 1 --token-budget 100"
+    },
+    {
+      "id": "compiler_parser_lookup_focused",
+      "task_class": "compiler",
+      "task_type": "lookup",
+      "prompt": "Where is the Rust parser entry point for a HARC transactor declaration? Return the function and source path.",
+      "required": ["parse_transactor", "src/parser.rs"],
+      "graph_hint": "harc graph dev-query 'transactor parser' --index .harcdevgraph --roles parser --token-budget 100"
+    },
+    {
+      "id": "compiler_regblock_impact_focused",
+      "task_class": "compiler",
+      "task_type": "impact",
+      "prompt": "Identify the AST, parser, and lowerer paths for HARC regblock support, plus a validating fixture.",
+      "required": ["src/ast.rs", "src/parser.rs", "src/ir/lower/regblock.rs"],
+      "required_any": [["regblock_addrmap_test.harc", "regblock_basic_test.harc", "regblock_subset_test.harc"]],
+      "graph_hint": "harc graph dev-query regblock --index .harcdevgraph --roles ast,parser,lowerer,fixture --token-budget 350"
+    }
+  ]
+}

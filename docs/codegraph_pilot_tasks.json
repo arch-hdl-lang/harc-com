@@ -1,0 +1,38 @@
+{
+  "repo_sha": "c3ca30da",
+  "status": "pilot_only_not_confirmation",
+  "tasks": [
+    {
+      "id": "user_dut_lookup_1",
+      "task_class": "user",
+      "task_type": "lookup",
+      "prompt": "Which HARC test exercises the top_counter SystemVerilog DUT? Return the test name and source path.",
+      "required": ["TopCounterTest", "tests/fixtures/top_counter_test.harc"],
+      "graph_hint": "harc graph tests-for top_counter --index .harcgraph"
+    },
+    {
+      "id": "user_transactor_impact_1",
+      "task_class": "user",
+      "task_type": "impact",
+      "prompt": "Find a shipped HARC fixture that uses AxilXactor and identify the bus type it binds.",
+      "required": ["tests/fixtures/transactor_active_test.harc", "BusAxiLite"],
+      "graph_hint": "harc graph context AxilXactor --index .harcgraph --token-budget 300"
+    },
+    {
+      "id": "compiler_parser_lookup_1",
+      "task_class": "compiler",
+      "task_type": "lookup",
+      "prompt": "Where is the Rust parser entry point for a HARC transactor declaration? Return the function and source path.",
+      "required": ["parse_transactor", "src/parser.rs"],
+      "graph_hint": "harc graph dev-query 'transactor parser' --index .harcdevgraph"
+    },
+    {
+      "id": "compiler_regblock_impact_1",
+      "task_class": "compiler",
+      "task_type": "impact",
+      "prompt": "Identify the AST, parser, and lowerer paths for HARC regblock support, plus a validating fixture.",
+      "required": ["RegblockDecl", "parse_regblock", "lower_regblock", "regblock_addrmap_test.harc"],
+      "graph_hint": "harc graph dev-query regblock --index .harcdevgraph"
+    }
+  ]
+}
