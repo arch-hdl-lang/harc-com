@@ -25,7 +25,9 @@ struct GraphManifest {
     source_revision: Option<String>,
     inputs: Vec<String>,
     discovered: Vec<String>,
-    missing_import_candidates: Vec<String>,
+    import_probes: BTreeMap<String, Option<String>>,
+    import_search_path: Option<String>,
+    allowed_roots: Option<String>,
     sources: BTreeMap<String, String>,
 }
 
@@ -238,19 +240,22 @@ pub fn index_paths(inputs: &[PathBuf], out_dir: &Path) -> std::io::Result<IndexS
     }
 
     let cwd = std::env::current_dir()?;
-    let missing_import_candidates = import_candidates(&parsed)
+    let import_probes = import_candidates(&parsed)
         .into_iter()
-        .filter(|path| !path.exists())
         .map(|path| {
-            if path.is_absolute() {
+            let absolute = if path.is_absolute() {
                 path
             } else {
                 cwd.join(path)
-            }
-            .to_string_lossy()
-            .to_string()
+            };
+            let fingerprint = if absolute.exists() && allowed_graph_source(&absolute)? {
+                fs::read(&absolute).ok().map(|bytes| dev_graph::digest(&bytes))
+            } else {
+                None
+            };
+            Ok((absolute.to_string_lossy().to_string(), fingerprint))
         })
-        .collect();
+        .collect::<std::io::Result<BTreeMap<_, _>>>()?;
     let imported = resolve_imported_bus_files(&parsed, &mut issues);
     parsed.extend(imported);
 
@@ -298,12 +303,14 @@ pub fn index_paths(inputs: &[PathBuf], out_dir: &Path) -> std::io::Result<IndexS
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
     let manifest = GraphManifest {
-        schema_version: 3,
+        schema_version: 4,
         generator: generator_id(),
         source_revision,
         inputs,
         discovered,
-        missing_import_candidates,
+        import_probes,
+        import_search_path: std::env::var("HARC_LIB_PATH").ok(),
+        allowed_roots: std::env::var("HARC_GRAPH_ALLOWED_ROOTS").ok(),
         sources,
     };
     fs::write(
@@ -390,7 +397,7 @@ fn check_freshness(index_dir: &Path) -> std::io::Result<()> {
         ));
     }
     let manifest: GraphManifest = serde_json::from_slice(&fs::read(path)?)?;
-    if manifest.schema_version != 3 || manifest.generator != generator_id() {
+    if manifest.schema_version != 4 || manifest.generator != generator_id() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "graph schema or generator changed; rebuild with harc graph index",
@@ -414,15 +421,27 @@ fn check_freshness(index_dir: &Path) -> std::io::Result<()> {
             "graph source set changed; rebuild with harc graph index",
         ));
     }
-    if manifest
-        .missing_import_candidates
-        .iter()
-        .any(|path| Path::new(path).exists())
+    if manifest.import_search_path != std::env::var("HARC_LIB_PATH").ok()
+        || manifest.allowed_roots != std::env::var("HARC_GRAPH_ALLOWED_ROOTS").ok()
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "graph import set changed; rebuild with harc graph index",
+            "graph import search path changed; rebuild with harc graph index",
         ));
+    }
+    for (path, expected) in &manifest.import_probes {
+        let path = Path::new(path);
+        let actual = if path.exists() && allowed_graph_source(path)? {
+            fs::read(path).ok().map(|bytes| dev_graph::digest(&bytes))
+        } else {
+            None
+        };
+        if &actual != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "graph import set changed; rebuild with harc graph index",
+            ));
+        }
     }
     for (path, expected) in manifest.sources {
         let allowed = allowed_graph_source(Path::new(&path)).map_err(|_| {
@@ -3024,6 +3043,26 @@ mod tests {
         let stdlib = base.join("stdlib");
         fs::create_dir_all(&stdlib).unwrap();
         fs::write(stdlib.join("NewBus.arch"), "bus NewBus\nend bus NewBus\n").unwrap();
+        assert!(query(&out, "Importer", 5)
+            .unwrap_err()
+            .to_string()
+            .contains("import set changed"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn query_rejects_repaired_import_candidate() {
+        let base = std::env::temp_dir().join(format!("harc-graph-repair-{}", std::process::id()));
+        let stdlib = base.join("stdlib");
+        fs::create_dir_all(&stdlib).unwrap();
+        let bus = stdlib.join("NewBus.arch");
+        fs::write(&bus, "bus NewBus\n").unwrap();
+        let input = base.join("importer.harc");
+        fs::write(&input, "use NewBus\nmodule Importer kind verilator\nend module Importer\n").unwrap();
+        let out = base.join("index");
+        index_paths(&[input], &out).unwrap();
+        assert!(query(&out, "Importer", 5).is_ok());
+        fs::write(&bus, "bus NewBus\nend bus NewBus\n").unwrap();
         assert!(query(&out, "Importer", 5)
             .unwrap_err()
             .to_string()
