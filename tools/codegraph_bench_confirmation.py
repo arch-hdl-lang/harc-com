@@ -117,7 +117,7 @@ def grade(task: dict, answer: str, work: Path, before: dict[str, str | None], ha
     return len(changed) == len(before) and not missing_markers and all(check["passed"] for check in checks), rubric
 
 
-def run_one(task: dict, condition: str, repeat: int, frozen: Path, repo: Path, output: Path, metadata: dict, harc: Path) -> dict:
+def run_one(task: dict, condition: str, repeat: int, frozen: Path, repo: Path, output: Path, metadata: dict, harc: Path, grader=None) -> dict:
     run_id = f"{task['id']}-r{repeat}-{condition}"
     raw_path = output / f"{run_id}.jsonl"
     stderr_path = output / f"{run_id}.stderr.txt"
@@ -146,7 +146,7 @@ def run_one(task: dict, condition: str, repeat: int, frozen: Path, repo: Path, o
         usage = [event["usage"] for event in events if event.get("type") == "turn.completed"]
         answers = [event["item"]["text"] for event in events if event.get("type") == "item.completed" and event.get("item", {}).get("type") == "agent_message"]
         answer = answers[-1] if answers else ""
-        rubric_ok, rubric = grade(task, answer, work, before, harc, target_dir)
+        rubric_ok, rubric = (grader or grade)(task, answer, work, before, harc, target_dir)
         graph_chars = 0
         other_chars = 0
         tool_calls = 0
