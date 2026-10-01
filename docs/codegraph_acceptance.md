@@ -65,14 +65,17 @@ the parser, lowerer, IR schema, backend, AST, semantic check, and fixture locati
 context query returned `AxilXactor` and its `binds_bus` edge within a
 100-token response budget.
 
-Compiler regressions: all 174 library tests and three `check_cli` tests
+Compiler regressions: all 175 library tests and 21 binary tests
 passed. `harc check` and `harc dump-ir` passed on
 `transactor_active_test.harc`; emit-only generated the C++ testbench; the
 full `harc sim --sv tests/dut/AxiLiteRegs.sv` run passed all tests at cycle
 98. The HTML graph command wrote a viewer successfully. The benchmark
 analyzer's three unit tests also passed. The MCP stdio smoke test initialized
 a client session, listed graph tools, and queried both graph types through
-fresh indexes, exercising automatic index creation. The MCP dependency is
+fresh indexes, exercising automatic index creation. It also refreshed a
+stale custom index from its recorded source path, without replacing it with
+the default fixture corpus. Source-set and generator-change tests reject
+stale indexes. The MCP dependency is
 constrained to 1.x because the server uses FastMCP.
 
 The frozen paired token-efficiency experiment is reported in

@@ -151,9 +151,12 @@ def run_one(task: dict, condition: str, repeat: int, frozen: Path, repo: Path, o
         other_chars = 0
         tool_calls = 0
         graph_calls = 0
+        first_command = None
         for event in events:
             item = event.get("item", {})
             if event.get("type") == "item.completed" and item.get("type") == "command_execution":
+                if first_command is None:
+                    first_command = item
                 tool_calls += 1
                 chars = len(item.get("aggregated_output", ""))
                 if " graph " in item.get("command", ""):
@@ -162,7 +165,8 @@ def run_one(task: dict, condition: str, repeat: int, frozen: Path, repo: Path, o
                 else:
                     other_chars += chars
         protocol_ok = (graph_calls == 0 if condition == "baseline" or task.get("known_files")
-                       else graph_calls > 0)
+                       else first_command is not None and " graph " in first_command.get("command", "")
+                       and first_command.get("exit_code") == 0)
         return {
             "task_id": task["id"], "task_class": task["task_class"], "task_type": task["task_type"],
             "repeat": repeat, "condition": condition, "model": task["model"], "effort": task["effort"],
