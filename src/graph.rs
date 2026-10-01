@@ -25,6 +25,7 @@ struct GraphManifest {
     source_revision: Option<String>,
     inputs: Vec<String>,
     discovered: Vec<String>,
+    missing_import_candidates: Vec<String>,
     sources: BTreeMap<String, String>,
 }
 
@@ -236,6 +237,20 @@ pub fn index_paths(inputs: &[PathBuf], out_dir: &Path) -> std::io::Result<IndexS
         }
     }
 
+    let cwd = std::env::current_dir()?;
+    let missing_import_candidates = import_candidates(&parsed)
+        .into_iter()
+        .filter(|path| !path.exists())
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+            .to_string_lossy()
+            .to_string()
+        })
+        .collect();
     let imported = resolve_imported_bus_files(&parsed, &mut issues);
     parsed.extend(imported);
 
@@ -283,11 +298,12 @@ pub fn index_paths(inputs: &[PathBuf], out_dir: &Path) -> std::io::Result<IndexS
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
     let manifest = GraphManifest {
-        schema_version: 2,
+        schema_version: 3,
         generator: generator_id(),
         source_revision,
         inputs,
         discovered,
+        missing_import_candidates,
         sources,
     };
     fs::write(
@@ -374,7 +390,7 @@ fn check_freshness(index_dir: &Path) -> std::io::Result<()> {
         ));
     }
     let manifest: GraphManifest = serde_json::from_slice(&fs::read(path)?)?;
-    if manifest.schema_version != 2 || manifest.generator != generator_id() {
+    if manifest.schema_version != 3 || manifest.generator != generator_id() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "graph schema or generator changed; rebuild with harc graph index",
@@ -396,6 +412,16 @@ fn check_freshness(index_dir: &Path) -> std::io::Result<()> {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "graph source set changed; rebuild with harc graph index",
+        ));
+    }
+    if manifest
+        .missing_import_candidates
+        .iter()
+        .any(|path| Path::new(path).exists())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "graph import set changed; rebuild with harc graph index",
         ));
     }
     for (path, expected) in manifest.sources {
@@ -2194,41 +2220,21 @@ fn resolve_imported_bus_files(
     parsed: &[ParsedFile],
     issues: &mut Vec<IndexIssue>,
 ) -> Vec<ParsedFile> {
+    let candidates = import_candidates(parsed);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
     let mut wanted = BTreeSet::new();
     for file in parsed {
         collect_use_names(&file.ast.items, &mut wanted);
     }
-    if wanted.is_empty() {
-        return Vec::new();
-    }
-
-    let mut search_dirs = Vec::new();
-    if let Ok(raw) = std::env::var("HARC_LIB_PATH") {
-        for part in raw.split(':').filter(|p| !p.is_empty()) {
-            search_dirs.push(PathBuf::from(part));
-        }
-    }
-    search_dirs.push(PathBuf::from("stdlib"));
-    for file in parsed {
-        let base = Path::new(&file.display)
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        search_dirs.push(base.join("stdlib"));
-        search_dirs.push(base.join("../arch-com/stdlib"));
-        search_dirs.push(base.join("../arch-com/examples"));
-    }
-    search_dirs.sort();
-    search_dirs.dedup();
+    let search_dirs = import_search_dirs(parsed);
 
     let mut imported = Vec::new();
     let mut seen_paths = BTreeSet::new();
     for name in wanted {
         for dir in &search_dirs {
-            let candidates = [
-                dir.join(format!("{name}.harc")),
-                dir.join(format!("{name}.arch")),
-            ];
+            let candidates = [dir.join(format!("{name}.harc")), dir.join(format!("{name}.arch"))];
             let Some(path) = candidates
                 .into_iter()
                 .find(|p| p.exists() && allowed_graph_source(p).unwrap_or(false))
@@ -2293,6 +2299,44 @@ fn resolve_imported_bus_files(
         }
     }
     imported
+}
+
+fn import_search_dirs(parsed: &[ParsedFile]) -> Vec<PathBuf> {
+    let mut search_dirs = Vec::new();
+    if let Ok(raw) = std::env::var("HARC_LIB_PATH") {
+        for part in raw.split(':').filter(|p| !p.is_empty()) {
+            search_dirs.push(PathBuf::from(part));
+        }
+    }
+    search_dirs.push(PathBuf::from("stdlib"));
+    for file in parsed {
+        let base = Path::new(&file.display)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        search_dirs.push(base.join("stdlib"));
+        search_dirs.push(base.join("../arch-com/stdlib"));
+        search_dirs.push(base.join("../arch-com/examples"));
+    }
+    search_dirs.sort();
+    search_dirs.dedup();
+    search_dirs
+}
+
+fn import_candidates(parsed: &[ParsedFile]) -> BTreeSet<PathBuf> {
+    let mut wanted = BTreeSet::new();
+    for file in parsed {
+        collect_use_names(&file.ast.items, &mut wanted);
+    }
+    let search_dirs = import_search_dirs(parsed);
+    let mut candidates = BTreeSet::new();
+    for name in wanted {
+        for dir in &search_dirs {
+            candidates.insert(dir.join(format!("{name}.harc")));
+            candidates.insert(dir.join(format!("{name}.arch")));
+        }
+    }
+    candidates
 }
 
 fn collect_use_names(items: &[Item], out: &mut BTreeSet<String>) {
@@ -2965,6 +3009,25 @@ mod tests {
         assert!(!query(&out, "Inside", 5).unwrap().contains("Outside"));
         let manifest: GraphManifest = serde_json::from_slice(&fs::read(out.join(MANIFEST_JSON)).unwrap()).unwrap();
         assert_eq!(manifest.discovered.len(), 1);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn query_rejects_newly_available_import() {
+        let base = std::env::temp_dir().join(format!("harc-graph-import-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        let input = base.join("importer.harc");
+        fs::write(&input, "use NewBus\nmodule Importer kind verilator\nend module Importer\n").unwrap();
+        let out = base.join("index");
+        index_paths(&[input], &out).unwrap();
+        assert!(query(&out, "Importer", 5).is_ok());
+        let stdlib = base.join("stdlib");
+        fs::create_dir_all(&stdlib).unwrap();
+        fs::write(stdlib.join("NewBus.arch"), "bus NewBus\nend bus NewBus\n").unwrap();
+        assert!(query(&out, "Importer", 5)
+            .unwrap_err()
+            .to_string()
+            .contains("import set changed"));
         let _ = fs::remove_dir_all(base);
     }
 }
