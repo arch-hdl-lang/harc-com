@@ -1,0 +1,60 @@
+{
+  "status": "frozen_before_scored_runs",
+  "repeats": 3,
+  "tasks": [
+    {
+      "id": "sim01_register_overwrite",
+      "task_class": "user",
+      "task_type": "change",
+      "model": "gpt-6-sol",
+      "effort": "low",
+      "prompt": "In the shipped AxiLiteRegsTest, extend the MM2S_SA register scenario: after its existing 4096 write/readback, overwrite address 24 with 8192, read it back, and assert the new value is 8192. Keep the other register scenarios and diagnostics intact. Run the full SystemVerilog-backed simulation.",
+      "graph_hint": "harc graph query AxiLiteRegsTest --index .harcgraph --limit 5",
+      "expected_files": ["tests/fixtures/axilite_regs_test.harc"],
+      "must_add": {"tests/fixtures/axilite_regs_test.harc": ["axil_write(dut, 24, 8192)", "axil_read(dut, 24)", "== 8192"]},
+      "checks": [["{HARC_BIN}", "sim", "--sv", "tests/dut/AxiLiteRegs.sv", "tests/fixtures/axilite_regs_test.harc", "--top", "AxiLiteRegs", "--test", "AxiLiteRegsTest", "--outdir", ".bench_sim/register"]]
+    },
+    {
+      "id": "sim02_scoreboard_four_rounds",
+      "task_class": "user",
+      "task_type": "change",
+      "model": "gpt-6-sol",
+      "effort": "low",
+      "prompt": "In the shipped scoreboard-backed Top counter test, exercise four increasing enable runs instead of three (bumps 1, 2, 3, 4). Preserve queue push/pop comparisons, update the end-of-test write/read count, and assert the final DUT count is 10. Run the full SystemVerilog-backed simulation.",
+      "graph_hint": "harc graph context 'scoreboard basic counter Top' --index .harcgraph --limit 8 --token-budget 350",
+      "expected_files": ["tests/fixtures/scoreboard_basic_test.harc"],
+      "must_add": {"tests/fixtures/scoreboard_basic_test.harc": ["for i in 0 .. 3", "sb.writes == 4", "dut.count_out == 10"]},
+      "checks": [["{HARC_BIN}", "sim", "--sv", "tests/dut/top_counter.sv", "tests/fixtures/scoreboard_basic_test.harc", "--top", "Top", "--test", "ScoreboardBasicTest", "--outdir", ".bench_sim/scoreboard"]]
+    },
+    {
+      "id": "sim03_known_transactor_six",
+      "task_class": "user",
+      "task_type": "change",
+      "model": "gpt-6-sol",
+      "effort": "low",
+      "prompt": "In tests/fixtures/transactor_active_test.harc, dispatch six transactions through the active transactor instead of five. Preserve the final readback comparison, assert the expected-value queue is empty after draining it, and update the success log to reflect six. Adjust drain time only if needed. Run the full SystemVerilog-backed simulation.",
+      "known_files": true,
+      "expected_files": ["tests/fixtures/transactor_active_test.harc"],
+      "must_add": {"tests/fixtures/transactor_active_test.harc": ["RandomTxns(6)", "sb.expected.empty()", "PASS: 6 transactions"]},
+      "checks": [["{HARC_BIN}", "sim", "--sv", "tests/dut/AxiLiteRegs.sv", "tests/fixtures/transactor_active_test.harc", "--top", "AxiLiteRegs", "--test", "TransactorActiveTest", "--outdir", ".bench_sim/transactor"]]
+    },
+    {
+      "id": "sim04_counter_post_reset_hold",
+      "task_class": "user",
+      "task_type": "change",
+      "model": "gpt-6-luna",
+      "effort": "low",
+      "prompt": "Strengthen both the direct Top counter test and its scoreboard-backed counter test: after each deasserts reset, keep enable low for two more cycles and assert count_out is still zero before the first enable. Preserve the existing counting and scoreboard behavior. Run the full SystemVerilog-backed simulation for both tests.",
+      "graph_hint": "harc graph query TopCounterTest --index .harcgraph --limit 3; harc graph context 'scoreboard basic counter Top' --index .harcgraph --limit 5 --token-budget 250",
+      "expected_files": ["tests/fixtures/top_counter_test.harc", "tests/fixtures/scoreboard_basic_test.harc"],
+      "must_add": {
+        "tests/fixtures/top_counter_test.harc": ["wait 2 cycles", "assert dut.count_out == 0"],
+        "tests/fixtures/scoreboard_basic_test.harc": ["wait 2 cycles", "assert dut.count_out == 0"]
+      },
+      "checks": [
+        ["{HARC_BIN}", "sim", "--sv", "tests/dut/top_counter.sv", "tests/fixtures/top_counter_test.harc", "--top", "Top", "--test", "TopCounterTest", "--outdir", ".bench_sim/top"],
+        ["{HARC_BIN}", "sim", "--sv", "tests/dut/top_counter.sv", "tests/fixtures/scoreboard_basic_test.harc", "--top", "Top", "--test", "ScoreboardBasicTest", "--outdir", ".bench_sim/scoreboard"]
+      ]
+    }
+  ]
+}
