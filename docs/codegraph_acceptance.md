@@ -1,6 +1,6 @@
 # HARC code graph acceptance baseline
 
-Commit under test: `c3ca30da` plus the changes in this worktree. The source graph
+Commit under test: `cce5d626` plus the graph branch changes. The source graph
 and compiler-development graph are separate indexes.
 
 ## Curated corpus
@@ -34,9 +34,9 @@ cargo run --offline --bin harc -- graph context 'add coverage for AXI Lite read 
 cargo run --offline --bin harc -- graph html --index .harcgraph --out harc-graph.html
 ```
 
-Observed index: 363 files, 1,991 nodes, 6,481 edges, zero read/parse skips,
-18 lowering omissions. The run took 4.97 seconds including `cargo run` startup
-and build check. `tests-for top_counter` returned `TopCounterTest` at
+Observed index: 379 files, 2,172 nodes, 6,983 edges, zero read/parse skips,
+18 lowering omissions. The rebased run took 0.74 seconds with a prebuilt debug
+binary. `tests-for top_counter` returned `TopCounterTest` at
 `tests/fixtures/top_counter_test.harc:13`. The lowering omissions are written
 with source paths and reasons to `issues.jsonl`; they include incomplete
 standalone fixture dependencies and known TB IR unsupported forms, not parse
@@ -65,7 +65,7 @@ the parser, lowerer, IR schema, backend, AST, semantic check, and fixture locati
 context query returned `AxilXactor` and its `binds_bus` edge within a
 100-token response budget.
 
-Compiler regressions: all 178 library tests and 21 binary tests
+Compiler regressions: all 219 library tests and 24 binary tests
 passed. `harc check` and `harc dump-ir` passed on
 `transactor_active_test.harc`; emit-only generated the C++ testbench; the
 full `harc sim --sv tests/dut/AxiLiteRegs.sv` run passed all tests at cycle
