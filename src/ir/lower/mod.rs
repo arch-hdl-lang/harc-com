@@ -1643,20 +1643,36 @@ fn lower_program_impl(
         })
         .collect();
 
-    // Covergroup schemas, in file order. All declarations lower (even
-    // unreferenced ones — v1 emits a struct for each), so unsupported
-    // covergroup features are rejected here rather than dropped.
+    // Covergroup schemas, in file order. An uninstantiated declaration has
+    // no observable state or sampler registration, so do not make an inert
+    // declaration block the whole TB-IR program. v1 emits a struct for every
+    // declaration, but defers hook validation until an instance is created;
+    // it likewise never runs an impure sampler without an instance. Keep the
+    // same semantic boundary by requiring successful lowering only for
+    // referenced covergroup types. Keep every inert declaration that already
+    // lowers cleanly: common-object planning still owns those structural types
+    // even when no test instantiates them.
+    let referenced_covgroups = referenced_covergroup_names(&file);
     let mut covgroup_ids: HashMap<String, CovgroupId> = HashMap::new();
     let mut covgroups: Vec<CovgroupSchema> = Vec::new();
     for it in &file.items {
         if let Item::Covergroup(g) = it {
-            let schema = covergroups::lower_covergroup(
+            let lowered = covergroups::lower_covergroup(
                 g,
                 &helper_registry,
                 &extern_fn_decls,
                 &const_vals,
                 &ambiguous_variants,
-            )?;
+            );
+            let schema = match lowered {
+                Ok(schema) => schema,
+                Err(LowerError::Unsupported { .. } | LowerError::NotImplemented { .. })
+                    if !referenced_covgroups.contains(&g.name.name) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             covgroup_ids.insert(g.name.name.clone(), CovgroupId(covgroups.len() as u32));
             covgroups.push(schema);
         }
@@ -7444,6 +7460,212 @@ fn type_simple_name(t: Option<&TypeExpr>) -> Option<&str> {
         TypeExpr::Named { name, .. } => name.segments.last().map(|s| s.name.as_str()),
         _ => None,
     }
+}
+
+/// Covergroup declarations acquire runtime meaning only through a typed
+/// instance reachable from a test: a test-scope `let`, a bound testbench, or a
+/// field below one of those roots. Walk that component-type graph before
+/// lowering schemas so declarations hidden in unused component types remain
+/// inert too.
+fn referenced_covergroup_names(file: &SourceFile) -> HashSet<String> {
+    fn collect_stmt_types(
+        stmt: &AstStmt,
+        pending: &mut Vec<String>,
+        pending_helpers: &mut Vec<String>,
+    ) {
+        pending_helpers.extend(helpers::direct_callees_in_stmt(stmt));
+        match &stmt.kind {
+            StmtKind::Let(binding) => {
+                if let Some(name) = type_simple_name(binding.ty.as_ref()) {
+                    pending.push(name.to_string());
+                }
+            }
+            StmtKind::For(stmt) => collect_block_types(&stmt.body, pending, pending_helpers),
+            StmtKind::Repeat(stmt) => collect_block_types(&stmt.body, pending, pending_helpers),
+            StmtKind::Loop(body) => collect_block_types(body, pending, pending_helpers),
+            StmtKind::While { body, .. } => collect_block_types(body, pending, pending_helpers),
+            StmtKind::If(stmt) => {
+                collect_block_types(&stmt.then_block, pending, pending_helpers);
+                for (_, body) in &stmt.elsifs {
+                    collect_block_types(body, pending, pending_helpers);
+                }
+                if let Some(body) = &stmt.else_block {
+                    collect_block_types(body, pending, pending_helpers);
+                }
+            }
+            StmtKind::Fork(stmt) => {
+                for body in &stmt.branches {
+                    collect_block_types(body, pending, pending_helpers);
+                }
+            }
+            StmtKind::Parallel(blocks) | StmtKind::Schedule(blocks) => {
+                for body in blocks {
+                    collect_block_types(body, pending, pending_helpers);
+                }
+            }
+            StmtKind::Select(arms) => {
+                for arm in arms {
+                    collect_block_types(&arm.action, pending, pending_helpers);
+                }
+            }
+            StmtKind::On(handler) => collect_block_types(&handler.body, pending, pending_helpers),
+            StmtKind::After { body, .. } => collect_block_types(body, pending, pending_helpers),
+            _ => {}
+        }
+    }
+
+    fn collect_block_types(
+        block: &Block,
+        pending: &mut Vec<String>,
+        pending_helpers: &mut Vec<String>,
+    ) {
+        for stmt in &block.stmts {
+            collect_stmt_types(stmt, pending, pending_helpers);
+        }
+    }
+
+    let declared: HashSet<&str> = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Covergroup(group) => Some(group.name.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut referenced = HashSet::new();
+    let mut pending_types: Vec<String> = Vec::new();
+    let mut pending_helpers: Vec<String> = Vec::new();
+
+    for item in &file.items {
+        let Item::Test(test) = item else { continue };
+        if let Some(testbench) = &test.for_testbench {
+            pending_types.push(testbench.name.clone());
+        }
+        for item in &test.items {
+            match item {
+                TestItem::Let(binding) => {
+                    if let Some(name) = type_simple_name(binding.ty.as_ref()) {
+                        pending_types.push(name.to_string());
+                    }
+                    if let Some(value) = &binding.value {
+                        pending_helpers.extend(helpers::direct_callees_in_expr(value));
+                    }
+                }
+                TestItem::Scope(scope) => {
+                    for block in [
+                        scope.setup.as_ref(),
+                        scope.run.as_ref(),
+                        scope.check.as_ref(),
+                        scope.teardown.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        collect_block_types(block, &mut pending_types, &mut pending_helpers);
+                    }
+                }
+                TestItem::Stmt(stmt) => {
+                    collect_stmt_types(stmt, &mut pending_types, &mut pending_helpers)
+                }
+                TestItem::Phase(_, body) => {
+                    collect_block_types(body, &mut pending_types, &mut pending_helpers)
+                }
+                TestItem::Apply(_) | TestItem::Use(_) | TestItem::Clock(_) => {}
+            }
+        }
+    }
+
+    let mut visited_types = HashSet::new();
+    let mut visited_helpers = HashSet::new();
+    while !pending_types.is_empty() || !pending_helpers.is_empty() {
+        if let Some(helper) = pending_helpers.pop() {
+            if visited_helpers.insert(helper.clone()) {
+                if let Some(decl) = file.items.iter().find_map(|item| match item {
+                    Item::Function(decl) if decl.name.name == helper => Some(decl),
+                    _ => None,
+                }) {
+                    collect_block_types(
+                        &decl.body,
+                        &mut pending_types,
+                        &mut pending_helpers,
+                    );
+                }
+            }
+            continue;
+        }
+        let Some(name) = pending_types.pop() else { continue };
+        if !visited_types.insert(name.clone()) {
+            continue;
+        }
+        if declared.contains(name.as_str()) {
+            referenced.insert(name.clone());
+            continue;
+        }
+
+        let mut visit_items = |items: &[ComponentItem]| {
+            for item in items {
+                match item {
+                    ComponentItem::Field(field) => {
+                        if let Some(field_type) = type_simple_name(Some(&field.ty)) {
+                            pending_types.push(field_type.to_string());
+                        }
+                    }
+                    ComponentItem::OnHandler(handler) => {
+                        collect_block_types(
+                            &handler.body,
+                            &mut pending_types,
+                            &mut pending_helpers,
+                        )
+                    }
+                    ComponentItem::TargetTlmThread(thread) => {
+                        collect_block_types(
+                            &thread.body,
+                            &mut pending_types,
+                            &mut pending_helpers,
+                        )
+                    }
+                    ComponentItem::Hookable(method) => {
+                        collect_block_types(
+                            &method.body,
+                            &mut pending_types,
+                            &mut pending_helpers,
+                        )
+                    }
+                    ComponentItem::Lifecycle(_, body) => {
+                        collect_block_types(body, &mut pending_types, &mut pending_helpers)
+                    }
+                    ComponentItem::Watchdog(watchdog) => {
+                        collect_block_types(
+                            &watchdog.body,
+                            &mut pending_types,
+                            &mut pending_helpers,
+                        )
+                    }
+                    ComponentItem::Connect(_) | ComponentItem::Apply(_) => {}
+                }
+            }
+        };
+        for item in &file.items {
+            match item {
+                Item::Agent(component)
+                | Item::Env(component)
+                | Item::Scoreboard(component)
+                | Item::Sequencer(component)
+                    if component.name.name == name =>
+                {
+                    visit_items(&component.items)
+                }
+                Item::Transactor(transactor) if transactor.name.name == name => {
+                    visit_items(&transactor.items);
+                    if let Some(items) = &transactor.when_active {
+                        visit_items(items);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    referenced
 }
 
 fn component_mode_from_type(t: Option<&TypeExpr>) -> Option<ir::ComponentInstanceMode> {

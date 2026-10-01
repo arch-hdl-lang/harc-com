@@ -868,7 +868,18 @@ impl FuncBuilder<'_> {
                                 }
                                 return Ok(());
                             }
-                            format!("helper call `{}(...)`", id.name)
+                            // A bare unresolved call is not a TB-IR-only gap:
+                            // v1 passes the name straight through to C++,
+                            // where an omitted cross-file helper or an illegal
+                            // attempt to capture a sibling testbench method is
+                            // undeclared. Keep field calls on the ordinary
+                            // Unsupported path below because several of those
+                            // still have working v1 implementations.
+                            return Err(not_implemented(
+                                &format!("unresolved helper call `{}(...)`", id.name),
+                                "v1 accepts the source but emits a call to an undeclared C++ function",
+                                V1Status::EmitsUncompilable,
+                            ));
                         }
                         ExprKind::Field { name, .. } => {
                             format!("method call `.{}(...)`", name.name)
