@@ -21574,14 +21574,14 @@ end impl CovTest
 
 /// The axilite_cov fixture (range bins + declared cross + randomize)
 /// previously tripped on its range bins; those now lower, so the
-/// rejection shifted to the first construct still out of subset — the
-/// cross-file `axil_write(...)` helper call (the fixture's helper and
-/// `RegData` transaction live in axilite_regs_test.harc). When helpers
-/// across registries land, this shifts again to `randomize`.
+/// rejection shifted to a missing cross-file `axil_write(...)` helper
+/// (the fixture's helper and `RegData` transaction live in
+/// axilite_regs_test.harc). v1 accepts the isolated file but emits an
+/// undeclared C++ call, so this is not a working fallback.
 #[test]
-fn axilite_cov_fixture_still_unsupported() {
+fn axilite_cov_fixture_reports_missing_cross_file_helper() {
     let err = lower_src(&fixture("axilite_cov_test.harc")).unwrap_err();
-    let msg = assert_unsupported(&err);
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
     assert!(msg.contains("axil_write"), "names the helper call: {msg}");
 }
 
@@ -21652,6 +21652,35 @@ end impl CovTest
     assert!(
         matches!(err, lower::LowerError::Invalid(_)),
         "unknown cross point is Invalid, not Unsupported: {err:?}"
+    );
+    assert!(err.to_string().contains("cp_nope"), "{err}");
+}
+
+/// Reachability only controls backend capability diagnostics. Structural
+/// declaration errors remain errors even when no runtime instance exists,
+/// matching v1's declaration-time cross validation.
+#[test]
+fn unused_covergroup_cross_unknown_point_is_invalid() {
+    let src = r#"
+covergroup Cov @(posedge dut.clk)
+    cp_a : cover dut.a
+        bins
+            hi = {1}
+        end bins
+    cross cp_a, cp_nope
+end covergroup Cov
+
+test CovTest
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test CovTest
+"#;
+    let err = lower_src(src).unwrap_err();
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)),
+        "unused unknown cross point is still Invalid: {err:?}"
     );
     assert!(err.to_string().contains("cp_nope"), "{err}");
 }
@@ -28287,8 +28316,8 @@ impl TbNestedHelperFenceTest for Tb
 end impl TbNestedHelperFenceTest
 "#;
     let err = lower_src(src).expect_err("free helper must not see sibling testbench methods");
-    let msg = assert_unsupported(&err);
-    assert!(msg.contains("helper call `seed(...)`"), "{msg}");
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("unresolved helper call `seed(...)`"), "{msg}");
 }
 
 #[test]
@@ -48242,23 +48271,17 @@ end impl TbQTest"#
 /// | `@(drv.step post)` | the PARSER: "must be a method call before `pre` or `post`" |
 /// | `@(drv.step(n + 1) post)` | the PARSER: "arguments must be identifiers" |
 ///
-/// Both reachable arms are `Unsupported`, and the first version of
-/// this test said `Invalid` because it measured only the INSTANTIATED
-/// position. v1's matching refusal comes from
+/// Both reachable arms are rejected only for an instantiated schema.
+/// v1's matching refusal comes from
 /// `emit_covergroup_hook_sample_registration`, which runs per `cov :
 /// StepCov` field — a covergroup declared and never instantiated never
-/// reaches it, and v1 emits the whole testbench. TB-IR refuses at
-/// DECLARATION, so the two disagree exactly there:
+/// reaches it, and v1 emits the whole testbench. TB-IR now makes that
+/// same declaration/instantiation distinction:
 ///
 /// | | `cov : StepCov` present | covergroup uninstantiated |
 /// |---|---|---|
 /// | v1 | refuses: "must resolve to a `hookable`…" | emits, and g++ compiles it |
-/// | TB-IR | refuses | refuses |
-///
-/// "No backend runs it in ANY configuration" is what `Invalid` claims,
-/// and an uninstantiated covergroup is a configuration. Third time
-/// this rule has been broken on this branch, after `connect` and the
-/// built-in predicates.
+/// | TB-IR | refuses | omits the inert schema and builds |
 ///
 /// The four parser-guarded arms stay `Invalid` as invariant guards —
 /// they cannot emit a false `--codegen v1` suggestion from a position
@@ -48291,7 +48314,10 @@ fn a_covergroup_hook_trigger_has_two_reachable_shape_arms() {
         ("(drv.x + 1).step(n)", "hook trigger receiver"),
     ] {
         let src = with(trigger);
-        let msg = assert_unsupported(&lower_src(&src).unwrap_err());
+        let msg = assert_not_implemented(
+            &lower_src(&src).unwrap_err(),
+            lower::V1Status::Rejects,
+        );
         assert!(msg.contains(want), "{trigger}: {msg}");
 
         // Instantiated, v1 refuses it too — which is what the first
@@ -48320,8 +48346,102 @@ fn a_covergroup_hook_trigger_has_two_reachable_shape_arms() {
             out.contains("int main("),
             "{trigger}: v1 emits a whole testbench, not a stub"
         );
-        // TB-IR still refuses it, which is the gap this records.
-        assert_unsupported(&lower_src(&uninst).unwrap_err());
+        // TB-IR omits an inert declaration too: no instance means no
+        // counters, registration, report, or observable schema identity.
+        let prog = lower_src(&uninst)
+            .unwrap_or_else(|e| panic!("{trigger}: TB-IR lowers the uninstantiated form: {e}"));
+        assert!(prog.covgroups.is_empty(), "{trigger}: unused schema is omitted");
+        verify::verify_program(&prog).expect("unused malformed schema cannot poison verification");
+
+        let local_instance = uninst.replacen(
+            "    run\n",
+            "    run\n        let local_cov : StepCov\n",
+            1,
+        );
+        let msg = assert_not_implemented(
+            &lower_src(&local_instance)
+                .expect_err("a statement-local instance makes the malformed schema live"),
+            lower::V1Status::Rejects,
+        );
+        assert!(msg.contains(want), "{trigger}: {msg}");
+
+        let lifecycle_instance = uninst.replacen(
+            "    drv : StepXactor active\nend testbench CovHookTriggerTb",
+            "    drv : StepXactor active\n\
+             \n\
+             setup\n\
+                 let local_cov : StepCov\n\
+             end setup\n\
+             end testbench CovHookTriggerTb",
+            1,
+        );
+        assert_ne!(lifecycle_instance, uninst, "testbench fixture shape changed");
+        let msg = assert_not_implemented(
+            &lower_src(&lifecycle_instance)
+                .expect_err("a lifecycle-local instance makes the malformed schema live"),
+            lower::V1Status::Rejects,
+        );
+        assert!(msg.contains(want), "{trigger}: {msg}");
+
+        let helper_instance = uninst
+            .replacen(
+                "testbench CovHookTriggerTb",
+                "function sample_locally(dut: Top)\n\
+                     let local_cov : StepCov\n\
+                 end function sample_locally\n\
+                 \n\
+                 testbench CovHookTriggerTb",
+                1,
+            )
+            .replacen(
+                "    run\n",
+                "    run\n        sample_locally(dut)\n",
+                1,
+            );
+        let msg = assert_not_implemented(
+            &lower_src(&helper_instance)
+                .expect_err("a called helper-local instance makes the malformed schema live"),
+            lower::V1Status::Rejects,
+        );
+        assert!(msg.contains(want), "{trigger}: {msg}");
+
+        let initializer_instance = uninst
+            .replacen(
+                "testbench CovHookTriggerTb",
+                "function sample_locally(dut: Top) -> uint<8>\n\
+                     let local_cov : StepCov\n\
+                     return 1\n\
+                 end function sample_locally\n\
+                 \n\
+                 testbench CovHookTriggerTb",
+                1,
+            )
+            .replacen(
+                "    run\n",
+                "    let helper_value : uint<8> = sample_locally(dut)\n\
+                 \n\
+                     run\n",
+                1,
+            );
+        let msg = assert_not_implemented(
+            &lower_src(&initializer_instance)
+                .expect_err("a structural-let helper call makes its local schema live"),
+            lower::V1Status::Rejects,
+        );
+        assert!(msg.contains(want), "{trigger}: {msg}");
+
+        // A typed field inside a component declaration is still inert when
+        // no test instantiates that owner component.
+        let dormant_owner = uninst.replacen(
+            "testbench CovHookTriggerTb",
+            "env DormantCoverOwner\n    cov : StepCov\nend env DormantCoverOwner\n\ntestbench CovHookTriggerTb",
+            1,
+        );
+        let msg = assert_unsupported(
+            &lower_src(&dormant_owner)
+                .expect_err("component-only covergroup references retain the v1 fallback"),
+        );
+        assert!(msg.contains("DormantCoverOwner.cov"), "{trigger}: {msg}");
     }
 
     // The four the PARSER claims first, so lowering never sees them.
@@ -48335,6 +48455,129 @@ fn a_covergroup_hook_trigger_has_two_reachable_shape_arms() {
         let msg = format!("{err:?}");
         assert!(msg.contains(want), "{trigger}: {msg}");
     }
+}
+
+/// An unused covergroup is a declaration, not a sampler. In particular, an
+/// impure helper hidden in an inert point or bin must not prevent an unrelated
+/// test from using TB-IR. Once instantiated, v1 compiles these schemas but the
+/// first sample enters a coroutine as an ordinary value call and crashes; the
+/// diagnostic must not advertise v1 as an escape hatch.
+#[test]
+fn unused_impure_covergroup_expressions_do_not_block_tbir() {
+    let src = r#"
+function sample_value() -> uint<8>
+    wait 1 cycle
+    return 1
+end function sample_value
+
+function read_value(dut: Top) -> uint<8>
+    return dut.count_out
+end function read_value
+
+covergroup PointCov @(posedge dut.clk)
+    cp : cover sample_value()
+        bins
+            one = {1}
+        end bins
+end covergroup PointCov
+
+covergroup BinCov @(posedge dut.clk)
+    cp : cover dut.out
+        bins
+            one = {sample_value()}
+        end bins
+end covergroup BinCov
+
+covergroup V1Cov @(posedge dut.clk)
+    cp : cover read_value(dut)
+        bins
+            zero = {0}
+        end bins
+end covergroup V1Cov
+
+test T
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test T
+"#;
+    let prog = lower_src(src).expect("unused impure covergroups are inert");
+    assert!(prog.covgroups.is_empty(), "unused schemas are omitted");
+    verify::verify_program(&prog).expect("program without sampler schemas verifies");
+
+    let dormant_owner = src.replacen(
+        "test T",
+        "env DormantCoverOwner\n    point_cov : PointCov\nend env DormantCoverOwner\n\ntest T",
+        1,
+    );
+    let msg = assert_unsupported(
+        &lower_src(&dormant_owner)
+            .expect_err("component-only covergroup references retain the v1 fallback"),
+    );
+    assert!(msg.contains("DormantCoverOwner.point_cov"), "{msg}");
+
+    for group in ["PointCov", "BinCov"] {
+        let instantiated = src.replacen(
+            "    run\n",
+            &format!("    let cov : {group}\n    run\n"),
+            1,
+        );
+        let err = lower_src(&instantiated)
+            .expect_err("an instantiated impure covergroup must be rejected");
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        let helper = "sample_value";
+        assert!(msg.contains(&format!("impure helper call `{helper}`")), "{group}: {msg}");
+
+        let local_instance = src.replacen(
+            "    run\n",
+            &format!("    run\n        let local_cov : {group}\n"),
+            1,
+        );
+        let msg = assert_not_implemented(
+            &lower_src(&local_instance)
+                .expect_err("a statement-local instance makes the impure schema live"),
+            lower::V1Status::SilentlyMisLowers,
+        );
+        assert!(msg.contains(&format!("impure helper call `{helper}`")), "{group}: {msg}");
+    }
+
+    // Non-suspending helpers are also "impure" to TB-IR when they read the
+    // DUT, but v1 can execute this sampler. Keep the working fallback instead
+    // of generalizing the cycle-wait crash classification to every helper.
+    let v1_src = src.replacen("    run\n", "    let cov : V1Cov\n    run\n", 1);
+    let msg = assert_unsupported(&lower_src(&v1_src).unwrap_err());
+    assert!(msg.contains("impure helper call `read_value`"), "{msg}");
+    let v1_cpp = cpp_tb::emit(&merged_src(&v1_src)).expect("v1 emits the DUT-reading sampler");
+    assert_cpp_typechecks("nonsuspending_impure_cover_helper", &v1_cpp);
+
+    let after_src = r#"
+function after_value() -> uint<8>
+    after 1 cycle
+    end after
+    return 1
+end function after_value
+
+covergroup AfterCov @(posedge dut.clk)
+    cp : cover after_value()
+        bins
+            one = {1}
+        end bins
+end covergroup AfterCov
+
+test T
+    let dut : Top
+    let cov : AfterCov
+    run
+        wait 1 cycle
+    end run
+end test T
+"#;
+    let msg = assert_not_implemented(
+        &lower_src(after_src).expect_err("an `after` helper is a suspending sampler"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("impure helper call `after_value`"), "{msg}");
 }
 
 /// A transactor `function` is callable but is not a hook target.

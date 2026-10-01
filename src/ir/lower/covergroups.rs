@@ -4,15 +4,15 @@
 //! v1: clock-triggered (or trigger-less) covergroups whose points
 //! sample a direct DUT port and whose bins are finite value sets and/or
 //! inclusive ranges, plus declared `cross` items over those points.
-//! Hook triggers stay `Unsupported` — never silently mis-lowered.
+//! Hook triggers stay explicit in the schema — never silently mis-lowered.
 
 use super::{
     fold_const, helpers::HelperRegistry, not_implemented, unsupported, ConstFoldErr, ConstVal,
     LowerError, V1Status,
 };
 use crate::ast::{
-    BinaryOp, CoverItem, CoverTrigger, CovergroupDecl, Expr as AstExpr, ExprKind, ExternFnDecl,
-    UnaryOp,
+    BinaryOp, Block, CoverItem, CoverTrigger, CovergroupDecl, Expr as AstExpr, ExprKind,
+    ExternFnDecl, StmtKind, UnaryOp,
 };
 use crate::ir::{
     CallTarget, CovBinBound, CovBinValue, CovTrigger, CoverBinSchema, CoverCrossSchema,
@@ -223,19 +223,16 @@ fn lower_hook_call(group: &str, call: &AstExpr) -> Result<(Vec<String>, String),
         // never reaches it, and v1 emits the whole testbench: measured
         // on `covergroup_hook_trigger_test` with the `cov` field and
         // its readers removed, 298 lines out and g++ `-fsyntax-only`
-        // clean. TB-IR refuses at DECLARATION, which is why the two
-        // disagree.
+        // clean. TB-IR used to refuse every declaration before the
+        // instantiation pre-scan made the same distinction.
         //
-        // So this is a subset gap with a working escape hatch, not a
-        // program error. The first version measured only the
-        // instantiated position and called it `Invalid` — the same
-        // mistake made on `connect` and on the built-in predicates: an
-        // arm is only `Invalid` if NO backend runs it in ANY reachable
-        // configuration, and "nothing instantiates it" is one.
-        return Err(unsupported(
+        // Uninstantiated declarations are filtered before schema lowering.
+        // Reaching this arm therefore proves there is an instance, where v1
+        // rejects the same trigger during sampler registration.
+        return Err(not_implemented(
             &format!("covergroup `{group}` hook trigger `<name>(args)` without a receiver"),
-            "write `<obj>.<method>(args)`; v1 only checks the trigger where the covergroup \
-             is instantiated, so an uninstantiated one builds under `--codegen v1`",
+            "write `<obj>.<method>(args)`; v1 rejects the instantiated covergroup too",
+            V1Status::Rejects,
         ));
     };
     let method = name.name.clone();
@@ -261,10 +258,8 @@ fn lower_hook_call(group: &str, call: &AstExpr) -> Result<(Vec<String>, String),
                 // callee that IS a field access, so the arm above lets
                 // it through, and a receiver that is not a path.
                 //
-                // Same instantiation-site split as the arm above, and
-                // measured the same way: v1's refusal only fires where
-                // the covergroup is instantiated.
-                return Err(unsupported(
+                // Same instantiated-site verdict as the arm above.
+                return Err(not_implemented(
                     &format!("covergroup `{group}` hook trigger receiver"),
                     // NOT "`drv` or `env.drv`", which the first
                     // version suggested: a nested receiver is refused
@@ -272,9 +267,9 @@ fn lower_hook_call(group: &str, call: &AstExpr) -> Result<(Vec<String>, String),
                     // not supported by the tbir backend") and by
                     // `tbir::emit`'s single-segment rule. Advice has to
                     // be something the compiler accepts.
-                    "the receiver must be a single component name (`drv`); v1 only checks \
-                     the trigger where the covergroup is instantiated, so an uninstantiated \
-                     one builds under `--codegen v1`",
+                    "the receiver must be a single component name (`drv`); v1 rejects the \
+                     instantiated covergroup too",
+                    V1Status::Rejects,
                 ));
             }
         }
@@ -854,11 +849,28 @@ fn lower_point_target(
                 if let ExprKind::Ident(id) = &*callee.kind {
                     if let Some(entry) = helpers.get(&id.name) {
                         if !entry.pure {
+                            let construct = format!(
+                                "covergroup `{group}` point `{point}` impure helper call `{}`",
+                                id.name
+                            );
+                            if block_contains_direct_cycle_suspension(&entry.decl.body, true) {
+                                return Err(not_implemented(
+                                    &construct,
+                                    "only pure file-scope helper functions can be sampled in coverpoints; \
+                                     v1 emits an invalid `after` expression for this sampler",
+                                    V1Status::EmitsUncompilable,
+                                ));
+                            }
+                            if block_contains_direct_cycle_suspension(&entry.decl.body, false) {
+                                return Err(not_implemented(
+                                    &construct,
+                                    "only pure file-scope helper functions can be sampled in coverpoints; \
+                                     v1 compiles this cycle-waiting sampler but crashes when it runs",
+                                    V1Status::SilentlyMisLowers,
+                                ));
+                            }
                             return Err(unsupported(
-                                &format!(
-                                    "covergroup `{group}` point `{point}` impure helper call `{}`",
-                                    id.name
-                                ),
+                                &construct,
                                 "only pure file-scope helper functions can be sampled in coverpoints",
                             ));
                         }
@@ -1022,6 +1034,55 @@ fn lower_point_target(
             _ => return Err(unsupported_target(cur)),
         }
     }
+}
+
+/// The measured v1 failures are specific to source-written cycle suspension:
+/// `wait` recursively re-enters sampling at runtime, while `after` emits an
+/// invalid value expression. `HelperEntry::pure == false` is much broader
+/// (DUT reads, logging, assertions, and conservative unknown shapes), several
+/// of which remain usable under v1 and must retain an honest fallback.
+fn block_contains_direct_cycle_suspension(block: &Block, after: bool) -> bool {
+    fn stmt_contains(stmt: &crate::ast::Stmt, after: bool) -> bool {
+        match &stmt.kind {
+            StmtKind::Wait { .. } => !after,
+            StmtKind::After { .. } => after,
+            StmtKind::For(stmt) => block_contains_direct_cycle_suspension(&stmt.body, after),
+            StmtKind::Repeat(stmt) => block_contains_direct_cycle_suspension(&stmt.body, after),
+            StmtKind::Loop(body) => block_contains_direct_cycle_suspension(body, after),
+            StmtKind::While { body, .. } => {
+                block_contains_direct_cycle_suspension(body, after)
+            }
+            StmtKind::If(stmt) => {
+                block_contains_direct_cycle_suspension(&stmt.then_block, after)
+                    || stmt
+                        .elsifs
+                        .iter()
+                        .any(|(_, body)| block_contains_direct_cycle_suspension(body, after))
+                    || stmt
+                        .else_block
+                        .as_ref()
+                        .is_some_and(|body| block_contains_direct_cycle_suspension(body, after))
+            }
+            StmtKind::Fork(stmt) => stmt
+                .branches
+                .iter()
+                .any(|body| block_contains_direct_cycle_suspension(body, after)),
+            StmtKind::Parallel(blocks) | StmtKind::Schedule(blocks) => {
+                blocks
+                    .iter()
+                    .any(|body| block_contains_direct_cycle_suspension(body, after))
+            }
+            StmtKind::Select(arms) => arms
+                .iter()
+                .any(|arm| block_contains_direct_cycle_suspension(&arm.action, after)),
+            // A nested handler owns a different callback; its wait does not
+            // execute as part of evaluating this helper's return value.
+            StmtKind::On(_) => false,
+            _ => false,
+        }
+    }
+
+    block.stmts.iter().any(|stmt| stmt_contains(stmt, after))
 }
 
 /// Classify an expression the coverpoint/bin subset does not lower, by
