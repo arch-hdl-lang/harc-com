@@ -29,6 +29,8 @@ fn main() -> std::io::Result<()> {
         build_version::version(&manifest_dir, &env::var("CARGO_PKG_VERSION").unwrap())
     );
     println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=Cargo.lock");
+    println!("cargo:rerun-if-changed=build.rs");
     let mut paths = Vec::new();
     source_paths(Path::new("src"), &mut paths)?;
     paths.sort();
@@ -44,6 +46,12 @@ fn main() -> std::io::Result<()> {
         {
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
         }
+    }
+    for byte in fs::read("Cargo.lock")?.into_iter().chain([0]) {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    for byte in fs::read("build.rs")?.into_iter().chain([0]) {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
     }
     println!("cargo:rustc-env=HARC_GRAPH_GENERATOR_ID={hash:016x}");
     Ok(())
