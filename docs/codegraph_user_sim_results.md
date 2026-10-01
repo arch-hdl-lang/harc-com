@@ -39,6 +39,24 @@ task-cluster bootstrap (four tasks, seed 43) gives a **-14.2% to +45.6%**
 95% interval for the primary saving. This small holdout cannot establish a
 general token-saving effect despite crossing the numerical gate.
 
+The paired raw totals below retain the outlier and both failures. `F` means
+the frozen rubric marked the attempt unsuccessful; all other attempts passed.
+
+| Task | Repeat | Baseline tokens | Graph tokens | Frozen-rubric result |
+| --- | ---: | ---: | ---: | --- |
+| Register overwrite | 1 | 132,282 | 183,255 | pass / pass |
+| Register overwrite | 2 | 179,807 | 180,095 | pass / pass |
+| Register overwrite | 3 | 148,264 | 159,793 | pass / pass |
+| Scoreboard four rounds | 1 | 149,098 | 135,225 | pass / pass |
+| Scoreboard four rounds | 2 | 143,599 | 154,907 | pass / pass |
+| Scoreboard four rounds | 3 | 209,217 | 150,961 | pass / pass |
+| Known-file transactor | 1 | 147,069 | 206,043 | pass / pass |
+| Known-file transactor | 2 | 152,201 | 180,525 | pass / pass |
+| Known-file transactor | 3 | 170,114 | 151,951 | pass / pass |
+| Two-test post-reset hold | 1 | 186,564 | 209,516 | pass / F |
+| Two-test post-reset hold | 2 | 337,978 | 160,986 | F / pass |
+| Two-test post-reset hold | 3 | 589,567 | 144,654 | pass / pass |
+
 ## Outcome audit
 
 All 24 runs had valid provider usage, exited successfully, followed their
