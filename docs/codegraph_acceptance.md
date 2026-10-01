@@ -65,7 +65,7 @@ the parser, lowerer, IR schema, backend, AST, semantic check, and fixture locati
 context query returned `AxilXactor` and its `binds_bus` edge within a
 100-token response budget.
 
-Compiler regressions: all 177 library tests and 21 binary tests
+Compiler regressions: all 178 library tests and 21 binary tests
 passed. `harc check` and `harc dump-ir` passed on
 `transactor_active_test.harc`; emit-only generated the C++ testbench; the
 full `harc sim --sv tests/dut/AxiLiteRegs.sv` run passed all tests at cycle
@@ -76,9 +76,10 @@ fresh indexes, exercising automatic index creation. It also refreshed a
 stale custom index from its recorded source path, without replacing it with
 the default fixture corpus. Source-set and generator-change tests reject
 stale indexes, including when a previously unresolved import becomes
-available; directory indexing also skips symlinked descendants and
-directory cycles. The stdio smoke confirms external `HARC_LIB_PATH` imports
-are excluded unless their root is allowed, and that an index built outside
+available or a malformed import is repaired; directory indexing also skips
+symlinked descendants and directory cycles. The stdio smoke confirms external
+`HARC_LIB_PATH` imports are excluded unless their root is allowed, and that
+an index built outside
 MCP with an out-of-root source is rejected on query. The MCP dependency is
 constrained to 1.x because the server uses FastMCP.
 
