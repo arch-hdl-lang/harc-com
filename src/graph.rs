@@ -2147,7 +2147,10 @@ fn collect_paths(
 ) -> std::io::Result<()> {
     if path.is_dir() {
         for entry in fs::read_dir(path)? {
-            collect_paths(&entry?.path(), harc, dut)?;
+            let entry = entry?;
+            if !entry.file_type()?.is_symlink() {
+                collect_paths(&entry.path(), harc, dut)?;
+            }
         }
     } else if path.is_file() {
         match path.extension().and_then(|e| e.to_str()) {
@@ -2909,6 +2912,28 @@ mod tests {
         manifest["generator"] = "older compiler".into();
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert!(query(&out, "First", 5).unwrap_err().to_string().contains("generator changed"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_index_skips_symlinked_files_and_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!("harc-graph-links-{}", std::process::id()));
+        let inputs = base.join("inputs");
+        fs::create_dir_all(&inputs).unwrap();
+        fs::write(inputs.join("inside.harc"), "module Inside kind verilator\nend module Inside\n").unwrap();
+        let outside = base.join("outside.harc");
+        fs::write(&outside, "module Outside kind verilator\nend module Outside\n").unwrap();
+        symlink(&outside, inputs.join("linked.harc")).unwrap();
+        symlink(&inputs, inputs.join("loop")).unwrap();
+        let out = base.join("index");
+        let stats = index_paths(&[inputs], &out).unwrap();
+        assert_eq!(stats.files, 1);
+        assert!(!query(&out, "Inside", 5).unwrap().contains("Outside"));
+        let manifest: GraphManifest = serde_json::from_slice(&fs::read(out.join(MANIFEST_JSON)).unwrap()).unwrap();
+        assert_eq!(manifest.discovered.len(), 1);
         let _ = fs::remove_dir_all(base);
     }
 }
