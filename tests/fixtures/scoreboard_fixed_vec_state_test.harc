@@ -1,0 +1,146 @@
+// Data-only `scoreboard` host state carrying a fixed `Vec<...>` field —
+// the v1-vs-tbir equivalence coverage for PR #848 ("Support fixed-vector
+// scoreboard state in TBIR").
+//
+// #848 made a data-only scoreboard whose state includes a fixed
+// `Vec<...>` field (e.g. `regs : Vec<uint<32>, N>`) route through the
+// per-instance component lowering path in TB-IR, instead of the data-only
+// ScoreboardSchema path that lacked vector storage. Its own test
+// (`tests/tbir_scoreboard_fixed_vec.rs`) exercises ONLY the TB-IR backend
+// across its two layouts. The PR body notes the shape also passes under
+// legacy v1, but there was no v1-vs-tbir equivalence fixture pinning that:
+// a future change to the `scoreboard_is_component` routing could silently
+// misroute this shape and emit wrong output with no equivalence test
+// catching it. This fixture closes that gap.
+//
+// Shape (all data-only, no aggregate `default`, no event/nested-board
+// fields — the subset #848 routes through component lowering):
+//   RegfileSb  : `Vec<uint<32>, 8>` + a scalar counter, two instances
+//                (a, b) — per-lane writes in a loop, per-lane read-back,
+//                instance isolation, and scalar-field isolation.
+//   SingleLaneSb : `Vec<uint<32>, 1>`  — edge case: Vec of length 1.
+//   WideLaneSb   : `Vec<uint<128>, 4>` — edge case: element width > 64b,
+//                read/written whole-element (two instances for isolation).
+//
+// Both backends accept every assertion here, so the fixture is registered
+// in tests/tbir_equiv_fixtures.txt (equivalence-gated: v1 and tbir must
+// agree verdict + trace). State is written, the sim is advanced one
+// cycle, then read back in `run`, and a subset is re-read in `check` to
+// pin run->check persistence of the vector + scalar host state on `_tb`.
+//
+// NOTE (follow-up, not covered): a sub-element bit-select on a wide Vec
+// element (`regs[i][hi:lo]`) is rejected by BOTH backends today — v1
+// emits invalid C++, tbir rejects it in lowering ("read through an
+// element selection"). That is a general Vec-element limitation, not
+// scoreboard-specific, so this fixture reads wide elements whole only.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+scoreboard RegfileSb
+    regs   : Vec<uint<32>, 8>
+    writes : uint<32> default 0
+end scoreboard RegfileSb
+
+scoreboard SingleLaneSb
+    regs : Vec<uint<32>, 1>
+    tag  : uint<16> default 0
+end scoreboard SingleLaneSb
+
+scoreboard WideLaneSb
+    regs : Vec<uint<128>, 4>
+    tag  : uint<32> default 0
+end scoreboard WideLaneSb
+
+testbench ScoreboardFixedVecTb
+    dut : Top
+    a   : RegfileSb
+    b   : RegfileSb
+    one : SingleLaneSb
+    w   : WideLaneSb
+    x   : WideLaneSb
+end testbench ScoreboardFixedVecTb
+
+impl ScoreboardFixedVecTest for ScoreboardFixedVecTb
+    clock clk = SysDomain        // 100 MHz
+
+    run
+        log(info, "scoreboard fixed-vec: per-lane writes + instance isolation")
+
+        // Two 8-lane regfile scoreboards: distinct per-lane values so a
+        // misrouted instance (e.g. shared storage) would corrupt a lane
+        // or leak across instances.
+        for i in 0 .. 7
+            a.regs[i] = i + 1
+            b.regs[i] = 100 + i
+        end for
+        a.writes = a.writes + 1
+
+        // Edge case: Vec of length 1. The single lane must be written
+        // before any read (Vec fields take no `default`, so an unwritten
+        // lane is unspecified).
+        one.regs[0] = 0xdeadbeef
+        one.tag = 7
+
+        // Edge case: element width > 64 bits, read/written whole-element.
+        // Two instances with disjoint value patterns for isolation.
+        let bit : uint<128> = 1
+        for i in 0 .. 3
+            w.regs[i] = (bit << 100) + i
+            x.regs[i] = (bit << 64) + (i + 1)
+        end for
+        w.tag = 9
+
+        // Advance the sim one cycle: vector host state must survive it.
+        wait 1 cycle
+
+        // Per-lane read-back + instance isolation for the 8-lane boards.
+        for i in 0 .. 7
+            assert a.regs[i] == i + 1
+                else fail("a.regs[${i}] changed: ${a.regs[i]}")
+            assert b.regs[i] == 100 + i
+                else fail("b.regs[${i}] changed: ${b.regs[i]}")
+        end for
+        assert a.writes == 1 else fail("a.writes drift: ${a.writes}")
+        assert b.writes == 0 else fail("b.writes not isolated: ${b.writes}")
+
+        // Length-1 edge case read-back.
+        assert one.regs[0] == 0xdeadbeef
+            else fail("len-1 regs[0] changed: ${one.regs[0]}")
+        assert one.tag == 7 else fail("len-1 scalar changed: ${one.tag}")
+
+        // Wide-element edge case read-back + instance isolation.
+        for i in 0 .. 3
+            assert w.regs[i] == (bit << 100) + i
+                else fail("w.regs[${i}] (>64b) changed")
+            assert x.regs[i] == (bit << 64) + (i + 1)
+                else fail("x.regs[${i}] (>64b) changed")
+        end for
+        assert w.tag == 9 else fail("w scalar drift: ${w.tag}")
+        assert x.tag == 0 else fail("wide instance scalar not isolated: ${x.tag}")
+
+        log(info, "run complete: all lanes + scalars verified")
+    end run
+
+    // End-of-test invariants — the scoreboards live on the shared `_tb`
+    // struct, so `check` must see `run`'s mutations: this pins run->check
+    // persistence of the fixed-vector host state across both backends.
+    check
+        assert a.regs[0] == 1 else fail("a.regs[0] lost after run: ${a.regs[0]}")
+        assert a.regs[7] == 8 else fail("a.regs[7] lost after run: ${a.regs[7]}")
+        assert b.regs[0] == 100 else fail("b.regs[0] lost after run: ${b.regs[0]}")
+        assert a.writes == 1 else fail("a.writes lost after run: ${a.writes}")
+        assert one.regs[0] == 0xdeadbeef
+            else fail("len-1 regs[0] lost after run: ${one.regs[0]}")
+        assert one.tag == 7 else fail("len-1 scalar lost after run: ${one.tag}")
+        let chk_bit : uint<128> = 1
+        assert w.regs[3] == (chk_bit << 100) + 3
+            else fail("wide regs[3] lost after run")
+        assert x.regs[0] == (chk_bit << 64) + 1
+            else fail("wide instance x regs[0] lost after run")
+        assert w.tag == 9 else fail("w.tag lost after run: ${w.tag}")
+        assert x.tag == 0 else fail("wide instance scalar not isolated into check: ${x.tag}")
+        log(info, "PASS: fixed-vector scoreboard state persisted run->check")
+    end check
+end impl ScoreboardFixedVecTest

@@ -250,6 +250,7 @@ tb_lifecycle_on_fallback_test | Top | top_counter.sv | - | pass | - | - | OnLcB
 tb_lifecycle_coverage_test | Top | top_counter.sv | - | pass | - | - | LifecycleCoverageTwo
 tb_lifecycle_coverage_test | Top | top_counter.sv | - | pass | - | - | LifecycleCoverageFour
 scoreboard_basic_test | Top | top_counter.sv | - | pass
+scoreboard_fixed_vec_state_test | Top | top_counter.sv | - | pass
 scoreboard_data_queue_struct_test | Top | top_counter.sv | - | pass
 regblock_subset_test | Top | top_counter.sv | - | pass
 struct_basic_test | Top | top_counter.sv | - | pass
