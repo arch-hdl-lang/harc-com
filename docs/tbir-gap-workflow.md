@@ -14,7 +14,7 @@ incorrectly classified as gaps even though v1 rejects the same source.
 
 The refreshed 2026-09-30 inventory is recorded in
 [`tbir-migration-manifest.md`](tbir-migration-manifest.md). Current main has
-89 executable constructors (90 textual matches including the helper
+85 executable constructors (86 textual matches including the helper
 definition); the manifest separates positive runtime controls from diagnostic
 and deliberately deferred shapes.
 
@@ -169,7 +169,7 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 89 remaining constructor call sites (90 textual matches including
+Treat the 85 remaining constructor call sites (86 textual matches including
 the `unsupported` helper definition) as an inventory, not 116 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
