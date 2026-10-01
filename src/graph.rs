@@ -399,6 +399,18 @@ fn check_freshness(index_dir: &Path) -> std::io::Result<()> {
         ));
     }
     for (path, expected) in manifest.sources {
+        let allowed = allowed_graph_source(Path::new(&path)).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{path} disappeared; rebuild with harc graph index"),
+            )
+        })?;
+        if !allowed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("graph source outside allowed roots: {path}"),
+            ));
+        }
         let actual = fs::read(&path).map(|bytes| dev_graph::digest(&bytes));
         if actual.as_ref().ok() != Some(&expected) {
             return Err(std::io::Error::new(
@@ -2153,6 +2165,12 @@ fn collect_paths(
             }
         }
     } else if path.is_file() {
+        if !allowed_graph_source(path)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("graph source outside allowed roots: {}", path.display()),
+            ));
+        }
         match path.extension().and_then(|e| e.to_str()) {
             Some("harc") => harc.push(path.to_path_buf()),
             Some("sv") | Some("arch") => dut.push(path.to_path_buf()),
@@ -2160,6 +2178,16 @@ fn collect_paths(
         }
     }
     Ok(())
+}
+
+fn allowed_graph_source(path: &Path) -> std::io::Result<bool> {
+    let Some(raw_roots) = std::env::var_os("HARC_GRAPH_ALLOWED_ROOTS") else {
+        return Ok(true);
+    };
+    let source = path.canonicalize()?;
+    Ok(std::env::split_paths(&raw_roots)
+        .filter_map(|root| root.canonicalize().ok())
+        .any(|root| source.starts_with(root)))
 }
 
 fn resolve_imported_bus_files(
@@ -2201,7 +2229,10 @@ fn resolve_imported_bus_files(
                 dir.join(format!("{name}.harc")),
                 dir.join(format!("{name}.arch")),
             ];
-            let Some(path) = candidates.into_iter().find(|p| p.exists()) else {
+            let Some(path) = candidates
+                .into_iter()
+                .find(|p| p.exists() && allowed_graph_source(p).unwrap_or(false))
+            else {
                 continue;
             };
             let display = display_path(&path);

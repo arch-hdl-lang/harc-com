@@ -76,7 +76,9 @@ fresh indexes, exercising automatic index creation. It also refreshed a
 stale custom index from its recorded source path, without replacing it with
 the default fixture corpus. Source-set and generator-change tests reject
 stale indexes; directory indexing also skips symlinked descendants and
-directory cycles. The MCP dependency is
+directory cycles. The stdio smoke confirms external `HARC_LIB_PATH` imports
+are excluded unless their root is allowed, and that an index built outside
+MCP with an out-of-root source is rejected on query. The MCP dependency is
 constrained to 1.x because the server uses FastMCP.
 
 The frozen paired token-efficiency experiment is reported in
