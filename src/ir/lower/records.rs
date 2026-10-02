@@ -669,29 +669,19 @@ fn fixed_vec_field(
         },
         _ => return None,
     };
-    // `Vec<Record, N>`: a fixed array of a nested transaction/struct.
-    // The element record's own lowering already validated every leaf
-    // (an unsupported leaf failed THERE, naming its `Inner.field` path),
-    // so a resolved record id is sufficient here. Checked before the
-    // scalar mapping — record names are not scalars. NOTE the parser's
-    // type-arg heuristic: a bare named element (`Vec<Entry, 4>`) parses
-    // as `TypeArg::Expr(Ident)` (only builtin heads parse as
-    // `TypeArg::Type`), so a record element is matched in BOTH shapes.
+    // `Vec<Record, N>`: a fixed array of a nested transaction/struct. The
+    // element record's own lowering already validated every leaf (an
+    // unsupported leaf failed THERE, naming its `Inner.field` path), so a
+    // resolved record id is sufficient here. Checked before the scalar mapping
+    // — record names are not scalars. `fixed_vec_record_id` is the single
+    // matcher for this shape (also used by the AST-level cycle check).
+    if let Some(rid) = fixed_vec_record_id(t, record_ids) {
+        return Some((IrType::Record(rid), len));
+    }
     let elem = match args.first()? {
-        TypeArg::Type(ty) => {
-            if let Some(rid) = named_record_id(ty, record_ids) {
-                return Some((IrType::Record(rid), len));
-            }
-            ty
-        }
-        TypeArg::Expr(e) => {
-            if let ExprKind::Ident(id) = &*e.kind {
-                if let Some(&rid) = record_ids.get(id.name.as_str()) {
-                    return Some((IrType::Record(rid), len));
-                }
-            }
-            return None;
-        }
+        TypeArg::Type(ty) => ty,
+        // A bare-ident element that is not a record name (handled above) is not
+        // a supported fixed-vec element — matches the original `return None`.
         _ => return None,
     };
     let elem_ty = if matches!(
@@ -819,12 +809,53 @@ fn field_ir_type(t: &TypeExpr, enum_names: &std::collections::HashSet<String>) -
 /// names the same record as the bare one — the rule `tlm_ret_record_id`
 /// and `field_ir_type` already use, and the reason this is shared rather
 /// than restated at each caller.
-fn named_record_id(t: &TypeExpr, record_ids: &HashMap<String, RecordId>) -> Option<RecordId> {
+pub(crate) fn named_record_id(
+    t: &TypeExpr,
+    record_ids: &HashMap<String, RecordId>,
+) -> Option<RecordId> {
     let TypeExpr::Named { name, .. } = t else {
         return None;
     };
     let simple = name.segments.last().map(|s| s.name.as_str())?;
     record_ids.get(simple).copied()
+}
+
+/// The element record id of a fixed `Vec<Record, N>` field — the by-value
+/// nested-record case `fixed_vec_field` lowers to `IrType::Record(rid)` (with
+/// `vec_len = Some(N)`), which `check_no_record_cycles` follows as a cycle edge.
+/// A fixed vector needs a literal length (matching `fixed_vec_field`); a
+/// non-literal length is not lowered as a fixed vec, so it is not a record edge
+/// on the lowering side either. A deeper nesting (`Vec<Vec<Record>>`) lowers to
+/// `IrType::FixedVec`, not `IrType::Record`, so it is intentionally NOT matched;
+/// `list`/`queue` are not `Vec` and never match. Shared by `fixed_vec_field`
+/// and the AST-level [`super::check_record_cycles`] so both see the same edges.
+pub(crate) fn fixed_vec_record_id(
+    t: &TypeExpr,
+    record_ids: &HashMap<String, RecordId>,
+) -> Option<RecordId> {
+    let TypeExpr::Builtin {
+        name: BuiltinTy::Vec,
+        args,
+        ..
+    } = t
+    else {
+        return None;
+    };
+    match args.get(1)? {
+        TypeArg::Expr(e) if matches!(&*e.kind, ExprKind::Int(_)) => {}
+        _ => return None,
+    }
+    // The parser yields a bare named element as `TypeArg::Expr(Ident)` and a
+    // builtin-headed one as `TypeArg::Type`, so a record element appears in
+    // BOTH shapes.
+    match args.first()? {
+        TypeArg::Type(ty) => named_record_id(ty, record_ids),
+        TypeArg::Expr(e) => match &*e.kind {
+            ExprKind::Ident(id) => record_ids.get(id.name.as_str()).copied(),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// A short, human-readable label for a field's declared type, for the
@@ -847,48 +878,83 @@ fn type_expr_label(t: &TypeExpr) -> String {
 /// hard error rather than a codegen crash. DFS with a gray/black coloring
 /// over `IrType::Record` field edges.
 pub(crate) fn check_no_record_cycles(records: &[RecordSchema]) -> Result<(), LowerError> {
+    // Build the by-value record-reference graph from the lowered schemas: an
+    // edge `i -> j` for every field of record `i` whose type is exactly
+    // `IrType::Record(j)`. Vec/list/queue-of-record fields are NOT edges (they
+    // are finite/indirect), matching the by-value-only cycle rule.
+    let names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
+    let edges: Vec<Vec<(String, usize)>> = records
+        .iter()
+        .map(|r| {
+            r.fields
+                .iter()
+                .filter_map(|f| match f.ty {
+                    IrType::Record(rid) => Some((f.name.clone(), rid.index())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+    detect_record_cycle(&names, &edges)
+}
+
+/// DFS over a record-reference graph, reporting the first by-value cycle with
+/// the shared diagnostic. `names[i]` is record `i`'s name; `edges[i]` lists its
+/// by-value record-typed fields as `(field_name, target_record_index)`.
+///
+/// Shared by [`check_no_record_cycles`] (graph from lowered `RecordSchema`s)
+/// and [`super::check_record_cycles`] (graph read straight off the AST, for
+/// `harc check`), so both produce the identical diagnostic.
+pub(crate) fn detect_record_cycle(
+    names: &[&str],
+    edges: &[Vec<(String, usize)>],
+) -> Result<(), LowerError> {
     #[derive(Clone, Copy, PartialEq)]
     enum Color {
         White,
         Gray,
         Black,
     }
-    let mut color = vec![Color::White; records.len()];
-    // Explicit stack DFS carrying the containing record for the diagnostic.
-    fn visit(i: usize, records: &[RecordSchema], color: &mut [Color]) -> Result<(), LowerError> {
+    // Explicit-recursion DFS carrying the containing record for the diagnostic.
+    fn visit(
+        i: usize,
+        names: &[&str],
+        edges: &[Vec<(String, usize)>],
+        color: &mut [Color],
+    ) -> Result<(), LowerError> {
         color[i] = Color::Gray;
-        for f in &records[i].fields {
-            if let IrType::Record(rid) = f.ty {
-                let j = rid.index();
-                match color.get(j).copied() {
-                    Some(Color::Gray) => {
-                        // Structurally invalid, NOT a TB-IR-subset gap: a
-                        // by-value recursive struct is an infinitely-sized
-                        // C++ type in every backend (v1 stack-overflows on
-                        // it). Use `Invalid` so the diagnostic does NOT
-                        // suggest `re-run with --codegen v1` — that path
-                        // crashes rather than accepting the program.
-                        return Err(LowerError::Invalid(format!(
-                            "recursive nested record `{}`: field `{}` \
-                             transitively contains `{}` by value — a record \
-                             cannot contain itself (the generated C++ struct \
-                             would be infinitely sized). Break the cycle \
-                             (e.g. use a handle/index instead of a by-value \
-                             field).",
-                            records[i].name, f.name, records[j].name
-                        )));
-                    }
-                    Some(Color::White) => visit(j, records, color)?,
-                    _ => {}
+        for (fname, j) in &edges[i] {
+            let j = *j;
+            match color.get(j).copied() {
+                Some(Color::Gray) => {
+                    // Structurally invalid, NOT a TB-IR-subset gap: a by-value
+                    // recursive struct is an infinitely-sized C++ type in every
+                    // backend (v1 stack-overflows on it). Use `Invalid` so the
+                    // diagnostic does NOT suggest `re-run with --codegen v1` —
+                    // that path crashes rather than accepting the program.
+                    return Err(LowerError::Invalid(format!(
+                        "recursive nested record `{}`: field `{}` \
+                         transitively contains `{}` by value — a record \
+                         cannot contain itself (the generated C++ struct \
+                         would be infinitely sized). Break the cycle by \
+                         storing an index or handle instead of the record \
+                         by value: give `{}` a scalar type such as \
+                         `uint<32>` that indexes a separate pool of `{}`, \
+                         rather than a by-value `{}` field.",
+                        names[i], fname, names[j], fname, names[j], names[j]
+                    )));
                 }
+                Some(Color::White) => visit(j, names, edges, color)?,
+                _ => {}
             }
         }
         color[i] = Color::Black;
         Ok(())
     }
-    for i in 0..records.len() {
+    let mut color = vec![Color::White; names.len()];
+    for i in 0..names.len() {
         if color[i] == Color::White {
-            visit(i, records, &mut color)?;
+            visit(i, names, edges, &mut color)?;
         }
     }
     Ok(())

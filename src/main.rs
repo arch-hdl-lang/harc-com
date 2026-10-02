@@ -1532,6 +1532,7 @@ fn validate_check_backend_codegen_limitations(path: &PathBuf, src: &str) -> Resu
 
 fn cmd_check(files: Vec<PathBuf>, ast: bool) -> Result<()> {
     let mut total_items = 0;
+    let mut all_parsed: Vec<harc::ast::SourceFile> = Vec::new();
     for file in &files {
         let src = fs::read_to_string(file).into_diagnostic()?;
         let parsed = parse_file_source(file, &src)?;
@@ -1541,6 +1542,35 @@ fn cmd_check(files: Vec<PathBuf>, ast: bool) -> Result<()> {
             println!("// {}", file.display());
             println!("{:#?}", parsed);
         }
+        all_parsed.push(parsed);
+    }
+    // Reject by-value recursive records here so `harc check` fails before
+    // either codegen is reached (issue #483). `check_record_cycles` reads only
+    // the record-reference graph off the AST — it lowers nothing, so `harc
+    // check` stays lowering-free and keeps accepting testless files and files
+    // that reference externally-defined or codegen-unsupported field types.
+    // Concatenate all input items into one synthetic file so a record cycle
+    // that spans input files is still caught (multiple inputs are one program,
+    // as the codegen paths treat them).
+    {
+        let mut merged_items = Vec::new();
+        let mut merged_item_sources = Vec::new();
+        let mut merged_sources = Vec::new();
+        for f in all_parsed {
+            merged_items.extend(f.items);
+            merged_item_sources.extend(f.item_sources);
+            merged_sources.extend(f.sources);
+        }
+        let merged = harc::ast::SourceFile {
+            items: merged_items,
+            item_sources: merged_item_sources,
+            sources: merged_sources,
+            inner_doc: None,
+            frontmatter: None,
+        };
+        // On a cycle this surfaces the `LowerError::Invalid` diagnostic, which
+        // points the user at a scalar index/handle field.
+        harc::ir::lower::check_record_cycles(&merged).map_err(|e| miette::miette!("{}", e))?;
     }
     if !ast {
         println!(
