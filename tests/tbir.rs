@@ -48580,6 +48580,214 @@ end test T
     assert!(msg.contains("impure helper call `after_value`"), "{msg}");
 }
 
+/// Cycle suspension is classified through the whole helper closure, not just
+/// the sampled helper's own body. v1 CFG-inlines impure helpers, so a wrapper
+/// `outer() { return inner() }` with a suspending `inner` emits the identical
+/// `tick()`-in-`_checkers` construct as a direct suspension — the same
+/// `SilentlyMisLowers`/`EmitsUncompilable` outcome, never a working `--codegen
+/// v1` fallback. The diagnostic names the SAMPLED helper (`outer`), which is
+/// what the user wrote in the coverpoint.
+#[test]
+fn transitive_cycle_suspension_in_cover_helper_is_not_a_v1_fallback() {
+    // Two-hop `wait`: the suspension lives in `inner_wait`, reached only via
+    // `outer`'s `return inner_wait()`.
+    let wait_src = r#"
+function inner_wait() -> uint<8>
+    wait 1 cycle
+    return 1
+end function inner_wait
+
+function outer() -> uint<8>
+    return inner_wait()
+end function outer
+
+covergroup PointCov @(posedge dut.clk)
+    cp : cover outer()
+        bins
+            one = {1}
+        end bins
+end covergroup PointCov
+
+test T
+    let dut : Top
+    let cov : PointCov
+    run
+        wait 1 cycle
+    end run
+end test T
+"#;
+    let msg = assert_not_implemented(
+        &lower_src(wait_src).expect_err("a transitively cycle-waiting sampler must be rejected"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(
+        msg.contains("impure helper call `outer`"),
+        "names the sampled helper, not the inner one: {msg}"
+    );
+    // And v1 really does emit that crashing construct: it compiles (so the
+    // fallback would look valid) but re-enters the checker at runtime.
+    let wait_cpp = cpp_tb::emit(&merged_src(wait_src)).expect("v1 emits the two-hop sampler");
+    assert_cpp_typechecks("transitive_cycle_wait_cover_helper", &wait_cpp);
+
+    // Two-hop `after`: v1 emits an invalid value expression.
+    let after_src = r#"
+function inner_after() -> uint<8>
+    after 1 cycle
+    end after
+    return 1
+end function inner_after
+
+function outer() -> uint<8>
+    return inner_after()
+end function outer
+
+covergroup PointCov @(posedge dut.clk)
+    cp : cover outer()
+        bins
+            one = {1}
+        end bins
+end covergroup PointCov
+
+test T
+    let dut : Top
+    let cov : PointCov
+    run
+        wait 1 cycle
+    end run
+end test T
+"#;
+    let msg = assert_not_implemented(
+        &lower_src(after_src).expect_err("a transitive `after` sampler is EmitsUncompilable"),
+        lower::V1Status::EmitsUncompilable,
+    );
+    assert!(msg.contains("impure helper call `outer`"), "{msg}");
+
+    // `fork`/`select`/`parallel`/`schedule` branches are suspension contexts in
+    // the direct check, and call discovery must descend into them symmetrically
+    // — including when they are NESTED under an `if`/`for`/etc., the shape that a
+    // "scan_stmt handles if/for, extra arms handle fork" split still misses. A
+    // suspending call inside a `fork` branch nested under an `if` must still be
+    // classified, not routed to v1.
+    let fork_under_if_src = r#"
+function inner_wait() -> uint<8>
+    wait 1 cycle
+    return 1
+end function inner_wait
+
+function forky() -> uint<8>
+    let x : uint<8> = 0
+    let g : uint<1> = 1
+    if g == 1
+        fork
+        branch
+            x = inner_wait()
+        end branch
+        join_none
+    end if
+    return x
+end function forky
+
+covergroup PointCov @(posedge dut.clk)
+    cp : cover forky()
+        bins
+            one = {1}
+        end bins
+end covergroup PointCov
+
+test T
+    let dut : Top
+    let cov : PointCov
+    run
+        wait 1 cycle
+    end run
+end test T
+"#;
+    let msg = assert_not_implemented(
+        &lower_src(fork_under_if_src)
+            .expect_err("a suspending call in a fork branch under an if is not a v1 fallback"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("impure helper call `forky`"), "{msg}");
+
+    // Mirror shape with `select` nested under `for`: the kinds alternate the
+    // other way (loop outside, select inside).
+    let select_under_for_src = r#"
+function inner_wait() -> uint<8>
+    wait 1 cycle
+    return 1
+end function inner_wait
+
+function selecty() -> uint<8>
+    let x : uint<8> = 0
+    for i in 0..0
+        select
+            dut.out == 1 => x = inner_wait()
+        end select
+    end for
+    return x
+end function selecty
+
+covergroup PointCov @(posedge dut.clk)
+    cp : cover selecty()
+        bins
+            one = {1}
+        end bins
+end covergroup PointCov
+
+test T
+    let dut : Top
+    let cov : PointCov
+    run
+        wait 1 cycle
+    end run
+end test T
+"#;
+    let msg = assert_not_implemented(
+        &lower_src(select_under_for_src)
+            .expect_err("a suspending call in a select arm under a for is not a v1 fallback"),
+        lower::V1Status::SilentlyMisLowers,
+    );
+    assert!(msg.contains("impure helper call `selecty`"), "{msg}");
+
+    // Uninstantiated: still inert — the #859 skip of unreferenced covergroups
+    // is untouched by the transitive check.
+    let uninstantiated = wait_src.replacen("    let cov : PointCov\n", "", 1);
+    let prog = lower_src(&uninstantiated).expect("unused transitive-suspend covergroup is inert");
+    assert!(prog.covgroups.is_empty(), "unused schema is omitted");
+
+    // Critical false-positive guard: a transitive DUT-reading helper with NO
+    // suspension anywhere in its closure keeps the working v1 fallback.
+    let nonsuspending_src = r#"
+function inner_read(dut: Top) -> uint<8>
+    return dut.count_out
+end function inner_read
+
+function outer_read(dut: Top) -> uint<8>
+    return inner_read(dut)
+end function outer_read
+
+covergroup V1Cov @(posedge dut.clk)
+    cp : cover outer_read(dut)
+        bins
+            zero = {0}
+        end bins
+end covergroup V1Cov
+
+test T
+    let dut : Top
+    let cov : V1Cov
+    run
+        wait 1 cycle
+    end run
+end test T
+"#;
+    let msg = assert_unsupported(&lower_src(nonsuspending_src).unwrap_err());
+    assert!(msg.contains("impure helper call `outer_read`"), "{msg}");
+    let v1_cpp =
+        cpp_tb::emit(&merged_src(nonsuspending_src)).expect("v1 emits the transitive DUT reader");
+    assert_cpp_typechecks("transitive_nonsuspending_cover_helper", &v1_cpp);
+}
+
 /// A transactor `function` is callable but is not a hook target.
 ///
 /// The dedicated transactor IR used to discard `HookableMethod::is_hookable`
