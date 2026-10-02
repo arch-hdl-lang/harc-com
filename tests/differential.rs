@@ -1655,16 +1655,22 @@ end impl T7
                 );
                 continue;
             }
-            // v1 is measured, not remembered: it emits
-            // `_harc_u128 w = <literal>;`, which g++ accepts with a
-            // `-Woverflow` warning and evaluates to 0. That is
-            // `SilentlyMisLowers`, and it is why `Invalid` — which
-            // claims no backend runs the program — was wrong here.
-            assert_eq!(
-                v1_behaviour(cc, &src, &dir, &stem),
-                V1Behaviour::Compiles,
-                "{site}: v1 is expected to compile `default {lit}` (and get it wrong)"
-            );
+            // v1 emits `_harc_u128 w = <literal>;`. GCC accepts the
+            // oversized literal with a warning and truncates it; Clang
+            // rejects the literal. Both are consistent with the arm's
+            // worst-case SilentlyMisLowers grade. Accept only that specific
+            // rejection so unrelated generated-C++ errors still fail here.
+            match v1_behaviour(cc, &src, &dir, &stem) {
+                V1Behaviour::Compiles => {}
+                V1Behaviour::EmitsUncompilable(ref diagnostic)
+                    if diagnostic.contains(
+                        "error: integer literal is too large to be represented in any integer type",
+                    ) => {}
+                other => panic!(
+                    "{site}: v1 must compile or diagnose the oversized literal \
+                     `default {lit}`, got {other:?}"
+                ),
+            }
             match tb {
                 TbVerdict::NotImplemented(lower::V1Status::SilentlyMisLowers, _) => {}
                 other => panic!(
