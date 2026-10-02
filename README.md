@@ -189,7 +189,9 @@ The dashed paths share the same parser + AST + IR; they branch at codegen by emi
 | `harc graph query <query> --index .harcgraph` | Search graph nodes and edges by symbol, text, file, doc, or relationship kind. |
 | `harc graph tests-for <symbol> --index .harcgraph` | List tests that reference a DUT, type, or symbol. |
 | `harc graph impact <symbol> --index .harcgraph` | Return a bounded dependency/impact slice around a symbol. |
-| `harc graph context <task> --index .harcgraph` | Return compact graph context for a natural-language task. |
+| `harc graph context <task> --index .harcgraph [--node-kind KIND] [--edge-kind KIND]` | Return filtered, token-bounded graph context for a task. |
+| `harc graph dev-index --root . --map docs/codegraph_feature_map.json --out .harcdevgraph` | Build and validate the separate compiler-development graph. |
+| `harc graph dev-query <query> --root . --index .harcdevgraph [--roles ROLE]` | Find selected compiler layers and fixtures for a language feature. |
 | `harc graph html --index .harcgraph --out harc-graph.html` | Render the indexed graph as a standalone searchable HTML viewer. |
 
 Common `harc sim` flags:

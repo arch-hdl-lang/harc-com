@@ -57,7 +57,9 @@ allowed so bundled docs and fixtures remain available.
 | `harc_advise` | Query local HARC error-to-fix learning store |
 | `harc_graph_index` | Build the compiler-native JSONL graph index for HARC/DUT paths |
 | `harc_graph_query` | Search graph nodes and edges for a symbol or text query |
-| `harc_graph_context` | Return compact graph context for a task description |
+| `harc_graph_context` | Return compact context; optional `node_kinds`/`edge_kinds` filters and `source_paths` for refresh |
+| `harc_dev_graph_index` | Build and validate the compiler-development feature graph |
+| `harc_dev_graph_query` | Find compiler source locations and fixtures; optional `roles` filter |
 | `harc_graph_impact` | Return a bounded dependency/impact slice around a graph symbol |
 | `harc_graph_tests_for_dut` | List tests that reference a DUT, type, or symbol |
 | `harc_graph_examples_for` | Run `harc graph query` for feature or construct example searches |
@@ -70,6 +72,16 @@ allowed so bundled docs and fixtures remain available.
 | `HARC_BIN` | `target/release/harc` | Path to the HARC compiler binary |
 | `HARC_MCP_WORKSPACE_ROOTS` | repo root | Additional colon-separated roots allowed for file operations |
 | `ARCH_BIN` | unset | Optional path forwarded to `harc sim --dut` |
+
+The focused context and developer query tools automatically build missing indexes and
+refresh stale ones. User graph context defaults to the shipped fixtures and DUTs
+when querying this repository; pass `source_paths` for an external workspace.
+Developer queries default to this repository's curated feature map. Skip graph
+retrieval when the task already identifies the exact files and no relationship
+discovery is needed.
+Graph indexing and querying honor `HARC_MCP_WORKSPACE_ROOTS` for imported bus
+sources too. Add a sibling ARCH checkout to that variable when its bus
+declarations should appear in MCP graph results.
 
 When `harc_sim_emit_only` is called without `outdir`, the server writes emitted
 artifacts to a temporary directory instead of the `harc-com` checkout.

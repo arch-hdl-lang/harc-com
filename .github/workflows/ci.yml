@@ -89,6 +89,16 @@ jobs:
         env:
           HARC_REQUIRE_VERILATOR: "1"
 
+      - name: Set up Python for MCP smoke
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: MCP stdio graph smoke
+        run: |
+          python3 -m pip install -r mcp/requirements.txt
+          python3 tools/smoke_codegraph_mcp_stdio.py --harc ./target/release/harc
+
   parse-fixtures:
     # Every fixture must round-trip parse + check cleanly. This catches
     # AST/parser regressions that the snapshot suite alone won't.
@@ -118,6 +128,12 @@ jobs:
 
       - name: Build harc
         run: cargo build --release --bin harc
+
+      - name: Validate developer graph mappings
+        run: |
+          set -euo pipefail
+          ./target/release/harc graph dev-index --out .harcdevgraph
+          ./target/release/harc graph dev-query 'transactor lowering' --index .harcdevgraph | grep -q lower_transactor
 
       - name: harc check every fixture
         run: |

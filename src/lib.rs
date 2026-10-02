@@ -2,6 +2,7 @@ pub mod ast;
 pub mod check_backends;
 pub mod codegen;
 pub mod constraints;
+pub mod dev_graph;
 pub mod diagnostics;
 pub mod graph;
 pub mod ir;
