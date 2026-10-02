@@ -18,7 +18,7 @@ use crate::ir::{
     CallTarget, CovBinBound, CovBinValue, CovTrigger, CoverBinSchema, CoverCrossSchema,
     CoverPointSchema, CovgroupSchema, Expr, IrType, PortAccess, PortRef, UnOp, WidthCastKind,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub(crate) fn lower_covergroup(
     g: &CovergroupDecl,
@@ -853,7 +853,7 @@ fn lower_point_target(
                                 "covergroup `{group}` point `{point}` impure helper call `{}`",
                                 id.name
                             );
-                            if block_contains_direct_cycle_suspension(&entry.decl.body, true) {
+                            if sampled_helper_suspends(entry, true, helpers) {
                                 return Err(not_implemented(
                                     &construct,
                                     "only pure file-scope helper functions can be sampled in coverpoints; \
@@ -861,7 +861,7 @@ fn lower_point_target(
                                     V1Status::EmitsUncompilable,
                                 ));
                             }
-                            if block_contains_direct_cycle_suspension(&entry.decl.body, false) {
+                            if sampled_helper_suspends(entry, false, helpers) {
                                 return Err(not_implemented(
                                     &construct,
                                     "only pure file-scope helper functions can be sampled in coverpoints; \
@@ -1083,6 +1083,138 @@ fn block_contains_direct_cycle_suspension(block: &Block, after: bool) -> bool {
     }
 
     block.stmts.iter().any(|stmt| stmt_contains(stmt, after))
+}
+
+/// Whether sampling `entry` in a coverpoint/bin is a cycle-suspending sampler,
+/// following calls transitively through the helper closure — not just `entry`'s
+/// own body.
+///
+/// v1 CFG-inlines impure helpers, so a wrapper like `h() { return g() }` with a
+/// suspending `g` emits the identical `tick()`-in-`_checkers` construct as a
+/// direct suspension in `h`: for `wait` it compiles but re-enters the checker at
+/// runtime (`SilentlyMisLowers`), for `after` it emits an invalid value
+/// expression (`EmitsUncompilable`). Classifying only the sampled helper's own
+/// body left the transitive form routed to a `--codegen v1` escape hatch that
+/// does not actually work — the exact false-fallback this gap queue exists to
+/// eliminate. Inspecting the closure keeps the two forms consistent.
+fn sampled_helper_suspends(
+    entry: &super::helpers::HelperEntry<'_>,
+    after: bool,
+    helpers: &HelperRegistry<'_>,
+) -> bool {
+    let mut visited = HashSet::new();
+    visited.insert(entry.decl.name.name.clone());
+    helper_closure_contains_cycle_suspension(&entry.decl.body, after, helpers, &mut visited)
+}
+
+/// Transitive worker for [`sampled_helper_suspends`]. Checks `body` directly,
+/// then recurses into every file-scope helper it calls. Cycle-guarded by the
+/// `visited` set, which makes termination hold in isolation — independent of the
+/// impure-helper acyclicity invariant (`check_acyclic`), whose own scan does not
+/// descend into `fork`/`select` bodies the way [`collect_closure_callees`] does.
+/// An unresolved callee (not a file-scope helper) contributes no suspension and
+/// falls through to the ordinary `Unsupported` fallback, unchanged.
+fn helper_closure_contains_cycle_suspension(
+    body: &Block,
+    after: bool,
+    helpers: &HelperRegistry<'_>,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if block_contains_direct_cycle_suspension(body, after) {
+        return true;
+    }
+    let mut callees = Vec::new();
+    collect_closure_callees(body, &mut callees);
+    for callee in callees {
+        if !visited.insert(callee.clone()) {
+            continue;
+        }
+        if let Some(entry) = helpers.get(&callee) {
+            if helper_closure_contains_cycle_suspension(&entry.decl.body, after, helpers, visited) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Collect file-scope helper calls reachable from `block` for the transitive
+/// suspension walk.
+///
+/// This owns the full structural descent itself, mirroring
+/// [`block_contains_direct_cycle_suspension`]'s `stmt_contains` exactly
+/// (`if`/`elsif`/`else`, `for`/`repeat`/`while`/`loop` bodies, `fork` branches,
+/// `parallel`/`schedule` blocks, `select` arm actions; `on` excluded) and reads
+/// leaf expressions with `helpers::direct_callees_in_expr`. Delegating structure
+/// to `direct_callees_in_stmt` is wrong here: its backing `scan_stmt` descends
+/// into `if`/`for`/`while`/`loop`/`repeat` but routes `fork`/`parallel`/
+/// `select`/`schedule` to a catch-all, so the two walkers would cover disjoint
+/// block kinds and a `fork`/`select` nested under a loop or conditional (or vice
+/// versa) would be reached by neither — re-opening the exact asymmetry with the
+/// direct check that this walk closes. A single walker cannot develop that gap.
+fn collect_closure_callees(block: &Block, out: &mut Vec<String>) {
+    use super::helpers::direct_callees_in_expr as expr_callees;
+    for stmt in &block.stmts {
+        match &stmt.kind {
+            StmtKind::Let(l) => {
+                if let Some(v) = &l.value {
+                    out.extend(expr_callees(v));
+                }
+            }
+            StmtKind::Assign { target, value } | StmtKind::Send { target, value } => {
+                out.extend(expr_callees(target));
+                out.extend(expr_callees(value));
+            }
+            StmtKind::Return(v) => {
+                if let Some(e) = v {
+                    out.extend(expr_callees(e));
+                }
+            }
+            StmtKind::Expr(e) => out.extend(expr_callees(e)),
+            StmtKind::If(i) => {
+                out.extend(expr_callees(&i.cond));
+                collect_closure_callees(&i.then_block, out);
+                for (cond, body) in &i.elsifs {
+                    out.extend(expr_callees(cond));
+                    collect_closure_callees(body, out);
+                }
+                if let Some(eb) = &i.else_block {
+                    collect_closure_callees(eb, out);
+                }
+            }
+            StmtKind::For(f) => {
+                out.extend(expr_callees(&f.iter));
+                collect_closure_callees(&f.body, out);
+            }
+            StmtKind::Repeat(r) => {
+                out.extend(expr_callees(&r.count));
+                collect_closure_callees(&r.body, out);
+            }
+            StmtKind::While { cond, body, .. } => {
+                out.extend(expr_callees(cond));
+                collect_closure_callees(body, out);
+            }
+            StmtKind::Loop(b) => collect_closure_callees(b, out),
+            StmtKind::Fork(fork) => {
+                for branch in &fork.branches {
+                    collect_closure_callees(branch, out);
+                }
+            }
+            StmtKind::Parallel(blocks) | StmtKind::Schedule(blocks) => {
+                for body in blocks {
+                    collect_closure_callees(body, out);
+                }
+            }
+            StmtKind::Select(arms) => {
+                for arm in arms {
+                    collect_closure_callees(&arm.action, out);
+                }
+            }
+            // `on` handler bodies are excluded, matching the direct check; the
+            // remaining kinds carry no helper-call expression to collect.
+            _ => {}
+        }
+    }
 }
 
 /// Classify an expression the coverpoint/bin subset does not lower, by
