@@ -1381,6 +1381,27 @@ struct Scan {
     callees: Vec<String>,
 }
 
+/// Bare helper-call candidates reached from an executable statement.
+/// Resolution against the helper registry happens at the caller; unknown
+/// names are retained for the same deferred-diagnostic behavior as lowering.
+pub(crate) fn direct_callees_in_stmt(stmt: &AstStmt) -> Vec<String> {
+    let mut scan = Scan {
+        impure: false,
+        callees: Vec::new(),
+    };
+    scan_stmt(stmt, &mut scan);
+    scan.callees
+}
+
+pub(crate) fn direct_callees_in_expr(expr: &AstExpr) -> Vec<String> {
+    let mut scan = Scan {
+        impure: false,
+        callees: Vec::new(),
+    };
+    scan_expr(expr, &mut scan);
+    scan.callees
+}
+
 fn scan_decl(d: &FunctionDecl) -> Scan {
     let mut s = Scan {
         impure: false,
@@ -1448,6 +1469,13 @@ fn scan_stmt(st: &AstStmt, s: &mut Scan) {
             if let Some(e) = v {
                 scan_expr(e, s);
             }
+        }
+        StmtKind::Expr(expr) => {
+            // Statement-position calls are effectful even when their callee
+            // is otherwise pure, but retain the edge for reachability and
+            // recursive-impurity analysis.
+            s.impure = true;
+            scan_expr(expr, s);
         }
         // Everything else needs the DUT, the scheduler, or the runtime
         // log context (`wait`, `log`, `assert`, `fail`, ...), or is

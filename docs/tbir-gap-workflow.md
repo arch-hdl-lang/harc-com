@@ -13,10 +13,10 @@ queue: some sites cover several source shapes, and some diagnostics were
 incorrectly classified as gaps even though v1 rejects the same source.
 
 The refreshed 2026-09-30 inventory is recorded in
-[`tbir-migration-manifest.md`](tbir-migration-manifest.md). Current main has
-89 executable constructors (90 textual matches including the helper
-definition); the manifest separates positive runtime controls from diagnostic
-and deliberately deferred shapes.
+[`tbir-migration-manifest.md`](tbir-migration-manifest.md). After the current
+batch there are 83 executable constructors (84 textual matches including the
+helper definition); the manifest separates positive runtime controls from
+diagnostic and deliberately deferred shapes.
 
 ## Source of truth and ordering
 
@@ -47,6 +47,10 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Bound-transactor `thread` items routed through the component path.
 - [x] Direct coverpoint value gaps with working v1 behavior (sized literals,
   runtime slice/lane selectors, and directly sampled or narrowed wide values).
+- [x] Uninstantiated covergroup declarations with malformed hook targets or
+  impure point/bin helpers. Inert schemas no longer block TB-IR; instantiated
+  forms split between v1 rejection, `wait` runtime failure, invalid `after`
+  emission, and the working v1 path for non-suspending helpers.
 - [x] Composed wide cover expressions and width-preserving wrapping arithmetic
   (wide unary/binary/ternary operands are coerced through the 1024-bit scalar
   model; known-width `+%`/`-%`/`*%` cover expressions retain their 1–64-bit
@@ -169,7 +173,7 @@ they are not retirement blockers and come after the proven migration gaps.
 
 ## Faster burn-down
 
-Treat the 89 remaining constructor call sites (90 textual matches including
+Treat the 83 remaining constructor call sites (84 textual matches including
 the `unsupported` helper definition) as an inventory, not 116 separate tasks.
 Maintain a generated migration manifest with one row per executable
 source shape: owning lowering function, diagnostic class, v1 evidence,
@@ -616,6 +620,16 @@ not applicable before requesting review:
    unmerged `extend` a pipeline-invalid diagnostic. Four constructor sites are
    removed across those five semantic paths, leaving 86 textual matches (85
    executable constructors plus the helper definition).
+   Unsupported uninstantiated covergroups no longer block program lowering,
+   matching v1's deferred validation and sampling behavior for inert
+   declarations, while valid inert schemas remain in the common structural
+   catalog. Used malformed hook triggers and suspending samplers report
+   no-fallback diagnostics, while non-suspending impure helpers retain the
+   measured v1 path. An unresolved bare statement call records v1's undeclared
+   C++ function.
+   The two dedicated hook-trigger constructors are removed. The impure-helper
+   constructor remains for non-suspending helpers that v1 can run, leaving 84
+   textual matches (83 executable constructors plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
