@@ -389,7 +389,7 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf \
             https://github.com/arch-hdl-lang/arch-com/releases/download/v0.70.4/arch-installer.sh | sh
-          "$HOME/.cargo/bin/arch" --version
+          "$CARGO_HOME/bin/arch" --version
 
       - name: Run sim<->SV parity net
         env:
@@ -402,5 +402,5 @@ jobs:
           ARCH_COM: arch-com
         run: |
           # Absolute path avoids coreutils `arch` (prints machine arch) shadowing.
-          export ARCH="$HOME/.cargo/bin/arch"
+          export ARCH="$CARGO_HOME/bin/arch"
           ./tests/run_check_backends.sh
