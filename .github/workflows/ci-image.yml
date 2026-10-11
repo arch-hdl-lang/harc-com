@@ -33,7 +33,12 @@ jobs:
           docker push "$IMAGE"
           docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE" | tee image-digest.txt
           cat image-digest.txt >> "$GITHUB_STEP_SUMMARY"
+          docker manifest inspect "$IMAGE" > image-manifest.json
+          python3 -c 'import json; m=json.load(open("image-manifest.json")); print("Compressed image layers: %.1f MiB" % (sum(x["size"] for x in m["layers"]) / 1024**2))' | tee image-size.txt
+          cat image-size.txt >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
           name: ci-image-digest
-          path: image-digest.txt
+          path: |
+            image-digest.txt
+            image-size.txt
