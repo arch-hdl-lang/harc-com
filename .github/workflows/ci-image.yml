@@ -1,0 +1,39 @@
+name: Build CI image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, codex/ci-fixture-shards]
+    paths: [ci/Dockerfile, .github/workflows/ci-image.yml]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    # The toolchain image belongs to public upstream; private forks consume it.
+    if: github.repository == 'arch-hdl-lang/harc-com'
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/arch-hdl-lang/harc-ci:verilator-5.034-rust-1.94.0-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Build image
+        run: docker build --platform linux/amd64 -f ci/Dockerfile -t "$IMAGE" ci
+      - name: Smoke-test toolchain
+        run: |
+          docker run --rm "$IMAGE" bash -euc 'verilator --version; rustc --version; cargo --version; clang++ --version; ccache --version; pkg-config --modversion z3'
+      - name: Publish image and record digest
+        run: |
+          docker push "$IMAGE"
+          docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE" | tee image-digest.txt
+          cat image-digest.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-image-digest
+          path: image-digest.txt
