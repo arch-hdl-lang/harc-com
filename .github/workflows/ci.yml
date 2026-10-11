@@ -10,81 +10,45 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+permissions:
+  contents: read
+  packages: read
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build-and-test:
     name: cargo test
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/arch-hdl-lang/harc-ci@sha256:ee3d4421cb32e657c2b34843f02c3d2945bfe8311480144d7061aff6309fe9a5
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Test fixture sharding
         run: python3 tests/test_fixture_sharding.py
 
-      - name: Install Z3 (needed by harc's Z3 bindings at link time) and ccache
-        # ccache is not optional here, even though nothing in this job
-        # asks for it directly. `/opt/verilator` is restored from the
-        # cache the FIXTURE jobs populate, and Verilator bakes the object
-        # cache it detected at configure time into every makefile it
-        # generates — so the binary this job restores emits
-        # `OBJCACHE = ccache` and the build dies with
-        # `make: ccache: No such file or directory` if the package is
-        # absent. It also earns its keep: this job now runs the
-        # Verilator-backed end-to-end tests, which share most of their
-        # object code.
-        # This job can be the first consumer of the Verilator cache. Install
-        # its source-build dependencies too (FlexLexer.h comes from libfl-dev).
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libz3-dev clang ccache \
-                                  git make autoconf flex bison g++ help2man perl python3 \
-                                  numactl perl-doc libfl2 libfl-dev zlib1g zlib1g-dev
-
       - name: Cache cargo registry + target
         uses: actions/cache@v6
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            /opt/cargo/registry
+            /opt/cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-
-      # Verilator, for the end-to-end tests in the suite
-      # (`tbir_wide_scoreboard_e2e`, `tlm_wait_timeout_e2e`, ...). They
-      # skip themselves when `verilator` is absent from PATH, and this
-      # job had no Verilator — so they reported `ok` in 0.00s having
-      # never run. harc#662: a genuine regression sat behind that green
-      # check for weeks. Same pinned version and cache key as the
-      # fixture jobs, so this is a cache hit after their first build.
-      - name: Cache Verilator
-        id: cache-verilator
-        uses: actions/cache@v6
-        with:
-          path: /opt/verilator
-          key: verilator-v5.034-ubuntu-${{ runner.os }}
-
-      - name: Build Verilator from source (cache miss)
-        if: steps.cache-verilator.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          git clone --branch v5.034 --depth 1 https://github.com/verilator/verilator.git /tmp/verilator-src
-          cd /tmp/verilator-src
-          autoconf
-          ./configure --prefix=/opt/verilator
-          make -j"$(nproc)"
-          sudo make install
-
-      - name: Add Verilator to PATH
-        run: |
-          echo "/opt/verilator/bin" >> "$GITHUB_PATH"
-          /opt/verilator/bin/verilator --version
+          key: ${{ runner.os }}-cargo-ci-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-ci-v1-
 
       - name: cargo build
         run: cargo build --release --all-targets
 
       - name: cargo test
         # HARC_REQUIRE_VERILATOR turns a Verilator-less skip into a hard
-        # failure. Installing Verilator above is what makes these tests
+        # failure. The prebuilt CI image is what makes these tests
         # run; this is what keeps them running — without it, a future
         # change to the steps above would put them straight back to
         # passing in 0.00s without ever executing.
@@ -97,6 +61,11 @@ jobs:
     # AST/parser regressions that the snapshot suite alone won't.
     name: harc check fixtures
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/arch-hdl-lang/harc-ci@sha256:ee3d4421cb32e657c2b34843f02c3d2945bfe8311480144d7061aff6309fe9a5
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     needs: build-and-test
     steps:
       - uses: actions/checkout@v6
@@ -106,18 +75,15 @@ jobs:
         # the omission is invisible — CI stays green. See #514.
         run: ./tests/check_fixture_registration.sh
 
-      - name: Install Z3
-        run: sudo apt-get update && sudo apt-get install -y libz3-dev
-
       - name: Cache cargo
         uses: actions/cache@v6
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            /opt/cargo/registry
+            /opt/cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-ci-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-ci-v1-
 
       - name: Build harc
         run: cargo build --release --bin harc
@@ -176,6 +142,11 @@ jobs:
     # This is what catches codegen regressions that parse-only CI misses.
     name: harc sim fixtures (shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/arch-hdl-lang/harc-ci@sha256:ee3d4421cb32e657c2b34843f02c3d2945bfe8311480144d7061aff6309fe9a5
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     needs: build-and-test
     strategy:
       fail-fast: false
@@ -187,67 +158,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Z3 + clang
-        # clang is needed because the emitted test `.cpp` uses
-        # `#pragma clang optimize off` to work around a C++20
-        # lambda-coroutine miscompile at `-Os` (verilator default)
-        # that affects both clang and GCC. GCC's equivalent pragma
-        # doesn't propagate through coroutine codegen, so we use
-        # clang on both platforms. See `run_verilator` in
-        # src/main.rs and the prelude in src/codegen/cpp_tb.rs
-        # for the full rationale.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libz3-dev clang ccache \
-                                  git make autoconf flex bison g++ help2man perl python3 \
-                                  numactl perl-doc libfl2 libfl-dev zlib1g zlib1g-dev
-
-      # Verilator: install from source. Ubuntu's apt package is
-      # 5.020 which rejects `<=` array assignment inside `for`
-      # loops (BLKLOOPINIT) — used in several arch-com DUTs we
-      # vendor (e.g. buf_mgr's reset for-loops over head/tail/count
-      # arrays, which legitimately need non-blocking assignment per
-      # always_ff convention). Verilator 5.034 fixes this; we pin
-      # to the v5.034 tag for reproducibility. Cached across runs
-      # so this only pays the build cost on cache miss.
-      - name: Cache Verilator
-        id: cache-verilator
-        uses: actions/cache@v6
-        with:
-          path: /opt/verilator
-          key: verilator-v5.034-ubuntu-${{ runner.os }}
-
-      - name: Build Verilator from source (cache miss)
-        if: steps.cache-verilator.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          git clone --branch v5.034 --depth 1 https://github.com/verilator/verilator.git /tmp/verilator-src
-          cd /tmp/verilator-src
-          autoconf
-          ./configure --prefix=/opt/verilator
-          make -j"$(nproc)"
-          sudo make install
-
-      - name: Add Verilator to PATH
-        run: |
-          echo "/opt/verilator/bin" >> "$GITHUB_PATH"
-          /opt/verilator/bin/verilator --version
-
-      # ccache: the fixture jobs do ~370 verilator+clang compiles, and
-      # most share object code — the verilated runtime is identical across
-      # every fixture, shared DUTs (e.g. top_counter.sv drives ~20
-      # fixtures) recompile identically, and the equivalence harness
-      # compiles each DUT twice (once per codegen). ccache turns those
-      # into cache hits within a run and across runs.
-      #
-      # HARC_CXX=clang++ is forwarded into the verilator makefile as a
-      # bare `CXX=clang++` (a multi-word `ccache clang++` would break
-      # make's command-line var parse — `clang++` would be read as a
-      # goal). So instead of wrapping the compiler in the var, we
-      # masquerade: a PATH dir whose `clang++` is a symlink to ccache,
-      # placed ahead of the real clang++. `make` resolves `clang++` to
-      # the symlink, ccache identifies the real compiler one hop further
-      # down PATH and caches it.
       - name: Set up ccache (masquerade clang++)
         run: |
           mkdir -p "$HOME/.ccache-bin"
@@ -275,11 +185,11 @@ jobs:
         uses: actions/cache@v6
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            /opt/cargo/registry
+            /opt/cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-ci-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-ci-v1-
 
       - name: Build harc
         run: cargo build --release --bin harc
@@ -305,8 +215,8 @@ jobs:
         if: matrix.shard == 0
         # A clocked TB with an active `phase post_eval` service, run under
         # VCD tracing, must not emit Verilator `previous dump at t=`
-        # warnings (duplicate same-timestamp dump). Reuses the Verilator
-        # install/cache and harc build above.
+        # warnings (duplicate same-timestamp dump). Reuses the image toolchain
+        # and harc build above.
         env:
           HARC_CXX: clang++
         run: ./tests/run_vcd_dump_smoke.sh
@@ -315,7 +225,7 @@ jobs:
         # Every registered fixture (tests/tbir_equiv_fixtures.txt) must
         # produce identical semantic traces under both C++ emitters
         # (`--codegen v1` and `--codegen tbir`). Lives in this job to
-        # reuse the Verilator install/cache and harc build above.
+        # reuse the image toolchain and harc build above.
         # ARCH_BIN is intentionally NOT set here (no arch checkout in
         # this job), so the optional --dut sweep self-skips.
         env:
@@ -346,9 +256,14 @@ jobs:
     # boundary through generated typed accessors. Full parity with the
     # direct backend (130/130) is the standing invariant — this job is
     # the gate that keeps the co-sim contract from rotting. Mirrors
-    # run-fixtures' setup and reuses its Verilator/ccache/cargo caches.
+    # run-fixtures' prebuilt toolchain and reuses its ccache/cargo caches.
     name: harc sim fixtures (cosim dpi) (shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/arch-hdl-lang/harc-ci@sha256:ee3d4421cb32e657c2b34843f02c3d2945bfe8311480144d7061aff6309fe9a5
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     needs: build-and-test
     strategy:
       fail-fast: false
@@ -359,36 +274,6 @@ jobs:
       SHARD_COUNT: "4"
     steps:
       - uses: actions/checkout@v6
-
-      - name: Install Z3 + clang
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libz3-dev clang ccache \
-                                  git make autoconf flex bison g++ help2man perl python3 \
-                                  numactl perl-doc libfl2 libfl-dev zlib1g zlib1g-dev
-
-      - name: Cache Verilator
-        id: cache-verilator
-        uses: actions/cache@v6
-        with:
-          path: /opt/verilator
-          key: verilator-v5.034-ubuntu-${{ runner.os }}
-
-      - name: Build Verilator from source (cache miss)
-        if: steps.cache-verilator.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          git clone --branch v5.034 --depth 1 https://github.com/verilator/verilator.git /tmp/verilator-src
-          cd /tmp/verilator-src
-          autoconf
-          ./configure --prefix=/opt/verilator
-          make -j"$(nproc)"
-          sudo make install
-
-      - name: Add Verilator to PATH
-        run: |
-          echo "/opt/verilator/bin" >> "$GITHUB_PATH"
-          /opt/verilator/bin/verilator --version
 
       - name: Set up ccache (masquerade clang++)
         # Same masquerade as run-fixtures (see the rationale there).
@@ -419,11 +304,11 @@ jobs:
         uses: actions/cache@v6
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            /opt/cargo/registry
+            /opt/cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-ci-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-ci-v1-
 
       - name: Build harc
         run: cargo build --release --bin harc
@@ -459,6 +344,11 @@ jobs:
     # and builds arch-com alongside harc.
     name: harc sim<->SV parity
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/arch-hdl-lang/harc-ci@sha256:ee3d4421cb32e657c2b34843f02c3d2945bfe8311480144d7061aff6309fe9a5
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     needs: build-and-test
     steps:
       - uses: actions/checkout@v6
@@ -479,45 +369,15 @@ jobs:
           sparse-checkout: examples/nic400
           sparse-checkout-cone-mode: true
 
-      - name: Install Z3 + clang
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libz3-dev clang ccache \
-                                  git make autoconf flex bison g++ help2man perl python3 \
-                                  numactl perl-doc libfl2 libfl-dev zlib1g zlib1g-dev
-
-      - name: Cache Verilator
-        id: cache-verilator
-        uses: actions/cache@v6
-        with:
-          path: /opt/verilator
-          key: verilator-v5.034-ubuntu-${{ runner.os }}
-
-      - name: Build Verilator from source (cache miss)
-        if: steps.cache-verilator.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          git clone --branch v5.034 --depth 1 https://github.com/verilator/verilator.git /tmp/verilator-src
-          cd /tmp/verilator-src
-          autoconf
-          ./configure --prefix=/opt/verilator
-          make -j"$(nproc)"
-          sudo make install
-
-      - name: Add Verilator to PATH
-        run: |
-          echo "/opt/verilator/bin" >> "$GITHUB_PATH"
-          /opt/verilator/bin/verilator --version
-
       - name: Cache cargo
         uses: actions/cache@v6
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            /opt/cargo/registry
+            /opt/cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-ci-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-ci-v1-
 
       - name: Build harc
         run: cargo build --release --bin harc
