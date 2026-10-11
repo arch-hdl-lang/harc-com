@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main, codex/ci-fixture-shards]
-    paths: [ci/Dockerfile, .github/workflows/ci-image.yml]
+    paths: [ci/**, .github/workflows/ci-image.yml]
 
 permissions:
   contents: read
@@ -27,7 +27,7 @@ jobs:
         run: docker build --platform linux/amd64 -f ci/Dockerfile -t "$IMAGE" ci
       - name: Smoke-test toolchain
         run: |
-          docker run --rm "$IMAGE" bash -euc 'verilator --version; rustc --version; cargo --version; clang++ --version; ccache --version; pkg-config --modversion z3'
+          docker run --rm -v "$PWD/ci:/ci:ro" "$IMAGE" bash /ci/smoke.sh
       - name: Publish image and record digest
         run: |
           docker push "$IMAGE"
