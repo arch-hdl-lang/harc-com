@@ -17,6 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Test fixture sharding
+        run: python3 tests/test_fixture_sharding.py
+
       - name: Install Z3 (needed by harc's Z3 bindings at link time) and ccache
         # ccache is not optional here, even though nothing in this job
         # asks for it directly. `/opt/verilator` is restored from the
@@ -171,9 +174,16 @@ jobs:
     # End-to-end: build harc + Verilator-compile each vendored DUT +
     # run the matching .harc fixture, asserting "ALL TESTS PASSED".
     # This is what catches codegen regressions that parse-only CI misses.
-    name: harc sim fixtures
+    name: harc sim fixtures (shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
     needs: build-and-test
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      SHARD_INDEX: ${{ matrix.shard }}
+      SHARD_COUNT: "4"
     steps:
       - uses: actions/checkout@v6
 
@@ -256,8 +266,10 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.ccache
-          key: ccache-sim-${{ github.run_id }}
-          restore-keys: ccache-sim-
+          key: ccache-sim-shard-${{ matrix.shard }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-sim-shard-${{ matrix.shard }}-
+            ccache-sim-
 
       - name: Cache cargo
         uses: actions/cache@v6
@@ -284,11 +296,13 @@ jobs:
         run: ./tests/run_fixtures.sh
 
       - name: Run negative-fixture runner (expects FATAL / abort)
+        if: matrix.shard == 0
         env:
           HARC_CXX: clang++
         run: ./tests/run_negative_fixtures.sh
 
       - name: VCD dup-dump smoke test (issue #477)
+        if: matrix.shard == 0
         # A clocked TB with an active `phase post_eval` service, run under
         # VCD tracing, must not emit Verilator `previous dump at t=`
         # warnings (duplicate same-timestamp dump). Reuses the Verilator
@@ -321,9 +335,16 @@ jobs:
     # direct backend (130/130) is the standing invariant — this job is
     # the gate that keeps the co-sim contract from rotting. Mirrors
     # run-fixtures' setup and reuses its Verilator/ccache/cargo caches.
-    name: harc sim fixtures (cosim dpi)
+    name: harc sim fixtures (cosim dpi) (shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
     needs: build-and-test
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      SHARD_INDEX: ${{ matrix.shard }}
+      SHARD_COUNT: "4"
     steps:
       - uses: actions/checkout@v6
 
@@ -376,8 +397,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.ccache
-          key: ccache-cosim-${{ github.run_id }}
+          key: ccache-cosim-shard-${{ matrix.shard }}-${{ github.run_id }}
           restore-keys: |
+            ccache-cosim-shard-${{ matrix.shard }}-
             ccache-cosim-
             ccache-sim-
 
@@ -403,6 +425,7 @@ jobs:
         run: ./tests/run_cosim_fixtures.sh
 
       - name: Run negative fixtures through --cosim dpi (expects $fatal path)
+        if: matrix.shard == 0
         # Exercises the failure half of the co-sim protocol —
         # RC_DONE_FAIL -> $fatal -> nonzero exit — which the all-green
         # parity sweep never touches.
