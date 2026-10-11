@@ -326,6 +326,18 @@ jobs:
         if: always()
         run: ccache -s
 
+  run-fixtures-complete:
+    # Preserve the required check name while aggregating all matrix shards.
+    name: harc sim fixtures
+    runs-on: ubuntu-latest
+    needs: run-fixtures
+    if: always()
+    steps:
+      - name: Require every fixture shard to pass
+        env:
+          FIXTURE_RESULT: ${{ needs.run-fixtures.result }}
+        run: test "$FIXTURE_RESULT" = success
+
   run-cosim-fixtures:
     # Same fixture table as run-fixtures, through the `--cosim dpi`
     # backend (spec §10 simulator-owned-time DPI-C co-sim): generated
