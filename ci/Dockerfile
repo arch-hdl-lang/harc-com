@@ -12,7 +12,7 @@ LABEL org.opencontainers.image.description="HARC CI: Verilator 5.034, Rust 1.94.
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
-        clang libz3-dev curl pkg-config ccache make g++ perl python3 git \
+        clang libz3-dev curl pkg-config ccache make g++ perl python3 git xz-utils zstd \
         ca-certificates libgoogle-perftools4 libtcmalloc-minimal4 libfl2 zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 

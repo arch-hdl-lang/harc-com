@@ -7,6 +7,8 @@ cargo --version
 clang++ --version
 ccache --version
 pkg-config --modversion z3
+xz --version
+zstd --version
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cd "$work"
