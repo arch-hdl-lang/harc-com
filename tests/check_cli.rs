@@ -850,3 +850,155 @@ end test DefaultWidthTest
     );
     assert!(!stderr.contains("OutOfBounds"), "{stderr}");
 }
+
+// --- #483: by-value recursive records ---------------------------------------
+
+/// `harc check` on a testless file whose struct contains itself by value must
+/// FAIL with the recursive-record diagnostic (v1 codegen would stack-overflow).
+#[test]
+fn check_rejects_self_recursive_record_in_testless_file() {
+    let path = source_file(
+        "rec_self.harc",
+        "struct Node\n  next: Node\n  val: uint<8>\nend struct Node\n",
+    );
+    let output = Command::new(harc_bin())
+        .args(["check", path.to_str().unwrap()])
+        .output()
+        .expect("run harc check");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "harc check must reject a by-value recursive record\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("recursive nested record") && stderr.contains("Node"),
+        "expected recursive-record diagnostic naming the record:\n{stderr}"
+    );
+    // The suggested remedy must be one that actually works — `ref`/`list`/
+    // `queue` are not valid record-field types, so the message must not name
+    // them (see #483 review).
+    assert!(
+        !stderr.contains("`ref ") && !stderr.contains("list<") && !stderr.contains("queue<"),
+        "diagnostic must not suggest unimplemented ref/list/queue remedies:\n{stderr}"
+    );
+}
+
+/// A testless library file (a `struct` + `function`, no `test` declaration)
+/// must be ACCEPTED — the record-cycle check must not require a testbench.
+/// Guards the regression where `harc check` forced a full sim lower and
+/// rejected every testless file.
+#[test]
+fn check_accepts_testless_library_without_test_declaration() {
+    let path = source_file(
+        "lib_ok.harc",
+        "struct Packet\n  hdr: uint<16>\n  body: uint<32>\nend struct Packet\n\
+         function widen(a: uint<8>) -> uint<32>\n    return a.zext<32>()\nend function widen\n",
+    );
+    let output = Command::new(harc_bin())
+        .args(["check", path.to_str().unwrap()])
+        .output()
+        .expect("run harc check");
+    assert!(
+        output.status.success(),
+        "harc check must accept a testless struct/function library\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A record cycle that spans two input files (A contains B, B contains A) must
+/// be caught: `harc check` treats its inputs as one program.
+#[test]
+fn check_rejects_cross_file_record_cycle() {
+    let a = source_file(
+        "cyc_a.harc",
+        "struct A\n  b: B\n  tag: uint<8>\nend struct A\n",
+    );
+    let b = source_file(
+        "cyc_b.harc",
+        "struct B\n  a: A\n  tag: uint<8>\nend struct B\n",
+    );
+    let output = Command::new(harc_bin())
+        .args(["check", a.to_str().unwrap(), b.to_str().unwrap()])
+        .output()
+        .expect("run harc check");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "harc check must reject a cross-file record cycle\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("recursive nested record"),
+        "expected recursive-record diagnostic for cross-file cycle:\n{stderr}"
+    );
+}
+
+/// A fixed `Vec<Record, N>` of the record itself is by-value recursive (it
+/// lowers to an inline `std::array`, an infinitely-sized C++ type — v1 stack-
+/// overflows). The AST cycle detector must follow the vector element, not only
+/// bare record fields (#483 review F5).
+#[test]
+fn check_rejects_fixed_vec_of_self_record() {
+    let path = source_file(
+        "rec_vec_self.harc",
+        "struct Node\n  kids: Vec<Node, 4>\n  val: uint<8>\nend struct Node\n",
+    );
+    let output = Command::new(harc_bin())
+        .args(["check", path.to_str().unwrap()])
+        .output()
+        .expect("run harc check");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "harc check must reject a Vec<Self, N> record (by-value inline array)\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("recursive nested record") && stderr.contains("Node"),
+        "expected recursive-record diagnostic for Vec-of-self:\n{stderr}"
+    );
+}
+
+/// A mutual cycle routed through a `Vec<Record, N>` field (A holds `Vec<B,_>`,
+/// B holds `A`) must be caught too.
+#[test]
+fn check_rejects_mutual_cycle_through_fixed_vec() {
+    let path = source_file(
+        "rec_vec_mutual.harc",
+        "struct A\n  bs: Vec<B, 2>\n  tag: uint<8>\nend struct A\n\
+         struct B\n  a: A\n  tag: uint<8>\nend struct B\n",
+    );
+    let output = Command::new(harc_bin())
+        .args(["check", path.to_str().unwrap()])
+        .output()
+        .expect("run harc check");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "harc check must reject a mutual cycle through Vec<Record, N>\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("recursive nested record"),
+        "expected recursive-record diagnostic:\n{stderr}"
+    );
+}
+
+/// A `Vec<Record, N>` of a DIFFERENT, non-cyclic record is fine — the detector
+/// must not over-follow and reject an ordinary array-of-record field.
+#[test]
+fn check_accepts_fixed_vec_of_noncyclic_record() {
+    let path = source_file(
+        "rec_vec_ok.harc",
+        "struct Leaf\n  v: uint<8>\nend struct Leaf\n\
+         struct Tree\n  leaves: Vec<Leaf, 4>\n  n: uint<8>\nend struct Tree\n",
+    );
+    let output = Command::new(harc_bin())
+        .args(["check", path.to_str().unwrap()])
+        .output()
+        .expect("run harc check");
+    assert!(
+        output.status.success(),
+        "harc check must accept a non-cyclic Vec<Record, N> field\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
