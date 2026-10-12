@@ -16,3 +16,9 @@ STATUS RULES:
 PREFER FIXTURES OVER PROSE:
 - Runnable examples in `tests/fixtures/` and DUTs in `tests/dut/` are usually the most reliable syntax source.
 - When a user asks for a pattern, retrieve one or two matching fixtures and adapt the smallest relevant shape.
+
+GRAPH RETRIEVAL:
+- If the task already names the exact file(s) and their ownership is clear, inspect those files directly; a graph call adds overhead. Use graph when ownership is unknown or a cross-file relationship must be discovered.
+- For unknown DUT/test and verification-component relationships, use `harc_graph_tests_for_dut()` or `harc_graph_context()` before broad file reads. For focused context, set `node_kinds`, `edge_kinds`, and a small `token_budget`; pass `source_paths` for an external workspace.
+- For unknown compiler ownership, ask `harc_dev_graph_query()` for the feature path before opening large Rust files. Set `roles` to the needed layers, such as `parser` or `lowerer`.
+- Focused MCP queries build missing indexes and refresh stale ones. If a query is empty or uncertain, fall back to fixture search and source inspection. A curated feature link identifies likely ownership, not a proven runtime call edge.

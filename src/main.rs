@@ -480,6 +480,30 @@ enum Cmd {
 
 #[derive(Subcommand, Debug)]
 enum GraphCmd {
+    /// Build the curated language-feature to compiler graph.
+    DevIndex {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, default_value = "docs/codegraph_feature_map.json")]
+        map: PathBuf,
+        #[arg(long, default_value = ".harcdevgraph")]
+        out: PathBuf,
+    },
+    /// Find compiler components and fixtures for a language feature.
+    DevQuery {
+        query: String,
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, default_value = ".harcdevgraph")]
+        index: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+        #[arg(long, default_value_t = 1200)]
+        token_budget: usize,
+        /// Only show these relationship roles (comma-separated or repeated).
+        #[arg(long, value_delimiter = ',')]
+        roles: Vec<String>,
+    },
     /// Index .harc source and DUT files/directories into JSONL files.
     Index {
         /// Input .harc/.sv/.arch files or directories.
@@ -535,6 +559,14 @@ enum GraphCmd {
         /// Maximum result lines per section.
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        #[arg(long, default_value_t = 1200)]
+        token_budget: usize,
+        /// Only return these node kinds (comma-separated or repeated).
+        #[arg(long, value_delimiter = ',')]
+        node_kind: Vec<String>,
+        /// Only return these edge kinds (comma-separated or repeated).
+        #[arg(long, value_delimiter = ',')]
+        edge_kind: Vec<String>,
     },
     /// Render an indexed graph as a standalone clickable HTML file.
     Html {
@@ -786,16 +818,29 @@ fn cmd_manifest_sources(manifest_path: &Path, probe_stub: bool, all_artifacts: b
 
 fn cmd_graph(cmd: GraphCmd) -> Result<()> {
     match cmd {
+        GraphCmd::DevIndex { root, map, out } => {
+            let stats = harc::dev_graph::index(&root, &map, &out).into_diagnostic()?;
+            println!("indexed: {} feature(s), {} node(s), {} edge(s) -> {}", stats.features, stats.nodes, stats.edges, out.display());
+            Ok(())
+        }
+        GraphCmd::DevQuery { query, root, index, limit, token_budget, roles } => {
+            println!("{}", harc::dev_graph::query(&root, &index, &query, limit, token_budget, &roles).into_diagnostic()?);
+            Ok(())
+        }
         GraphCmd::Index { paths, out } => {
             let stats = harc::graph::index_paths(&paths, &out).into_diagnostic()?;
             println!(
-                "indexed: {} file(s), {} node(s), {} edge(s), {} skipped -> {}",
+                "indexed: {} file(s), {} node(s), {} edge(s), {} skipped, {} lowering omission(s) -> {}",
                 stats.files,
                 stats.nodes,
                 stats.edges,
                 stats.skipped,
+                stats.lowering_omissions,
                 out.display()
             );
+            for issue in &stats.issues {
+                eprintln!("graph {} [{}]: {}", issue.kind, issue.path, issue.reason);
+            }
             Ok(())
         }
         GraphCmd::Query {
@@ -832,10 +877,10 @@ fn cmd_graph(cmd: GraphCmd) -> Result<()> {
             );
             Ok(())
         }
-        GraphCmd::Context { task, index, limit } => {
+        GraphCmd::Context { task, index, limit, token_budget, node_kind, edge_kind } => {
             println!(
                 "{}",
-                harc::graph::context(&index, &task, limit).into_diagnostic()?
+                harc::graph::context(&index, &task, limit, token_budget, &node_kind, &edge_kind).into_diagnostic()?
             );
             Ok(())
         }

@@ -8,6 +8,7 @@ docs/fixtures, running the compiler, and querying the local learning store.
 from __future__ import annotations
 
 import os
+import json
 import pathlib
 import re
 import subprocess
@@ -35,6 +36,7 @@ def _workspace_roots_from_env() -> list[pathlib.Path]:
 
 
 WORKSPACE_ROOTS = _workspace_roots_from_env()
+os.environ["HARC_GRAPH_ALLOWED_ROOTS"] = os.pathsep.join(str(root) for root in WORKSPACE_ROOTS)
 HARC_BIN = os.environ.get("HARC_BIN", str(PROJECT_ROOT / "target" / "release" / "harc"))
 
 _INSTRUCTIONS = (SCRIPT_DIR / "instructions.md").read_text()
@@ -127,6 +129,32 @@ def _run(args: list[str], timeout: int = 30, cwd: pathlib.Path | None = None) ->
         omitted = len(output) - MAX_OUTPUT_CHARS
         output = output[:MAX_OUTPUT_CHARS] + f"\n\n[TRUNCATED: omitted {omitted} characters]"
     return output
+
+
+def _graph_result(args: list[str], timeout: int, cwd: pathlib.Path) -> tuple[bool, str]:
+    timeout = max(MIN_TIMEOUT_SECONDS, min(int(timeout), MAX_TIMEOUT_SECONDS))
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=str(cwd))
+    except (subprocess.TimeoutExpired, FileNotFoundError) as err:
+        return False, str(err)
+    output = (result.stdout if result.returncode == 0 else result.stderr or result.stdout).strip()
+    return result.returncode == 0, output[:MAX_OUTPUT_CHARS]
+
+
+def _graph_query_with_refresh(query_cmd: list[str], index_path: pathlib.Path, rebuild_cmd: list[str] | None, timeout: int, cwd: pathlib.Path, marker: str) -> str:
+    if index_path.joinpath("manifest.json").exists():
+        ok, output = _graph_result(query_cmd, timeout, cwd)
+        if ok:
+            return output
+        if marker not in output:
+            return f"[ERROR] {output}"
+    if rebuild_cmd is None:
+        return "[ERROR] Graph index is absent or stale; provide source_paths or call harc_graph_index."
+    ok, output = _graph_result(rebuild_cmd, max(timeout, 120), cwd)
+    if not ok:
+        return f"[ERROR] Graph refresh failed: {output}"
+    ok, output = _graph_result(query_cmd, timeout, cwd)
+    return output if ok else f"[ERROR] {output}"
 
 
 def _grep_files(query: str, files: list[pathlib.Path], max_hits: int) -> list[SearchHit]:
@@ -395,11 +423,60 @@ def harc_graph_query(query: str, index: str = ".harcgraph", limit: int = 20, tim
 
 
 @mcp.tool()
-def harc_graph_context(task: str, index: str = ".harcgraph", limit: int = 20, timeout: int = 30) -> str:
+def harc_graph_context(task: str, index: str = ".harcgraph", limit: int = 20, token_budget: int = 1200, node_kinds: list[str] | None = None, edge_kinds: list[str] | None = None, source_paths: list[str] | None = None, timeout: int = 30) -> str:
     """Return a compact graph context slice for a task description."""
     limit = max(1, min(limit, 80))
+    token_budget = max(50, min(token_budget, 4000))
     index_path = _resolve_safe(index)
-    return _run([HARC_BIN, "graph", "context", task, "--index", str(index_path), "--limit", str(limit)], timeout=timeout)
+    root = _owning_root(index_path)
+    cmd = [HARC_BIN, "graph", "context", task, "--index", str(index_path), "--limit", str(limit), "--token-budget", str(token_budget)]
+    for kind in node_kinds or []:
+        cmd.extend(["--node-kind", kind])
+    for kind in edge_kinds or []:
+        cmd.extend(["--edge-kind", kind])
+    manifest = index_path / "manifest.json"
+    if source_paths is not None:
+        inputs = [_resolve_safe(path) for path in source_paths]
+    elif manifest.exists():
+        try:
+            saved_inputs = json.loads(manifest.read_text())["inputs"]
+            inputs = [_resolve_safe(path) for path in saved_inputs]
+        except (OSError, ValueError, KeyError, TypeError):
+            inputs = []
+        if not inputs and index_path != PROJECT_ROOT / ".harcgraph":
+            return "[ERROR] Custom graph index lacks recorded source paths; provide source_paths to rebuild it."
+    elif root == PROJECT_ROOT:
+        inputs = [PROJECT_ROOT / "tests/fixtures", PROJECT_ROOT / "tests/dut"]
+    else:
+        inputs = []
+    if not inputs and index_path == PROJECT_ROOT / ".harcgraph":
+        inputs = [PROJECT_ROOT / "tests/fixtures", PROJECT_ROOT / "tests/dut"]
+    rebuild = [HARC_BIN, "graph", "index", *map(str, inputs), "--out", str(index_path)] if inputs else None
+    return _graph_query_with_refresh(cmd, index_path, rebuild, timeout, root, "rebuild with harc graph index")
+
+
+@mcp.tool()
+def harc_dev_graph_index(root: str = str(PROJECT_ROOT), feature_map: str = "docs/codegraph_feature_map.json", out: str = ".harcdevgraph", timeout: int = 120) -> str:
+    """Build the curated compiler-development graph and validate its source symbols."""
+    root_path = _resolve_safe(root)
+    map_path = _resolve_safe(str(root_path / feature_map))
+    out_path = _resolve_safe(str(root_path / out))
+    return _run([HARC_BIN, "graph", "dev-index", "--root", str(root_path), "--map", str(map_path), "--out", str(out_path)], timeout=timeout, cwd=root_path)
+
+
+@mcp.tool()
+def harc_dev_graph_query(query: str, root: str = str(PROJECT_ROOT), index: str = ".harcdevgraph", limit: int = 30, token_budget: int = 1200, roles: list[str] | None = None, timeout: int = 30) -> str:
+    """Find AST, parser, lowering, IR, backend, and fixture paths for a HARC feature."""
+    root_path = _resolve_safe(root)
+    index_path = _resolve_safe(str(root_path / index))
+    limit = max(1, min(limit, 80))
+    token_budget = max(50, min(token_budget, 4000))
+    cmd = [HARC_BIN, "graph", "dev-query", query, "--root", str(root_path), "--index", str(index_path), "--limit", str(limit), "--token-budget", str(token_budget)]
+    for role in roles or []:
+        cmd.extend(["--roles", role])
+    feature_map = _resolve_safe(str(root_path / "docs/codegraph_feature_map.json"))
+    rebuild = [HARC_BIN, "graph", "dev-index", "--root", str(root_path), "--map", str(feature_map), "--out", str(index_path)]
+    return _graph_query_with_refresh(cmd, index_path, rebuild, timeout, root_path, "rebuild with harc graph dev-index")
 
 
 @mcp.tool()
