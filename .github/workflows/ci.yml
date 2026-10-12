@@ -12,7 +12,6 @@ env:
 
 permissions:
   contents: read
-  packages: read
 
 defaults:
   run:
@@ -24,9 +23,6 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/arch-hdl-lang/harc-ci@sha256:ee3d4421cb32e657c2b34843f02c3d2945bfe8311480144d7061aff6309fe9a5
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v6
 
@@ -63,9 +59,6 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/arch-hdl-lang/harc-ci@sha256:ee3d4421cb32e657c2b34843f02c3d2945bfe8311480144d7061aff6309fe9a5
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     needs: build-and-test
     steps:
       - uses: actions/checkout@v6
@@ -144,9 +137,6 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/arch-hdl-lang/harc-ci@sha256:ee3d4421cb32e657c2b34843f02c3d2945bfe8311480144d7061aff6309fe9a5
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     needs: build-and-test
     strategy:
       fail-fast: false
@@ -261,9 +251,6 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/arch-hdl-lang/harc-ci@sha256:ee3d4421cb32e657c2b34843f02c3d2945bfe8311480144d7061aff6309fe9a5
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     needs: build-and-test
     strategy:
       fail-fast: false
@@ -346,9 +333,6 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/arch-hdl-lang/harc-ci@sha256:ee3d4421cb32e657c2b34843f02c3d2945bfe8311480144d7061aff6309fe9a5
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     needs: build-and-test
     steps:
       - uses: actions/checkout@v6

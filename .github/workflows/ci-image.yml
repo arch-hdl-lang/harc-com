@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main, codex/ci-fixture-shards]
-    paths: [ci/**, .github/workflows/ci-image.yml]
+    paths: [ci/Dockerfile, ci/smoke.sh, .github/workflows/ci-image.yml]
 
 permissions:
   contents: read

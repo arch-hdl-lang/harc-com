@@ -14,7 +14,7 @@ only: Docker build context is `ci/`, never the HARC compiler or private fork cod
 
 1. Edit `ci/Dockerfile` and/or `ci/smoke.sh`.
 2. Run the **Build CI image** workflow in public `arch-hdl-lang/harc-com`. It runs
-   automatically for changes under `ci/` on main, and can be dispatched manually.
+   automatically for Dockerfile and smoke-test changes on main, and can be dispatched manually.
    The PR branch is included for bootstrapping this image.
 3. The workflow verifies tool versions, compiles and runs a timed Verilator
    simulation with FST support and Clang, and compiles/links/runs a Z3 API program.
@@ -23,12 +23,10 @@ only: Docker build context is `ci/`, never the HARC compiler or private fork cod
 5. Update all five container image pins in `.github/workflows/ci.yml` to that
    digest. Image publication never silently updates CI consumers.
 
-CI currently authenticates to GHCR with its repository `GITHUB_TOKEN` and
-read-only package permissions. GHCR publishes new packages privately by default.
-The organization must allow public package visibility and the `harc-ci` package
-must be public to let forks consume it without cross-repository package grants.
-Only the toolchain image should be made public; private source code remains
-outside the image build context.
+The `harc-ci` package is public, and anonymous access to the pinned digest has
+been verified. CI pulls it without registry credentials, including private forks.
+Only toolchain files are published; private source code remains outside the image
+build context.
 
 Cargo caches use `/opt/cargo` and a separate `cargo-ci-v1` namespace to avoid
 restoring host-runner build products into the container toolchain. ccache caches
