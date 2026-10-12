@@ -28,6 +28,9 @@
 # Skipped silently when ARCH_BIN is unset — CI has no arch checkout.
 set -uo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/fixture_sharding.sh"
+fixture_shard_init || exit 1
+
 HARC="${HARC:-./target/release/harc}"
 DUT_DIR="tests/dut"
 FIX_DIR="tests/fixtures"
@@ -243,19 +246,30 @@ fi
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
-echo "Running ${PWD}/$REGISTRY v1-vs-tbir equivalence fixtures (seed $SEED, JOBS=$JOBS)..."
+echo "Running ${PWD}/$REGISTRY v1-vs-tbir equivalence fixtures (seed $SEED, JOBS=$JOBS, shard=$SHARD_INDEX/$SHARD_COUNT)..."
 
 # Materialize cleaned rows to numbered files so workers can be addressed
 # by index without quoting the pipe-delimited row through xargs.
 RESDIR="$(mktemp -d "${TMPDIR:-/tmp}/harc_tbir_equiv.XXXXXX")"
 trap 'rm -rf "$RESDIR"' EXIT
 n=0
+row_index=0
 while IFS= read -r row; do
     row="${row%%#*}"
     [ -z "$(echo "$row" | xargs)" ] && continue
+    selected=0
+    fixture_shard_contains "$row_index" && selected=1
+    row_index=$((row_index + 1))
+    [ "$selected" -eq 1 ] || continue
     printf '%s\n' "$row" >"$RESDIR/$n.row"
     n=$((n + 1))
 done < "$REGISTRY"
+
+# Fail closed rather than scheduling row -1 or reporting an empty shard green.
+if [ "$n" -eq 0 ]; then
+    echo "error: shard $SHARD_INDEX/$SHARD_COUNT has no active fixtures" >&2
+    exit 1
+fi
 
 # Fan out one worker per row, JOBS at a time. Each worker's stdout is
 # captured to <idx>.log so aggregated output is ordered, not interleaved.

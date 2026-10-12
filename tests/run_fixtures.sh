@@ -9,6 +9,9 @@
 # from `cargo build --release --bin harc`).
 set -uo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/fixture_sharding.sh"
+fixture_shard_init || exit 1
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARC="${HARC:-./target/release/harc}"
 DUT_DIR="tests/dut"
@@ -111,20 +114,31 @@ if [ "${1:-}" = "__worker" ]; then
     exit 0
 fi
 
-echo "Running ${PWD}/$DUT_DIR fixtures (JOBS=$JOBS)..."
+echo "Running ${PWD}/$DUT_DIR fixtures (JOBS=$JOBS, shard=$SHARD_INDEX/$SHARD_COUNT)..."
 
 # Materialize each non-empty row to a numbered file so workers can be
 # addressed by index — avoids quoting the pipe-delimited row through xargs.
 RESDIR="$(mktemp -d "${TMPDIR:-/tmp}/harc_fixtures.XXXXXX")"
 trap 'rm -rf "$RESDIR"' EXIT
 n=0
+row_index=0
 while IFS= read -r row; do
     [ -z "$(echo "$row" | xargs)" ] && continue
     # `#` comments, as in every sibling list file in tests/.
     case "$(echo "$row" | xargs)" in '#'*) continue ;; esac
+    selected=0
+    fixture_shard_contains "$row_index" && selected=1
+    row_index=$((row_index + 1))
+    [ "$selected" -eq 1 ] || continue
     printf '%s\n' "$row" >"$RESDIR/$n.row"
     n=$((n + 1))
 done <<<"$FIXTURES"
+
+# Fail closed rather than scheduling row -1 or reporting an empty shard green.
+if [ "$n" -eq 0 ]; then
+    echo "error: shard $SHARD_INDEX/$SHARD_COUNT has no active fixtures" >&2
+    exit 1
+fi
 
 # Fan out: one worker per row, JOBS at a time. Each worker's stdout is
 # captured to <idx>.log so the aggregated output below is ordered and
