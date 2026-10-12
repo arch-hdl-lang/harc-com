@@ -17,6 +17,7 @@ signed_component_method_param_test | Top | top_counter.sv         |
 component_value_expression_test | Top      | top_counter.sv         |
 lazy_impure_helper_test | Top              | top_counter.sv         |
 lazy_transactor_value_test | Top            | top_counter.sv         |
+lazy_message_noneval_test | Top            | top_counter.sv         |
 signed_host_state_test  | Top            | top_counter.sv         |
 signed_state_field_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv |
 msg_call_hoist_test     | Top            | top_counter.sv         |
