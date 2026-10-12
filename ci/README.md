@@ -7,7 +7,7 @@ files, and ccache. Both base images are pinned by digest in `ci/Dockerfile`.
 
 The final stage copies only Verilator's installed files from its official image;
 its source-build dependencies and debug executables are excluded. The initial
-validated image has 454.7 MiB of compressed layers. It contains toolchain files
+validated image has 455.5 MiB of compressed layers. It contains toolchain files
 only: Docker build context is `ci/`, never the HARC compiler or private fork code.
 
 ## Updating the image

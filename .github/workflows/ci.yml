@@ -22,7 +22,7 @@ jobs:
     name: cargo test
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/arch-hdl-lang/harc-ci@sha256:ee3d4421cb32e657c2b34843f02c3d2945bfe8311480144d7061aff6309fe9a5
+      image: ghcr.io/arch-hdl-lang/harc-ci@sha256:609b2bd6d6bbfb92e0b6d3ba583ce33caf642caeec59da2946a0c9a2b0921117
     steps:
       - uses: actions/checkout@v6
 
@@ -58,7 +58,7 @@ jobs:
     name: harc check fixtures
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/arch-hdl-lang/harc-ci@sha256:ee3d4421cb32e657c2b34843f02c3d2945bfe8311480144d7061aff6309fe9a5
+      image: ghcr.io/arch-hdl-lang/harc-ci@sha256:609b2bd6d6bbfb92e0b6d3ba583ce33caf642caeec59da2946a0c9a2b0921117
     needs: build-and-test
     steps:
       - uses: actions/checkout@v6
@@ -136,7 +136,7 @@ jobs:
     name: harc sim fixtures (shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/arch-hdl-lang/harc-ci@sha256:ee3d4421cb32e657c2b34843f02c3d2945bfe8311480144d7061aff6309fe9a5
+      image: ghcr.io/arch-hdl-lang/harc-ci@sha256:609b2bd6d6bbfb92e0b6d3ba583ce33caf642caeec59da2946a0c9a2b0921117
     needs: build-and-test
     strategy:
       fail-fast: false
@@ -250,7 +250,7 @@ jobs:
     name: harc sim fixtures (cosim dpi) (shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/arch-hdl-lang/harc-ci@sha256:ee3d4421cb32e657c2b34843f02c3d2945bfe8311480144d7061aff6309fe9a5
+      image: ghcr.io/arch-hdl-lang/harc-ci@sha256:609b2bd6d6bbfb92e0b6d3ba583ce33caf642caeec59da2946a0c9a2b0921117
     needs: build-and-test
     strategy:
       fail-fast: false
@@ -332,7 +332,7 @@ jobs:
     name: harc sim<->SV parity
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/arch-hdl-lang/harc-ci@sha256:ee3d4421cb32e657c2b34843f02c3d2945bfe8311480144d7061aff6309fe9a5
+      image: ghcr.io/arch-hdl-lang/harc-ci@sha256:609b2bd6d6bbfb92e0b6d3ba583ce33caf642caeec59da2946a0c9a2b0921117
     needs: build-and-test
     steps:
       - uses: actions/checkout@v6
