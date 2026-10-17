@@ -195,6 +195,95 @@ end module CatalogTop
 }
 
 #[test]
+fn dut_interface_catalog_resolves_arch_local_param_port_widths() {
+    // ARCH `.archi` interfaces declare module-local constants as
+    // `local param`; ports sized by them must resolve like `param`-sized ones,
+    // and a command-line override must not reach the local constant.
+    let dir = std::env::temp_dir().join(format!(
+        "harc_dut_interface_local_param_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    std::fs::write(
+        dir.join("LocalTop.arch"),
+        "module LocalTop\n  param W: const = 8;\n  local param N: const = 32;\n  local param M: const = N + W;\n  port a: in UInt<N>;\n  port b: out UInt<M>;\n  port c: in UInt<W>;\nend module LocalTop\n",
+    )
+    .expect("write arch source");
+    let catalog = cpp_tb::dut_interface_catalog(
+        &[],
+        &[dir.join("LocalTop.arch")],
+        "LocalTop",
+        &std::collections::HashMap::new(),
+    )
+    .expect("resolve DUT interface")
+    .expect("catalog exists");
+    assert_eq!(catalog.port("a").unwrap().resolved_width(), Some(32));
+    assert_eq!(catalog.port("b").unwrap().resolved_width(), Some(40));
+    assert_eq!(catalog.port("c").unwrap().resolved_width(), Some(8));
+    let overridden = cpp_tb::dut_interface_catalog_with_parameter_overrides(
+        &[],
+        &[dir.join("LocalTop.arch")],
+        "LocalTop",
+        &std::collections::HashMap::new(),
+        &["W=4".to_string(), "N=99".to_string()],
+    )
+    .expect("resolve overridden DUT interface")
+    .expect("overridden catalog exists");
+    assert_eq!(overridden.port("a").unwrap().resolved_width(), Some(32));
+    assert_eq!(overridden.port("b").unwrap().resolved_width(), Some(36));
+    assert_eq!(overridden.port("c").unwrap().resolved_width(), Some(4));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn dut_interface_catalog_local_constants_ignore_overrides_even_when_unevaluated() {
+    // A local constant is never overridable. When its own expression is not
+    // evaluable (here `<<`), a same-named --param must not size the port;
+    // the width stays unresolved instead. Same rule for SV `localparam`.
+    let dir = std::env::temp_dir().join(format!(
+        "harc_dut_interface_local_unevaluated_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    std::fs::write(
+        dir.join("LocalTop.arch"),
+        "module LocalTop\n  param W: const = 3;\n  local param N: const = 1 << W;\n  port a: in UInt<N>;\n  port c: in UInt<W>;\nend module LocalTop\n",
+    )
+    .expect("write arch source");
+    let arch = cpp_tb::dut_interface_catalog_with_parameter_overrides(
+        &[],
+        &[dir.join("LocalTop.arch")],
+        "LocalTop",
+        &std::collections::HashMap::new(),
+        &["N=99".to_string()],
+    )
+    .expect("resolve DUT interface")
+    .expect("catalog exists");
+    assert_eq!(arch.port("a").unwrap().resolved_width(), None);
+    assert_eq!(arch.port("c").unwrap().resolved_width(), Some(3));
+
+    std::fs::write(
+        dir.join("LocalSv.sv"),
+        "module LocalSv #(\n  parameter int W = 8,\n  localparam int N = 32\n)(\n  input logic [N-1:0] a,\n  input logic [W-1:0] c\n);\nendmodule\n",
+    )
+    .expect("write sv source");
+    let sv = cpp_tb::dut_interface_catalog_with_parameter_overrides(
+        &[dir.join("LocalSv.sv")],
+        &[],
+        "LocalSv",
+        &std::collections::HashMap::new(),
+        &["W=4".to_string(), "N=99".to_string()],
+    )
+    .expect("resolve SV DUT interface")
+    .expect("SV catalog exists");
+    assert_eq!(sv.port("a").unwrap().resolved_width(), Some(32));
+    assert_eq!(sv.port("c").unwrap().resolved_width(), Some(4));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn dut_interface_catalog_resolves_imported_package_symbols_and_verilator_names() {
     let dir = std::env::temp_dir().join(format!(
         "harc_dut_interface_packages_{}",

@@ -972,7 +972,14 @@ fn collect_port_catalog_from_src(
         if !in_top {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("param ") {
+        // `local param` (ARCH `.archi` emits it for module-local constants,
+        // e.g. `local param NUM_WORDS: const = 32;`) sizes ports like a
+        // `param` does, but cannot be overridden from the command line.
+        let (param_rest, is_local) = match line.strip_prefix("local param ") {
+            Some(rest) => (Some(rest), true),
+            None => (line.strip_prefix("param "), false),
+        };
+        if let Some(rest) = param_rest {
             if let Some((name, declaration)) = rest.split_once(':') {
                 let declaration = declaration.trim();
                 if let Some(value) = declaration.strip_prefix("type") {
@@ -985,9 +992,18 @@ fn collect_port_catalog_from_src(
                 } else if let Some(value) = declaration.strip_prefix("const") {
                     if let Some((_, value)) = value.split_once('=') {
                         let value = value.split(';').next().unwrap_or(value).trim();
-                        if !overridden_names.contains(name.trim()) {
-                            if let Some(value) = eval_sv_const_expr(value, &const_params) {
-                                const_params.insert(name.trim().to_string(), value);
+                        if is_local || !overridden_names.contains(name.trim()) {
+                            match eval_sv_const_expr(value, &const_params) {
+                                Some(value) => {
+                                    const_params.insert(name.trim().to_string(), value);
+                                }
+                                // `const_params` starts from the overrides: when a
+                                // local param's own expression does not evaluate,
+                                // drop a same-named override so it cannot size ports.
+                                None if is_local => {
+                                    const_params.remove(name.trim());
+                                }
+                                None => {}
                             }
                         }
                     }
@@ -1602,7 +1618,19 @@ fn scan_sv_module_ports_with_package_symbols(
                     // evaluate.
                     let v = eval_sv_const_expr(val, &params)
                         .or_else(|| eval_sv_const_expr(val.trim_end_matches(')'), &params));
-                    if let Some(v) = v.filter(|_| !overridden_names.contains(name)) {
+                    if kw.starts_with("localparam") {
+                        // A `localparam` cannot be overridden, and `params` starts
+                        // from the overrides: take its own value, or forget a
+                        // same-named override when the expression does not evaluate.
+                        match v {
+                            Some(v) => {
+                                params.insert(name.to_string(), v);
+                            }
+                            None => {
+                                params.remove(name);
+                            }
+                        }
+                    } else if let Some(v) = v.filter(|_| !overridden_names.contains(name)) {
                         params.insert(name.to_string(), v);
                     }
                 }
