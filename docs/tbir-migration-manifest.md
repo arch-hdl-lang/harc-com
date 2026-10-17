@@ -1,6 +1,6 @@
 # TB-IR migration manifest
 
-Snapshot: 2026-09-30, `origin/main` at `cce5d626` plus this batch.
+Snapshot: 2026-10-17, `origin/main` at `dd3551a3` plus this batch.
 
 This is the retirement queue, not a count of every defensive diagnostic.
 The source inventory is regenerated with:
@@ -12,8 +12,8 @@ awk '/^fn [A-Za-z0-9_]+\(/ { fn=$2; sub(/\(.*/, "", fn) }
   sort -u
 ```
 
-The snapshot has 84 textual `unsupported(` matches under `src/ir/lower`:
-83 executable constructor sites and the constructor definition. That is down
+The snapshot has 74 textual `unsupported(` matches under `src/ir/lower`:
+73 executable constructor sites and the constructor definition. That is down
 from 174 constructor sites at the `e17b938d` baseline. The count is only an
 inventory: one constructor can fence many source shapes, and adding a precise
 fail-closed neighbor can increase it while the supported surface grows.
@@ -40,6 +40,15 @@ statement-position unresolved bare-helper call. The two dedicated covergroup
 hook constructors are gone; the impure-helper fallback remains for
 non-suspending helpers that v1 can run, as does the shared field-method call
 fallback.
+
+The next ten-site batch removes stale v1 suggestions from nested-`String`
+declaration gates: file helpers (parameter and return), tseqs (parameter and
+return), externs (parameter and return), components (field, method parameter,
+and method return), and persistent transactor state. Direct v1 emission probes
+at every landing show a reachable queue/event/fixed-vector spelling whose
+String leaf is erased to `uint64_t`; these now report
+`NotImplemented { SilentlyMisLowers }` while the separate, genuinely usable v1
+fallbacks remain `Unsupported`.
 
 No other state/helper `Unsupported` assertion currently has both a positive v1
 runtime control and an unambiguous intended value semantics.

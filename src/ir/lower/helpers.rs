@@ -74,19 +74,21 @@ impl<'a> HelperRegistry<'a> {
                     nested_string_type_span(param.ty.as_ref()).map(|span| (param, span))
                 }) {
                     diagnostics.record(file.item_source(item_index), span);
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         &format!(
                             "function `{}` parameter `{}` whose type contains `String`",
                             f.name.name, param.name.name
                         ),
-                        "String containers and aggregates are not supported; use exact top-level `String` for a callable parameter",
+                        "String containers and aggregates are not supported; v1 erases a nested String leaf to `uint64_t` for queue, event, and fixed-vector callable parameters",
+                        V1Status::SilentlyMisLowers,
                     ));
                 }
                 if let Some(span) = nested_string_type_span(f.return_ty.as_ref()) {
                     diagnostics.record(file.item_source(item_index), span);
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         &format!("function `{}` return type containing `String`", f.name.name),
-                        "String containers and aggregates are not supported; use exact top-level `String` for a callable return",
+                        "String containers and aggregates are not supported; v1 erases a nested String leaf to `uint64_t` for queue, event, and fixed-vector callable returns",
+                        V1Status::SilentlyMisLowers,
                     ));
                 }
                 decls.push(f);
