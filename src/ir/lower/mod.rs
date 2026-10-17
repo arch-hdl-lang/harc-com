@@ -1848,22 +1848,24 @@ fn lower_program_impl(
             helpers::nested_string_type_span(param.ty.as_ref()).map(|span| (param, span))
         }) {
             diagnostics.record(file.item_source(item_index), span);
-            return Err(unsupported(
+            return Err(not_implemented(
                 &format!(
                     "extern function `{}` parameter `{}` whose type contains `String`",
                     decl.name.name, param.name.name
                 ),
-                "String containers and aggregates are not supported; use exact top-level `String` for a callable parameter",
+                "String containers and aggregates are not supported; v1 erases a nested String leaf to `uint64_t` for queue, event, and fixed-vector extern parameters",
+                V1Status::SilentlyMisLowers,
             ));
         }
         if let Some(span) = helpers::nested_string_type_span(decl.return_ty.as_ref()) {
             diagnostics.record(file.item_source(item_index), span);
-            return Err(unsupported(
+            return Err(not_implemented(
                 &format!(
                     "extern function `{}` return type containing `String`",
                     decl.name.name
                 ),
-                "String containers and aggregates are not supported; use exact top-level `String` for a callable return",
+                "String containers and aggregates are not supported; v1 erases a nested String leaf to `uint64_t` for queue, event, and fixed-vector extern returns",
+                V1Status::SilentlyMisLowers,
             ));
         }
         let bad = decl
