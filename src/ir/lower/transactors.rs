@@ -42,7 +42,7 @@ use super::{
 };
 use crate::ast::{
     BusDecl, ComponentField, ComponentItem, HookableMethod, Param, TargetTlmThread, TransactorDecl,
-    TypeArg, TypeExpr,
+    TypeExpr,
 };
 use crate::ir::{
     self, Activation, FunctionId, FunctionKind, IrType, StateFieldKind, StateFieldSchema,
@@ -2128,9 +2128,10 @@ fn resolve_tlm_wire_ty(
             &format!("transactor method `{tname}.{mname}` {what} wider than 1024 bits"),
             &format!("the packed TLM value model supports at most 1024 bits, got {width}"),
         )),
-        _ => Err(unsupported(
+        _ => Err(not_implemented(
             &format!("transactor method `{tname}.{mname}` {what} with a non-scalar type"),
-            "TLM wires carry bool, fixed-width uint/sint, or finite packed records",
+            "TLM wires carry bool, fixed-width uint/sint, or finite packed records; v1 erases stream and buffer wire types to `uint64_t`",
+            V1Status::SilentlyMisLowers,
         )),
     }
 }
@@ -2149,7 +2150,7 @@ fn check_method_param_ty(
     what: &str,
     ty: Option<&TypeExpr>,
 ) -> Result<(), LowerError> {
-    check_scalar_ty_max(tname, mname, what, ty, u32::MAX)
+    check_scalar_ty(tname, mname, what, ty)
 }
 
 /// Active-method scalar return values use the same exact-width C++ ABI as
@@ -2162,7 +2163,7 @@ fn check_method_return_ty(
     what: &str,
     ty: Option<&TypeExpr>,
 ) -> Result<(), LowerError> {
-    check_scalar_ty_max(tname, mname, what, ty, u32::MAX)
+    check_scalar_ty(tname, mname, what, ty)
 }
 
 /// Resolve a transactor method return through the aggregate-aware parameter
@@ -2211,67 +2212,45 @@ fn check_method_nested_string_types(
         helpers::nested_string_type_span(param.ty.as_ref()).map(|span| (param, span))
     }) {
         ctx.diagnostics.record(ctx.source_id, span);
-        return Err(unsupported(
+        return Err(not_implemented(
             &format!(
                 "transactor `{tname}` method `{}` parameter `{}` whose type contains `String`",
                 method.name.name, param.name.name
             ),
-            "String containers and aggregates are not supported; use exact top-level `String` for a callable parameter",
+            "String containers and aggregates are not supported; v1 erases nested String leaves to `uint64_t` in transactor-method parameters",
+            V1Status::SilentlyMisLowers,
         ));
     }
     if let Some(span) = helpers::nested_string_type_span(method.return_ty.as_ref()) {
         ctx.diagnostics.record(ctx.source_id, span);
-        return Err(unsupported(
+        return Err(not_implemented(
             &format!(
                 "transactor `{tname}` method `{}` return type containing `String`",
                 method.name.name
             ),
-            "String containers and aggregates are not supported; use exact top-level `String` for a callable return",
+            "String containers and aggregates are not supported; v1 erases nested String leaves to `uint64_t` in transactor-method returns",
+            V1Status::SilentlyMisLowers,
         ));
     }
     Ok(())
 }
 
-/// Shared scalar-type gate parameterized by the maximum allowed bit width
-/// (`max_w`). A width arg above `max_w` is rejected; a non-scalar type is
-/// rejected; widthless / classifiable scalars pass.
-fn check_scalar_ty_max(
+/// Shared scalar-type gate for method parameters and returns. Every scalar
+/// width accepted by the parser has an exact-width v1/TB-IR ABI; only
+/// non-scalar spellings remain outside this path.
+fn check_scalar_ty(
     tname: &str,
     mname: &str,
     what: &str,
     ty: Option<&TypeExpr>,
-    max_w: u32,
 ) -> Result<(), LowerError> {
     let site = || format!("transactor method `{tname}.{mname}` {what}");
     match ty {
         None => Ok(()),
-        Some(TypeExpr::Builtin { args, .. }) => {
-            // Width arg, when present, must fit the value model for this site.
-            if let Some(TypeArg::Expr(e)) = args.first() {
-                if let crate::ast::ExprKind::Int(s) = &*e.kind {
-                    if let Ok(w) = s.replace('_', "").parse::<u32>() {
-                        if w > max_w {
-                            let hint = if max_w == 64 {
-                                "the tbir value model is 64-bit".to_string()
-                            } else {
-                                format!(
-                                    "the tbir wide-value method ABI mirrors v1's \
-                                     `_harc_u128` model up to {max_w} bits"
-                                )
-                            };
-                            return Err(unsupported(
-                                &format!("{} wider than {max_w} bits (uint<{w}>)", site()),
-                                &hint,
-                            ));
-                        }
-                    }
-                }
-            }
-            // ir_type_of's IrType covers the scalar builtins; anything
-            // it can't classify still lowers as an untyped u64 local,
-            // matching pure-helper parameter handling.
-            Ok(())
-        }
+        // ir_type_of's IrType covers the scalar builtins; anything it can't
+        // classify still lowers as an untyped u64 local, matching pure-helper
+        // parameter handling.
+        Some(TypeExpr::Builtin { .. }) => Ok(()),
         Some(_) => Err(unsupported(
             &format!("{} with a non-scalar type", site()),
             "",

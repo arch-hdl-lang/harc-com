@@ -1005,9 +1005,10 @@ impl FuncBuilder<'_> {
                     TypeExpr::Named { span, .. } | TypeExpr::Builtin { span, .. } => *span,
                 });
             }
-            return Err(unsupported(
+            return Err(super::not_implemented(
                 &format!("local `{}` whose type contains `String`", l.name.name),
-                "String containers and aggregates are not supported; use exact top-level `String` for an ephemeral local",
+                "String containers and aggregates are not supported; v1 erases nested String leaves to `uint64_t` in ephemeral storage",
+                super::V1Status::SilentlyMisLowers,
             ));
         }
         if !l.probes.is_empty() {

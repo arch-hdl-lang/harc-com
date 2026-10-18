@@ -389,9 +389,10 @@ fn lower_record_field(
 ) -> Result<(), LowerError> {
     let fname = &f.name.name;
     if super::helpers::is_nested_string_type(Some(&f.ty)) {
-        return Err(unsupported(
+        return Err(not_implemented(
             &format!("{kind} `{owner}` field `{fname}` whose type contains `String`"),
-            "String containers and aggregates are not supported in persistent fields",
+            "String containers and aggregates are not supported in persistent fields; v1 erases nested String leaves to `uint64_t` storage",
+            V1Status::SilentlyMisLowers,
         ));
     }
     if fields.iter().any(|x| x.name == *fname) {

@@ -27519,10 +27519,9 @@ fn placement_classifies_transactor_call_block_timing_tolerant() {
     assert_eq!(timing, placement::TimingClass::TimingTolerant);
 }
 
-/// Out-of-subset transactor shapes reject with precise messages:
-/// event fields (the sequencer-driven form) and >64-bit method params
-/// (the tbir value model is u64). Scalar STATE fields, by contrast, now
-/// lower (state-field slice) — asserted positively here.
+/// Out-of-subset event-field transactor shapes reject precisely. Scalar
+/// state fields and exact-width method parameters lower, including widths
+/// above the old u64/u128 limits.
 #[test]
 fn transactor_shape_rejections() {
     let event_src = r#"
@@ -53901,7 +53900,7 @@ test T
     end run
 end test T
 "#;
-    // Ten declaration landings used to return `Unsupported`, promising v1 as
+    // Declaration landings that used to return `Unsupported`, promising v1 as
     // an escape hatch. At each landing v1 has a reachable aggregate spelling
     // that recursively erases String to `uint64_t`; pin the emitted ABI before
     // classifying the whole landing by its worst behavior.
@@ -54005,38 +54004,16 @@ end test T
             .to_string(),
             "HarcQueue<uint64_t> values",
         ),
-    ];
-    for (case, source, erased_abi) in erased {
-        let v1 = cpp_tb::emit(&merged_src(&source)).expect("v1 emits nested String probe");
-        assert!(
-            v1.contains(erased_abi),
-            "{case}: v1 did not emit `{erased_abi}`:\n{v1}"
-        );
-        let err = lower_src(&source).expect_err("a nested String type must fail closed");
-        let message = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
-        assert!(
-            message.contains("type contains `String`")
-                || message.contains("type containing `String`"),
-            "{case}: {message}"
-        );
-    }
-
-    // Adjacent String-storage boundaries remain honest v1 fallbacks and keep
-    // `Unsupported`; they are separate constructors from the ten above.
-    let retained = [
         (
-            "transactor method return",
+            "transactor method parameter",
             r#"transactor Bad
     dut : Top
-    when active
-        hookable f() -> queue<String>
-            return 0
-        end f
-    end when
+    hookable f(values: Vec<String, 2>)
+    end f
 end transactor Bad
 test T
     let dut : Top
-    let bad : Bad active
+    let bad : Bad passive
     run
         bad.dut = dut
         wait 1 cycle
@@ -54044,13 +54021,48 @@ test T
 end test T
 "#
             .to_string(),
+            "std::array<uint64_t, 2> values",
         ),
         (
-            "testbench method return",
+            "transactor method return",
+            r#"transactor Bad
+    dut : Top
+    hookable f(values: queue<uint<8>>) -> queue<String>
+        return values
+    end f
+end transactor Bad
+test T
+    let dut : Top
+    let bad : Bad passive
+    run
+        bad.dut = dut
+        wait 1 cycle
+    end run
+end test T
+"#
+            .to_string(),
+            "HarcQueue<uint64_t>&",
+        ),
+        (
+            "testbench field",
             r#"testbench Tb
     dut : Top
-    function f() -> TSeq<String>
-        return 0
+    values : Vec<String, 2>
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T
+"#
+            .to_string(),
+            "std::array<uint64_t, 2> values",
+        ),
+        (
+            "testbench method parameter",
+            r#"testbench Tb
+    dut : Top
+    function f(values: Vec<String, 2>)
     end function f
 end testbench Tb
 impl T for Tb
@@ -54060,33 +54072,109 @@ impl T for Tb
 end impl T
 "#
             .to_string(),
+            "std::array<uint64_t, 2> values",
         ),
         (
-            "local",
+            "testbench method return",
+            r#"testbench Tb
+    dut : Top
+    function f(values: queue<uint<8>>) -> queue<String>
+        return values
+    end function f
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T
+"#
+            .to_string(),
+            "HarcQueue<uint64_t>&",
+        ),
+        (
+            "ephemeral local",
             r#"test T
     let dut : Top
     run
-        let values : event<String>
+        let values : queue<String>
         wait 1 cycle
     end run
 end test T
 "#
             .to_string(),
+            "int64_t values",
         ),
         (
             "record field",
             format!("struct Bad\n    values : Vec<String, 2>\nend struct Bad\n{test}"),
+            "std::array<uint64_t, 2> values",
+        ),
+        (
+            "scoreboard field",
+            r#"scoreboard Bad
+    values : Vec<String, 2>
+end scoreboard Bad
+test T
+    let dut : Top
+    let bad : Bad
+    run
+        wait 1 cycle
+    end run
+end test T
+"#
+            .to_string(),
+            "std::array<uint64_t, 2> values",
         ),
     ];
-    for (case, source) in retained {
+    for (case, source, erased_abi) in erased {
+        let v1 = cpp_tb::emit(&merged_src(&source)).expect("v1 emits nested String probe");
+        assert!(
+            v1.contains(erased_abi),
+            "{case}: v1 did not emit `{erased_abi}`:\n{v1}"
+        );
+        if matches!(case, "transactor method return" | "testbench method return") {
+            assert_cpp_typechecks(&format!("nested_string_{}", case.replace(' ', "_")), &v1);
+        }
         let err = lower_src(&source).expect_err("a nested String type must fail closed");
-        let message = assert_unsupported(&err);
+        let message = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
         assert!(
             message.contains("type contains `String`")
                 || message.contains("type containing `String`"),
             "{case}: {message}"
         );
     }
+}
+
+#[test]
+fn non_scalar_tlm_signatures_do_not_advertise_v1_type_erasure() {
+    let target = r#"bus B
+    tlm_method read(value: stream<uint<8>>) -> uint<8>: blocking;
+end bus B
+transactor Bad bound to B
+    thread bus.read(value: stream<uint<8>>)
+        return 0
+    end thread
+end transactor Bad
+testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    let bus : B = bind dut
+    let bad : Bad passive = bind bus
+    run
+        wait 1 cycle
+    end run
+end impl T
+"#;
+
+    let v1 = cpp_tb::emit(&merged_src(target)).expect("v1 emits non-scalar signature probe");
+    assert!(
+        v1.contains("uint64_t value"),
+        "v1 did not erase the stream payload to `uint64_t`:\n{v1}"
+    );
+    let err = lower_src(target).expect_err("a non-scalar signature must fail closed");
+    let message = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+    assert!(message.contains("non-scalar type"), "{message}");
 }
 
 #[test]

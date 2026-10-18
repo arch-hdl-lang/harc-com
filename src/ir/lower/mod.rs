@@ -2334,12 +2334,13 @@ fn lower_program_impl(
                                 helpers::nested_string_type_span(Some(&field.ty))
                             {
                                 diagnostics.record(file.item_source(item_index), span);
-                                return Err(unsupported(
+                                return Err(not_implemented(
                                     &format!(
                                         "testbench `{}` field `{}` whose type contains `String`",
                                         c.name.name, field.name.name
                                     ),
-                                    "String containers and aggregates are not supported in persistent fields",
+                                    "String containers and aggregates are not supported in persistent fields; v1 erases nested String leaves to `uint64_t` storage",
+                                    V1Status::SilentlyMisLowers,
                                 ));
                             }
                         }
@@ -2351,24 +2352,26 @@ fn lower_program_impl(
                                 .map(|span| (param, span))
                         }) {
                             diagnostics.record(file.item_source(item_index), span);
-                            return Err(unsupported(
+                            return Err(not_implemented(
                                 &format!(
                                     "testbench `{}` method `{}` parameter `{}` whose type contains `String`",
                                     c.name.name, method.name.name, param.name.name
                                 ),
-                                "String containers and aggregates are not supported; use exact top-level `String` for a callable parameter",
+                                "String containers and aggregates are not supported; v1 erases nested String leaves to `uint64_t` in testbench-method parameters",
+                                V1Status::SilentlyMisLowers,
                             ));
                         }
                         if let Some(span) =
                             helpers::nested_string_type_span(method.return_ty.as_ref())
                         {
                             diagnostics.record(file.item_source(item_index), span);
-                            return Err(unsupported(
+                            return Err(not_implemented(
                                 &format!(
                                     "testbench `{}` method `{}` return type containing `String`",
                                     c.name.name, method.name.name
                                 ),
-                                "String containers and aggregates are not supported; use exact top-level `String` for a callable return",
+                                "String containers and aggregates are not supported; v1 erases nested String leaves to `uint64_t` in testbench-method returns",
+                                V1Status::SilentlyMisLowers,
                             ));
                         }
                     }
