@@ -1,6 +1,6 @@
 # TB-IR migration manifest
 
-Snapshot: 2026-10-17, `origin/main` at `aa1079e7` plus this batch.
+Snapshot: 2026-10-17, `origin/main` at `7f8217e5` plus this batch.
 
 This is the retirement queue, not a count of every defensive diagnostic.
 The source inventory is regenerated with:
@@ -12,8 +12,8 @@ awk '/^fn [A-Za-z0-9_]+\(/ { fn=$2; sub(/\(.*/, "", fn) }
   sort -u
 ```
 
-The snapshot has 64 textual `unsupported(` matches under `src/ir/lower`:
-63 executable constructor sites and the constructor definition. That is down
+The snapshot has 63 textual `unsupported(` matches under `src/ir/lower`:
+62 executable constructor sites and the constructor definition. That is down
 from 174 constructor sites at the `e17b938d` baseline. The count is only an
 inventory: one constructor can fence many source shapes, and adding a precise
 fail-closed neighbor can increase it while the supported surface grows.

@@ -2122,12 +2122,12 @@ fn resolve_tlm_wire_ty(
     }
     let lowered = helpers::ir_type_of(Some(ty));
     match lowered {
-        IrType::Bool => Ok(lowered),
-        IrType::UInt(Some(width)) | IrType::SInt(Some(width)) if width <= 1024 => Ok(lowered),
-        IrType::UInt(Some(width)) | IrType::SInt(Some(width)) => Err(unsupported(
-            &format!("transactor method `{tname}.{mname}` {what} wider than 1024 bits"),
-            &format!("the packed TLM value model supports at most 1024 bits, got {width}"),
-        )),
+        // Target responders use the same exact-width scalar ABI as active
+        // methods: <=64 bits are u64-backed, 65..128 bits use `_harc_u128`,
+        // and wider values use `HarcWide<ceil(width / 32)>`. Request capture
+        // and response drive already go through the width-generic typed-wire
+        // helpers, so imposing a separate 1024-bit ceiling here was stale.
+        IrType::Bool | IrType::UInt(Some(_)) | IrType::SInt(Some(_)) => Ok(lowered),
         _ => Err(not_implemented(
             &format!("transactor method `{tname}.{mname}` {what} with a non-scalar type"),
             "TLM wires carry bool, fixed-width uint/sint, or finite packed records; v1 erases stream and buffer wire types to `uint64_t`",
