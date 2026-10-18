@@ -258,7 +258,7 @@ impl FuncBuilder<'_> {
         )
     }
 
-    fn bus_origin(&self, bind: &str) -> crate::ir::PortOrigin {
+    pub(crate) fn bus_origin(&self, bind: &str) -> crate::ir::PortOrigin {
         self.ctx
             .bus_origins
             .get(bind)

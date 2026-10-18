@@ -1,6 +1,6 @@
 # TB-IR migration manifest
 
-Snapshot: 2026-10-18, `origin/main` at `e7f1e6f8` plus this batch.
+Snapshot: 2026-10-18, `origin/main` at `b37f4072` plus this batch.
 
 This is the retirement queue, not a count of every defensive diagnostic.
 The source inventory is regenerated with:
@@ -111,6 +111,17 @@ rules, codegen emits the local receiver path, and the component-copy runtime
 test proves that both destinations receive user-state snapshots rather than
 aliases. The raw inventory is now 13 textual matches (12 executable
 constructors plus the helper definition).
+
+The direct-bus regblock follow-up routes a `let regs : R = bind bus` frontdoor
+through the concrete blocking-TLM call seam already used by ordinary
+`bus.method(...)` calls. Bus-backed reads materialize a scheduler statement,
+predict the mirror from the response, and participate in lazy-message and
+re-evaluated-predicate preflight; transactor-backed reads retain their inline
+hookable-lambda representation. A self-checking TLM-memory fixture covers
+write, `let` read, assert read, and failure-message read. This is a TBIR-first
+extension: v1 emits the bus-binding name as an undeclared C++ receiver and
+does not compile the same fixture. The raw inventory is now 12 textual matches
+(11 executable constructors plus the helper definition).
 
 No other state/helper `Unsupported` assertion currently has both a positive v1
 runtime control and an unambiguous intended value semantics.

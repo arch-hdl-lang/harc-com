@@ -5799,11 +5799,12 @@ fn lower_test(
         }
     }
 
-    // Resolve regblock bindings now the transactor fields are known: the
-    // `via <helper>` instance must be an active transactor field, and
-    // that transactor must declare the frontdoor `write(addr, data)` /
-    // `read(addr) -> data` methods. Build the per-binding access context
-    // (carried in `LowerCtx`) plus the schema (carried for dump-ir).
+    // Resolve regblock bindings now the transactor fields and concrete bus
+    // bindings are known. The `via <helper>` route may be either an active
+    // transactor field or a bound bus; both must declare the frontdoor
+    // `write(addr, data)` / `read(addr) -> data` methods. Build the
+    // per-binding access context (carried in `LowerCtx`) plus the schema
+    // (carried for dump-ir).
     let transactor_field_ids: HashMap<&str, ir::TransactorId> = transactor_fields
         .iter()
         .map(|(f, x)| (f.as_str(), *x))
@@ -5831,38 +5832,81 @@ fn lower_test(
                 t.name.name
             )));
         }
-        let Some(&xid) = transactor_field_ids.get(helper_field.as_str()) else {
-            if bus_binding_decls.contains_key(helper_field) {
-                return Err(unsupported(
-                    &format!("regblock binding `{binding}` via bus binding `{helper_field}`"),
-                    "the bus-bound helper form is a follow-up slice",
-                ));
+        if let Some(&xid) = transactor_field_ids.get(helper_field.as_str()) {
+            // Validate the transactor frontdoor methods at the expected
+            // arity so a malformed helper fails at lowering, not C++ compile.
+            let xschema = &prog.transactors[xid.index()];
+            for (m, n) in [("write", 2usize), ("read", 1usize)] {
+                match xschema.method(m) {
+                    Some(ms) if ms.param_names.len() == n => {}
+                    Some(ms) => {
+                        return Err(LowerError::Invalid(format!(
+                            "regblock `via` helper `{}` method `{m}` takes {} argument(s), \
+                             the frontdoor needs {n}",
+                            xschema.name,
+                            ms.param_names.len()
+                        )));
+                    }
+                    None => {
+                        return Err(LowerError::Invalid(format!(
+                            "regblock `via` helper `{}` has no `{m}(addr, data)`-style method",
+                            xschema.name
+                        )));
+                    }
+                }
             }
+        } else if let Some(bus) = bus_binding_decls.get(helper_field) {
+            // A direct bus frontdoor uses the same concrete TLM seam as an
+            // ordinary `bus.method(...)` call. Arity is the regblock ABI;
+            // payload typing remains checked by the bus access plan/emitter.
+            // This is TBIR-first: v1 emits calls with the binding identifier
+            // as an undeclared C++ receiver.
+            for (m, n) in [("write", 2usize), ("read", 1usize)] {
+                match bus.tlm_methods.iter().find(|method| method.name.name == m) {
+                    Some(method)
+                        if method.args.len() == n
+                            && method.mode.name == "blocking"
+                            && ((m == "read" && method.ret.is_some())
+                                || (m == "write" && method.ret.is_none())) => {}
+                    Some(method) if method.args.len() != n => {
+                        return Err(LowerError::Invalid(format!(
+                            "regblock `via` bus `{}` tlm_method `{m}` takes {} argument(s), \
+                             the frontdoor needs {n}",
+                            bus.name.name,
+                            method.args.len()
+                        )));
+                    }
+                    Some(method) if method.mode.name != "blocking" => {
+                        return Err(LowerError::Invalid(format!(
+                            "regblock `via` bus `{}` tlm_method `{m}` must be blocking, not `{}`",
+                            bus.name.name, method.mode.name
+                        )));
+                    }
+                    Some(method) if m == "write" && method.ret.is_some() => {
+                        return Err(LowerError::Invalid(format!(
+                            "regblock `via` bus `{}` tlm_method `write` must not return a value",
+                            bus.name.name
+                        )));
+                    }
+                    Some(_) => {
+                        return Err(LowerError::Invalid(format!(
+                            "regblock `via` bus `{}` tlm_method `{m}` must return the register value",
+                            bus.name.name
+                        )));
+                    }
+                    None => {
+                        return Err(LowerError::Invalid(format!(
+                            "regblock `via` bus `{}` has no tlm_method \
+                             `{m}(addr, data)`-style frontdoor",
+                            bus.name.name
+                        )));
+                    }
+                }
+            }
+        } else {
             return Err(LowerError::Invalid(format!(
                 "regblock binding `{binding}` names unknown `via` helper `{helper_field}`"
             )));
-        };
-        // Validate the frontdoor methods exist at the expected arity so
-        // a malformed helper fails at lowering, not at C++ compile.
-        let xschema = &prog.transactors[xid.index()];
-        for (m, n) in [("write", 2usize), ("read", 1usize)] {
-            match xschema.method(m) {
-                Some(ms) if ms.param_names.len() == n => {}
-                Some(ms) => {
-                    return Err(LowerError::Invalid(format!(
-                        "regblock `via` helper `{}` method `{m}` takes {} argument(s), \
-                         the frontdoor needs {n}",
-                        xschema.name,
-                        ms.param_names.len()
-                    )));
-                }
-                None => {
-                    return Err(LowerError::Invalid(format!(
-                        "regblock `via` helper `{}` has no `{m}(addr, data)`-style method",
-                        xschema.name
-                    )));
-                }
-            }
         }
         let rb = &prog.regblocks[rbid.index()];
         regblock_bindings_map.insert(

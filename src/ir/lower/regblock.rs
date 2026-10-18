@@ -332,7 +332,7 @@ impl super::FuncBuilder<'_> {
         });
         if writes_bus {
             let call = self.regblock_call(helper_field, "write", vec![lit(reg.offset), v])?;
-            self.push(Stmt::TransactorCall { dest: None, call });
+            self.push_regblock_frontdoor_call(None, call);
         }
         Ok(true)
     }
@@ -424,7 +424,7 @@ impl super::FuncBuilder<'_> {
                 index: None,
             };
             let call = self.regblock_call(helper_field, "write", vec![lit(reg.offset), word])?;
-            self.push(Stmt::TransactorCall { dest: None, call });
+            self.push_regblock_frontdoor_call(None, call);
         }
         Ok(true)
     }
@@ -446,8 +446,12 @@ impl super::FuncBuilder<'_> {
                 "regblock binding `{binding}` is not in scope at its field-read site"
             )));
         };
-        let helper_ty = self.regblock_helper_type(&bctx.helper_field, "read", 1)?;
-        let extract = self.field_read_expr(mirror, &helper_ty, &reg, &fld);
+        let word = if fld.access.reads_from_bus() {
+            self.lower_reg_read_value(mirror, &bctx.helper_field, &reg)?
+        } else {
+            mirror_field_expr(mirror, &reg.name)
+        };
+        let extract = field_extract_expr(word, &fld);
         let id = self.declare(dest_name);
         self.push(Stmt::Assign(id, extract));
         Ok(true)
@@ -491,12 +495,12 @@ impl super::FuncBuilder<'_> {
     /// `let`-RHS. Returns the field-extract expression. The bus-read
     /// count matches v1: one read per textual occurrence.
     pub(crate) fn lower_regblock_subfield_read_expr(
-        &self,
+        &mut self,
         binding: &str,
         reg_name: &str,
         fld_name: &str,
     ) -> Result<Expr, LowerError> {
-        let bctx = &self.ctx.regblock_bindings[binding];
+        let bctx = self.ctx.regblock_bindings[binding].clone();
         let reg = bctx
             .registers
             .iter()
@@ -513,8 +517,12 @@ impl super::FuncBuilder<'_> {
                 "regblock binding `{binding}` is not in scope at its field-read site"
             )));
         };
-        let helper_ty = self.regblock_helper_type(&bctx.helper_field, "read", 1)?;
-        Ok(self.field_read_expr(mirror, &helper_ty, reg, &fld))
+        let word = if fld.access.reads_from_bus() {
+            self.lower_reg_read_value(mirror, &bctx.helper_field, reg)?
+        } else {
+            mirror_field_expr(mirror, &reg.name)
+        };
+        Ok(field_extract_expr(word, &fld))
     }
 
     /// `Some((binding, register, field))` when `e` is a three-level
@@ -608,10 +616,7 @@ impl super::FuncBuilder<'_> {
                     "write",
                     vec![lit(reg.offset), lit(pat)],
                 )?;
-                self.push(Stmt::TransactorCall {
-                    dest: None,
-                    call: wcall,
-                });
+                self.push_regblock_frontdoor_call(None, wcall);
                 // got = Helper.read(off)
                 let rcall =
                     self.regblock_call(&bctx.helper_field, "read", vec![lit(reg.offset)])?;
@@ -619,10 +624,7 @@ impl super::FuncBuilder<'_> {
                 if let Some(ty) = self.transactor_call_ret_ty(&rcall) {
                     self.set_local_type(got, ty);
                 }
-                self.push(Stmt::TransactorCall {
-                    dest: Some(got),
-                    call: rcall,
-                });
+                self.push_regblock_frontdoor_call(Some(got), rcall);
                 // assert got == pat else fail("bitbash REG label: wrote 0x.., got 0x..")
                 let cond = Expr::Binary(BinOp::Eq, Box::new(Expr::Local(got)), Box::new(lit(pat)));
                 // v1's exact message: `bitbash <reg> <label>: wrote
@@ -765,10 +767,7 @@ impl super::FuncBuilder<'_> {
             if let Some(ty) = self.transactor_call_ret_ty(&call) {
                 self.set_local_type(id, ty);
             }
-            self.push(Stmt::TransactorCall {
-                dest: Some(id),
-                call,
-            });
+            self.push_regblock_frontdoor_call(Some(id), call);
             // Read-side mirror predict: store the bus-returned value.
             self.push(Stmt::RecordFieldWrite {
                 local: mirror,
@@ -807,11 +806,11 @@ impl super::FuncBuilder<'_> {
     /// branch). No statement hoist is needed because the `via` helper's
     /// `read` is an ordinary hookable lambda, not the bus wire protocol.
     pub(crate) fn lower_regblock_read_expr(
-        &self,
+        &mut self,
         binding: &str,
         reg_name: &str,
     ) -> Result<Expr, LowerError> {
-        let bctx = &self.ctx.regblock_bindings[binding];
+        let bctx = self.ctx.regblock_bindings[binding].clone();
         let reg = bctx
             .registers
             .iter()
@@ -822,11 +821,73 @@ impl super::FuncBuilder<'_> {
                 "regblock binding `{binding}` is not in scope at its read site"
             )));
         };
-        // Resolve the helper TYPE name (the emitted lambda is
-        // `<helper_ty>_read`) and validate the `read` method/arity, the
-        // same way `regblock_call` does for the statement paths.
-        let helper_ty = self.regblock_helper_type(&bctx.helper_field, "read", 1)?;
+        self.lower_reg_read_value(mirror, &bctx.helper_field, reg)
+    }
+
+    /// Produce one frontdoor read value and update the mirror. A transactor
+    /// helper remains an inline `RegRead` because its hookable `read` is an
+    /// ordinary C++ lambda. A bus helper must use the scheduler-aware TLM
+    /// statement seam, so materialize its response before the mirror write.
+    fn lower_reg_read_value(
+        &mut self,
+        mirror: ir::LocalId,
+        helper_field: &str,
+        reg: &RegRegisterSchema,
+    ) -> Result<Expr, LowerError> {
+        if !reg.access.reads_from_bus() {
+            return Ok(Expr::RecordField {
+                local: mirror,
+                field: reg.name.clone(),
+                path: Vec::new(),
+                mid_indices: Vec::new(),
+                index: None,
+            });
+        }
+        if self.ctx.bus_bindings.contains_key(helper_field) {
+            let call = self.regblock_call(helper_field, "read", vec![lit(reg.offset)])?;
+            let temp = self.fresh_temp();
+            if let Some(ty) = self.transactor_call_ret_ty(&call) {
+                self.set_local_type(temp, ty);
+            }
+            self.push_regblock_frontdoor_call(Some(temp), call);
+            self.push(Stmt::RecordFieldWrite {
+                local: mirror,
+                field: reg.name.clone(),
+                path: Vec::new(),
+                mid_indices: Vec::new(),
+                index: None,
+                value: Expr::Local(temp),
+            });
+            return Ok(Expr::Local(temp));
+        }
+        let helper_ty = self.regblock_helper_type(helper_field, "read", 1)?;
         Ok(self.reg_read_expr(mirror, &helper_ty, reg))
+    }
+
+    /// Whether this source access will materialize a scheduler statement.
+    /// The AST preflight uses this for lazy messages and re-evaluated
+    /// predicates before lowering mutates the CFG.
+    pub(crate) fn bus_regblock_read_has_value_prelude(&self, e: &crate::ast::Expr) -> bool {
+        let resolved = self
+            .as_regblock_subfield(e)
+            .map(|(binding, _, field)| (binding, field.access.reads_from_bus()))
+            .or_else(|| {
+                self.as_regblock_register(e).and_then(|(binding, name)| {
+                    let reg = self.ctx.regblock_bindings[&binding]
+                        .registers
+                        .iter()
+                        .find(|reg| reg.name == name)?
+                        .clone();
+                    Some((binding, reg.access.reads_from_bus()))
+                })
+            });
+        resolved.is_some_and(|(binding, reads_bus)| {
+            reads_bus
+                && self
+                    .ctx
+                    .bus_bindings
+                    .contains_key(&self.ctx.regblock_bindings[&binding].helper_field)
+        })
     }
 
     /// Shared register-level read-expression for the flat regblock
@@ -1280,47 +1341,135 @@ impl super::FuncBuilder<'_> {
         ))
     }
 
-    /// Build the frontdoor `Helper.<method>(args)` call edge. Validates
-    /// the helper transactor declares the method at the expected arity —
-    /// v1 would surface a missing method as a C++ compile error.
+    /// Build the frontdoor `<helper>.<method>(args)` call edge. A transactor
+    /// helper resolves to its callable; a direct bus helper resolves to the
+    /// concrete scheduler-aware TLM binding. Both validate method arity.
     fn regblock_call(
         &self,
         helper_field: &str,
         method: &str,
         args: Vec<Expr>,
     ) -> Result<Expr, LowerError> {
-        let Some(&xid) = self.ctx.transactor_fields.get(helper_field) else {
+        if let Some(&xid) = self.ctx.transactor_fields.get(helper_field) {
+            let schema = &self.ctx.transactors[xid.index()];
+            let Some(m) = schema.method(method) else {
+                return Err(LowerError::Invalid(format!(
+                    "regblock `via` helper `{}` has no `{method}` method",
+                    schema.name
+                )));
+            };
+            if m.param_names.len() != args.len() {
+                return Err(LowerError::Invalid(format!(
+                    "regblock `via` helper `{}` method `{method}` takes {} argument(s), \
+                     the frontdoor passes {}",
+                    schema.name,
+                    m.param_names.len(),
+                    args.len()
+                )));
+            }
+            return Ok(Expr::Call(
+                ir::CallTarget::TransactorMethod {
+                    bus_field: helper_field.to_string(),
+                    method: method.to_string(),
+                    target: ir::TransactorMethodTarget::Callable {
+                        transactor: xid,
+                        function: m.function,
+                    },
+                },
+                args,
+            ));
+        }
+
+        let bus = self.ctx.bus_bindings.get(helper_field).ok_or_else(|| {
+            LowerError::Invalid(format!(
+                "regblock `via` helper `{helper_field}` is neither an active transactor field nor a bus binding"
+            ))
+        })?;
+        let m = bus
+            .tlm_methods
+            .iter()
+            .find(|candidate| candidate.name.name == method)
+            .ok_or_else(|| {
+                LowerError::Invalid(format!(
+                    "regblock `via` bus `{}` has no tlm_method `{method}`",
+                    bus.name.name
+                ))
+            })?;
+        if m.args.len() != args.len() {
             return Err(LowerError::Invalid(format!(
-                "regblock `via` helper `{helper_field}` is not an active transactor field"
-            )));
-        };
-        let schema = &self.ctx.transactors[xid.index()];
-        let Some(m) = schema.method(method) else {
-            return Err(LowerError::Invalid(format!(
-                "regblock `via` helper `{}` has no `{method}` method",
-                schema.name
-            )));
-        };
-        if m.param_names.len() != args.len() {
-            return Err(LowerError::Invalid(format!(
-                "regblock `via` helper `{}` method `{method}` takes {} argument(s), \
+                "regblock `via` bus `{}` tlm_method `{method}` takes {} argument(s), \
                  the frontdoor passes {}",
-                schema.name,
-                m.param_names.len(),
+                bus.name.name,
+                m.args.len(),
                 args.len()
             )));
         }
+        let logical_bus = bus.name.name.clone();
+        let target = match self.bus_origin(helper_field) {
+            ir::PortOrigin::BusBinding { binding, field } => self
+                .testbench_method_owner
+                .map(|testbench| ir::TransactorMethodTarget::TestbenchBusField {
+                    testbench,
+                    field: field.clone(),
+                    bus: logical_bus,
+                })
+                .unwrap_or(ir::TransactorMethodTarget::ConcreteBusBinding { binding, field }),
+            ir::PortOrigin::BoundBus => ir::TransactorMethodTarget::BoundBus,
+            ir::PortOrigin::Dut => {
+                return Err(LowerError::Invalid(format!(
+                    "regblock `via` bus `{helper_field}` lost its typed binding provenance"
+                )))
+            }
+        };
         Ok(Expr::Call(
             ir::CallTarget::TransactorMethod {
                 bus_field: helper_field.to_string(),
                 method: method.to_string(),
-                target: ir::TransactorMethodTarget::Callable {
-                    transactor: xid,
-                    function: m.function,
-                },
+                target,
             },
             args,
         ))
+    }
+
+    /// Place one frontdoor edge at the seam required by its receiver.
+    /// Callable transactor helpers use `Stmt::TransactorCall`; concrete bus
+    /// methods use the complete RHS of `Stmt::Assign`, the canonical TLM
+    /// handshake edge consumed by verification and codegen.
+    fn push_regblock_frontdoor_call(&mut self, dest: Option<ir::LocalId>, call: Expr) {
+        let bus_edge = matches!(
+            &call,
+            Expr::Call(
+                ir::CallTarget::TransactorMethod {
+                    target: ir::TransactorMethodTarget::ConcreteBusBinding { .. }
+                        | ir::TransactorMethodTarget::TestbenchBusField { .. }
+                        | ir::TransactorMethodTarget::BoundBus,
+                    ..
+                },
+                _
+            )
+        );
+        if bus_edge {
+            let dest = dest.unwrap_or_else(|| self.fresh_temp());
+            self.push(Stmt::Assign(dest, call));
+        } else {
+            self.push(Stmt::TransactorCall { dest, call });
+        }
+    }
+}
+
+fn field_extract_expr(word: Expr, fld: &RegFieldSchema) -> Expr {
+    let mask = field_mask(fld.bit_width);
+    let pos = fld.bit_pos as u64;
+    bin(BinOp::BitAnd, bin(BinOp::Shr, word, lit(pos)), lit(mask))
+}
+
+fn mirror_field_expr(mirror: ir::LocalId, field: &str) -> Expr {
+    Expr::RecordField {
+        local: mirror,
+        field: field.to_string(),
+        path: Vec::new(),
+        mid_indices: Vec::new(),
+        index: None,
     }
 }
 

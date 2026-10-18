@@ -4871,11 +4871,22 @@ impl FuncBuilder<'_> {
             crate::ir::CallTarget::TransactorMethod {
                 bus_field, method, ..
             } => {
-                let xid = self.ctx.transactor_fields.get(bus_field)?;
-                self.ctx.transactors[xid.index()]
-                    .method(method)?
-                    .ret_ty
-                    .clone()
+                if let Some(xid) = self.ctx.transactor_fields.get(bus_field) {
+                    self.ctx.transactors[xid.index()]
+                        .method(method)?
+                        .ret_ty
+                        .clone()
+                } else {
+                    let bus = self.ctx.bus_bindings.get(bus_field)?;
+                    let method = bus
+                        .tlm_methods
+                        .iter()
+                        .find(|candidate| candidate.name.name == *method)?;
+                    method
+                        .ret
+                        .as_ref()
+                        .map(|ty| super::helpers::ir_type_of(Some(ty)))
+                }
             }
             crate::ir::CallTarget::TransactorSelfMethod { method, .. } => {
                 self.self_transactor_methods.get(method)?.2.clone()
@@ -6893,6 +6904,9 @@ impl FuncBuilder<'_> {
             let parsed = parse_fmt_capture(&capture.expr)?;
             if self.fmt_expr_has_hoistable_call(&parsed)?
                 || self.fmt_expr_has_conditional_hoistable_call(&parsed, false)?
+                || self
+                    .expr_value_prelude_summary(&parsed)
+                    .has_inline_statements()
             {
                 return Ok(true);
             }
@@ -6934,7 +6948,8 @@ impl FuncBuilder<'_> {
                 Ok::<_, LowerError>(
                     found
                         || self.fmt_expr_has_hoistable_call(e)?
-                        || self.fmt_expr_has_conditional_hoistable_call(e, false)?,
+                        || self.fmt_expr_has_conditional_hoistable_call(e, false)?
+                        || self.expr_value_prelude_summary(e).has_inline_statements(),
                 )
             })?;
         let mut args = Vec::with_capacity(parsed_caps.len());
