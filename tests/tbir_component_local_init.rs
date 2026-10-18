@@ -163,7 +163,7 @@ fn component_local_modes_gate_active_only_methods() {
 }
 
 #[test]
-fn runtime_managed_component_locals_are_rejected_instead_of_misemitted() {
+fn event_managed_component_locals_register_their_handlers() {
     let source = r#"
 agent Listener
     input : event<uint<8>>
@@ -172,25 +172,329 @@ agent Listener
     on input(value)
         seen = value
     end on
+
+    hookable read() -> uint<8>
+        return seen
+    end read
 end agent Listener
 
 test LocalListenerTest
     let dut : Top
     run
         let listener : Listener
+        emit listener.input(9)
+        assert listener.read() == 9 else fail("local handler did not run")
     end run
 end test LocalListenerTest
 "#;
     cpp_tb::emit(&merged_source(source)).expect("v1 installs local component handlers");
-    let err = lower_source(source)
-        .expect_err("TB-IR must not silently omit local component runtime setup");
+    let merged = merged_source(source);
+    let program = lower::lower_program(&merged).expect("TB-IR lowers the local handler component");
+    verify::verify_program(&program).expect("local handler component verifies");
+    let cpp = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default())
+        .expect("TB-IR emits the local handler registration");
     assert!(
-        matches!(err, lower::LowerError::Unsupported { .. }),
-        "{err:?}"
+        cpp.contains("listener.input.push_back([&](auto _t)"),
+        "local event handler must subscribe at ComponentInit:\n{cpp}"
     );
-    let message = err.to_string();
-    assert!(message.contains("listener"), "{message}");
-    assert!(message.contains("event-handler registration"), "{message}");
+    assert!(
+        cpp.contains("(listener, _t);"),
+        "local event handler must dispatch on the local receiver:\n{cpp}"
+    );
+}
+
+#[test]
+fn component_locals_install_internal_connect_bridges() {
+    let source = r#"
+transactor Source
+    observed : out event<uint<8>>
+    hookable publish(value : uint<8>)
+        emit observed(value)
+    end publish
+end transactor Source
+
+scoreboard Sink
+    seen : uint<8> default 0
+    hookable take(value : uint<8>)
+        seen = seen + value
+    end take
+    hookable read() -> uint<8>
+        return seen
+    end read
+end scoreboard Sink
+
+env LocalEnv
+    source : Source passive
+    sink : Sink
+    connect
+        source.observed -> sink.take
+    end connect
+    hookable publish(value : uint<8>)
+        source.publish(value)
+    end publish
+    hookable read() -> uint<8>
+        return sink.read()
+    end read
+end env LocalEnv
+
+test LocalConnectTest
+    let dut : Top
+    run
+        repeat 2
+            let local_env : LocalEnv
+            local_env.publish(11)
+            assert local_env.read() == 11 else fail("local connect did not deliver exactly once")
+        end repeat
+        log(info, "ALL TESTS PASSED - repeated local connect")
+    end run
+end test LocalConnectTest
+"#;
+    let merged = merged_source(source);
+    let program = lower::lower_program(&merged).expect("local connect graph lowers");
+    verify::verify_program(&program).expect("local connect graph verifies");
+    let cpp = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default())
+        .expect("local connect graph emits");
+    assert!(
+        cpp.contains("local_env.source.observed.push_back([&](auto _t)"),
+        "ComponentInit must install the local env's connect bridge:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("Sink_take(local_env.sink, _t)"),
+        "the bridge must dispatch on the nested local sink:\n{cpp}"
+    );
+    let clear = cpp
+        .find("local_env.source.observed.clear();")
+        .expect("ComponentInit clears old connect bridges");
+    let register = cpp
+        .find("local_env.source.observed.push_back([&](auto _t)")
+        .expect("ComponentInit reinstalls the connect bridge");
+    assert!(
+        clear < register,
+        "ComponentInit must clear old connect bridges before reinstalling them:\n{cpp}"
+    );
+
+    if !verilator_present() {
+        eprintln!("skipping repeated local-connect runtime test: verilator not found");
+        return;
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for codegen in ["v1", "tbir"] {
+        let outdir = runtime_outdir(&format!("{codegen}_connect"));
+        let _ = std::fs::remove_dir_all(&outdir);
+        std::fs::create_dir_all(&outdir).expect("create local-connect runtime directory");
+        let source_path = outdir.join("component_local_connect.harc");
+        std::fs::write(&source_path, source).expect("write local-connect source");
+        let output = Command::new(env!("CARGO_BIN_EXE_harc"))
+            .arg("sim")
+            .arg("--codegen")
+            .arg(codegen)
+            .arg("--sv")
+            .arg(root.join("tests/dut/top_counter.sv"))
+            .arg(&source_path)
+            .arg("--top")
+            .arg("Top")
+            .arg("--outdir")
+            .arg(&outdir)
+            .output()
+            .unwrap_or_else(|error| panic!("spawn {codegen} local-connect simulation: {error}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{codegen} local-connect simulation failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("ALL TESTS PASSED - repeated local connect")
+                || stderr.contains("ALL TESTS PASSED - repeated local connect"),
+            "{codegen} local-connect simulation did not reach its success marker:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        std::fs::remove_dir_all(&outdir).expect("remove local-connect runtime directory");
+    }
+}
+
+#[test]
+fn initialized_component_local_owns_its_runtime_graph() {
+    let source = r#"
+agent Listener
+    input : event<uint<8>>
+    seen : uint<8> default 0
+
+    on input(value)
+        seen = seen + value
+    end on
+
+    hookable read() -> uint<8>
+        return seen
+    end read
+end agent Listener
+
+test LocalListenerCopyTest
+    let dut : Top
+    run
+        let original : Listener
+        emit original.input(3)
+        let copy : Listener = original
+        assert copy.read() == 3 else fail("component state was not copied")
+        emit copy.input(2)
+        assert copy.read() == 5 else fail("component copy owns no event handler")
+        assert original.read() == 3 else fail("component copy handler targets its source")
+        log(info, "ALL TESTS PASSED - component copy graph")
+    end run
+end test LocalListenerCopyTest
+"#;
+    let merged = merged_source(source);
+    let program = lower::lower_program(&merged).expect("TB-IR lowers a component-value local");
+    verify::verify_program(&program).expect("component-value local verifies");
+    let run = program.function(program.tests[0].run);
+    let copy = run
+        .locals
+        .iter()
+        .position(|local| local.name == "copy")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("copy local");
+    let stmts = statements(run).collect::<Vec<_>>();
+    let init = stmts
+        .iter()
+        .position(|stmt| matches!(stmt, ir::Stmt::ComponentInit { local, .. } if *local == copy))
+        .expect("the copy owns a fresh runtime graph");
+    let assign = stmts
+        .iter()
+        .position(|stmt| matches!(stmt, ir::Stmt::Assign(local, ir::Expr::ComponentValue { .. }) if *local == copy))
+        .expect("the source user state is copied");
+    assert!(init < assign, "runtime graph installation must precede the state copy");
+
+    if !verilator_present() {
+        eprintln!("skipping component-copy runtime test: verilator not found");
+        return;
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let outdir = runtime_outdir("tbir_copy");
+    let _ = std::fs::remove_dir_all(&outdir);
+    std::fs::create_dir_all(&outdir).expect("create component-copy runtime directory");
+    let source_path = outdir.join("component_copy_graph.harc");
+    std::fs::write(&source_path, source).expect("write component-copy source");
+    let output = Command::new(env!("CARGO_BIN_EXE_harc"))
+        .arg("sim")
+        .arg("--codegen")
+        .arg("tbir")
+        .arg("--sv")
+        .arg(root.join("tests/dut/top_counter.sv"))
+        .arg(&source_path)
+        .arg("--top")
+        .arg("Top")
+        .arg("--outdir")
+        .arg(&outdir)
+        .output()
+        .unwrap_or_else(|error| panic!("spawn tbir component-copy simulation: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "tbir component-copy simulation failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stdout.contains("ALL TESTS PASSED - component copy graph")
+            || stderr.contains("ALL TESTS PASSED - component copy graph"),
+        "tbir component-copy simulation did not reach its success marker:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    std::fs::remove_dir_all(&outdir).expect("remove component-copy runtime directory");
+}
+
+#[test]
+fn repeated_component_init_replaces_event_subscribers() {
+    let source = r#"
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+agent Listener
+    input : event<uint<8>>
+    seen : uint<8> default 0
+
+    on input(value)
+        seen = seen + value
+    end on
+
+    hookable read() -> uint<8>
+        return seen
+    end read
+end agent Listener
+
+test RepeatedLocalListenerTest
+    let dut : Top
+    clock clk = SysDomain
+    run
+        wait 2 cycles
+        repeat 2
+            let listener : Listener
+            assert listener.idle(1) else fail("fresh local retained activity history")
+            emit listener.input(1)
+            assert listener.read() == 1 else fail("local handler was registered more than once")
+        end repeat
+        log(info, "ALL TESTS PASSED - repeated component init")
+    end run
+end test RepeatedLocalListenerTest
+"#;
+    let merged = merged_source(source);
+    cpp_tb::emit(&merged).expect("v1 supports repeated local component initialization");
+    let program = lower::lower_program(&merged).expect("TB-IR lowers repeated ComponentInit");
+    verify::verify_program(&program).expect("repeated ComponentInit verifies");
+    let cpp = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default())
+        .expect("TB-IR emits repeated ComponentInit");
+    let clear = cpp
+        .find("listener.input.clear();")
+        .expect("ComponentInit clears old event subscribers");
+    let register = cpp
+        .find("listener.input.push_back([&](auto _t)")
+        .expect("ComponentInit reinstalls the event handler");
+    assert!(
+        clear < register,
+        "subscriber reset must precede registration:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("listener._last_in_cycle = 0;")
+            && cpp.contains("listener._last_out_cycle = 0;")
+            && cpp.contains("listener._harc_hook_read_post.clear();"),
+        "ComponentInit must reset all fresh-instance runtime state:\n{cpp}"
+    );
+
+    if !verilator_present() {
+        eprintln!("skipping repeated ComponentInit runtime test: verilator not found");
+        return;
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for codegen in ["v1", "tbir"] {
+        let outdir = runtime_outdir(&format!("{codegen}_repeated"));
+        let _ = std::fs::remove_dir_all(&outdir);
+        std::fs::create_dir_all(&outdir).expect("create repeated-init runtime directory");
+        let source_path = outdir.join("repeated_component_init.harc");
+        std::fs::write(&source_path, source).expect("write repeated-init source");
+        let output = Command::new(env!("CARGO_BIN_EXE_harc"))
+            .arg("sim")
+            .arg("--codegen")
+            .arg(codegen)
+            .arg("--sv")
+            .arg(root.join("tests/dut/top_counter.sv"))
+            .arg(&source_path)
+            .arg("--top")
+            .arg("Top")
+            .arg("--outdir")
+            .arg(&outdir)
+            .output()
+            .unwrap_or_else(|error| panic!("spawn {codegen} repeated-init simulation: {error}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{codegen} repeated-init simulation failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("ALL TESTS PASSED - repeated component init")
+                || stderr.contains("ALL TESTS PASSED - repeated component init"),
+            "{codegen} repeated-init simulation did not reach its success marker:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        std::fs::remove_dir_all(&outdir).expect("remove repeated-init runtime directory");
+    }
 }
 
 #[test]

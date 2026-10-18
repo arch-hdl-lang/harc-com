@@ -1411,9 +1411,10 @@ pub fn validate_component_binding_modes(
 }
 
 /// Return the first constructor-time facility that prevents a component tree
-/// from being represented as a function-local value. TB-IR can reset plain
-/// state and dispatch methods on such a local, but runtime registrations and
-/// DUT/bus bindings require testbench-owned lifetime and setup.
+/// from being represented as a function-local value. Event subscribers and
+/// internal `connect` bridges are owned by the local component's own event
+/// vectors and can be installed at `ComponentInit`. Scheduler-global lifecycle
+/// services and DUT/bus bindings still require testbench-owned setup.
 pub(crate) fn component_local_runtime_requirement(
     components: &[ComponentSchema],
     component: ComponentId,
@@ -1429,10 +1430,6 @@ pub(crate) fn component_local_runtime_requirement(
         let schema = components.get(component.index())?;
         let reason = if schema.bound_bus.is_some() {
             Some(format!("bound-bus setup on `{}`", schema.name))
-        } else if !schema.connects.is_empty() {
-            Some(format!("connect registration on `{}`", schema.name))
-        } else if !schema.on_handlers.is_empty() {
-            Some(format!("event-handler registration on `{}`", schema.name))
         } else if !schema.periodic_handlers.is_empty()
             || !schema.cycle_handlers.is_empty()
             || schema.watchdog.is_some()

@@ -2913,19 +2913,22 @@ where
     // in an UNINSTANTIATED one it emits no wiring at all and succeeds,
     // so the same malformed edge is invisible there. tbir resolves
     // `connect` for every env in the merged file, so it sees edges v1
-    // never reaches. No single `V1Status` is honest, so the suggestion
-    // stays, being true somewhere. The regression test is
-    // `a_malformed_connect_endpoint_keeps_its_v1_suggestion`.
+    // never reaches. `ReachabilityDependent` records that split without
+    // presenting declaration-skipping as a working fallback. The regression
+    // test is
+    // `a_malformed_connect_endpoint_reports_reachability_dependent_v1_behavior`.
     let from = dotted_path(&edge.from).ok_or_else(|| {
-        unsupported(
+        not_implemented(
             &format!("a non-path `connect` source in `{}`", owner.name.name),
-            "",
+            "connect endpoints must be component/event paths",
+            V1Status::ReachabilityDependent,
         )
     })?;
     let to = dotted_path(&edge.to).ok_or_else(|| {
-        unsupported(
+        not_implemented(
             &format!("a non-path `connect` sink in `{}`", owner.name.name),
-            "",
+            "connect endpoints must be component/method paths",
+            V1Status::ReachabilityDependent,
         )
     })?;
     // The source path is `<subcomp>.<event>` (final segment is the event
@@ -2970,12 +2973,13 @@ where
     // nothing) and why deleting it would be trading a diagnostic for a
     // panic.
     if from.is_empty() || (from.len() < 2 && owner_id.is_none()) {
-        return Err(unsupported(
+        return Err(not_implemented(
             &format!(
                 "a `connect` source `{}` without an event field",
                 from.join(".")
             ),
-            "",
+            "the source endpoint must name an `out event` field",
+            V1Status::EmitsUncompilable,
         ));
     }
     let (src_path, src_event) = from.split_at(from.len() - 1);
@@ -2986,9 +2990,10 @@ where
     // hookable, which v1 wires (see the source note above).
     // Same underflow guard as the source side above.
     if to.is_empty() || (to.len() < 2 && owner_id.is_none()) {
-        return Err(unsupported(
+        return Err(not_implemented(
             &format!("a `connect` sink `{}` without a method", to.join(".")),
-            "",
+            "the sink endpoint must name a hookable method or an input event",
+            V1Status::EmitsUncompilable,
         ));
     }
     let (sink_path, sink_name) = to.split_at(to.len() - 1);
@@ -3007,12 +3012,13 @@ where
             ..
         }) => (payload.clone(), *activation),
         _ => {
-            return Err(unsupported(
+            return Err(not_implemented(
                 &format!(
                     "a `connect` source `{}` that is not an `out event` port",
                     endpoint_label(src_path, &src_event)
                 ),
-                "",
+                "v1 validates this only when the owning component is instantiated",
+                V1Status::ReachabilityDependent,
             ));
         }
     };
@@ -3379,9 +3385,10 @@ fn resolve_sub_path(
             // prints the path verbatim in an instantiated env (a member
             // access that does not compile) and emits nothing at all in
             // an uninstantiated one.
-            unsupported(
+            not_implemented(
                 &format!("a `connect` path segment `{seg}` that is not a sub-component field"),
-                "",
+                "v1 validates this only when the owning component is instantiated",
+                V1Status::ReachabilityDependent,
             )
         })?;
         match &f.kind {
@@ -3390,9 +3397,10 @@ fn resolve_sub_path(
                 cur = &components[component.index()];
             }
             _ => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!("a `connect` path segment `{seg}` that is not a sub-component"),
-                    "",
+                    "v1 validates this only when the owning component is instantiated",
+                    V1Status::ReachabilityDependent,
                 ));
             }
         }
@@ -3453,12 +3461,14 @@ pub(crate) fn lower_queue_elem(
                 V1Status::EmitsUncompilable,
             );
         }
-        unsupported(
+        not_implemented(
             &format!("a non-scalar queue element `{named}` on `{comp}.{fname}`"),
             "lowered queue elements are scalars, declared transaction/struct records, \
              fully specified `Vec<scalar-or-record, N>` values (including nested vectors), \
              and `list<scalar-or-record>` values; \
-             this element shape has no typed queue representation yet",
+             v1 substitutes a different fallback element type, so the queue does not \
+             preserve the declared value shape",
+            V1Status::SilentlyMisLowers,
         )
     };
     match arg {
@@ -3516,8 +3526,8 @@ pub(crate) fn lower_queue_elem(
 /// `record_field_c_type`. v1 declares the records it emits; it emits no
 /// C++ enum at all. So an enum name reaching a subscriber signature or
 /// a `HarcQueue<T>` parameter is undeclared and g++ refuses — which
-/// makes `--codegen v1` a dead end there, and every other non-record
-/// name an honest `Unsupported`.
+/// makes `--codegen v1` a dead end there. Every other non-record name is
+/// flattened to fallback scalar storage, which is a silent type erasure.
 ///
 /// Asked at both the event-payload and queue-element seams. The first
 /// version of this rule lived only at the event one, and the queue seam
@@ -3558,7 +3568,8 @@ pub(crate) fn lower_event_payload(
     // no C++ enum at all, so an enum payload becomes
     // `std::function<void(Color)>` with `Color` undeclared — g++
     // refuses, and `--codegen v1` is a dead end. Every other non-record
-    // payload gets a real C++ type and builds.
+    // payload gets fallback scalar storage and builds with different value
+    // semantics.
     //
     // One `unsupported` used to cover both and promised a v1 that
     // cannot build the enum half. Splitting on "is it a NAMED type"
@@ -3582,14 +3593,16 @@ pub(crate) fn lower_event_payload(
         if v1_leaves_the_type_name_undeclared(named, enum_names) {
             return reject_enum(named);
         }
-        unsupported(
+        not_implemented(
             &format!("a non-record event payload `{named}` on `{comp}.{fname}`"),
             format!(
                 "only event<scalar>, recursively nested event<Vec<scalar-or-record, N>>, and \
                  event<transaction|struct> payloads are lowered \
-                 ({}); enum and other unresolved named payloads remain unsupported",
+                 ({}); v1 substitutes a 64-bit scalar callback payload, so delivery does not \
+                 preserve the declared payload type",
                 scalar_width_detail()
             ),
+            V1Status::SilentlyMisLowers,
         )
     };
     match arg {

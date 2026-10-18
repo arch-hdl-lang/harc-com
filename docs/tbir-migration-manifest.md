@@ -1,6 +1,6 @@
 # TB-IR migration manifest
 
-Snapshot: 2026-10-18, `origin/main` at `280c1ea9` plus this batch.
+Snapshot: 2026-10-18, `origin/main` at `ed53b288` plus this batch.
 
 This is the retirement queue, not a count of every defensive diagnostic.
 The source inventory is regenerated with:
@@ -12,8 +12,8 @@ awk '/^fn [A-Za-z0-9_]+\(/ { fn=$2; sub(/\(.*/, "", fn) }
   sort -u
 ```
 
-The snapshot has 23 textual `unsupported(` matches under `src/ir/lower`:
-22 executable constructor sites and the constructor definition. That is down
+The snapshot has 14 textual `unsupported(` matches under `src/ir/lower`:
+13 executable constructor sites and the constructor definition. That is down
 from 174 constructor sites at the `e17b938d` baseline. The count is only an
 inventory: one constructor can fence many source shapes, and adding a precise
 fail-closed neighbor can increase it while the supported surface grows.
@@ -87,6 +87,21 @@ including synchronous named-clock method waits, non-constant fixed-vector
 lengths, mixed initiator/responder declarations, unsupported ephemeral types,
 and residual aggregate writes. The raw inventory is now 23 textual matches
 (22 executable constructors plus the helper definition).
+
+The remaining-sites follow-up adds constructor-time runtime setup for
+function-local components whose runtime graph is self-owned: event handlers
+subscribe to the local instance's event vectors, and internal `connect`
+bridges are installed for the local component tree. Scheduler-global
+lifecycle services and DUT/bus-bound locals retain their measured v1 fallback
+until their lifetime and receiver setup are represented. Repeated initialization
+resets heartbeats, hooks, and subscribers before rebuilding the runtime graph,
+and initialized component values install their own graph before source user
+state is copied. The same batch removes
+nine stale v1 suggestions: seven malformed
+`connect` landings whose v1 outcome depends on whether their owner is
+reachable, plus incomplete queue/event payload spellings that v1 silently
+erases to a 64-bit scalar. The raw inventory is now 14 textual matches (13
+executable constructors plus the helper definition).
 
 No other state/helper `Unsupported` assertion currently has both a positive v1
 runtime control and an unambiguous intended value semantics.
