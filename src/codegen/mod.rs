@@ -10,6 +10,7 @@ pub mod dut_interface;
 pub mod emission;
 pub mod merge;
 pub(crate) mod native;
+pub mod probe_catalog;
 pub mod randomize;
 pub(crate) mod render_support;
 pub(crate) mod source_transform;
