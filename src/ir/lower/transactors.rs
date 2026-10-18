@@ -38,7 +38,7 @@
 //! body and never schedules it, so that one is a `NotImplemented`.
 
 use super::{
-    helpers, not_implemented, unsupported, FuncBuilder, LowerCtx, LowerError, SideTables, V1Status,
+    helpers, not_implemented, FuncBuilder, LowerCtx, LowerError, SideTables, V1Status,
 };
 use crate::ast::{
     BusDecl, ComponentField, ComponentItem, HookableMethod, Param, TargetTlmThread, TransactorDecl,
@@ -423,10 +423,9 @@ pub(crate) fn lower_transactor(
     }
 
     let Some((dut_field, dut_type)) = dut else {
-        return Err(unsupported(
-            &format!("transactor `{tname}` without a module-typed (DUT handle) field"),
-            "unbound transactors drive the DUT directly and need exactly one",
-        ));
+        return Err(LowerError::Invalid(format!(
+            "internal error: handle-less transactor `{tname}` escaped component routing"
+        )));
     };
 
     let mut schema = TransactorSchema {
@@ -915,7 +914,7 @@ fn lower_bound_target_transactor(
         cov_fields: HashMap::new(),
         covgroups: Vec::new(),
         clock_names: Vec::new(),
-        allow_scheduler_time_waits: false,
+        allow_scheduler_time_waits: true,
         record_ids: record_ctx.record_ids.clone(),
         records: record_ctx.records.clone(),
         bus_bindings: downstream_binds.clone(),
@@ -1229,6 +1228,7 @@ fn lower_bound_initiator_transactor(
     side_tables: &RefCell<SideTables>,
 ) -> Result<(TransactorSchema, Vec<TbFunction>), LowerError> {
     let tname = &t.name.name;
+    let component_hosted = super::components::bound_transactor_is_component(t);
     let bus_name = match t.bound_to.as_ref() {
         Some(bt) => super::bound_bus_name(bt, &format!("transactor `{tname}`"))?,
         // Both bound paths are reached only from `lower_transactor`'s
@@ -1271,6 +1271,9 @@ fn lower_bound_initiator_transactor(
         match ci {
             ComponentItem::Hookable(h) => methods_ast.push((h, false)),
             ComponentItem::Field(f) => {
+                if component_hosted && super::components::is_event_field(f) {
+                    continue;
+                }
                 // An event/directional field (`req : in event<T>`) on a
                 // bound-to transactor is the event-driven driver form —
                 // it routes to the component path, which does not yet
@@ -1305,7 +1308,7 @@ fn lower_bound_initiator_transactor(
                 state_fields.push(sf);
             }
             ComponentItem::TargetTlmThread(th) => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!(
                         "initiator-side bound-to transactor `{tname}` mixing a `thread {}` \
                          responder with `hookable` initiator methods",
@@ -1317,7 +1320,9 @@ fn lower_bound_initiator_transactor(
                             .join(".")
                     ),
                     "a transactor is either an initiator BFM (hookable methods) or a \
-                     target responder (thread bus.<m> bodies), not both",
+                     target responder (thread bus.<m> bodies), not both; v1 selects the \
+                     initiator shape and silently drops the responder thread",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::OnHandler(_) => {
@@ -1389,6 +1394,9 @@ fn lower_bound_initiator_transactor(
         match ci {
             ComponentItem::Hookable(h) => methods_ast.push((h, true)),
             ComponentItem::Field(f) => {
+                if component_hosted && super::components::is_event_field(f) {
+                    continue;
+                }
                 // The directional rule lives in `lower_state_field`,
                 // which every state field already goes through. This
                 // site used to answer first, which made the split there
@@ -1415,7 +1423,7 @@ fn lower_bound_initiator_transactor(
                 state_fields.push(sf);
             }
             ComponentItem::TargetTlmThread(th) => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!(
                         "initiator-side bound-to transactor `{tname}` mixing a `thread {}` \
                          responder with `hookable` initiator methods",
@@ -1427,7 +1435,9 @@ fn lower_bound_initiator_transactor(
                             .join(".")
                     ),
                     "a transactor is either an initiator BFM (hookable methods) or a \
-                     target responder (thread bus.<m> bodies), not both",
+                     target responder (thread bus.<m> bodies), not both; v1 selects the \
+                     initiator shape and silently drops the responder thread",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
             ComponentItem::OnHandler(_) => {
@@ -1863,12 +1873,9 @@ fn lower_state_field(
                     V1Status::EmitsUncompilable,
                 ));
             }
-            return Err(unsupported(
-                &format!("{who} `{tname}` directional event field `{fname}`"),
-                "event-driven transactors await the event slice; an `in event<T>` needs an \
-                 `on <ev>` handler and an `out event<T>` needs an `emit` site and a \
-                 subscriber, and neither is lowered yet",
-            ));
+            return Err(LowerError::Invalid(format!(
+                "internal error: {who} `{tname}` directional event field `{fname}` escaped component event routing"
+            )));
         }
         // NOT "scalar": this is everything directional that is not an
         // event — `in Vec<uint<8>, 4>`, `in Beat`, `in Color`, and a
@@ -2252,9 +2259,10 @@ fn check_scalar_ty(
         // classify still lowers as an untyped u64 local, matching pure-helper
         // parameter handling.
         Some(TypeExpr::Builtin { .. }) => Ok(()),
-        Some(_) => Err(unsupported(
+        Some(_) => Err(not_implemented(
             &format!("{} with a non-scalar type", site()),
-            "",
+            "v1 erases unsupported method types to its scalar carrier or names a type it never declares",
+            V1Status::SilentlyMisLowers,
         )),
     }
 }

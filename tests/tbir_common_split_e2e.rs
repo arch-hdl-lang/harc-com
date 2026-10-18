@@ -1050,7 +1050,7 @@ tseq PureValues(seed: uint<8>) -> TSeq<uint<16>>
 end tseq PureValues
 
 tseq TimedValues(ctx: uint<8>) -> TSeq<uint<16>>
-    wait 1 cycle
+    wait 1ps
     yield ctx.zext<16>()
 end tseq TimedValues
 
@@ -1126,7 +1126,7 @@ impl CommonMethodTiming for TimingTb
         assert tb_helper == 11 else fail("testbench helper wait")
         assert component_tseq == 27 else fail("component tseq")
         assert tb_tseq == 35 else fail("testbench tseq")
-        assert cycle_count == before + 4 else fail("method timing cycle count")
+        assert cycle_count == before + 2 else fail("method timing cycle count")
         log(info, "METHOD_TIMING_RESULT=${cycle_count}")
     end run
 end impl CommonMethodTiming
@@ -5489,7 +5489,7 @@ fn tbir_common_method_timing_and_tseq_calls_match_self_contained() {
             String::from_utf8_lossy(&result.stderr)
         );
         assert!(result.status.success(), "{layout} run failed:\n{log}");
-        assert!(log.contains("METHOD_TIMING_RESULT=4"), "{layout}:\n{log}");
+        assert!(log.contains("METHOD_TIMING_RESULT=2"), "{layout}:\n{log}");
         assert!(log.contains("ALL TESTS PASSED"), "{layout}:\n{log}");
     }
     assert_eq!(

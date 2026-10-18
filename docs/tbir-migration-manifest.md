@@ -1,6 +1,6 @@
 # TB-IR migration manifest
 
-Snapshot: 2026-10-18, `origin/main` at `52be19ca` plus this batch.
+Snapshot: 2026-10-18, `origin/main` at `280c1ea9` plus this batch.
 
 This is the retirement queue, not a count of every defensive diagnostic.
 The source inventory is regenerated with:
@@ -12,8 +12,8 @@ awk '/^fn [A-Za-z0-9_]+\(/ { fn=$2; sub(/\(.*/, "", fn) }
   sort -u
 ```
 
-The snapshot has 43 textual `unsupported(` matches under `src/ir/lower`:
-42 executable constructor sites and the constructor definition. That is down
+The snapshot has 23 textual `unsupported(` matches under `src/ir/lower`:
+22 executable constructor sites and the constructor definition. That is down
 from 174 constructor sites at the `e17b938d` baseline. The count is only an
 inventory: one constructor can fence many source shapes, and adding a precise
 fail-closed neighbor can increase it while the supported surface grows.
@@ -71,6 +71,22 @@ invariants now report `Invalid` instead of advertising a backend escape hatch.
 Focused tests cover the three new paths and representative classifications; the raw
 inventory is now 43 textual matches (42 executable constructors plus the
 helper definition).
+
+The next twenty-site batch adds six TB-IR paths: testbench-declaration event
+subscriptions register in the owning test's run flow, handle-less state-only
+transactors route through component storage, and untyped promoted lets with a
+composed runtime initializer use the existing widthless host-scalar ABI.
+Test-scope covergroup declarations now register with the coverage field table,
+so their samplers receive the same lowering and precise width diagnostics as
+testbench fields. Constant ternaries fold with C++'s selected-arm semantics,
+and wall-clock waits in transaction sequences and target responders use their
+owning test scheduler. Four
+post-routing guards are now explicit internal invariants. The other sites no
+longer advertise v1 for measured uncompilable emission or type erasure,
+including synchronous named-clock method waits, non-constant fixed-vector
+lengths, mixed initiator/responder declarations, unsupported ephemeral types,
+and residual aggregate writes. The raw inventory is now 23 textual matches
+(22 executable constructors plus the helper definition).
 
 No other state/helper `Unsupported` assertion currently has both a positive v1
 runtime control and an unambiguous intended value semantics.

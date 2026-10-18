@@ -214,6 +214,12 @@ pub(crate) fn transactor_is_component(
     if transactor_is_function_library(t) {
         return true;
     }
+    // A handle-less state-only transactor is a host-side value component,
+    // not a DUT-poking BFM. Route it through the component schema so its
+    // persistent fields can be instantiated even when it declares no method.
+    if !has_module_field {
+        return true;
+    }
     // Passive helper / monitor: DUT handle + always-on hookables, with no
     // active-only body to elide. This must lower as a component so a
     // `testbench` can hold `mon : Monitor passive` and call `mon.observe()`.
@@ -1683,9 +1689,10 @@ fn lower_field(
                 }
             };
             let folded = super::fold_const(len_expr, consts, "").map_err(|error| match error {
-                super::ConstFoldErr::Unsupported(detail) => unsupported(
+                super::ConstFoldErr::Unsupported(detail) => not_implemented(
                     &format!("fixed-vector field `{comp}.{fname}` with an unsupported length"),
                     format!("the length must be a compile-time integer expression: {detail}"),
+                    V1Status::EmitsUncompilable,
                 ),
                 super::ConstFoldErr::Invalid(detail) => LowerError::Invalid(format!(
                     "fixed-vector field `{comp}.{fname}` has an invalid length: {detail}"
@@ -3808,9 +3815,10 @@ fn fixed_vec_elem_ir_type_with_records_and_consts(
             ));
         }
         let folded = super::fold_const(len_expr, consts, "").map_err(|error| match error {
-            super::ConstFoldErr::Unsupported(detail) => unsupported(
+            super::ConstFoldErr::Unsupported(detail) => not_implemented(
                 "a nested fixed-vector length outside the constant-expression subset",
                 detail,
+                V1Status::EmitsUncompilable,
             ),
             super::ConstFoldErr::Invalid(detail) => LowerError::Invalid(format!(
                 "nested fixed-vector length is invalid: {detail}"
@@ -5178,12 +5186,15 @@ impl super::FuncBuilder<'_> {
                             return Ok(None);
                         }
                         _ => {
-                            return Err(unsupported(
+                            return Err(not_implemented(
                                 &format!(
                                     "write to `{}` — not a scalar component field",
                                     path.join(".")
                                 ),
-                                "",
+                                "the remaining aggregate field kinds have no whole-value TB-IR \
+                                 assignment; v1 either emits an ill-typed container assignment or \
+                                 erases the aggregate to a scalar carrier",
+                                V1Status::SilentlyMisLowers,
                             ));
                         }
                     }

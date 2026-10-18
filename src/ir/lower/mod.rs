@@ -548,6 +548,251 @@ fn const_helper_scalar_type(ty: Option<&crate::ast::TypeExpr>, allow_untyped: bo
     }
 }
 
+#[derive(Clone, Copy)]
+struct ConstScalarShape {
+    signed: bool,
+    boolean: bool,
+}
+
+fn const_type_scalar_shape(ty: Option<&crate::ast::TypeExpr>) -> Option<ConstScalarShape> {
+    use crate::ast::{BuiltinTy, TypeExpr};
+    let Some(TypeExpr::Builtin { name, args, .. }) = ty else {
+        return ty.is_none().then_some(ConstScalarShape {
+            signed: true,
+            boolean: false,
+        });
+    };
+    match name {
+        BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit if args.is_empty() => {
+            Some(ConstScalarShape {
+                signed: true,
+                boolean: true,
+            })
+        }
+        BuiltinTy::SInt | BuiltinTy::SIntCap => Some(ConstScalarShape {
+            signed: true,
+            boolean: false,
+        }),
+        BuiltinTy::UInt
+        | BuiltinTy::UIntCap
+        | BuiltinTy::Bits
+        | BuiltinTy::Int
+        | BuiltinTy::Time => Some(ConstScalarShape {
+            signed: false,
+            boolean: false,
+        }),
+        _ => None,
+    }
+}
+
+fn validate_const_helper_call_contract(
+    helper_name: &str,
+    args: &[CallArg],
+    params: &[crate::ast::Param],
+) -> Result<(), ConstFoldErr> {
+    if args.len() != params.len() {
+        return Err(FoldInvalid(format!(
+            "helper `{helper_name}` takes {} argument(s), call passes {}",
+            params.len(),
+            args.len()
+        )));
+    }
+    let declared: Vec<&str> = params
+        .iter()
+        .map(|param| param.name.name.as_str())
+        .collect();
+    let mut unknown_name: Option<&str> = None;
+    let mut misplaced: Option<(&str, usize, usize)> = None;
+    for (index, arg) in args.iter().enumerate() {
+        let CallArg::Named { name: written, .. } = arg else {
+            continue;
+        };
+        if declared
+            .get(index)
+            .is_some_and(|name| *name == written.name)
+        {
+            continue;
+        }
+        if let Some(expected) = declared.iter().position(|name| *name == written.name) {
+            misplaced.get_or_insert((written.name.as_str(), expected, index));
+        } else {
+            unknown_name.get_or_insert(written.name.as_str());
+        }
+    }
+    if let Some((written, expected, found)) = misplaced {
+        return Err(ConstFoldErr::Unsupported(format!(
+            "`{written}` is parameter {} of helper `{helper_name}` but was written in position {}; argument names are dropped and values bind strictly by position",
+            expected + 1,
+            found + 1,
+        )));
+    }
+    if let Some(written) = unknown_name {
+        return Err(FoldInvalid(format!(
+            "`{written}` names no parameter of helper `{helper_name}` (expected {})",
+            declared
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )));
+    }
+    Ok(())
+}
+
+/// Determine the scalar type participating in a constant conditional without
+/// evaluating the expression. C++ type-checks both `?:` arms but evaluates
+/// only the selected one; keeping those operations separate is what permits
+/// `true ? 7 : (1 / 0)` while still applying mixed-signedness conversion.
+fn const_expr_scalar_shape(
+    e: &crate::ast::Expr,
+    consts: &HashMap<String, ConstVal>,
+    helpers: Option<&helpers::HelperRegistry<'_>>,
+) -> Result<ConstScalarShape, ConstFoldErr> {
+    use crate::ast::{BinaryOp, TypeExpr, UnaryOp};
+    let common = |lhs: ConstScalarShape, rhs: ConstScalarShape| ConstScalarShape {
+        signed: lhs.signed && rhs.signed,
+        boolean: lhs.boolean && rhs.boolean,
+    };
+    match &*e.kind {
+        ExprKind::Paren(inner) => const_expr_scalar_shape(inner, consts, helpers),
+        ExprKind::Int(text) => exprs::parse_int_literal(text)
+            .map(|value| ConstScalarShape {
+                signed: value <= i64::MAX as u64,
+                boolean: false,
+            })
+            .ok_or_else(|| {
+                ConstFoldErr::Unsupported(format!(
+                    "the integer literal `{text}` does not fit the 64-bit constant-evaluation domain"
+                ))
+            }),
+        ExprKind::Bool(_) => Ok(ConstScalarShape {
+            signed: true,
+            boolean: true,
+        }),
+        ExprKind::Ident(id) => consts
+            .get(&id.name)
+            .map(|value| ConstScalarShape {
+                signed: value.signed,
+                boolean: value.is_boolean_kind(),
+            })
+            .ok_or_else(|| FoldInvalid(format!("references unknown constant `{}`", id.name))),
+        ExprKind::Cast { expr, ty } => {
+            // Casts do not evaluate their operand in an unselected arm,
+            // but C++ still resolves and type-checks it.
+            const_expr_scalar_shape(expr, consts, helpers)?;
+            if !exprs::cast_relabel_width(ty).is_some_and(|width| width <= 64) {
+                return Err(ConstFoldErr::Unsupported(
+                    "`as` casts outside scalar uint/sint/bits (≤ 64 bits) in a constant expression"
+                        .into(),
+                ));
+            };
+            Ok(ConstScalarShape {
+                signed: matches!(
+                    ty,
+                    TypeExpr::Builtin {
+                        name: crate::ast::BuiltinTy::SInt | crate::ast::BuiltinTy::SIntCap,
+                        ..
+                    }
+                ),
+                boolean: false,
+            })
+        }
+        ExprKind::Unary { op, expr } => {
+            let shape = const_expr_scalar_shape(expr, consts, helpers)?;
+            if matches!(op, UnaryOp::Not | UnaryOp::NotKw) {
+                Ok(ConstScalarShape {
+                    signed: true,
+                    boolean: true,
+                })
+            } else {
+                Ok(shape)
+            }
+        }
+        ExprKind::Binary { op, lhs, rhs } => {
+            let lhs = const_expr_scalar_shape(lhs, consts, helpers)?;
+            let rhs = const_expr_scalar_shape(rhs, consts, helpers)?;
+            if matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::AndAnd
+                    | BinaryOp::OrOr
+                    | BinaryOp::AndKw
+                    | BinaryOp::OrKw
+            ) {
+                Ok(ConstScalarShape {
+                    signed: true,
+                    boolean: true,
+                })
+            } else if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
+                Ok(lhs)
+            } else {
+                Ok(common(lhs, rhs))
+            }
+        }
+        ExprKind::Ternary {
+            then_branch,
+            else_branch,
+            ..
+        } => Ok(common(
+            const_expr_scalar_shape(then_branch, consts, helpers)?,
+            const_expr_scalar_shape(else_branch, consts, helpers)?,
+        )),
+        ExprKind::Call { callee, args } => {
+            let ExprKind::Ident(name) = &*callee.kind else {
+                return Err(ConstFoldErr::Unsupported(
+                    "only a direct pure-helper call has a scalar constant type".into(),
+                ));
+            };
+            let Some(registry) = helpers else {
+                return Err(ConstFoldErr::Unsupported(format!(
+                    "the call to `{}` is not part of this constant-expression subset",
+                    name.name
+                )));
+            };
+            let Some(entry) = registry.get(&name.name) else {
+                return Err(ConstFoldErr::Unsupported(format!(
+                    "`{}` is not a declared pure helper",
+                    name.name
+                )));
+            };
+            if !entry.pure
+                || !const_helper_scalar_type(entry.decl.return_ty.as_ref(), false)
+                || entry
+                    .decl
+                    .params
+                    .iter()
+                    .any(|param| !const_helper_scalar_type(param.ty.as_ref(), true))
+            {
+                return Err(ConstFoldErr::Unsupported(format!(
+                    "helper `{}` must be pure and use only scalar parameter and return types within the 64-bit constant-evaluation domain",
+                    name.name
+                )));
+            }
+            validate_const_helper_call_contract(&name.name, args, &entry.decl.params)?;
+            for arg in args {
+                let expr = match arg {
+                    CallArg::Expr(expr) | CallArg::Named { value: expr, .. } => expr,
+                };
+                const_expr_scalar_shape(expr, consts, helpers)?;
+            }
+            const_type_scalar_shape(entry.decl.return_ty.as_ref()).ok_or_else(|| {
+                ConstFoldErr::Unsupported(format!(
+                    "helper `{}` has no scalar constant return type",
+                    name.name
+                ))
+            })
+        }
+        _ => Err(ConstFoldErr::Unsupported(
+            "expression has no scalar constant type".into(),
+        )),
+    }
+}
+
 /// Apply the scalar conversion used at an ordinary pure-helper ABI
 /// boundary after validating the declared width. This differs from a
 /// file-scope const declaration: helper slots emit untyped, `int`, and
@@ -842,6 +1087,36 @@ fn fold_const_inner(
                 ))),
             }
         }
+        ExprKind::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            // Match C++ constexpr `?:`: evaluate the condition first and
+            // only fold the selected arm. Besides preserving ordinary
+            // truthiness, this keeps an invalid expression in the unchosen
+            // arm (for example division by zero) from becoming observable.
+            let then_shape = const_expr_scalar_shape(then_branch, consts, helpers)?;
+            let else_shape = const_expr_scalar_shape(else_branch, consts, helpers)?;
+            let result_shape = ConstScalarShape {
+                signed: then_shape.signed && else_shape.signed,
+                boolean: then_shape.boolean && else_shape.boolean,
+            };
+            let cond = fold_const_inner(cond, consts, self_name, helpers, call_stack)?;
+            let selected = if cond.bits != 0 {
+                then_branch
+            } else {
+                else_branch
+            };
+            let mut value = fold_const_inner(selected, consts, self_name, helpers, call_stack)?;
+            value.signed = result_shape.signed;
+            value.provenance = if result_shape.boolean {
+                ConstProvenance::UntypedBool
+            } else {
+                ConstProvenance::Untyped
+            };
+            Ok(value)
+        }
         ExprKind::Call { callee, args } => {
             let ExprKind::Ident(name) = &*callee.kind else {
                 return Err(ConstFoldErr::Unsupported(
@@ -879,14 +1154,7 @@ fn fold_const_inner(
                     name.name
                 )));
             }
-            if args.len() != entry.decl.params.len() {
-                return Err(FoldInvalid(format!(
-                    "helper `{}` takes {} argument(s), call passes {}",
-                    name.name,
-                    entry.decl.params.len(),
-                    args.len()
-                )));
-            }
+            validate_const_helper_call_contract(&name.name, args, &entry.decl.params)?;
             if call_stack.contains(&name.name) {
                 return Err(FoldInvalid(format!(
                     "constant helper call cycle: {} -> {}",
@@ -906,52 +1174,6 @@ fn fold_const_inner(
                     name.name
                 )));
             };
-
-            let declared: Vec<&str> = entry
-                .decl
-                .params
-                .iter()
-                .map(|param| param.name.name.as_str())
-                .collect();
-            let mut unknown_name: Option<&str> = None;
-            let mut misplaced: Option<(&str, usize, usize)> = None;
-            for (index, arg) in args.iter().enumerate() {
-                let CallArg::Named { name: written, .. } = arg else {
-                    continue;
-                };
-                if declared
-                    .get(index)
-                    .is_some_and(|name| *name == written.name)
-                {
-                    continue;
-                }
-                if let Some(expected) = declared.iter().position(|name| *name == written.name) {
-                    misplaced.get_or_insert((written.name.as_str(), expected, index));
-                } else {
-                    unknown_name.get_or_insert(written.name.as_str());
-                }
-            }
-            // Match `reject_misplaced_named_args`: a real positional swap is
-            // the more serious verdict and wins over an unrelated typo.
-            if let Some((written, expected, found)) = misplaced {
-                return Err(ConstFoldErr::Unsupported(format!(
-                    "`{written}` is parameter {} of helper `{}` but was written in position {}; argument names are dropped and values bind strictly by position",
-                    expected + 1,
-                    name.name,
-                    found + 1,
-                )));
-            }
-            if let Some(written) = unknown_name {
-                return Err(FoldInvalid(format!(
-                    "`{written}` names no parameter of helper `{}` (expected {})",
-                    name.name,
-                    declared
-                        .iter()
-                        .map(|name| format!("`{name}`"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                )));
-            }
 
             let mut env = consts.clone();
             for (param, arg) in entry.decl.params.iter().zip(args) {
@@ -1565,9 +1787,13 @@ fn lower_program_impl(
                                 V1Status::EmitsUncompilable,
                             ));
                         }
-                        return Err(unsupported(
+                        return Err(not_implemented(
                             &format!("`const {}` initializer", c.name.name),
-                            detail,
+                            format!(
+                                "{detail}; v1 pastes the expression into a C++ `static constexpr`, \
+                                 where this non-constant form cannot compile"
+                            ),
+                            V1Status::EmitsUncompilable,
                         ));
                     }
                     Err(ConstFoldErr::Invalid(detail)) => {
@@ -2719,7 +2945,7 @@ fn lower_program_impl(
         cov_fields: HashMap::new(),
         covgroups: Vec::new(),
         clock_names: Vec::new(),
-        allow_scheduler_time_waits: false,
+        allow_scheduler_time_waits: true,
         record_ids: record_ids.clone(),
         records: prog.records.clone(),
         bus_bindings: HashMap::new(),
@@ -3990,20 +4216,10 @@ fn validate_testbench_component(
                         V1Status::SilentlyMisLowers,
                     ));
                 }
-                // An event-subscription / handshake-monitor form (`on
-                // ev(arg)`) is a `Call` trigger; testbench scope has no
-                // event fields to subscribe to, so reject it distinctly.
-                if !h.periodic && matches!(&*h.event.kind, ExprKind::Call { .. }) {
-                    return Err(unsupported(
-                        &format!(
-                            "a testbench-scoped event / handshake-monitor `on` handler in `{}`",
-                            c.name.name
-                        ),
-                        "only periodic `on <N> cycles` and cycle-trigger `on <bool-expr>` \
-                         handlers are lowered at testbench scope; move an event / handshake \
-                         handler onto a component field",
-                    ));
-                }
+                // Event subscriptions are registered at the beginning of the bound test's
+                // run flow, through the same statement-position `on` lowering used inside
+                // an impl body. The component declaration supplies ownership; the run flow
+                // supplies the runtime lifetime and captures.
                 // A periodic handler (`on <N> cycles`) or a cycle-trigger
                 // handler (`on <bool-expr>`) is accepted; its period /
                 // predicate is validated when `lower_test` lowers it.
@@ -4012,14 +4228,16 @@ fn validate_testbench_component(
             // bindings have been collected in `lower_test`.
             ComponentItem::Connect(_) => {}
             _ => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!(
                         "a `{}` item in testbench `{}`",
                         item_component_label(ci),
                         c.name.name
                     ),
                     "only fields, lifecycle phases, helper methods, and periodic `on <N> cycles` \
-                     handlers are lowered at testbench scope",
+                     handlers are lowered at testbench scope; v1 either discards this item or emits \
+                     it without a runnable registration",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
         }
@@ -4245,6 +4463,11 @@ fn lower_test(
     // passive). Keeping the mode lets the shared call resolver expose
     // always-on state while rejecting methods declared in `when active`.
     let mut test_scope_xactors: Vec<(String, TransactorId, bool)> = Vec::new();
+    // Test-scope covergroup instances are declaration markers rather than
+    // function-local values. Collect them into the testbench coverage field
+    // table so sampler lowering and diagnostics run exactly as they do for a
+    // covergroup-typed testbench field.
+    let mut test_scope_cov_fields: Vec<(String, CovgroupId)> = Vec::new();
     // Test-scope composite-component instances (`let env : AnalysisEnv`),
     // collected as (name, component id). Emitted as plain run-scope
     // locals + their `connect` push_backs.
@@ -4859,6 +5082,15 @@ fn lower_test(
                 }
                 test_scope_xactors.push((l.name.name.clone(), xid, passive));
             }
+            TestItem::Let(l)
+                if !l.bind
+                    && l.value.is_none()
+                    && type_simple_name(l.ty.as_ref())
+                        .is_some_and(|name| covgroup_ids.contains_key(name)) =>
+            {
+                let name = type_simple_name(l.ty.as_ref()).expect("matched covergroup type");
+                test_scope_cov_fields.push((l.name.name.clone(), covgroup_ids[name]));
+            }
             TestItem::Let(l) => {
                 if !l.probes.is_empty() || l.bind {
                     // A bind whose type name matches a `use` that never
@@ -5029,7 +5261,7 @@ fn lower_test(
     // v1); transactor order is the method-lambda emission order. Scalar
     // member fields and helper methods (`function`/`hookable`) are
     // collected in the same walk.
-    let mut cov_fields: Vec<(String, CovgroupId)> = Vec::new();
+    let mut cov_fields: Vec<(String, CovgroupId)> = test_scope_cov_fields;
     let mut transactor_fields: Vec<(String, TransactorId)> = Vec::new();
     // Testbench-field transactor instances declared `passive` (`a :
     // Poker passive`). A passive instance exposes only its passive
@@ -5056,6 +5288,10 @@ fn lower_test(
     // body lowers to a flow-owned `TestHook` function and the predicate is
     // re-evaluated every cycle in a registration closure.
     let mut tb_cycle_asts: Vec<&crate::ast::OnHandler> = Vec::new();
+    // Testbench-declaration event subscriptions. Keep owned, rewritten
+    // handlers because bare testbench fields in their bodies need the same
+    // `_tb.<field>` rewrite as declaration-scoped helper methods.
+    let mut tb_event_asts: Vec<crate::ast::OnHandler> = Vec::new();
     if let Some(tbn) = &tb_name {
         if let Some(c) = components.get(tbn) {
             for ci in &c.items {
@@ -5253,6 +5489,37 @@ fn lower_test(
                             && !matches!(&*h.event.kind, ExprKind::Call { .. }) =>
                     {
                         tb_cycle_asts.push(h)
+                    }
+                    ComponentItem::OnHandler(h)
+                        if !h.periodic
+                            && h.hook.is_none()
+                            && matches!(&*h.event.kind, ExprKind::Call { .. }) =>
+                    {
+                        let mut handler = h.clone();
+                        // The call argument is the event payload binding and
+                        // shadows an equally named testbench field in the
+                        // handler body. Preserve it as a bare local while the
+                        // ordinary testbench-field rewrite prefixes the rest.
+                        let payload_names: HashSet<String> =
+                            if let ExprKind::Call { args, .. } = &*h.event.kind {
+                                args.iter()
+                                    .filter_map(|arg| match arg {
+                                        CallArg::Expr(expr) => match &*expr.kind {
+                                            ExprKind::Ident(id) => Some(id.name.clone()),
+                                            _ => None,
+                                        },
+                                        _ => None,
+                                    })
+                                    .collect()
+                            } else {
+                                HashSet::new()
+                            };
+                        crate::codegen::cpp_tb::rewrite_testbench_scope_body(
+                            &mut handler.body,
+                            c,
+                            &payload_names,
+                        );
+                        tb_event_asts.push(handler);
                     }
                     _ => {}
                 }
@@ -6120,18 +6387,10 @@ fn lower_test(
                     // default uint64 carrier.  The source-ordered assignment
                     // below still lowers the port through DutRead, so using
                     // UInt(None) here only sizes the persistent `_tb` cell.
-                    let untyped_port_init =
-                        l.value.as_ref().is_some_and(is_direct_dut_port_initializer);
-                    if declared_ty.is_none() && inferred_ty.is_none() && !untyped_port_init {
-                        return Err(unsupported(
-                            &format!(
-                                "an untyped promoted test-scope `let {}` with a runtime initializer",
-                                l.name.name
-                            ),
-                            "declare the promoted let's scalar type so its shared `_tb` storage \
-                             can be sized before the run expression is lowered",
-                        ));
-                    }
+                    // Promoted storage already uses the same widthless host-scalar fallback as
+                    // ordinary inferred lets. The source-ordered assignment below performs the
+                    // actual runtime computation, so a composed initializer needs no special
+                    // declaration-time type information beyond `UInt(None)`.
                     promoted_runtime_inits.insert(
                         l.name.name.clone(),
                         AstStmt {
@@ -6203,7 +6462,16 @@ fn lower_test(
     // Hoisted test-scope lets first (v1 evaluates them at `main` scope
     // before the coroutine bootstraps — i.e. before any body statement
     // and before the first clock edge), then the body in scope order.
-    let mut run_stmts: Vec<SourcedStmt<'_>> = Vec::with_capacity(test_let_stmts.len());
+    let tb_event_registration_stmts: Vec<AstStmt> = tb_event_asts
+        .into_iter()
+        .map(|handler| AstStmt {
+            span: handler.span,
+            kind: StmtKind::On(handler),
+        })
+        .collect();
+    let mut run_stmts: Vec<SourcedStmt<'_>> = Vec::with_capacity(
+        test_let_stmts.len() + tb_event_registration_stmts.len(),
+    );
     for (stmt, source) in test_let_stmts.iter().zip(test_let_sources.iter().copied()) {
         let StmtKind::Let(l) = &stmt.kind else {
             run_stmts.push(SourcedStmt::new(stmt, source));
@@ -6216,6 +6484,11 @@ fn lower_test(
         }
     }
     let n_hoisted_lets = run_stmts.len();
+    run_stmts.extend(
+        tb_event_registration_stmts
+            .iter()
+            .map(|stmt| SourcedStmt::new(stmt, source_id)),
+    );
     let mut check_stmts: Vec<SourcedStmt<'_>> = Vec::new();
     // Bare statements that precede the `scope` block run before its
     // setup/run (matching v1's single-coroutine item-order emission);
@@ -6254,16 +6527,9 @@ fn lower_test(
         scan.extend(check_stmts.iter().map(|s| s.stmt));
         for s in scan {
             if let Some(detail) = regblock::detect_regblock_residual(s, &binding_names) {
-                return Err(unsupported(
-                    &detail,
-                    "a per-register `on regs.REG` write callback lowers to a \
-                     reference-capturing closure over run-scope state fired from \
-                     inside `record_write`, which the function-per-CFG IR cannot \
-                     express (the same blocker as the `axilite_hooks` pre/post \
-                     method hooks); the passive `record_write`/`record_read` API, \
-                     register-level frontdoor reads/writes, and `bitbash(regs)` ARE \
-                     supported",
-                ));
+                return Err(LowerError::Invalid(format!(
+                    "internal error: extracted regblock callback escaped callback lowering: {detail}"
+                )));
             }
         }
     }

@@ -208,10 +208,9 @@ impl FuncBuilder<'_> {
                         ));
                     }
                     if !self.ctx.allow_scheduler_time_waits {
-                        return Err(unsupported(
-                            "wall-clock `wait <time>` in this context",
-                            "only test-scoped run/check, hook, component, and \
-                             transactor method bodies can capture scheduler time",
+                        return Err(LowerError::Invalid(
+                            "internal error: a scheduler-time wait reached a non-runtime lowering context"
+                                .to_string(),
                         ));
                     }
                     let ps = super::time_literal_to_ps(s).map_err(LowerError::Invalid)?;
@@ -900,7 +899,12 @@ impl FuncBuilder<'_> {
                         return Ok(());
                     }
                 };
-                Err(unsupported(&what, ""))
+                Err(not_implemented(
+                    &what,
+                    "v1 emits the unresolved statement expression verbatim; the generated C++ \
+                     either names no callable member or discards a source construct it cannot type",
+                    V1Status::EmitsUncompilable,
+                ))
             }
         }
     }
@@ -917,9 +921,11 @@ impl FuncBuilder<'_> {
         clock: Option<&crate::ast::Ident>,
     ) -> Result<(), LowerError> {
         if self.in_transactor_method && clock.is_some() {
-            return Err(unsupported(
+            return Err(not_implemented(
                 "`wait N cycles on <clock>` inside a transactor method",
-                "method bodies run synchronously and know no test clocks",
+                "method bodies run synchronously and know no test clocks; v1 emits a named-clock \
+                 suspension from the synchronous method lambda and the generated C++ cannot compile",
+                V1Status::EmitsUncompilable,
             ));
         }
         let clock = match clock {
@@ -1398,13 +1404,16 @@ impl FuncBuilder<'_> {
             // A typed declaration that did not match any supported type
             // above is not an inert placeholder. Keep the subset boundary:
             // dropping it could also drop semantic registration (for
-            // example, a covergroup-typed local).
-            return Err(unsupported(
+            // example, an unknown aggregate-typed local).
+            return Err(not_implemented(
                 &format!(
                     "uninitialized `let {}` without a supported scalar, record, event, or fixed-vector type",
                     l.name.name
                 ),
-                "use a supported explicit type or give the declaration an initializer",
+                "use a supported explicit type or give the declaration an initializer; v1 \
+                 erases unsupported local types to a scalar carrier, so the declaration does \
+                 not retain the source type",
+                V1Status::SilentlyMisLowers,
             ));
         };
         // Explicit scalar bit-width of the declaration, tracked on
@@ -3544,12 +3553,10 @@ impl FuncBuilder<'_> {
                 }
             }
             if self.in_check && self.ctx.test_scope_lets.contains(&id.name) {
-                return Err(unsupported(
-                    &format!("test-scope `let {}` referenced in the check phase", id.name),
-                    "test-scope lets lower as run-function locals; run and check are \
-                     separate functions in the IR, so v1's shared-capture scoping is \
-                     not representable",
-                ));
+                return Err(LowerError::Invalid(format!(
+                    "internal error: promoted test-scope `let {}` escaped check-phase assignment lowering",
+                    id.name
+                )));
             }
             // Same as the read side: v1 emits `nosuchthing = 1;`
             // against an undeclared name.

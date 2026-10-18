@@ -1518,12 +1518,10 @@ impl FuncBuilder<'_> {
                     }
                 }
                 if self.in_check && self.ctx.test_scope_lets.contains(&id.name) {
-                    return Err(unsupported(
-                        &format!("test-scope `let {}` referenced in the check phase", id.name),
-                        "test-scope lets lower as run-function locals; run and check are \
-                         separate functions in the IR, so v1's shared-capture scoping is \
-                         not representable",
-                    ));
+                    return Err(LowerError::Invalid(format!(
+                        "internal error: promoted test-scope `let {}` escaped check-phase expression lowering",
+                        id.name
+                    )));
                 }
                 // v1 has no rejection for an unresolved name: it emits
                 // the identifier verbatim (`int64_t x = nosuchthing;`),

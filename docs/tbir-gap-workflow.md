@@ -14,7 +14,7 @@ incorrectly classified as gaps even though v1 rejects the same source.
 
 The refreshed 2026-10-18 inventory is recorded in
 [`tbir-migration-manifest.md`](tbir-migration-manifest.md). After the current
-batch there are 42 executable constructors (43 textual matches including the
+batch there are 22 executable constructors (23 textual matches including the
 helper definition); the manifest separates positive runtime controls from
 diagnostic and deliberately deferred shapes.
 
@@ -653,6 +653,17 @@ not applicable before requesting review:
    rejection, uncompilable-emission, or silent-type-erasure diagnostics, and
    turns unreachable pipeline states into `Invalid` invariants. The raw
    inventory is now 43 textual matches (42 executable constructors plus the
+   helper definition).
+8. The next twenty-site batch registers testbench-declaration event
+   subscriptions in run flow, routes handle-less state transactors through
+   component IR, and accepts composed runtime initializers for untyped promoted
+   host state. Test-scope covergroup declarations also enter the coverage field
+   table instead of being masked by generic local-type handling. Constant
+   ternaries and scheduler-backed wall-clock waits in transaction sequences or
+   target responders lower natively as well. Stale
+   post-routing guards become invariants, while measured v1
+   failures and type erasures receive `NotImplemented` grades. The source
+   inventory is now 23 textual matches (22 executable constructors plus the
    helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
