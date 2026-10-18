@@ -594,6 +594,7 @@ pub(crate) fn lower_component_schema(
     ids: &HashMap<String, ComponentId>,
     scoreboard_ids: &HashMap<String, ScoreboardId>,
     record_ids: &HashMap<String, RecordId>,
+    covgroup_ids: &HashMap<String, crate::ir::CovgroupId>,
     next_fn: &mut u32,
     consts: &HashMap<String, super::ConstVal>,
     declared_types: &std::collections::HashSet<String>,
@@ -832,6 +833,7 @@ pub(crate) fn lower_component_schema(
                         ids,
                         scoreboard_ids,
                         record_ids,
+                        covgroup_ids,
                         is_transactor,
                         consts,
                         declared_types,
@@ -1530,6 +1532,7 @@ fn lower_field(
     ids: &HashMap<String, ComponentId>,
     scoreboard_ids: &HashMap<String, ScoreboardId>,
     record_ids: &HashMap<String, RecordId>,
+    covgroup_ids: &HashMap<String, crate::ir::CovgroupId>,
     is_transactor: bool,
     consts: &HashMap<String, super::ConstVal>,
     // Every type NAME declared anywhere in the file. Used only to tell a
@@ -1791,6 +1794,14 @@ fn lower_field(
                     mode,
                 });
             }
+            if let Some(covgroup) = covgroup_ids.get(simple).copied() {
+                if f.default.is_some() || mode.is_some() {
+                    return Err(LowerError::Invalid(format!(
+                        "covergroup field `{comp}.{fname}` cannot have a default or instance mode"
+                    )));
+                }
+                return Ok(ComponentFieldKind::Covgroup { covgroup });
+            }
             // A record type held by value is persistent host-side state,
             // not a DUT handle. This is the component-routed counterpart
             // of `StateFieldKind::Record` on a standalone transactor.
@@ -1865,18 +1876,9 @@ fn lower_field(
                     dut_type: simple.to_string(),
                 });
             }
-            // Two very different inputs used to share this arm, and v1
-            // treats them oppositely:
-            //
-            //   * a DECLARED type that is not a supported sub-component
-            //     kind (a `covergroup`, say) — v1 emits
-            //     `AnalysisCovCollector2 weird;` and wires its sampling
-            //     (`env.weird.cp.b0++`). That was a working legacy
-            //     feature, so preserve the evidence as
-            //     `NotImplemented { WorksButRetired }` without offering
-            //     the retired backend as an escape hatch.
-            //
-            //   * a name that is declared NOWHERE — v1 assumes a
+            // Two very different inputs used to share this arm. Covergroups
+            // are now resolved above as typed component fields. A name that
+            // is declared NOWHERE makes v1 assume a
             //     Verilated DUT handle and emits
             //     `VNoSuchThing* weird = nullptr;`, naming a type that
             //     does not exist. That is a typo, and a program error
@@ -1907,12 +1909,11 @@ fn lower_field(
                     V1Status::EmitsUncompilable,
                 ));
             }
-            Err(not_implemented(
-                &format!("sub-component field `{comp}.{fname}` of type `{simple}`"),
-                "only env/method-scoreboard/data-scoreboard/analysis-source \
-                 sub-components are lowered",
-                V1Status::WorksButRetired,
-            ))
+            Err(LowerError::Invalid(format!(
+                "component `{comp}` field `{fname}` has declared type `{simple}`, but that \
+                 declaration is not a component, scoreboard, covergroup, record, regblock, \
+                 enum, scalar, queue, event, or fixed-vector field type"
+            )))
         }
     }
 }
@@ -3682,7 +3683,7 @@ fn type_arg_simple_name(t: &TypeExpr) -> Option<&str> {
 
 // --- shared scalar-field helpers (mirroring scoreboards.rs) ---
 
-fn decoded_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
+pub(crate) fn decoded_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     let TypeExpr::Builtin { name, args, .. } = t else {
         return None;
     };

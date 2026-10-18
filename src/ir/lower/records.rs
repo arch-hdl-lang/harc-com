@@ -141,7 +141,13 @@ fn non_scalar_record_leaf(
         );
     }
     match crate::codegen::cpp_tb::record_leaf_fate(ty, &|n| record_ids.contains_key(n)) {
-        RecordLeafFate::Models => not_implemented(&what, SUBSET, V1Status::WorksButRetired),
+        RecordLeafFate::Models => not_implemented(
+            &what,
+            format!(
+                "{SUBSET}; v1 maps this unsupported zero-width/container spelling to a full-width host carrier, so the emitted value semantics do not match the source type"
+            ),
+            V1Status::SilentlyMisLowers,
+        ),
         RecordLeafFate::Flattens => not_implemented(
             &what,
             format!(
@@ -514,7 +520,7 @@ fn lower_record_field(
     // state; everything else (bit layout, C++
     // storage, access) is driven off those two. An unsupported element
     // type or a non-literal/zero length is still rejected.
-    let (ty, vec_len) = match fixed_vec_field(&f.ty, enum_names, record_ids) {
+    let (ty, vec_len) = match fixed_vec_field(&f.ty, enum_names, record_ids, consts)? {
         Some((elem_ty, len)) => (elem_ty, Some(len)),
         None => {
             let scalar = field_ir_type(&f.ty, enum_names)
@@ -623,15 +629,87 @@ pub(super) fn record_list_elem_ir_type(
             | BuiltinTy::BoolLower
             | BuiltinTy::Bit
     )
-    .then(|| super::components::scalar_field_ir_type(elem))
+    .then(|| super::components::decoded_scalar_ir_type(elem))
     .flatten()?;
     matches!(
         ty,
         IrType::Bool
-            | IrType::UInt(Some(1..=crate::MAX_WIDTH_METHOD_BITS))
-            | IrType::SInt(Some(1..=64))
+            | IrType::UInt(Some(1..))
+            | IrType::SInt(Some(1..))
     )
     .then_some(ty)
+}
+
+/// Decode a persistent fixed-vector value without applying the 1024-bit
+/// expression-method ceiling. Record and scoreboard storage render arbitrary
+/// nonzero scalar widths with `HarcWide<N>`, matching the legacy value shape.
+pub(super) fn persistent_fixed_vec_ir_type(
+    t: &TypeExpr,
+    record_ids: &HashMap<String, RecordId>,
+    consts: &HashMap<String, super::ConstVal>,
+) -> Result<Option<IrType>, LowerError> {
+    let TypeExpr::Builtin {
+        name: BuiltinTy::Vec,
+        args,
+        ..
+    } = t
+    else {
+        if let Some(record) = named_record_id(t, record_ids) {
+            return Ok(Some(IrType::Record(record)));
+        }
+        return Ok(super::components::decoded_scalar_ir_type(t).filter(|ty| {
+            matches!(ty, IrType::Bool)
+                || matches!(ty, IrType::UInt(Some(1..)) | IrType::SInt(Some(1..)))
+        }));
+    };
+    let Some(first) = args.first() else {
+        return Ok(None);
+    };
+    let elem = match first {
+        TypeArg::Type(elem) => {
+            let Some(elem) = persistent_fixed_vec_ir_type(elem, record_ids, consts)? else {
+                return Ok(None);
+            };
+            elem
+        }
+        TypeArg::Expr(expr) => {
+            let ExprKind::Ident(id) = &*expr.kind else {
+                return Ok(None);
+            };
+            let Some(record) = record_ids.get(&id.name) else {
+                return Ok(None);
+            };
+            IrType::Record(*record)
+        }
+        TypeArg::Named { .. } => return Ok(None),
+    };
+    let Some(TypeArg::Expr(len_expr)) = args.get(1) else {
+        return Ok(None);
+    };
+    let folded = super::fold_const(len_expr, consts, "").map_err(|error| match error {
+        super::ConstFoldErr::Unsupported(detail) => not_implemented(
+            "a persistent fixed-vector length outside the constant-expression subset",
+            detail,
+            V1Status::EmitsUncompilable,
+        ),
+        super::ConstFoldErr::Invalid(detail) => {
+            LowerError::Invalid(format!("persistent fixed-vector length is invalid: {detail}"))
+        }
+    })?;
+    if folded.is_negative() {
+        return Err(LowerError::Invalid(
+            "persistent fixed-vector length is negative".to_string(),
+        ));
+    }
+    let len = usize::try_from(folded.bits).map_err(|_| {
+        LowerError::Invalid(
+            "persistent fixed-vector length does not fit the host index size".to_string(),
+        )
+    })?;
+    Ok(Some(IrType::FixedVec {
+        elem: Box::new(elem),
+        len,
+    }))
 }
 
 /// Recognize a `Vec<T, N>` field whose element `T` this slice can
@@ -654,22 +732,34 @@ fn fixed_vec_field(
     t: &TypeExpr,
     enum_names: &std::collections::HashSet<String>,
     record_ids: &HashMap<String, RecordId>,
-) -> Option<(IrType, usize)> {
+    consts: &HashMap<String, super::ConstVal>,
+) -> Result<Option<(IrType, usize)>, LowerError> {
     let TypeExpr::Builtin {
         name: BuiltinTy::Vec,
         args,
         ..
     } = t
     else {
-        return None;
+        return Ok(None);
     };
-    let len = match args.get(1)? {
-        TypeArg::Expr(e) => match &*e.kind {
-            ExprKind::Int(s) => s.replace('_', "").parse::<usize>().ok()?,
-            _ => return None,
-        },
-        _ => return None,
+    let Some(TypeArg::Expr(len_expr)) = args.get(1) else {
+        return Ok(None);
     };
+    let folded = match super::fold_const(len_expr, consts, "") {
+        Ok(value) => value,
+        // Preserve the existing legacy-fate diagnostic for lengths that
+        // neither backend can resolve. Declared constants and genuine
+        // constant expressions take the new supported path above it.
+        Err(_) => return Ok(None),
+    };
+    if folded.is_negative() {
+        return Err(LowerError::Invalid(
+            "record fixed-vector length is negative".to_string(),
+        ));
+    }
+    let len = usize::try_from(folded.bits).map_err(|_| {
+        LowerError::Invalid("record fixed-vector length does not fit the host index size".into())
+    })?;
     // `Vec<Record, N>`: a fixed array of a nested transaction/struct.
     // The element record's own lowering already validated every leaf
     // (an unsupported leaf failed THERE, naming its `Inner.field` path),
@@ -678,22 +768,25 @@ fn fixed_vec_field(
     // type-arg heuristic: a bare named element (`Vec<Entry, 4>`) parses
     // as `TypeArg::Expr(Ident)` (only builtin heads parse as
     // `TypeArg::Type`), so a record element is matched in BOTH shapes.
-    let elem = match args.first()? {
+    let Some(first) = args.first() else {
+        return Ok(None);
+    };
+    let elem = match first {
         TypeArg::Type(ty) => {
             if let Some(rid) = named_record_id(ty, record_ids) {
-                return Some((IrType::Record(rid), len));
+                return Ok(Some((IrType::Record(rid), len)));
             }
             ty
         }
         TypeArg::Expr(e) => {
             if let ExprKind::Ident(id) = &*e.kind {
                 if let Some(&rid) = record_ids.get(id.name.as_str()) {
-                    return Some((IrType::Record(rid), len));
+                    return Ok(Some((IrType::Record(rid), len)));
                 }
             }
-            return None;
+            return Ok(None);
         }
-        _ => return None,
+        _ => return Ok(None),
     };
     let elem_ty = if matches!(
         elem,
@@ -702,15 +795,21 @@ fn fixed_vec_field(
             ..
         }
     ) {
-        super::components::fixed_vec_elem_ir_type(elem)?
+        let Some(ty) = persistent_fixed_vec_ir_type(elem, record_ids, consts)? else {
+            return Ok(None);
+        };
+        ty
     } else {
-        field_ir_type(elem, enum_names)?
+        let Some(ty) = field_ir_type(elem, enum_names) else {
+            return Ok(None);
+        };
+        ty
     };
     match elem_ty {
         IrType::UInt(_) | IrType::SInt(_) | IrType::Bool | IrType::FixedVec { .. } => {
-            Some((elem_ty, len))
+            Ok(Some((elem_ty, len)))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 

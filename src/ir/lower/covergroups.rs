@@ -869,11 +869,22 @@ fn lower_point_target(
                                     V1Status::SilentlyMisLowers,
                                 ));
                             }
-                            return Err(not_implemented(
-                                &construct,
-                                "only pure file-scope helper functions can be sampled in coverpoints",
-                                V1Status::WorksButRetired,
-                            ));
+                            let return_expr = cover_helper_return_expr(
+                                group,
+                                point,
+                                &id.name,
+                                entry.decl,
+                                args,
+                            )?;
+                            return lower_point_target(
+                                group,
+                                point,
+                                &return_expr,
+                                hook_params,
+                                helpers,
+                                extern_fns,
+                                consts,
+                            );
                         }
                         if args.len() != entry.decl.params.len() {
                             return Err(LowerError::Invalid(format!(
@@ -1348,6 +1359,144 @@ fn lower_point_call_args(
         )?);
     }
     Ok(lowered)
+}
+
+/// Turn a non-suspending value helper into the expression sampled by a
+/// coverpoint. These helpers are classified as impure solely because a DUT
+/// parameter is read, so they cannot use the ordinary file-scope helper ABI;
+/// substituting the actual arguments preserves per-sample port reads without
+/// introducing a statement prelude into the covergroup callback.
+fn cover_helper_return_expr(
+    group: &str,
+    point: &str,
+    name: &str,
+    decl: &crate::ast::FunctionDecl,
+    args: &[crate::ast::CallArg],
+) -> Result<AstExpr, LowerError> {
+    if args.len() != decl.params.len() {
+        return Err(LowerError::Invalid(format!(
+            "covergroup `{group}` point `{point}` helper `{name}` takes {} argument(s), call passes {}",
+            decl.params.len(),
+            args.len()
+        )));
+    }
+    let declared: Vec<String> = decl
+        .params
+        .iter()
+        .map(|param| param.name.name.clone())
+        .collect();
+    super::reject_misplaced_named_args(
+        args,
+        &declared,
+        &format!("covergroup helper call `{name}(...)`"),
+    )?;
+
+    let [stmt] = decl.body.stmts.as_slice() else {
+        return Err(LowerError::Invalid(format!(
+            "covergroup `{group}` point `{point}` helper `{name}` must reduce to a single value return when used as a sampler"
+        )));
+    };
+    let StmtKind::Return(Some(value)) = &stmt.kind else {
+        return Err(LowerError::Invalid(format!(
+            "covergroup `{group}` point `{point}` helper `{name}` must reduce to a single value return when used as a sampler"
+        )));
+    };
+
+    let replacements: HashMap<String, AstExpr> = decl
+        .params
+        .iter()
+        .zip(args)
+        .map(|(param, arg)| {
+            let (crate::ast::CallArg::Expr(value)
+            | crate::ast::CallArg::Named { value, .. }) = arg;
+            (param.name.name.clone(), value.clone())
+        })
+        .collect();
+    let mut value = value.clone();
+    substitute_cover_helper_params(&mut value, &replacements);
+    Ok(value)
+}
+
+fn substitute_cover_helper_params(
+    expr: &mut AstExpr,
+    replacements: &HashMap<String, AstExpr>,
+) {
+    if let ExprKind::Ident(id) = &*expr.kind {
+        if let Some(value) = replacements.get(&id.name) {
+            *expr = value.clone();
+        }
+        return;
+    }
+
+    let visit = |child: &mut AstExpr| substitute_cover_helper_params(child, replacements);
+    match expr.kind.as_mut() {
+        ExprKind::Field { target, .. } => visit(target),
+        ExprKind::Index { target, index } => {
+            visit(target);
+            visit(index);
+        }
+        ExprKind::BitSlice { target, hi, lo } => {
+            visit(target);
+            visit(hi);
+            visit(lo);
+        }
+        ExprKind::Call { callee, args } => {
+            visit(callee);
+            for arg in args {
+                match arg {
+                    crate::ast::CallArg::Expr(value)
+                    | crate::ast::CallArg::Named { value, .. } => visit(value),
+                }
+            }
+        }
+        ExprKind::Cast { expr, .. }
+        | ExprKind::Unary { expr, .. }
+        | ExprKind::Paren(expr)
+        | ExprKind::HashHash { expr, .. }
+        | ExprKind::SeqRepeat { expr, .. } => visit(expr),
+        ExprKind::Binary { lhs, rhs, .. }
+        | ExprKind::CoverArrow { lhs, rhs, .. } => {
+            visit(lhs);
+            visit(rhs);
+        }
+        ExprKind::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            visit(cond);
+            visit(then_branch);
+            visit(else_branch);
+        }
+        ExprKind::RangeLit { lo, hi } => {
+            if let Some(lo) = lo {
+                visit(lo);
+            }
+            if let Some(hi) = hi {
+                visit(hi);
+            }
+        }
+        ExprKind::SetLit(values) | ExprKind::SolveOrder { args: values } => {
+            for value in values {
+                visit(value);
+            }
+        }
+        ExprKind::SystemCall { args, .. } => {
+            for value in args {
+                visit(value);
+            }
+        }
+        ExprKind::StructLit { fields, .. } => {
+            for field in fields {
+                visit(&mut field.value);
+            }
+        }
+        ExprKind::Membership { expr, set } => {
+            visit(expr);
+            visit(set);
+        }
+        _ => {}
+    }
 }
 
 /// What a folded constant is standing in for. The four roles do NOT

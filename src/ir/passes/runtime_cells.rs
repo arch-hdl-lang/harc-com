@@ -1695,6 +1695,8 @@ pub fn analyze(prog: &TbProgram) -> Result<RuntimeCellPlan, RuntimeCellError> {
         if !testbench.synthetic
             || !testbench.state_fields.is_empty()
             || !testbench.record_fields.is_empty()
+            || !testbench.cov_fields.is_empty()
+            || !testbench.scoreboard_fields.is_empty()
         {
             for heartbeat in [ComponentHeartbeat::Input, ComponentHeartbeat::Output] {
                 insert(

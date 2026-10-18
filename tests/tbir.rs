@@ -166,24 +166,6 @@ fn assert_wiring_matches_v1(src: &str, what: &str) {
     assert_eq!(v1, tb, "{what}: tbir must wire it exactly as v1 does");
 }
 
-/// A real legacy-v1-only or shape-dependent gap must remain explicit without
-/// presenting the retired backend as an escape hatch.
-fn assert_retired_tbir_gap(err: &lower::LowerError) -> String {
-    match err {
-        lower::LowerError::NotImplemented {
-            v1: lower::V1Status::WorksButRetired | lower::V1Status::Unreliable,
-            ..
-        } => {}
-        _ => panic!("must be an explicit retired-v1 TB-IR gap: {err:?}"),
-    }
-    let msg = err.to_string();
-    assert!(
-        msg.contains("retired `--codegen v1`") && !msg.contains("re-run with"),
-        "retired-v1 gap must not offer the backend as a fallback: {msg}"
-    );
-    msg
-}
-
 /// A construct no backend implements. The diagnostic must NOT suggest
 /// `--codegen v1` — that suggestion is only honest when v1 actually
 /// implements the construct, and sending a user to a backend that
@@ -3173,11 +3155,7 @@ fn scoreboard_scalar_schema_and_write_width_are_verified() {
 
     for bad_ty in [
         ir::IrType::UInt(Some(0)),
-        ir::IrType::UInt(Some(harc::MAX_WIDTH_METHOD_BITS + 1)),
-        // Signed now shares the unsigned ceiling (harc#657): `sint<65>`
-        // is a valid field, so the invalid signed case is one past the
-        // ceiling, same as the unsigned row above it.
-        ir::IrType::SInt(Some(harc::MAX_WIDTH_METHOD_BITS + 1)),
+        ir::IrType::SInt(Some(0)),
         ir::IrType::Record(ir::RecordId(0)),
     ] {
         let mut broken = prog.clone();
@@ -12098,11 +12076,20 @@ end impl T"#;
         "        wait until sb.q.pop() == 7",
         1,
     );
-    let msg = assert_retired_tbir_gap(&lower_src(&wait).unwrap_err());
-    assert!(
-        msg.contains("queue pop") && msg.contains("wait until"),
-        "wait predicates keep their repeated-evaluation guard: {msg}"
-    );
+    let wait_prog = lower_src(&wait).expect("queue pop is materialized inside the polling loop");
+    verify::verify_program(&wait_prog).expect("effectful wait-until CFG verifies");
+    let wait_run = wait_prog.function(wait_prog.tests[0].run);
+    assert!(wait_run.blocks.iter().any(|block| matches!(
+        block.terminator,
+        ir::Terminator::WaitCycles(_, None, next)
+            if wait_run.blocks[next.index()].stmts.iter().any(|stmt| matches!(
+                stmt,
+                ir::Stmt::ScoreboardOp {
+                    op: ir::ScoreboardOp::QueuePop { .. },
+                    ..
+                }
+            ))
+    )), "the queue pop must be re-run after each polling wait:\n{wait_run}");
 
     let message = src.replacen(
         "        assert (guard == 1 && sb.q.pop() == 7) || sb.q.size() == 1\n            else fail(\"queue was popped despite the short circuit\")",
@@ -15998,6 +15985,42 @@ end test T"#
     }
 }
 
+#[test]
+fn persistent_records_and_scoreboards_preserve_scalars_beyond_the_method_ceiling() {
+    let source = r#"struct WideRecord
+    values : list<sint<2048>>
+    nested : Vec<Vec<uint<2048>, 2>, 3>
+end struct WideRecord
+
+scoreboard WideBoard
+    scalar : uint<2048> default 0
+    values : list<sint<2048>>
+    nested : list<Vec<uint<2048>, 2>>
+end scoreboard WideBoard
+
+testbench Tb
+    dut : Top
+    board : WideBoard
+end testbench Tb
+
+impl PersistentWide for Tb
+    run
+        let value : WideRecord
+        wait 1 cycle
+    end run
+end impl PersistentWide"#;
+    let program = lower_src(source).expect("persistent wide values lower");
+    verify::verify_program(&program).expect("persistent wide values verify");
+    let cpp = tbir::emit(&program, &merged_src(source), &cpp_tb::EmitOpts::default())
+        .expect("persistent wide values emit");
+    assert!(
+        cpp.contains("std::vector<harc_rt::HarcWide<64>> values")
+            && cpp.contains("harc_rt::HarcWide<64> scalar")
+            && cpp.contains("std::array<harc_rt::HarcWide<64>, 2>"),
+        "{cpp}"
+    );
+}
+
 /// The other `records.rs` arms, each measured on its own.
 ///
 /// | construct | v1 | verdict |
@@ -19101,15 +19124,15 @@ end test PureLazyTest
 
     let waiting = fixture("lazy_impure_helper_test.harc").replace(
         "        let free_and = false && nested_tick(dut)",
-        "        wait until nested_tick(dut)",
+        "        let free_and = false\n        wait until nested_tick(dut)",
     );
-    let msg = assert_retired_tbir_gap(
-        &lower_src(&waiting).expect_err("an impure helper cannot run inside wait-until"),
-    );
-    assert!(
-        msg.contains("wait until") && msg.contains("statement materialization"),
-        "wait-until keeps its repeated-evaluation diagnostic: {msg}"
-    );
+    let waiting_prog = lower_src(&waiting).expect("an impure helper runs in the polling CFG");
+    verify::verify_program(&waiting_prog).expect("helper polling CFG verifies");
+    let waiting_run = waiting_prog.function(waiting_prog.tests[0].run);
+    assert!(waiting_run.blocks.iter().any(|block| matches!(
+        block.terminator,
+        ir::Terminator::WaitCycles(_, None, _)
+    )), "effectful wait-until owns a cycle back-edge:\n{waiting_run}");
 }
 
 /// Bound and sibling transactor value calls are hoisted into call statements.
@@ -23247,11 +23270,12 @@ end impl XtWaitUntilSelfCallTest
     let predicate = wait_ready
         .blocks
         .iter()
-        .find_map(|block| match &block.terminator {
-            ir::Terminator::WaitUntil { preds, .. } => Some(preds[0].expr.clone()),
+        .flat_map(|block| &block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::TransactorSelfCall { call, .. } => Some(call.clone()),
             _ => None,
         })
-        .expect("wait-until predicate");
+        .expect("re-evaluated self-call predicate");
     assert!(
         matches!(
             predicate,
@@ -23265,8 +23289,18 @@ end impl XtWaitUntilSelfCallTest
         unreachable!()
     };
     assert!(
-        matches!(args.as_slice(), [ir::Expr::Port(_)]),
-        "the DUT argument must remain inline for every predicate attempt: {predicate:?}"
+        matches!(args.as_slice(), [ir::Expr::Local(_)]),
+        "the DUT argument must be materialized inside every polling attempt: {predicate:?}"
+    );
+    let argument = match args.as_slice() {
+        [ir::Expr::Local(argument)] => *argument,
+        _ => unreachable!(),
+    };
+    assert!(
+        wait_ready.blocks.iter().any(|block| block.stmts.iter().any(|stmt| {
+            matches!(stmt, ir::Stmt::DutRead(local, _) if *local == argument)
+        })),
+        "the polling loop must refresh the DUT argument before every self call: {wait_ready}"
     );
 
     // The same call edge remains illegal in an ordinary expression landing;
@@ -23282,11 +23316,12 @@ end impl XtWaitUntilSelfCallTest
         prog.functions[fid.index()]
             .blocks
             .iter_mut()
-            .find_map(|block| match &mut block.terminator {
-                ir::Terminator::WaitUntil { preds, .. } => Some(&mut preds[0].expr),
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|stmt| match stmt {
+                ir::Stmt::TransactorSelfCall { call, .. } => Some(call),
                 _ => None,
             })
-            .expect("wait predicate")
+            .expect("re-evaluated self-call predicate")
     }
 
     let mut broken = prog.clone();
@@ -23349,8 +23384,9 @@ end impl XtWaitUntilSelfCallTest
 
     let cpp = emit_cpp_src(&fixture("transactor_wait_self_predicate_test.harc"));
     assert!(
-        cpp.contains("CounterWaiter_reached(self_state, harc_rt::harc_read(dut->count_out))"),
-        "a sibling predicate forwards state and re-reads its DUT argument:\n{cpp}"
+        cpp.contains("= harc_rt::harc_read(dut->count_out);")
+            && cpp.contains("CounterWaiter_reached(self_state, __t"),
+        "a sibling predicate forwards state and re-reads its DUT argument on every polling pass:\n{cpp}"
     );
 }
 
@@ -23395,11 +23431,11 @@ end impl XtWaitUntilInstanceCallTest
             .unwrap_or_else(|error| panic!("`wait until {predicate}` must verify: {error:?}"));
         let run = prog.function(prog.tests[0].run);
         assert!(
-            !run.blocks
+            run.blocks
                 .iter()
                 .flat_map(|block| &block.stmts)
                 .any(|stmt| matches!(stmt, ir::Stmt::TransactorCall { .. })),
-            "the instance call must remain in the re-evaluated predicate: {run}"
+            "the instance call must be materialized inside the polling loop: {run}"
         );
         let cpp = emit_cpp_src(&src);
         assert!(
@@ -29083,11 +29119,31 @@ end impl Test
     );
 
     let wait = src.replace("        let v = regs.A", "        wait until regs.A == 5\n        let v = regs.A");
-    let error = lower_src(&wait).expect_err("a bus read cannot be hoisted out of a polling predicate");
-    assert!(
-        error.to_string().contains("statement materialization inside a `wait until` predicate"),
-        "{error}"
-    );
+    let wait_prog = lower_src(&wait).expect("a bus read is materialized inside the polling loop");
+    verify::verify_program(&wait_prog).expect("effectful regblock polling IR verifies");
+    let wait_run = wait_prog.function(wait_prog.tests[0].run);
+    let poll = wait_run
+        .blocks
+        .iter()
+        .find_map(|block| match block.terminator {
+            ir::Terminator::WaitCycles(_, None, successor) => Some(successor),
+            _ => None,
+        })
+        .expect("polling backedge");
+    let polling_reads = wait_run.blocks[poll.index()]
+        .stmts
+        .iter()
+        .filter(|stmt| {
+            matches!(
+                stmt,
+                ir::Stmt::Assign(
+                    _,
+                    ir::Expr::Call(ir::CallTarget::TransactorMethod { method, .. }, _)
+                ) if method == "read"
+            )
+        })
+        .count();
+    assert_eq!(polling_reads, 1, "the frontdoor read must run once per polling pass: {wait_run}");
 
     let ooo = src.replace(
         "tlm_method read(addr: uint<8>) -> uint<32>: blocking;",
@@ -31432,10 +31488,51 @@ fn component_call_in_message_stays_in_the_failure_branch() {
         "assert true else fail(\"untaken diagnostic call=${harness.inner.step(2)}\")",
         "wait until harness.inner.peek() == 66891",
     );
-    let msg = assert_retired_tbir_gap(
-        &lower_src(&wait).expect_err("component call in wait predicate must be rejected"),
-    );
-    assert!(msg.contains("`wait until` predicate"), "{msg}");
+    let wait_prog = lower_src(&wait).expect("component call lowers into the polling loop");
+    verify::verify_program(&wait_prog).expect("component-call polling CFG verifies");
+    let wait_run = wait_prog.function(wait_prog.tests[0].run);
+    assert!(wait_run.blocks.iter().any(|block| block.stmts.iter().any(|stmt| matches!(
+        stmt,
+        ir::Stmt::ComponentCall { method, .. } if method == "peek"
+    ))), "the predicate call remains in the repeated loop body:\n{wait_run}");
+
+    // `all of` and `any of` retain source-order short-circuiting even when a
+    // later predicate needs statement-level materialization. The component
+    // call block must only be reached through the undecided edge.
+    for (mode, first, call_on_true_edge) in
+        [("all", "false", true), ("any", "true", false)]
+    {
+        let source = fixture("component_value_expression_test.harc").replace(
+            "assert true else fail(\"untaken diagnostic call=${harness.inner.step(2)}\")",
+            &format!(
+                "wait until {mode} of {first}, harness.inner.peek() == 66891 timeout 1 cycle"
+            ),
+        );
+        let program = lower_src(&source)
+            .unwrap_or_else(|error| panic!("effectful `{mode} of` lowers: {error}"));
+        verify::verify_program(&program)
+            .unwrap_or_else(|error| panic!("effectful `{mode} of` verifies: {error:?}"));
+        let run = program.function(program.tests[0].run);
+        let call_block = run
+            .blocks
+            .iter()
+            .rposition(|block| {
+                block.stmts.iter().any(|stmt| {
+                    matches!(stmt, ir::Stmt::ComponentCall { method, .. } if method == "peek")
+                })
+            })
+            .map(|index| ir::BlockId(index as u32))
+            .expect("later predicate call block");
+        assert!(run.blocks.iter().any(|block| match block.terminator {
+            ir::Terminator::Branch(_, on_true, on_false) if call_on_true_edge => {
+                on_true == call_block && on_false != call_block
+            }
+            ir::Terminator::Branch(_, on_true, on_false) => {
+                on_false == call_block && on_true != call_block
+            }
+            _ => false,
+        }), "`{mode} of` must bypass the effectful predicate once decided:\n{run}");
+    }
 }
 
 #[test]
@@ -32603,10 +32700,8 @@ end test T"#;
     );
 
     let zero = src.replace("wait 1 cycle\n    return 1", "wait 0 cycles\n    return 1");
-    let msg = assert_retired_tbir_gap(
-        &lower_src(&zero).expect_err("a zero-wait helper still needs an unavailable CFG step"),
-    );
-    assert!(msg.contains("statement-level step"), "got: {msg}");
+    let prog = lower_src(&zero).expect("a zero-wait value helper is expression-only");
+    verify::verify_program(&prog).expect("zero-wait concurrent helper verifies");
 }
 
 /// `cover` registers a per-run witness counter and reports it at end of test.
@@ -33337,11 +33432,10 @@ end impl T"#;
     );
 }
 
-/// A synchronous cycle callback cannot advance time: doing so re-enters the
-/// checker pass that invoked it. The rejection is a language-safety rule,
-/// rather than a backend fallback.
+/// A suspending statement-position handler runs as its own scheduler task;
+/// the checker callback only launches it and never advances time recursively.
 #[test]
-fn a_wait_inside_an_on_handler_body_is_rejected() {
+fn a_wait_inside_an_on_handler_body_runs_as_a_coroutine() {
     let src = r#"test T
     let dut : Top
     run
@@ -33352,12 +33446,13 @@ fn a_wait_inside_an_on_handler_body_is_rejected() {
         wait 2 cycles
     end run
 end test T"#;
-    let err = lower_src(src).expect_err("a suspending handler body must not lower");
-    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
-    assert!(
-        msg.contains("void per-cycle checker callback"),
-        "got: {msg}"
-    );
+    let prog = lower_src(src).expect("a suspending handler lowers");
+    verify::verify_program(&prog).expect("suspending handler IR verifies");
+    let cpp = emit_cpp_src(src);
+    assert!(cpp.contains("-> harc_rt::HarcThread"), "{cpp}");
+    assert!(cpp.contains("co_await harc_rt::wait_cycles"), "{cpp}");
+    assert!(cpp.contains("_harc_callback_slots.emplace_back"), "{cpp}");
+    assert_cpp_typechecks("suspending_statement_on_handler", &cpp);
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the re-entrant handler");
     let checker_start = v1
@@ -33371,7 +33466,7 @@ end test T"#;
 }
 
 #[test]
-fn other_suspending_on_handler_shapes_remain_conservatively_unsupported() {
+fn other_suspending_on_handler_shapes_use_scheduler_tasks() {
     let cases = [
         r#"test T
     let dut : Top
@@ -33458,11 +33553,28 @@ test T
     end run
 end test T"#,
     ];
-    for src in cases {
-        let err = lower_src(src).expect_err("a suspending handler body must not lower");
-        let msg = assert_retired_tbir_gap(&err);
-        assert!(msg.contains("per-cycle checker pass"), "got: {msg}");
+    for (index, src) in cases.into_iter().enumerate() {
+        let prog = lower_src(src)
+            .unwrap_or_else(|error| panic!("suspending handler case {index} lowers: {error}"));
+        verify::verify_program(&prog)
+            .unwrap_or_else(|error| panic!("suspending handler case {index} verifies: {error:?}"));
+        let cpp = emit_cpp_src(src);
+        assert!(cpp.contains("-> harc_rt::HarcThread"), "case {index}: {cpp}");
+        if !matches!(index, 1..=3) {
+            assert_cpp_typechecks(&format!("suspending_statement_on_handler_{index}"), &cpp);
+        }
     }
+}
+
+fn assert_async_handler_supported(src: &str, label: &str) {
+    let prog = lower_src(src).unwrap_or_else(|error| panic!("{label} lowers: {error}"));
+    verify::verify_program(&prog)
+        .unwrap_or_else(|error| panic!("{label} verifies: {error:?}"));
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("-> harc_rt::HarcThread"),
+        "{label} did not emit a scheduler-owned coroutine: {cpp}"
+    );
 }
 
 #[test]
@@ -33478,11 +33590,7 @@ fn a_named_clock_wait_inside_an_on_handler_reports_v1_recursion() {
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("a named-clock handler wait must be fenced"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("recursively re-entering"), "got: {msg}");
+    assert_async_handler_supported(src, "named-clock handler wait");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the re-entrant handler");
     let checker_start = v1
@@ -33514,11 +33622,7 @@ fn a_guaranteed_nested_named_clock_handler_wait_reports_v1_recursion() {
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("the guaranteed nested named wait must be fenced"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("recursively firing"), "got: {msg}");
+    assert_async_handler_supported(src, "guaranteed nested named-clock wait");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive handler");
     assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
@@ -33528,11 +33632,7 @@ end test T"#;
         "            end if\n",
         "            end if\n            wait until false\n",
     );
-    let msg = assert_not_implemented(
-        &lower_src(&mixed).expect_err("the coroutine failure must outrank recursion"),
-        lower::V1Status::EmitsUncompilable,
-    );
-    assert!(msg.contains("untimed `wait until`"), "got: {msg}");
+    assert_async_handler_supported(&mixed, "mixed named-clock and wait-until handler");
 }
 
 #[test]
@@ -33552,11 +33652,7 @@ fn a_literal_false_else_named_clock_handler_wait_reports_v1_recursion() {
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("the literal-false else wait must be fenced"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("recursively firing"), "got: {msg}");
+    assert_async_handler_supported(src, "literal-false else named-clock wait");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive else arm");
     assert!(v1.contains("if (false)"), "{v1}");
@@ -33566,9 +33662,7 @@ end test T"#;
         "            else\n",
         "            elsif true\n                log(info, \"taken\")\n            else\n",
     );
-    assert_retired_tbir_gap(
-        &lower_src(&reachable_elsif).expect_err("a reachable elsif remains a retired gap"),
-    );
+    assert_async_handler_supported(&reachable_elsif, "reachable elsif handler");
 }
 
 #[test]
@@ -33590,20 +33684,14 @@ fn all_false_elsif_paths_reach_named_clock_handler_wait() {
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("all-false conditions guarantee the else wait"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("recursively firing"), "got: {msg}");
+    assert_async_handler_supported(src, "all-false elsif handler");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive else arm");
     assert!(v1.contains("else if (false)"), "{v1}");
     assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
 
     let runtime_elsif = src.replace("            elsif false\n", "            elsif dut.rst == 1\n");
-    assert_retired_tbir_gap(
-        &lower_src(&runtime_elsif).expect_err("a runtime-dependent elsif remains a retired gap"),
-    );
+    assert_async_handler_supported(&runtime_elsif, "runtime-dependent elsif handler");
 }
 
 #[test]
@@ -33621,22 +33709,16 @@ fn a_positive_literal_repeat_reaches_named_clock_handler_wait() {
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("a positive repeat guarantees its first iteration"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("recursively firing"), "got: {msg}");
+    assert_async_handler_supported(src, "positive repeat handler");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive repeat body");
     assert!(v1.contains("for (int64_t _r = 0; _r < 2; _r++)"), "{v1}");
     assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
 
     let zero = src.replace("            repeat 2\n", "            repeat 0\n");
-    assert_retired_tbir_gap(&lower_src(&zero).expect_err("a zero repeat remains a retired gap"));
+    assert_async_handler_supported(&zero, "zero repeat handler");
     let runtime = src.replace("            repeat 2\n", "            repeat dut.rst\n");
-    assert_retired_tbir_gap(
-        &lower_src(&runtime).expect_err("a runtime repeat remains a retired gap"),
-    );
+    assert_async_handler_supported(&runtime, "runtime repeat handler");
 }
 
 #[test]
@@ -33654,11 +33736,7 @@ fn an_unconditional_loop_reaches_named_clock_handler_wait() {
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("an unconditional loop guarantees its first iteration"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("recursively firing"), "got: {msg}");
+    assert_async_handler_supported(src, "unconditional loop handler");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive loop body");
     assert!(v1.contains("while (true)"), "{v1}");
@@ -33668,19 +33746,13 @@ end test T"#;
         "                wait 1 cycle on aux\n",
         "                if dut.rst == 1\n                    wait 1 cycle on aux\n                end if\n",
     );
-    assert_retired_tbir_gap(
-        &lower_src(&conditional).expect_err("a conditional loop-entry wait remains a retired gap"),
-    );
+    assert_async_handler_supported(&conditional, "conditional loop-entry handler");
 
     let uncompilable = src.replace(
         "                wait 1 cycle on aux\n",
         "                wait 1 cycle on aux\n                wait until false\n",
     );
-    let msg = assert_not_implemented(
-        &lower_src(&uncompilable).expect_err("wait-until must outrank loop recursion"),
-        lower::V1Status::EmitsUncompilable,
-    );
-    assert!(msg.contains("untimed `wait until`"), "got: {msg}");
+    assert_async_handler_supported(&uncompilable, "loop with named wait and wait-until");
 }
 
 #[test]
@@ -33698,21 +33770,13 @@ fn parenthesized_boolean_paths_reach_named_clock_handler_wait() {
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(true_src).expect_err("parentheses do not hide a literal-true path"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("recursively firing"), "got: {msg}");
+    assert_async_handler_supported(true_src, "parenthesized literal-true handler");
 
     let false_src = true_src.replace(
         "            if ((true))\n                wait 1 cycle on aux\n            end if\n",
         "            if ((false))\n                log(info, \"unreachable\")\n            else\n                wait 1 cycle on aux\n            end if\n",
     );
-    let msg = assert_not_implemented(
-        &lower_src(&false_src).expect_err("parentheses do not hide a literal-false path"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("recursively firing"), "got: {msg}");
+    assert_async_handler_supported(&false_src, "parenthesized literal-false handler");
 }
 
 #[test]
@@ -33736,20 +33800,14 @@ fn a_literal_true_elsif_reaches_named_clock_handler_wait() {
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("the first literal-true elsif is guaranteed"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("recursively firing"), "got: {msg}");
+    assert_async_handler_supported(src, "literal-true elsif handler");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive elsif arm");
     assert!(v1.contains("else if (true)"), "{v1}");
     assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
 
     let runtime_first = src.replace("            elsif false\n", "            elsif dut.rst == 1\n");
-    assert_retired_tbir_gap(
-        &lower_src(&runtime_first).expect_err("an earlier runtime elsif remains a retired gap"),
-    );
+    assert_async_handler_supported(&runtime_first, "runtime-first elsif handler");
 }
 
 #[test]
@@ -33767,22 +33825,16 @@ fn a_literal_true_while_reaches_named_clock_handler_wait() {
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("a literal-true while guarantees its first iteration"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("recursively firing"), "got: {msg}");
+    assert_async_handler_supported(src, "literal-true while handler");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive while body");
     assert!(v1.contains("while ((true))"), "{v1}");
     assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
 
     let runtime = src.replace("            while (true)\n", "            while dut.rst == 1\n");
-    assert_retired_tbir_gap(
-        &lower_src(&runtime).expect_err("a runtime while remains a retired gap"),
-    );
+    assert_async_handler_supported(&runtime, "runtime while handler");
     let never = src.replace("            while (true)\n", "            while false\n");
-    assert_retired_tbir_gap(&lower_src(&never).expect_err("a false while remains a retired gap"));
+    assert_async_handler_supported(&never, "literal-false while handler");
 }
 
 #[test]
@@ -33800,22 +33852,16 @@ fn a_nonempty_literal_for_reaches_named_clock_handler_wait() {
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("a nonempty literal range guarantees its first iteration"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("recursively firing"), "got: {msg}");
+    assert_async_handler_supported(src, "nonempty literal for handler");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive for body");
     assert!(v1.contains("for (int64_t i = 0; i <= 2; i++)"), "{v1}");
     assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
 
     let empty = src.replace("for i in 0 .. 2", "for i in 2 .. 0");
-    assert_retired_tbir_gap(&lower_src(&empty).expect_err("an empty range remains a retired gap"));
+    assert_async_handler_supported(&empty, "empty literal for handler");
     let runtime = src.replace("for i in 0 .. 2", "for i in 0 .. dut.count");
-    assert_retired_tbir_gap(
-        &lower_src(&runtime).expect_err("a runtime range remains a retired gap"),
-    );
+    assert_async_handler_supported(&runtime, "runtime range handler");
 }
 
 #[test]
@@ -33835,11 +33881,7 @@ fn a_runtime_if_with_two_named_wait_arms_reports_v1_recursion() {
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("both runtime-if paths guarantee a named-clock wait"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("recursively firing"), "got: {msg}");
+    assert_async_handler_supported(src, "runtime if with two named-clock waits");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits both recursive if arms");
     assert!(v1.contains("if (harc_rt::harc_read(dut->rst) == 1)"), "{v1}");
@@ -33849,16 +33891,12 @@ end test T"#;
         "            else\n                wait 2 cycles on aux\n",
         "",
     );
-    assert_retired_tbir_gap(
-        &lower_src(&missing_else).expect_err("a missing else remains a retired gap"),
-    );
+    assert_async_handler_supported(&missing_else, "runtime if without else");
     let open_then = src.replace(
         "                wait 1 cycle on aux",
         "                log(info, \"open\")",
     );
-    assert_retired_tbir_gap(
-        &lower_src(&open_then).expect_err("an open then arm remains a retired gap"),
-    );
+    assert_async_handler_supported(&open_then, "runtime if with open then arm");
 }
 
 #[test]
@@ -33882,11 +33920,7 @@ fn a_runtime_elsif_chain_with_all_named_wait_arms_reports_v1_recursion() {
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("every runtime elsif path guarantees a named-clock wait"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("recursively firing"), "got: {msg}");
+    assert_async_handler_supported(src, "runtime elsif chain");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits every recursive elsif arm");
     assert_eq!(v1.matches("while (clocks_[1].rising_count < _target").count(), 4, "{v1}");
@@ -33895,16 +33929,12 @@ end test T"#;
         "                wait 2 cycles on aux",
         "                log(info, \"open\")",
     );
-    assert_retired_tbir_gap(
-        &lower_src(&open_elsif).expect_err("an open elsif arm remains a retired gap"),
-    );
+    assert_async_handler_supported(&open_elsif, "runtime elsif chain with open arm");
     let missing_else = src.replace(
         "            else\n                wait 4 cycles on aux\n",
         "",
     );
-    assert_retired_tbir_gap(
-        &lower_src(&missing_else).expect_err("an elsif chain without else remains a retired gap"),
-    );
+    assert_async_handler_supported(&missing_else, "runtime elsif chain without else");
 }
 
 #[test]
@@ -33918,11 +33948,7 @@ fn an_untimed_wait_until_inside_an_on_handler_is_uncompilable_in_v1() {
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("an untimed handler wait-until must be fenced"),
-        lower::V1Status::EmitsUncompilable,
-    );
-    assert!(msg.contains("void checker/service callback"), "got: {msg}");
+    assert_async_handler_supported(src, "untimed wait-until handler");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the invalid callback");
     let checker_start = v1
@@ -33948,11 +33974,7 @@ fn a_nested_untimed_wait_until_inside_an_on_handler_is_uncompilable_in_v1() {
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("a nested untimed handler wait-until must be fenced"),
-        lower::V1Status::EmitsUncompilable,
-    );
-    assert!(msg.contains("nested inside control flow"), "got: {msg}");
+    assert_async_handler_supported(src, "nested untimed wait-until handler");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the invalid callback");
     let checker_start = v1
@@ -33976,11 +33998,7 @@ fn a_timed_wait_until_inside_an_on_handler_is_uncompilable_in_v1() {
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("a timed handler wait-until must be fenced"),
-        lower::V1Status::EmitsUncompilable,
-    );
-    assert!(msg.contains("void checker/service callback"), "got: {msg}");
+    assert_async_handler_supported(src, "timed wait-until handler");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the invalid callback");
     let checker_start = v1
@@ -34006,11 +34024,7 @@ fn a_nested_timed_wait_until_inside_an_on_handler_is_uncompilable_in_v1() {
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("a nested timed handler wait-until must be fenced"),
-        lower::V1Status::EmitsUncompilable,
-    );
-    assert!(msg.contains("nested inside control flow"), "got: {msg}");
+    assert_async_handler_supported(src, "nested timed wait-until handler");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the invalid callback");
     let checker_start = v1
@@ -34020,6 +34034,34 @@ end test T"#;
     assert!(
         checker_window.contains("co_await harc_rt::wait_until_timeout(_slot"),
         "v1 emits the nested timed coroutine await inside the checker callback: {checker_window}"
+    );
+}
+
+#[test]
+fn a_suspending_statement_handler_emits_randomization_in_its_coroutine() {
+    let source = r#"transaction Item
+    value : uint<8>
+end transaction Item
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    run
+        on true
+            let item : Item
+            wait 1 cycle
+            randomize(item)
+        end on
+        wait 2 cycles
+    end run
+end impl T"#;
+    assert_async_handler_supported(source, "mixed wait/randomize handler");
+    let cpp = emit_cpp_src(source);
+    assert!(
+        cpp.contains("_harc_randomize_c") && cpp.contains("co_await harc_rt::wait_cycles"),
+        "the scheduler-owned hook must contain both suspension and randomization: {cpp}"
     );
 }
 
@@ -34038,11 +34080,7 @@ test T
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("a positive synchronous helper wait must be fenced"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("unbounded recursion"), "got: {msg}");
+    assert_async_handler_supported(src, "positive helper wait handler");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the re-entrant helper call");
     let delay_once = v1_callable_symbol(&v1, "delay_once");
@@ -34064,13 +34102,9 @@ end test T"#;
     );
 
     let periodic = src.replace("on true", "on 1 cycles");
-    assert_retired_tbir_gap(
-        &lower_src(&periodic).expect_err("periodic helper waits remain a retired gap"),
-    );
+    assert_async_handler_supported(&periodic, "periodic helper wait handler");
     let post_eval = src.replace("on true", "on true phase post_eval");
-    assert_retired_tbir_gap(
-        &lower_src(&post_eval).expect_err("post-eval helper waits remain a retired gap"),
-    );
+    assert_async_handler_supported(&post_eval, "post-eval helper wait handler");
 
     let runtime = r#"function delay_count(n: uint<8>)
     wait n cycles
@@ -34085,9 +34119,7 @@ test T
         wait 2 cycles
     end run
 end test T"#;
-    assert_retired_tbir_gap(
-        &lower_src(runtime).expect_err("runtime-count helper waits remain a retired gap"),
-    );
+    assert_async_handler_supported(runtime, "runtime-count helper wait handler");
 
     let conditional = r#"function maybe_delay()
     if false
@@ -34104,9 +34136,7 @@ test T
         wait 2 cycles
     end run
 end test T"#;
-    assert_retired_tbir_gap(
-        &lower_src(conditional).expect_err("conditional helper waits remain a retired gap"),
-    );
+    assert_async_handler_supported(conditional, "conditional helper wait handler");
 
     let changed_trigger = r#"function clear_then_delay(d: Top)
     d.rst = 0
@@ -34122,10 +34152,7 @@ test T
         wait 2 cycles
     end run
 end test T"#;
-    assert_retired_tbir_gap(
-        &lower_src(changed_trigger)
-            .expect_err("a helper that changes its trigger remains a retired gap"),
-    );
+    assert_async_handler_supported(changed_trigger, "trigger-changing helper wait handler");
 }
 
 #[test]
@@ -34143,11 +34170,7 @@ test T
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("an always-blocking synchronous helper must be fenced"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("unbounded recursion"), "got: {msg}");
+    assert_async_handler_supported(src, "untimed helper wait handler");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the re-entrant helper");
     assert!(v1.contains("while (!(false)) tick();"), "{v1}");
@@ -34170,11 +34193,7 @@ test T
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("a timed synchronous helper must be fenced"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("unbounded recursion"), "got: {msg}");
+    assert_async_handler_supported(src, "timed helper wait handler");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the re-entrant helper");
     assert!(
@@ -34199,11 +34218,7 @@ test T
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("a helper-defined blocking handler must be fenced"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("recursively firing"), "got: {msg}");
+    assert_async_handler_supported(src, "helper-defined untimed handler");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive callback");
     assert!(v1.contains("while (!(false)) tick();"), "{v1}");
@@ -34225,11 +34240,7 @@ test T
         wait 2 cycles
     end run
 end test T"#;
-    let msg = assert_not_implemented(
-        &lower_src(src).expect_err("a timed helper-defined handler must be fenced"),
-        lower::V1Status::SilentlyMisLowers,
-    );
-    assert!(msg.contains("recursively fires"), "got: {msg}");
+    assert_async_handler_supported(src, "helper-defined timed handler");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive callback");
     assert!(
@@ -34280,10 +34291,8 @@ end test T"#;
     );
 
     let zero = src.replace("wait 1 cycle", "wait 0 cycles");
-    let msg = assert_retired_tbir_gap(
-        &lower_src(&zero).expect_err("a zero-wait trigger still needs an unavailable CFG step"),
-    );
-    assert!(msg.contains("statement-level step"), "{msg}");
+    let prog = lower_src(&zero).expect("a zero-wait trigger lowers as a pure trigger");
+    verify::verify_program(&prog).expect("zero-wait trigger IR verifies");
 }
 
 #[test]
@@ -35730,7 +35739,7 @@ end impl T"#,
     );
 
     let effectful = r#"function peek(d: Top) -> uint<8>
-    return d.a
+    return d.rst
 end function peek
 
 testbench Tb
@@ -35738,19 +35747,16 @@ testbench Tb
 end testbench Tb
 impl T for Tb
     run
-        assert past(dut.a) == 0 else fail("a=${peek(dut)}")
+        assert past(dut.rst) == 0 else fail("rst=${peek(dut)}")
         wait 1 cycle
     end run
 end impl T"#;
-    let message = assert_retired_tbir_gap(
-        &lower_src(effectful)
-            .expect_err("a concurrent message cannot materialize an effectful helper call"),
-    );
-    assert!(
-        message.contains("DUT/sync-touching helper call `peek(...)`")
-            && message.contains("inside a message"),
-        "the concurrent path retains the honest shared lazy-message diagnostic: {message}"
-    );
+    let prog = lower_src(effectful).expect("a DUT-reading message helper stays lazy");
+    verify::verify_program(&prog).expect("effectful concurrent message verifies");
+    let cpp = tbir::emit(&prog, &merged_src(effectful), &cpp_tb::EmitOpts::default())
+        .expect("effectful concurrent message emits");
+    assert_cpp_typechecks("concurrent_effectful_message", &cpp);
+    assert!(cpp.contains("harc_rt::harc_read(dut->rst)"), "{cpp}");
 }
 
 /// An `assume` honors the clause the same way, in both the immediate
@@ -42268,13 +42274,17 @@ env AnalysisEnv"#;
         "v1 emits an undeclared DUT-handle pointer"
     );
 
-    // A DECLARED type of an unsupported kind stays `Unsupported`, since
-    // v1 handles it correctly — the arm must not sweep the two together.
+    // A declared covergroup type is a real nested component field. TB-IR
+    // keeps its counters in the env and installs its sampler with the env.
     let declared = fixture
         .replace(ANCHOR, &format!("{ANCHOR}\n    weird  : ExtraCov"))
         .replacen("env AnalysisEnv", EXTRA_COV, 1);
-    let msg = assert_retired_tbir_gap(&lower_src(&declared).unwrap_err());
-    assert!(msg.contains("sub-component field"), "{msg}");
+    let prog = lower_src(&declared).expect("nested covergroup field lowers");
+    verify::verify_program(&prog).expect("nested covergroup field verifies");
+    let emitted = tbir::emit(&prog, &merged_src(&declared), &cpp_tb::EmitOpts::default())
+        .expect("nested covergroup field emits");
+    assert_cpp_typechecks("nested_component_covergroup", &emitted);
+    assert!(emitted.contains("env.weird.cp.b0++"), "{emitted}");
 
     // An ENUM is the case the first draft broke: the declared-type set
     // was a whitelist of the kinds that seemed relevant, and omitting
@@ -47380,11 +47390,8 @@ end impl SpTest"#
     );
 
     let zero_composite = composite.replace("wait 1 cycle", "wait 0 cycles");
-    let msg = assert_retired_tbir_gap(
-        &lower_src(&zero_composite)
-            .expect_err("a zero-wait composite still needs an unavailable CFG step"),
-    );
-    assert!(msg.contains("statement-level step"), "{msg}");
+    let zero_prog = lower_src(&zero_composite).expect("a zero-wait composite period lowers");
+    verify::verify_program(&zero_prog).expect("zero-wait composite period verifies");
 
     // A non-positive literal remains rejected. v1 emits
     // the handler and its own `period > 0` guard never lets it fire —
@@ -48746,11 +48753,11 @@ fn a_covergroup_hook_trigger_has_two_reachable_shape_arms() {
             "env DormantCoverOwner\n    cov : StepCov\nend env DormantCoverOwner\n\ntestbench CovHookTriggerTb",
             1,
         );
-        let msg = assert_retired_tbir_gap(
+        let msg = assert_invalid(
             &lower_src(&dormant_owner)
-                .expect_err("component-only covergroup references remain a retired gap"),
+                .expect_err("a component field cannot name an omitted malformed schema"),
         );
-        assert!(msg.contains("DormantCoverOwner.cov"), "{trigger}: {msg}");
+        assert!(msg.contains("DormantCoverOwner") && msg.contains("`cov`"), "{trigger}: {msg}");
     }
 
     // The four the PARSER claims first, so lowering never sees them.
@@ -48811,8 +48818,12 @@ test T
     end run
 end test T
 "#;
-    let prog = lower_src(src).expect("unused impure covergroups are inert");
-    assert!(prog.covgroups.is_empty(), "unused schemas are omitted");
+    let prog = lower_src(src).expect("unused suspending covergroups are inert");
+    assert_eq!(
+        prog.covgroups.iter().map(|group| group.name.as_str()).collect::<Vec<_>>(),
+        vec!["V1Cov"],
+        "the now-supported value helper schema lowers; unusable inert schemas stay omitted"
+    );
     verify::verify_program(&prog).expect("program without sampler schemas verifies");
 
     let dormant_owner = src.replacen(
@@ -48820,11 +48831,11 @@ end test T
         "env DormantCoverOwner\n    point_cov : PointCov\nend env DormantCoverOwner\n\ntest T",
         1,
     );
-    let msg = assert_retired_tbir_gap(
+    let msg = assert_invalid(
         &lower_src(&dormant_owner)
-            .expect_err("component-only covergroup references remain a retired gap"),
+            .expect_err("a component field cannot name an omitted suspending schema"),
     );
-    assert!(msg.contains("DormantCoverOwner.point_cov"), "{msg}");
+    assert!(msg.contains("DormantCoverOwner") && msg.contains("`point_cov`"), "{msg}");
 
     for group in ["PointCov", "BinCov"] {
         let instantiated = src.replacen(
@@ -48851,13 +48862,15 @@ end test T
         assert!(msg.contains(&format!("impure helper call `{helper}`")), "{group}: {msg}");
     }
 
-    // Non-suspending helpers are also "impure" to TB-IR when they read the
-    // DUT, but v1 could execute this sampler. Preserve that measured legacy
-    // behavior without generalizing the cycle-wait crash classification to
-    // every helper or offering the retired backend as a fallback.
+    // A non-suspending helper that reads through a DUT parameter is sampled
+    // by substituting its arguments into the returned expression. The port
+    // read remains live on every sample rather than being cached at setup.
     let v1_src = src.replacen("    run\n", "    let cov : V1Cov\n    run\n", 1);
-    let msg = assert_retired_tbir_gap(&lower_src(&v1_src).unwrap_err());
-    assert!(msg.contains("impure helper call `read_value`"), "{msg}");
+    let prog = lower_src(&v1_src).expect("DUT-reading value helper lowers in a coverpoint");
+    verify::verify_program(&prog).expect("DUT-reading coverpoint helper verifies");
+    let cpp = tbir::emit(&prog, &merged_src(&v1_src), &cpp_tb::EmitOpts::default())
+        .expect("DUT-reading coverpoint helper emits");
+    assert_cpp_typechecks("nonsuspending_impure_cover_helper_tbir", &cpp);
     let v1_cpp = cpp_tb::emit(&merged_src(&v1_src)).expect("v1 emits the DUT-reading sampler");
     assert_cpp_typechecks("nonsuspending_impure_cover_helper", &v1_cpp);
 
@@ -52024,9 +52037,9 @@ end impl T"#
 
     let cpp = emit_cpp_src(&fixture("transactor_wait_bound_predicate_test.harc"));
     assert!(
-        cpp.contains("CounterPredicate_reached(pred, harc_rt::harc_read(dut->count_out))"),
-        "the direct bound predicate must forward instance state and re-read its DUT argument: \
-         {cpp}"
+        cpp.contains("= harc_rt::harc_read(dut->count_out);")
+            && cpp.contains("CounterPredicate_reached(pred, __t"),
+        "the direct bound predicate must forward instance state and re-read its DUT argument on every polling pass: {cpp}"
     );
 }
 
@@ -52041,11 +52054,12 @@ fn bound_transactor_wait_predicate_verifier_and_bus_boundary() {
         prog.functions[fid.index()]
             .blocks
             .iter_mut()
-            .find_map(|block| match &mut block.terminator {
-                ir::Terminator::WaitUntil { preds, .. } => Some(&mut preds[0].expr),
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|stmt| match stmt {
+                ir::Stmt::TransactorCall { call, .. } => Some(call),
                 _ => None,
             })
-            .expect("wait predicate")
+            .expect("re-evaluated bound-call predicate")
     }
 
     let mut broken = prog.clone();
@@ -52116,7 +52130,7 @@ end impl T
 "#;
     let err = lower_src(aggregate_src)
         .expect_err("an aggregate-returning bound predicate must be rejected before emission");
-    assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert_invalid(&err);
 
     let bus_src = r#"
 bus MemBus
@@ -52197,8 +52211,8 @@ end impl CTest
             .unwrap_or_else(|e| panic!("{owner}: a signed wide field must verify: {e:?}"));
     }
 
-    // Width boundaries still hold: `sint` past the 1024-bit ceiling is
-    // still refused, same as unsigned.
+    // Persistent scoreboard storage is not an expression method: its
+    // `HarcWide<N>` carrier preserves widths beyond the method ceiling.
     let too_wide = "scoreboard Ov
     v : sint<1025> default 0
 end scoreboard Ov
@@ -52214,10 +52228,11 @@ end testbench T
     end run
 end impl I
 ";
-    assert!(
-        lower_src(too_wide).is_err(),
-        "a signed field past the 1024-bit ceiling must still be refused"
-    );
+    let wide = lower_src(too_wide).expect("a modeled persistent wide field lowers");
+    verify::verify_program(&wide).expect("a modeled persistent wide field verifies");
+    let cpp = tbir::emit(&wide, &merged_src(too_wide), &cpp_tb::EmitOpts::default())
+        .expect("a modeled persistent wide field emits");
+    assert!(cpp.contains("harc_rt::HarcWide<33> v"), "{cpp}");
 }
 
 /// A no-payload `on <event>()` handler lowers exactly as the one-argument

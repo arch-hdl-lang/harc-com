@@ -335,6 +335,9 @@ impl Display for TbProgram {
                         };
                         format!("out event<{inner}>")
                     }
+                    ComponentFieldKind::Covgroup { covgroup } => {
+                        format!("covergroup cg{}", covgroup.0)
+                    }
                     ComponentFieldKind::Sub { component, mode } => format!(
                         "sub c{}{}",
                         component.0,
@@ -1045,6 +1048,7 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             let descs: Vec<String> = pending.iter().map(|d| tlm_fork_desc_str(func, d)).collect();
             format!("TlmJoinAll([{}])", descs.join(", "))
         }
+        Stmt::ErrorIncrement => "ErrorIncrement".to_string(),
     }
 }
 

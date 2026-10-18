@@ -3149,6 +3149,7 @@ fn lower_program_impl(
             &component_ids,
             &scoreboard_ids,
             &record_ids,
+            &covgroup_ids,
             &mut next_fn,
             &const_vals,
             &declared_types,
@@ -3667,6 +3668,16 @@ fn reject_suspending_synchronous_callbacks(
             else {
                 continue;
             };
+            // Statement-position cycle handlers own scheduler slots. Their
+            // directly lowered waits therefore suspend the handler coroutine
+            // safely. A longer chain (or an intrinsic effect appended to the
+            // root name) still denotes a synchronous callee such as a
+            // blocking TLM method and must remain rejected.
+            if matches!(callback.kind, SynchronousCallbackKind::StatementCycle)
+                && chain.len() == 1
+            {
+                continue;
+            }
             diagnostics.record(callback.source_id, callback.span);
             let names = chain.join(" -> ");
             return Err(LowerError::Invalid(format!(
@@ -9148,22 +9159,6 @@ pub(crate) fn placeholder_function(id: FunctionId) -> TbFunction {
     }
 }
 
-/// Whether any block of `f` ends in a terminator that advances simulated
-/// time. Used to keep a suspending body out of a context that cannot
-/// suspend (a per-cycle checker closure).
-pub(crate) fn function_suspends(f: &TbFunction) -> bool {
-    f.blocks.iter().any(|b| {
-        matches!(
-            b.terminator,
-            Terminator::WaitCycles(..)
-                | Terminator::WaitCyclesSync(..)
-                | Terminator::WaitUntil { .. }
-                | Terminator::WaitUntilTimeout { .. }
-                | Terminator::WaitTimePs(..)
-        )
-    })
-}
-
 pub(crate) fn reserve_tb_record_names(b: &mut FuncBuilder<'_>, ctx: &LowerCtx) {
     for (name, _) in &ctx.tb_record_fields {
         b.reserve_local_name(name);
@@ -9871,6 +9866,7 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 | ir::Stmt::EventSubscribe { .. }
                 | ir::Stmt::MethodHookSubscribe { .. }
                 | ir::Stmt::EventEmit { .. }
+                | ir::Stmt::ErrorIncrement
                 | ir::Stmt::ProbeRelease(_) => None,
             };
             if found.is_some() {
@@ -10168,6 +10164,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 | ir::Stmt::EventSubscribe { .. }
                 | ir::Stmt::MethodHookSubscribe { .. }
                 | ir::Stmt::EventEmit { .. }
+                | ir::Stmt::ErrorIncrement
                 | ir::Stmt::ProbeRelease(_) => {}
             }
         }
@@ -10780,6 +10777,7 @@ fn fill_initiator_bus_prefix(
                     | Stmt::CycleHandler(_)
                     | Stmt::EventSubscribe { .. }
                     | Stmt::MethodHookSubscribe { .. }
+                    | Stmt::ErrorIncrement
                     | Stmt::EventEmit { .. } => {}
                 }
             }

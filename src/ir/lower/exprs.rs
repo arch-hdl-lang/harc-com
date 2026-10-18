@@ -17,7 +17,6 @@ pub(crate) struct ValuePreludeSummary {
     inline_statements: bool,
     transactor_edge_span: Option<crate::lexer::Span>,
 }
-
 impl ValuePreludeSummary {
     const INLINE_STATEMENTS: Self = Self {
         inline_statements: true,
@@ -807,12 +806,11 @@ impl super::FuncBuilder<'_> {
             return Ok(());
         }
         let segs = stripped.to_vec();
-        Err(not_implemented(
-            &format!("{what} an element selection inside `{}`", segs.join(".")),
-            "this indexed component/state record shape is outside the typed path resolver; \
-             use a supported fixed-vector leaf or `Vec<Record, N>` traversal",
-            V1Status::WorksButRetired,
-        ))
+        Err(LowerError::Invalid(format!(
+            "{what} an element selection inside `{}` that does not resolve to a typed \
+             fixed-vector leaf or `Vec<Record, N>` traversal",
+            segs.join(".")
+        )))
     }
 
     /// The exact element type and length of a LOWERED whole-`Vec` field read,
@@ -1596,14 +1594,11 @@ impl FuncBuilder<'_> {
                         index: chain.leaf_index.map(Box::new),
                     });
                 }
-                // Test-scope read of a bound-to target responder's
-                // persistent state (`target.read_count`, or a whole-record
-                // `target.last`).
-                if let Some((instance, field)) = self.as_transactor_state(e) {
-                    return Ok(Expr::TransactorState { instance, field });
-                }
-                // Scoreboard scalar-counter read (`sb.writes` /
-                // `_tb.sb.writes` after impl-form desugaring).
+                // Scoreboard value read (`sb.writes`, `sb.record`, or a
+                // whole fixed vector). Keep this ahead of the generic
+                // component path resolver: a data-only scoreboard also has
+                // a structural owner binding, but its field schema lives in
+                // `ScoreboardSchema`, not `ComponentSchema`.
                 if let Some((sb, field, nested_path)) = self.scoreboard_root(target) {
                     let scalar = self.scoreboard_scalar_field(sb, &name.name)?;
                     return Ok(Expr::ScoreboardQuery {
@@ -1612,6 +1607,12 @@ impl FuncBuilder<'_> {
                         query: crate::ir::ScoreboardQuery::Scalar { scalar },
                         nested_path,
                     });
+                }
+                // Test-scope read of a bound-to target responder's
+                // persistent state (`target.read_count`, or a whole-record
+                // `target.last`).
+                if let Some((instance, field)) = self.as_transactor_state(e) {
+                    return Ok(Expr::TransactorState { instance, field });
                 }
                 // Regblock-binding access in expression position. The
                 // mirror IS a record local, so `regs.NAME` would
@@ -6902,68 +6903,4 @@ pub(crate) fn parse_sized_int_literal_with_width(s: &str) -> Option<(u32, u64)> 
     };
     let value = u64::from_str_radix(digits, radix).ok()?;
     Some((width, value))
-}
-
-/// True when `e` contains a transactor call edge selected by `is_bound`.
-/// Re-evaluated predicates pass the bus-binding table here: synchronous
-/// sibling and testbench-instance methods can remain inline, while a bus/TLM
-/// handshake still needs the statement-level call seam.
-pub(crate) fn expr_has_bound_transactor_edge<F>(e: &Expr, is_bound: &F) -> bool
-where
-    F: Fn(&str) -> bool,
-{
-    match e {
-        Expr::Call(crate::ir::CallTarget::TransactorMethod { bus_field, .. }, _) => {
-            is_bound(bus_field)
-        }
-        Expr::Call(crate::ir::CallTarget::TransactorSelfMethod { .. }, _) => false,
-        Expr::Call(_, args) => args
-            .iter()
-            .any(|arg| expr_has_bound_transactor_edge(arg, is_bound)),
-        Expr::Binary(_, a, b) => {
-            expr_has_bound_transactor_edge(a, is_bound)
-                || expr_has_bound_transactor_edge(b, is_bound)
-        }
-        Expr::Unary(_, a) => expr_has_bound_transactor_edge(a, is_bound),
-        Expr::Ternary(c, t, f) => {
-            expr_has_bound_transactor_edge(c, is_bound)
-                || expr_has_bound_transactor_edge(t, is_bound)
-                || expr_has_bound_transactor_edge(f, is_bound)
-        }
-        Expr::WidthCast { inner, .. } => expr_has_bound_transactor_edge(inner, is_bound),
-        Expr::ComponentIdle { n, .. } | Expr::TransactorIdle { n, .. } => {
-            expr_has_bound_transactor_edge(n, is_bound)
-        }
-        Expr::SeqIndex {
-            index,
-            inner_index,
-            ..
-        } => {
-            expr_has_bound_transactor_edge(index, is_bound)
-                || inner_index
-                    .as_deref()
-                    .is_some_and(|inner| expr_has_bound_transactor_edge(inner, is_bound))
-        }
-        Expr::TbFieldVecElement {
-            index, inner_index, ..
-        }
-        | Expr::ComponentVecElement {
-            index, inner_index, ..
-        } => {
-            expr_has_bound_transactor_edge(index, is_bound)
-                || inner_index
-                    .as_deref()
-                    .is_some_and(|inner| expr_has_bound_transactor_edge(inner, is_bound))
-        }
-        Expr::BitSlice { target, .. } => expr_has_bound_transactor_edge(target, is_bound),
-        Expr::BitSliceDyn { target, hi, lo } => {
-            expr_has_bound_transactor_edge(target, is_bound)
-                || expr_has_bound_transactor_edge(hi, is_bound)
-                || expr_has_bound_transactor_edge(lo, is_bound)
-        }
-        Expr::CovHookParam {
-            index: Some(index), ..
-        } => expr_has_bound_transactor_edge(index, is_bound),
-        _ => false,
-    }
 }

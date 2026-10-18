@@ -487,6 +487,7 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
                     }
                 }
             }
+            Stmt::ErrorIncrement => {}
         }
     }
     match &block.terminator {

@@ -40,7 +40,115 @@ const INDENT: &str = "    ";
 /// case — the unused `dut` handle stays a nullptr (synthetic tests use a
 /// bare `dut` local).
 fn needs_tb_struct(tb: &ir::TestbenchSchema) -> bool {
-    !tb.synthetic || !tb.state_fields.is_empty() || !tb.record_fields.is_empty()
+    !tb.synthetic
+        || !tb.state_fields.is_empty()
+        || !tb.record_fields.is_empty()
+        || !tb.cov_fields.is_empty()
+        || !tb.scoreboard_fields.is_empty()
+}
+
+pub(in crate::codegen::tbir) fn emit_component_covergroup_registrations(
+    out: &mut String,
+    prog: &TbProgram,
+    component: ir::ComponentId,
+    instance: &str,
+    lanes: &HashMap<String, u32>,
+    ports: &HashMap<String, u32>,
+    dut_access: Option<&ir::passes::dut_access::DutAccessPlan>,
+) -> Result<(), EmitError> {
+    let schema = &prog.components[component.index()];
+    for field in &schema.fields {
+        match &field.kind {
+            ir::ComponentFieldKind::Covgroup { covgroup } => {
+                let cov = &prog.covgroups[covgroup.index()];
+                let cov_instance = format!("{instance}.{}", field.name);
+                match &cov.trigger {
+                    ir::CovTrigger::PosedgeDutClk => covergroup::sampler_registration(
+                        out,
+                        prog,
+                        cov,
+                        &cov_instance,
+                        lanes,
+                        ports,
+                        dut_access,
+                    )?,
+                    ir::CovTrigger::Hook {
+                        receiver_path,
+                        method,
+                        side,
+                        ..
+                    } => {
+                        let [receiver] = receiver_path.as_slice() else {
+                            return Err(EmitError(format!(
+                                "tbir: component covergroup `{}` has unsupported nested hook receiver `{}`",
+                                cov.name,
+                                receiver_path.join(".")
+                            )));
+                        };
+                        let receiver_field = schema.field(receiver).ok_or_else(|| {
+                            EmitError(format!(
+                                "tbir: component covergroup `{}` references missing sibling `{receiver}`",
+                                cov.name
+                            ))
+                        })?;
+                        let ir::ComponentFieldKind::Sub {
+                            component: receiver_component,
+                            mode,
+                        } = receiver_field.kind
+                        else {
+                            return Err(EmitError(format!(
+                                "tbir: component covergroup `{}` hook receiver `{receiver}` is not a component",
+                                cov.name
+                            )));
+                        };
+                        let target = prog.components[receiver_component.index()]
+                            .method(method)
+                            .ok_or_else(|| {
+                                EmitError(format!(
+                                    "tbir: component covergroup `{}` references missing method `{receiver}.{method}`",
+                                    cov.name
+                                ))
+                            })?;
+                        if !ir::component_mode_includes_activation(mode, target.activation) {
+                            return Err(EmitError(format!(
+                                "tbir: component covergroup `{}` targets inactive method `{receiver}.{method}`",
+                                cov.name
+                            )));
+                        }
+                        let side = match side {
+                            crate::ast::HookSide::Pre => "pre",
+                            crate::ast::HookSide::Post => "post",
+                        };
+                        covergroup::hook_sampler_registration(
+                            out,
+                            prog,
+                            cov,
+                            format!("{instance}.{receiver}._harc_cov_{method}_{side}"),
+                            target.function,
+                            target.param_names.len(),
+                            &cov_instance,
+                            lanes,
+                            ports,
+                            dut_access,
+                        )?;
+                    }
+                }
+            }
+            ir::ComponentFieldKind::Sub {
+                component: child, ..
+            } => emit_component_covergroup_registrations(
+                out,
+                prog,
+                *child,
+                &format!("{instance}.{}", field.name),
+                lanes,
+                ports,
+                dut_access,
+            )?,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn emit_component_dut_bindings(
@@ -486,6 +594,12 @@ fn emit_selected_tests(
         )?;
     }
 
+    // Covergroup counter structs may be held by value in component fields,
+    // so define them before the component dependency graph.
+    for cg in &prog.covgroups {
+        covergroup::covgroup_struct(&mut out, cg);
+    }
+
     // Composite-component structs (env/agent cluster). A component holds
     // its sub-components by value, so each held type's struct must be
     // defined first. Source order usually puts subs before the env, but
@@ -519,12 +633,6 @@ fn emit_selected_tests(
         writeln!(out).ok();
     }
     crate::codegen::cpp_tb::emit_extern_fn_decls(&mut out, file);
-    // Covergroup structs are leaf observables, but hook-triggered sampler
-    // bodies may call pure helpers or extern reference functions, so their
-    // forward declarations must be visible before the struct definition.
-    for cg in &prog.covgroups {
-        covergroup::covgroup_struct(&mut out, cg);
-    }
     for h in &helpers {
         func::emit_helper_function(&mut out, prog, h)?;
         writeln!(out).ok();
@@ -2169,12 +2277,25 @@ fn edge_is_enabled(
     ir::component_connect_modes_enabled(source_mode, sink_mode, edge)
 }
 
-fn persistent_setup_capture(run_context: Option<&str>) -> String {
-    run_context
-        .map(|context| {
-            format!("_harc_callback_state = &_harc_run_state, _harc_callback_context = &{context}")
-        })
-        .unwrap_or_else(|| "&".to_string())
+fn persistent_setup_capture(run_context: Option<&str>, referenced_path: Option<&str>) -> String {
+    let Some(context) = run_context else {
+        return "&".to_string();
+    };
+    let mut capture =
+        format!("_harc_callback_state = &_harc_run_state, _harc_callback_context = &{context}");
+    // Common-layout callbacks normally reach component instances through the
+    // captured run state. A component constructed in a function local is the
+    // exception: its durable callback body names that local directly, so the
+    // root object must also be captured explicitly. Nested paths only need
+    // their first C++ identifier (`watcher.child` -> `watcher`).
+    if let Some(root) = referenced_path
+        .and_then(|path| path.split('.').next())
+        .filter(|root| !root.is_empty() && *root != "_harc_run_state")
+    {
+        capture.push_str(", &");
+        capture.push_str(root);
+    }
+    capture
 }
 
 fn emit_persistent_setup_bindings(out: &mut String, depth: usize, run_context: Option<&str>) {
@@ -2262,7 +2383,7 @@ fn emit_on_handler_regs(
                 run_context,
             )?;
             if run_context.is_some() {
-                let capture = persistent_setup_capture(run_context);
+                let capture = persistent_setup_capture(run_context, Some(inst_path));
                 writeln!(
                     out,
                     "{pad}{inst_path}.{}.push_back([{capture}](auto _t) {{",
@@ -2451,7 +2572,7 @@ fn emit_one_connect(
                 .map(|context| format!("{sink_comp}_{method}({context}, {sink}, _t)"))
                 .unwrap_or_else(|| format!("{sink_comp}_{method}({sink}, _t)"));
             if run_context.is_some() {
-                let capture = persistent_setup_capture(run_context);
+                let capture = persistent_setup_capture(run_context, Some(inst_path));
                 writeln!(
                     out,
                     "{pad}{src}.{}.push_back([{capture}](auto _t) {{",
@@ -2476,7 +2597,7 @@ fn emit_one_connect(
             // registered `on <ev>` handler(s). Mirrors v1's
             // `for (auto& _s : <sink>.<event>) _s(_t);` bridge closure.
             if run_context.is_some() {
-                let capture = persistent_setup_capture(run_context);
+                let capture = persistent_setup_capture(run_context, Some(inst_path));
                 writeln!(
                     out,
                     "{pad}{src}.{}.push_back([{capture}](auto _t) {{",
@@ -2554,10 +2675,9 @@ const WATCHDOG_DEFAULT_MAX_IDLE: i64 = 10000;
 /// every cycle the closure re-reads the period (so a field-backed period
 /// stays test-overridable), fires once it is due, and — for the watchdog
 /// — runs the user body then the idle check.
-fn emit_lifecycle_checkers(
+pub(in crate::codegen::tbir) fn emit_lifecycle_checkers(
     out: &mut String,
     prog: &TbProgram,
-    runtime_cells: &ir::passes::runtime_cells::RuntimeCellPlan,
     component: ir::ComponentId,
     inst_path: &str,
     mode: Option<ir::ComponentInstanceMode>,
@@ -2567,11 +2687,14 @@ fn emit_lifecycle_checkers(
     bound_bus: Option<&ir::BusBindingSchema>,
     bus_adapters: Option<&[expr::TestbenchBusAdapterPlan]>,
     run_context: Option<&str>,
+    depth: usize,
 ) -> Result<(), EmitError> {
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
+    let pad2 = INDENT.repeat(depth + 2);
+    let pad3 = INDENT.repeat(depth + 3);
     let comp = &prog.components[component.index()];
-    let callback_capture = persistent_setup_capture(run_context);
-    let periodic_member_base = comp.methods.len() + comp.on_handlers.len();
-    let cycle_member_base = periodic_member_base + comp.periodic_handlers.len();
+    let callback_capture = persistent_setup_capture(run_context, Some(inst_path));
     // A valid C++ identifier for the static tag (`env.agent` → `env_agent`).
     let inst_tag = inst_path.replace('.', "_");
 
@@ -2591,31 +2714,27 @@ fn emit_lifecycle_checkers(
             &ph.period,
         )?;
         let tag = format!("_per_{inst_tag}_{}", ph.function.0);
-        let field = runtime::component_runtime_cell_field(
-            runtime_cells,
-            component,
+        let field = runtime::component_internal_member_name(
             comp,
-            &ir::passes::runtime_cells::RuntimeCellKind::ComponentPeriodicLast {
-                member: ir::ComponentCallableId((periodic_member_base + periodic_index) as u32),
-            },
-        )?;
+            &format!("_harc_component_periodic_{periodic_index}_last"),
+        );
         let last = format!("{inst_path}.{field}");
         let svc = ph.phase.service_vec();
-        writeln!(out, "{INDENT}{svc}.push_back([{callback_capture}]() {{").ok();
-        emit_persistent_setup_bindings(out, 2, run_context);
+        writeln!(out, "{pad}{svc}.push_back([{callback_capture}]() {{").ok();
+        emit_persistent_setup_bindings(out, depth + 1, run_context);
         writeln!(
             out,
-            "{INDENT}{INDENT}int64_t {tag}_period = (int64_t)({period});"
+            "{pad1}int64_t {tag}_period = (int64_t)({period});"
         )
         .ok();
         writeln!(
             out,
-            "{INDENT}{INDENT}if ({tag}_period > 0 && (int64_t)cycle_count - {last} >= {tag}_period) {{"
+            "{pad1}if ({tag}_period > 0 && (int64_t)cycle_count - {last} >= {tag}_period) {{"
         )
         .ok();
         writeln!(
             out,
-            "{INDENT}{INDENT}{INDENT}{last} = (int64_t)cycle_count;"
+            "{pad2}{last} = (int64_t)cycle_count;"
         )
         .ok();
         let call = component_callable_call(
@@ -2628,9 +2747,9 @@ fn emit_lifecycle_checkers(
             bus_adapters,
             run_context,
         )?;
-        writeln!(out, "{INDENT}{INDENT}{INDENT}{call};").ok();
-        writeln!(out, "{INDENT}{INDENT}}}").ok();
-        writeln!(out, "{INDENT}}});").ok();
+        writeln!(out, "{pad2}{call};").ok();
+        writeln!(out, "{pad1}}}").ok();
+        writeln!(out, "{pad}}});").ok();
     }
 
     // Cycle-trigger handlers (`on <bool-expr>`). Each installs a
@@ -2686,20 +2805,16 @@ fn emit_lifecycle_checkers(
             // cycle-service latch is trace-correct under both `--mt` and the
             // default — the latch already fires at the right phases on
             // every `tick()`.
-            writeln!(out, "{INDENT}{svc}.push_back([{callback_capture}]() {{").ok();
-            emit_persistent_setup_bindings(out, 2, run_context);
-            let field = runtime::component_runtime_cell_field(
-                runtime_cells,
-                component,
+            writeln!(out, "{pad}{svc}.push_back([{callback_capture}]() {{").ok();
+            emit_persistent_setup_bindings(out, depth + 1, run_context);
+            let field = runtime::component_internal_member_name(
                 comp,
-                &ir::passes::runtime_cells::RuntimeCellKind::ComponentCooldown {
-                    member: ir::ComponentCallableId((cycle_member_base + cycle_index) as u32),
-                },
-            )?;
+                &format!("_harc_component_cycle_{cycle_index}_cooldown"),
+            );
             let cooldown = format!("{inst_path}.{field}");
-            writeln!(out, "{INDENT}{INDENT}if ({cooldown}) {{").ok();
-            writeln!(out, "{INDENT}{INDENT}{INDENT}{cooldown} = false;").ok();
-            writeln!(out, "{INDENT}{INDENT}}} else if ((bool)({trigger})) {{").ok();
+            writeln!(out, "{pad1}if ({cooldown}) {{").ok();
+            writeln!(out, "{pad2}{cooldown} = false;").ok();
+            writeln!(out, "{pad1}}} else if ((bool)({trigger})) {{").ok();
             let call = component_callable_call(
                 prog,
                 ch.function,
@@ -2710,17 +2825,17 @@ fn emit_lifecycle_checkers(
                 bus_adapters,
                 run_context,
             )?;
-            writeln!(out, "{INDENT}{INDENT}{INDENT}{call};").ok();
-            writeln!(out, "{INDENT}{INDENT}{INDENT}{cooldown} = true;").ok();
-            writeln!(out, "{INDENT}{INDENT}}}").ok();
-            writeln!(out, "{INDENT}}});").ok();
+            writeln!(out, "{pad2}{call};").ok();
+            writeln!(out, "{pad2}{cooldown} = true;").ok();
+            writeln!(out, "{pad1}}}").ok();
+            writeln!(out, "{pad}}});").ok();
             continue;
         }
-        writeln!(out, "{INDENT}{svc}.push_back([{callback_capture}]() {{").ok();
-        emit_persistent_setup_bindings(out, 2, run_context);
+        writeln!(out, "{pad}{svc}.push_back([{callback_capture}]() {{").ok();
+        emit_persistent_setup_bindings(out, depth + 1, run_context);
         match ch.edge {
             ir::CycleEdge::Level => {
-                writeln!(out, "{INDENT}{INDENT}if ((bool)({trigger})) {{").ok();
+                writeln!(out, "{pad1}if ((bool)({trigger})) {{").ok();
                 let call = component_callable_call(
                     prog,
                     ch.function,
@@ -2731,26 +2846,22 @@ fn emit_lifecycle_checkers(
                     bus_adapters,
                     run_context,
                 )?;
-                writeln!(out, "{INDENT}{INDENT}{INDENT}{call};").ok();
-                writeln!(out, "{INDENT}{INDENT}}}").ok();
+                writeln!(out, "{pad2}{call};").ok();
+                writeln!(out, "{pad1}}}").ok();
             }
             ir::CycleEdge::Rising | ir::CycleEdge::Falling => {
-                let field = runtime::component_runtime_cell_field(
-                    runtime_cells,
-                    component,
+                let field = runtime::component_internal_member_name(
                     comp,
-                    &ir::passes::runtime_cells::RuntimeCellKind::ComponentEdgePrevious {
-                        member: ir::ComponentCallableId((cycle_member_base + cycle_index) as u32),
-                    },
-                )?;
+                    &format!("_harc_component_cycle_{cycle_index}_previous"),
+                );
                 let previous = format!("{inst_path}.{field}");
-                writeln!(out, "{INDENT}{INDENT}bool {tag}_curr = (bool)({trigger});").ok();
+                writeln!(out, "{pad1}bool {tag}_curr = (bool)({trigger});").ok();
                 let cond = match ch.edge {
                     ir::CycleEdge::Rising => format!("!{previous} && {tag}_curr"),
                     ir::CycleEdge::Falling => format!("{previous} && !{tag}_curr"),
                     ir::CycleEdge::Level => unreachable!(),
                 };
-                writeln!(out, "{INDENT}{INDENT}if ({cond}) {{").ok();
+                writeln!(out, "{pad1}if ({cond}) {{").ok();
                 let call = component_callable_call(
                     prog,
                     ch.function,
@@ -2761,12 +2872,12 @@ fn emit_lifecycle_checkers(
                     bus_adapters,
                     run_context,
                 )?;
-                writeln!(out, "{INDENT}{INDENT}{INDENT}{call};").ok();
-                writeln!(out, "{INDENT}{INDENT}}}").ok();
-                writeln!(out, "{INDENT}{INDENT}{previous} = {tag}_curr;").ok();
+                writeln!(out, "{pad2}{call};").ok();
+                writeln!(out, "{pad1}}}").ok();
+                writeln!(out, "{pad1}{previous} = {tag}_curr;").ok();
             }
         }
-        writeln!(out, "{INDENT}}});").ok();
+        writeln!(out, "{pad}}});").ok();
     }
 
     if let Some(w) = &comp.watchdog {
@@ -2809,32 +2920,26 @@ fn emit_lifecycle_checkers(
                 comp,
                 ir::passes::runtime_cells::ComponentHeartbeat::Output,
             );
-            let field = runtime::component_runtime_cell_field(
-                runtime_cells,
-                component,
+            let field = runtime::component_internal_member_name(
                 comp,
-                &ir::passes::runtime_cells::RuntimeCellKind::ComponentWatchdogLast {
-                    member: ir::ComponentCallableId(
-                        (cycle_member_base + comp.cycle_handlers.len()) as u32,
-                    ),
-                },
-            )?;
+                "_harc_component_watchdog_last",
+            );
             let last = format!("{inst_path}.{field}");
-            writeln!(out, "{INDENT}_checkers.push_back([{callback_capture}]() {{").ok();
-            emit_persistent_setup_bindings(out, 2, run_context);
+            writeln!(out, "{pad}_checkers.push_back([{callback_capture}]() {{").ok();
+            emit_persistent_setup_bindings(out, depth + 1, run_context);
             writeln!(
                 out,
-                "{INDENT}{INDENT}int64_t {tag}_period = (int64_t)({period});"
+                "{pad1}int64_t {tag}_period = (int64_t)({period});"
             )
             .ok();
             writeln!(
             out,
-            "{INDENT}{INDENT}if ({tag}_period > 0 && (int64_t)cycle_count - {last} >= {tag}_period) {{"
+            "{pad1}if ({tag}_period > 0 && (int64_t)cycle_count - {last} >= {tag}_period) {{"
         )
         .ok();
             writeln!(
                 out,
-                "{INDENT}{INDENT}{INDENT}{last} = (int64_t)cycle_count;"
+                "{pad2}{last} = (int64_t)cycle_count;"
             )
             .ok();
             // 1. User body (typically a heartbeat log).
@@ -2848,32 +2953,32 @@ fn emit_lifecycle_checkers(
                 bus_adapters,
                 run_context,
             )?;
-            writeln!(out, "{INDENT}{INDENT}{INDENT}{call};").ok();
+            writeln!(out, "{pad2}{call};").ok();
             // 2. Idle check — trips FAIL when BOTH activity stamps are
             //    `max_idle` cycles behind. Mirrors v1's emit_watchdog idle
             //    block (framework error-counter bump on trip).
             writeln!(
                 out,
-                "{INDENT}{INDENT}{INDENT}int64_t {tag}_max_idle = (int64_t)({max_idle});"
+                "{pad2}int64_t {tag}_max_idle = (int64_t)({max_idle});"
             )
             .ok();
             writeln!(
             out,
-            "{INDENT}{INDENT}{INDENT}if ({tag}_max_idle > 0 \
+            "{pad2}if ({tag}_max_idle > 0 \
              && (int64_t)((uint64_t)cycle_count - {inst_path}.{input_heartbeat}) >= {tag}_max_idle \
              && (int64_t)((uint64_t)cycle_count - {inst_path}.{output_heartbeat}) >= {tag}_max_idle) {{"
         )
         .ok();
             writeln!(
             out,
-            "{INDENT}{INDENT}{INDENT}{INDENT}sim_log_line(\"FAIL\", \"watchdog: {} has been idle for >= %lld cycles\", (long long){tag}_max_idle);",
+            "{pad3}sim_log_line(\"FAIL\", \"watchdog: {} has been idle for >= %lld cycles\", (long long){tag}_max_idle);",
             comp.name
         )
         .ok();
-            writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}ctx.errors++;").ok();
-            writeln!(out, "{INDENT}{INDENT}{INDENT}}}").ok();
-            writeln!(out, "{INDENT}{INDENT}}}").ok();
-            writeln!(out, "{INDENT}}});").ok();
+            writeln!(out, "{pad3}ctx.errors++;").ok();
+            writeln!(out, "{pad2}}}").ok();
+            writeln!(out, "{pad1}}}").ok();
+            writeln!(out, "{pad}}});").ok();
         }
     }
 
@@ -2885,7 +2990,6 @@ fn emit_lifecycle_checkers(
             emit_lifecycle_checkers(
                 out,
                 prog,
-                runtime_cells,
                 *sub,
                 &sub_path,
                 ir::resolve_component_path_mode(
@@ -2902,6 +3006,7 @@ fn emit_lifecycle_checkers(
                 None,
                 bus_adapters,
                 run_context,
+                depth,
             )?;
         }
     }
@@ -2914,7 +3019,7 @@ fn emit_tb_periodic_services(
     runtime_cells: expr::RuntimeCellRenderBinding<'_>,
     run_context: Option<&str>,
 ) -> Result<(), EmitError> {
-    let callback_capture = persistent_setup_capture(run_context);
+    let callback_capture = persistent_setup_capture(run_context, None);
     for svc in &tb.periodic_services {
         let lambda = runtime_cells.test_hook(svc.function)?;
         let kind = ir::passes::runtime_cells::RuntimeCellKind::TestbenchPeriodicLast {
@@ -2953,7 +3058,7 @@ fn emit_tb_cycle_services(
     runtime_cells: expr::RuntimeCellRenderBinding<'_>,
     run_context: Option<&str>,
 ) -> Result<(), EmitError> {
-    let callback_capture = persistent_setup_capture(run_context);
+    let callback_capture = persistent_setup_capture(run_context, None);
     for svc in &tb.cycle_services {
         let lambda = runtime_cells.test_hook(svc.function)?;
         let trigger = func::tb_service_expr_cpp(
@@ -3090,6 +3195,13 @@ fn emit_test(
 
     if needs_tb_struct(tb) {
         writeln!(out, "{INDENT}{} _tb;", tb.name).ok();
+    }
+    let has_async_test_hook = prog.functions.iter().any(|function| {
+        runtime::test_hook_belongs_to_test(function, test)
+            && func::test_hook_is_async_cycle(function)
+    });
+    if has_async_test_hook {
+        writeln!(out, "{INDENT}std::vector<std::unique_ptr<harc_rt::ThreadSlot>> _harc_callback_slots;").ok();
     }
     // Regblock mirrors are explicit per-run state shared by every callable in
     // the owning test. Callback-bearing bindings additionally own one
@@ -3278,6 +3390,17 @@ fn emit_test(
                 )?;
             }
         }
+    }
+    for binding in &tb.component_fields {
+        emit_component_covergroup_registrations(
+            out,
+            prog,
+            binding.component,
+            &binding.field,
+            &opts.vec_lane_widths,
+            &opts.dut_port_widths,
+            dut_access,
+        )?;
     }
     // tseq generator lambdas — one `<Name>` per `tseq` declaration in the
     // file, declared before the run coroutine so its `[&]` capture sees
@@ -3543,7 +3666,11 @@ fn emit_test(
                     },
                     runtime_cells: runtime_cell_binding,
                     common_contextual_tseqs: None,
+                    randomize_snippets,
+                    outofline_lifecycle: Some(outofline_lifecycle),
                     durable_capture: false,
+                    async_scheduler: "sched",
+                    async_slots: "_harc_callback_slots",
                 },
             )?;
         }
@@ -3637,7 +3764,6 @@ fn emit_test(
         emit_lifecycle_checkers(
             out,
             prog,
-            runtime_cells,
             cf.component,
             &cf.field,
             cf.mode,
@@ -3647,6 +3773,7 @@ fn emit_test(
             bound_bus,
             None,
             None,
+            1,
         )?;
     }
 

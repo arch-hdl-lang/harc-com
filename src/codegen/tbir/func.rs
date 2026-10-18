@@ -156,7 +156,13 @@ pub(super) struct TestHookRenderBindings<'a> {
     pub flow: FlowRenderBindings<'a>,
     pub runtime_cells: Option<RuntimeCellRenderBinding<'a>>,
     pub common_contextual_tseqs: Option<&'a BTreeSet<FunctionId>>,
+    pub randomize_snippets: &'a [String],
+    pub outofline_lifecycle: Option<&'a HashMap<FunctionId, LifecycleEmit>>,
     pub durable_capture: bool,
+    /// Scheduler and owning slot vector used by suspending statement-cycle
+    /// hooks. Other hook kinds remain synchronous.
+    pub async_scheduler: &'a str,
+    pub async_slots: &'a str,
 }
 
 /// Per-local emitted C++ names. Lowering already deduplicated names
@@ -3042,15 +3048,63 @@ fn emit_stmt(
                 *mode,
                 None,
                 None,
-                None,
+                cx.bindings.run_context,
                 depth,
             )?;
             for edge in &schema.connects {
                 if super::edge_is_enabled(prog, *component, *mode, edge) {
-                    super::emit_one_connect(out, prog, &name, edge, None, depth);
+                    super::emit_one_connect(
+                        out,
+                        prog,
+                        &name,
+                        edge,
+                        cx.bindings.run_context,
+                        depth,
+                    );
                 }
             }
-            super::emit_nested_connects(out, prog, *component, &name, *mode, None, depth);
+            super::emit_nested_connects(
+                out,
+                prog,
+                *component,
+                &name,
+                *mode,
+                cx.bindings.run_context,
+                depth,
+            );
+            let dut_receiver = cx.bindings.dut_receiver.unwrap_or("dut");
+            super::emit_component_dut_bindings(
+                out,
+                prog,
+                *component,
+                &name,
+                cx.dut_type,
+                dut_receiver,
+                depth,
+            )?;
+            super::emit_component_covergroup_registrations(
+                out,
+                prog,
+                *component,
+                &name,
+                cx.lanes,
+                cx.lanes,
+                cx.dut_access,
+            )?;
+            super::emit_lifecycle_checkers(
+                out,
+                prog,
+                *component,
+                &name,
+                *mode,
+                cx.dut_type,
+                cx.dut_access,
+                cx.lanes,
+                None,
+                None,
+                cx.bindings.run_context,
+                depth,
+            )?;
         }
         Stmt::TransactorCall { dest, call } => {
             let Expr::Call(
@@ -3987,6 +4041,9 @@ fn emit_stmt(
             }
             None => emit_log_call(out, cx, "FAIL", None, args, depth)?,
         },
+        Stmt::ErrorIncrement => {
+            writeln!(out, "{pad}ctx.errors++;").ok();
+        }
         Stmt::ScoreboardOp {
             sb,
             field,
@@ -8498,6 +8555,10 @@ pub(super) fn emit_test_hook(
     let pad1 = INDENT.repeat(depth + 1);
     let pad2 = INDENT.repeat(depth + 2);
     let pad3 = INDENT.repeat(depth + 3);
+    let empty_lifecycle = HashMap::new();
+    let outofline_lifecycle = render
+        .outofline_lifecycle
+        .unwrap_or(&empty_lifecycle);
 
     // Hooks are void in this subset; a value-returning hook is never
     // produced by lowering (the firing site discards any result).
@@ -8528,7 +8589,15 @@ pub(super) fn emit_test_hook(
             ))
         })?
         .test_hook(func.id)?;
-    if render.durable_capture {
+    let async_cycle = test_hook_is_async_cycle(func);
+    let body_name = format!("_harc_test_hook_coro_fn{}", func.id.0);
+    if async_cycle {
+        writeln!(
+            out,
+            "{pad}auto {body_name} = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {{"
+        )
+        .ok();
+    } else if render.durable_capture {
         writeln!(
             out,
             "{pad}{storage} = [_harc_callback_state = &_harc_run_state, _harc_callback_context = &ctx]({params}) -> void {{"
@@ -8619,20 +8688,33 @@ pub(super) fn emit_test_hook(
             }
             Terminator::WaitCycles(n, None, b) | Terminator::WaitCyclesSync(n, b) => {
                 let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
-                let tick = render
-                    .flow
-                    .run_context
-                    .map(|context| format!("harc_tseq_tick({context})"))
-                    .unwrap_or_else(|| "tick()".to_string());
-                writeln!(
-                    out,
-                    "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) {tick};"
-                )
-                .ok();
+                if async_cycle {
+                    writeln!(out, "{pad3}co_await harc_rt::wait_cycles(_slot, (uint32_t)({n}));").ok();
+                } else {
+                    let tick = render
+                        .flow
+                        .run_context
+                        .map(|context| format!("harc_tseq_tick({context})"))
+                        .unwrap_or_else(|| "tick()".to_string());
+                    writeln!(
+                        out,
+                        "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) {tick};"
+                    )
+                    .ok();
+                }
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::WaitCycles(n, Some(clock), b) => {
-                if render.flow.run_context.is_some() {
+                if async_cycle {
+                    let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
+                    let clocks = render
+                        .flow
+                        .run_context
+                        .map(|context| format!("{context}.clocks"))
+                        .unwrap_or_else(|| "clocks_".to_string());
+                    writeln!(out, "{pad3}auto _harc_target_edges = {clocks}[{}].rising_count + (uint64_t)({n});", clock.index).ok();
+                    writeln!(out, "{pad3}co_await harc_rt::wait_until(_slot, [&] {{ return {clocks}[{}].rising_count >= _harc_target_edges; }});", clock.index).ok();
+                } else if render.flow.run_context.is_some() {
                     let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
                     writeln!(
                         out,
@@ -8663,16 +8745,40 @@ pub(super) fn emit_test_hook(
             }
             Terminator::WaitUntil { preds, mode, succ } => {
                 let cond = preds_cpp(&cx, preds, *mode)?;
-                let tick = render
-                    .flow
-                    .run_context
-                    .map(|context| format!("harc_tseq_tick({context})"))
-                    .unwrap_or_else(|| "tick()".to_string());
-                writeln!(out, "{pad3}while (!({cond})) {tick};").ok();
+                if async_cycle {
+                    writeln!(out, "{pad3}co_await harc_rt::wait_until(_slot, [&] {{ return {cond}; }});").ok();
+                } else {
+                    let tick = render
+                        .flow
+                        .run_context
+                        .map(|context| format!("harc_tseq_tick({context})"))
+                        .unwrap_or_else(|| "tick()".to_string());
+                    writeln!(out, "{pad3}while (!({cond})) {tick};").ok();
+                }
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
+            Terminator::WaitUntilTimeout {
+                preds,
+                mode,
+                cycles,
+                on_fire,
+                on_timeout,
+            } if async_cycle => {
+                let cond = preds_cpp(&cx, preds, *mode)?;
+                let n = bounded_count_expr_cpp(&cx, cycles, u32::MAX as u64)?;
+                writeln!(out, "{pad3}bool _harc_satisfied = co_await harc_rt::wait_until_timeout(_slot, [&] {{ return {cond}; }}, (uint32_t)({n}));").ok();
+                writeln!(out, "{pad3}if (_harc_satisfied) {{ __bb = {}; }} else {{ errors++; __bb = {}; }}", on_fire.0, on_timeout.0).ok();
+            }
             Terminator::WaitTimePs(ps, b) => {
-                if let Some(context) = render.flow.run_context {
+                if async_cycle {
+                    let now = render
+                        .flow
+                        .run_context
+                        .map(|context| format!("{context}.now_ps"))
+                        .unwrap_or_else(|| "now_ps".to_string());
+                    writeln!(out, "{pad3}auto _harc_target_ps = {now} + {ps};").ok();
+                    writeln!(out, "{pad3}co_await harc_rt::wait_until(_slot, [&] {{ return {now} >= _harc_target_ps; }});").ok();
+                } else if let Some(context) = render.flow.run_context {
                     writeln!(
                         out,
                         "{pad3}harc_eval_clocks_until({context}, {context}.now_ps + {ps});"
@@ -8683,8 +8789,125 @@ pub(super) fn emit_test_hook(
                 }
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
+            Terminator::Randomize {
+                target,
+                constraints,
+                succ,
+            } => {
+                let run_context = cx.bindings.run_context.unwrap_or("ctx");
+                let state_receiver = randomize_state_receiver(
+                    func,
+                    *constraints,
+                    render
+                        .runtime_cells
+                        .filter(|_| cx.bindings.run_context.is_some()),
+                    run_context,
+                )?;
+                let snippet = randomize_snippet_for(
+                    prog,
+                    func,
+                    &names,
+                    *target,
+                    *constraints,
+                    render.randomize_snippets,
+                    run_context,
+                    &state_receiver,
+                    cx.bindings.self_receiver,
+                )?
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: Randomize in hook {} references missing constraint snippet c{}",
+                        func.name, constraints.0
+                    ))
+                })?;
+                out.push_str(&snippet);
+                writeln!(out, "{pad3}__bb = {};", succ.0).ok();
+            }
+            Terminator::TbLifecycleCall { function, succ } => {
+                let callee = prog.function(*function);
+                let testbench_receiver = cx.bindings.testbench_receiver.ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: lifecycle call in hook {} has no testbench receiver",
+                        func.name
+                    ))
+                })?;
+                match outofline_lifecycle.get(function).copied() {
+                    Some(LifecycleEmit::Plain) => {
+                        writeln!(
+                            out,
+                            "{pad3}{}(ctx, {testbench_receiver});",
+                            lifecycle_cpp_name(&callee.name)
+                        )
+                        .ok();
+                    }
+                    Some(LifecycleEmit::Coro) => {
+                        writeln!(
+                            out,
+                            "{pad3}{{ auto _lc_sub = {}(ctx, {testbench_receiver}, _slot); _lc_sub.resume();",
+                            lifecycle_cpp_name(&callee.name)
+                        )
+                        .ok();
+                        writeln!(
+                            out,
+                            "{pad3}{INDENT}while (!_lc_sub.done()) {{ co_await harc_rt::harc_lifecycle_yield(); _lc_sub.resume(); }}"
+                        )
+                        .ok();
+                        writeln!(out, "{pad3}{INDENT}_lc_sub.destroy(); }}").ok();
+                    }
+                    None => {
+                        if let Some(contextual_tseqs) = render.common_contextual_tseqs {
+                            emit_common_function(
+                                out,
+                                prog,
+                                callee,
+                                &prog.records,
+                                &owner_testbench.bus_bindings,
+                                cx.lanes,
+                                render.randomize_snippets,
+                                dut_type,
+                                &HashSet::new(),
+                                depth + 3,
+                                contextual_tseqs,
+                                render.runtime_cells,
+                                render.flow,
+                                outofline_lifecycle,
+                            )?;
+                        } else {
+                            emit_function(
+                                out,
+                                prog,
+                                callee,
+                                &prog.records,
+                                &owner_testbench.bus_bindings,
+                                cx.lanes,
+                                render.randomize_snippets,
+                                dut_type,
+                                &HashSet::new(),
+                                depth + 3,
+                                render.runtime_cells,
+                                render.flow,
+                                outofline_lifecycle,
+                            )?;
+                        }
+                    }
+                }
+                writeln!(out, "{pad3}__bb = {};", succ.0).ok();
+            }
+            Terminator::Fatal(args) => {
+                emit_log_call(out, &cx, "FATAL", None, args, depth + 3)?;
+                writeln!(out, "{pad3}errors++; _fatal = true;").ok();
+                if async_cycle {
+                    writeln!(out, "{pad3}co_return;").ok();
+                } else {
+                    writeln!(out, "{pad3}return;").ok();
+                }
+            }
             Terminator::Return => {
-                writeln!(out, "{pad3}return;").ok();
+                if async_cycle {
+                    writeln!(out, "{pad3}co_return;").ok();
+                } else {
+                    writeln!(out, "{pad3}return;").ok();
+                }
             }
             other => {
                 return Err(EmitError(format!(
@@ -8696,11 +8919,50 @@ pub(super) fn emit_test_hook(
         writeln!(out, "{pad3}break;").ok();
         writeln!(out, "{pad2}}}").ok();
     }
-    writeln!(out, "{pad2}default: return;").ok();
+    if async_cycle {
+        writeln!(out, "{pad2}default: co_return;").ok();
+    } else {
+        writeln!(out, "{pad2}default: return;").ok();
+    }
     writeln!(out, "{pad2}}}").ok(); // switch
     writeln!(out, "{pad1}}}").ok(); // while
     writeln!(out, "{pad}}};").ok(); // lambda
+    if async_cycle {
+        let scheduler = render.async_scheduler;
+        let slots = render.async_slots;
+        if render.durable_capture {
+            writeln!(out, "{pad}{storage} = [&{body_name}, _harc_async_context = &ctx]() -> void {{").ok();
+            writeln!(out, "{pad1}auto& _harc_slot = *(_harc_async_context->actor_slots.emplace_back(std::make_unique<harc_rt::ThreadSlot>()));").ok();
+            writeln!(out, "{pad1}_harc_async_context->scheduler.slots.push_back(&_harc_slot);").ok();
+        } else {
+            writeln!(out, "{pad}{storage} = [&]() -> void {{").ok();
+            writeln!(out, "{pad1}auto& _harc_slot = *({slots}.emplace_back(std::make_unique<harc_rt::ThreadSlot>()));").ok();
+            writeln!(out, "{pad1}{scheduler}.slots.push_back(&_harc_slot);").ok();
+        }
+        writeln!(out, "{pad1}_harc_slot.thread = {body_name}(&_harc_slot);").ok();
+        writeln!(out, "{pad1}_harc_slot.thread.resume();").ok();
+        writeln!(out, "{pad}}};").ok();
+    }
     Ok(())
+}
+
+pub(super) fn test_hook_is_async_cycle(func: &TbFunction) -> bool {
+    matches!(
+        func.kind,
+        FunctionKind::TestHook {
+            member: crate::ir::TestHookMember::StatementCycle(_),
+            ..
+        }
+    ) && func.blocks.iter().any(|block| {
+        matches!(
+            block.terminator,
+            Terminator::WaitCycles(..)
+                | Terminator::WaitCyclesSync(..)
+                | Terminator::WaitUntil { .. }
+                | Terminator::WaitUntilTimeout { .. }
+                | Terminator::WaitTimePs(..)
+        )
+    })
 }
 
 #[cfg(test)]

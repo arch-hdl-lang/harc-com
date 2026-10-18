@@ -1024,6 +1024,10 @@ pub(super) fn component_struct(
                 )
                 .ok();
             }
+            ComponentFieldKind::Covgroup { covgroup } => {
+                let name = &prog.covgroups[covgroup.index()].name;
+                writeln!(out, "{INDENT}{name} {}{{}};", f.name).ok();
+            }
             ComponentFieldKind::Sub { component, .. } => {
                 let cname = &components[component.index()].name;
                 writeln!(out, "{INDENT}{cname} {};", f.name).ok();
@@ -1255,28 +1259,6 @@ pub(super) fn component_internal_member_name(
         name = format!("_u_{name}");
     }
     name
-}
-
-pub(super) fn component_runtime_cell_field(
-    plan: &crate::ir::passes::runtime_cells::RuntimeCellPlan,
-    component: crate::ir::ComponentId,
-    schema: &crate::ir::ComponentSchema,
-    kind: &crate::ir::passes::runtime_cells::RuntimeCellKind,
-) -> Result<String, super::EmitError> {
-    let owner = crate::ir::passes::runtime_cells::RuntimeCellOwner::ComponentInstance {
-        component,
-        name: schema.name.clone(),
-    };
-    let cell = plan.find(&owner, kind).ok_or_else(|| {
-        super::EmitError(format!(
-            "tbir: component `{}` has no planned runtime cell {kind:?}",
-            schema.name
-        ))
-    })?;
-    Ok(component_internal_member_name(
-        schema,
-        &format!("_harc_{}", cell.symbol()),
-    ))
 }
 
 pub(super) fn component_copy_method_name(component: &crate::ir::ComponentSchema) -> String {
