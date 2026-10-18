@@ -1,7 +1,7 @@
 //! Statement lowering — one IR form per AST construct (design doc
 //! §"Statements within a run / check / transactor body").
 
-use super::{not_implemented, unsupported, FuncBuilder, LowerError, V1Status};
+use super::{not_implemented, FuncBuilder, LowerError, V1Status};
 use crate::ast::{
     BuiltinTy, CallArg, Expr as AstExpr, ExprKind, Ident, Stmt as AstStmt, StmtKind, TypeArg,
     TypeExpr,
@@ -1329,7 +1329,7 @@ impl FuncBuilder<'_> {
                 if let Some(detail) =
                     crate::ir::component_local_runtime_requirement(&self.ctx.components, component)
                 {
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         &format!(
                             "default-constructed component local `{}` of type `{}`",
                             l.name.name, self.ctx.components[component.index()].name
@@ -1337,6 +1337,7 @@ impl FuncBuilder<'_> {
                         format!(
                             "v1 installs per-instance runtime infrastructure for {detail}; TB-IR component locals currently support state, methods, event subscriptions, and internal connect graphs"
                         ),
+                        V1Status::WorksButRetired,
                     ));
                 }
                 let id = self.declare(&l.name.name);
@@ -6129,11 +6130,12 @@ impl FuncBuilder<'_> {
             ));
         }
         if super::function_suspends(&f) {
-            return Err(unsupported(
+            return Err(not_implemented(
                 "a `wait` inside a statement-position `on` handler body",
                 "the body runs from the per-cycle checker pass, and waits are not yet \
                  represented safely there — move the wait into the run body, or gate the \
                  run body on the same condition with `wait until`",
+                V1Status::Unreliable,
             ));
         }
         self.commit_pending_function(pending_id, f);
@@ -6300,11 +6302,12 @@ impl FuncBuilder<'_> {
                     V1Status::SilentlyMisLowers,
                 ));
             }
-            return Err(unsupported(
+            return Err(not_implemented(
                 construct,
                 "the body needs a statement-level step (a hoisted DUT read, an inlined \
                  helper, or a transactor call), which cannot run inside a per-cycle \
                  concurrent check",
+                V1Status::Unreliable,
             ));
         }
         Ok(out)
@@ -7666,9 +7669,10 @@ fn parse_fmt_capture(capture: &str) -> Result<AstExpr, LowerError> {
 }
 
 pub(crate) fn lazy_message_call_error(what: &str) -> LowerError {
-    unsupported(
+    not_implemented(
         &format!("{what} inside a message"),
         "the call is conditionally evaluated; bind the lazy expression to a `let` before formatting it",
+        V1Status::Unreliable,
     )
 }
 

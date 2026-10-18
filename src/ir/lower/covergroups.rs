@@ -7,8 +7,8 @@
 //! Hook triggers stay explicit in the schema — never silently mis-lowered.
 
 use super::{
-    fold_const, helpers::HelperRegistry, not_implemented, unsupported, ConstFoldErr, ConstVal,
-    LowerError, V1Status,
+    fold_const, helpers::HelperRegistry, not_implemented, ConstFoldErr, ConstVal, LowerError,
+    V1Status,
 };
 use crate::ast::{
     BinaryOp, Block, CoverItem, CoverTrigger, CovergroupDecl, Expr as AstExpr, ExprKind,
@@ -869,9 +869,10 @@ fn lower_point_target(
                                     V1Status::SilentlyMisLowers,
                                 ));
                             }
-                            return Err(unsupported(
+                            return Err(not_implemented(
                                 &construct,
                                 "only pure file-scope helper functions can be sampled in coverpoints",
+                                V1Status::WorksButRetired,
                             ));
                         }
                         if args.len() != entry.decl.params.len() {
@@ -1040,7 +1041,8 @@ fn lower_point_target(
 /// `wait` recursively re-enters sampling at runtime, while `after` emits an
 /// invalid value expression. `HelperEntry::pure == false` is much broader
 /// (DUT reads, logging, assertions, and conservative unknown shapes), several
-/// of which remain usable under v1 and must retain an honest fallback.
+/// of which used to run under v1; their measured legacy behavior is retained
+/// without presenting the retired backend as a fallback.
 fn block_contains_direct_cycle_suspension(block: &Block, after: bool) -> bool {
     fn stmt_contains(stmt: &crate::ast::Stmt, after: bool) -> bool {
         match &stmt.kind {

@@ -5,11 +5,10 @@
 //! port read/write, `let`/assign, `log`/`logf`, inline `assert ...
 //! else fail`, `fail`, `wait N cycles`, `wait until` in its single
 //! and `all of` forms with optional `timeout`, `if`/`for`/`while`/
-//! `repeat`/`loop`/`break`/`continue`). Everything else is rejected
-//! with
-//! `LowerError::Unsupported` naming the construct — lowering NEVER
-//! silently mis-lowers. Re-run with `--codegen v1` to use the legacy
-//! direct AST → C++ path for unsupported constructs.
+//! `repeat`/`loop`/`break`/`continue`). Constructs outside the implemented
+//! surface are rejected with a precise `LowerError::NotImplemented` or
+//! `LowerError::Invalid` classification — lowering never silently
+//! mis-lowers, and the retired v1 backend is not presented as a fallback.
 
 /// The widest scalar that is still a builtin C++ integer type.
 /// Past this, `local_scalar_cty` renders the value as
@@ -113,6 +112,14 @@ pub enum V1Status {
     /// while its owner is unreachable, but fails once that owner is
     /// instantiated. This is not a usable backend fallback.
     ReachabilityDependent,
+    /// v1 implements this particular source shape, but it is a retired
+    /// backend and is no longer offered as an escape hatch for a missing
+    /// TB-IR feature.
+    WorksButRetired,
+    /// v1's behavior depends on control-flow reachability or runtime
+    /// re-entry: some instances happen to run, while neighboring shapes
+    /// hang, recurse, or fail to compile. It is not a dependable fallback.
+    Unreliable,
 }
 
 impl V1Status {
@@ -127,6 +134,12 @@ impl V1Status {
             }
             V1Status::ReachabilityDependent => {
                 "`--codegen v1` only ignores it while its owner is unreachable and fails once the owner is instantiated"
+            }
+            V1Status::WorksButRetired => {
+                "the retired `--codegen v1` backend implemented this shape, but is no longer a supported fallback"
+            }
+            V1Status::Unreliable => {
+                "the retired `--codegen v1` backend is control-flow/runtime dependent for this shape and is not a reliable fallback"
             }
         }
     }
@@ -199,16 +212,9 @@ impl LowerDiagnosticRecorder {
     }
 }
 
-pub(crate) fn unsupported(construct: &str, detail: impl Into<String>) -> LowerError {
-    LowerError::Unsupported {
-        construct: construct.to_string(),
-        detail: detail.into(),
-    }
-}
-
-/// A construct no backend implements. Prefer this over [`unsupported`]
-/// whenever `--codegen v1` would not actually help — the whole point of
-/// the v1 suggestion is that it is a working escape hatch.
+/// A construct the current backend does not implement. `v1` records the
+/// measured legacy behavior without presenting the retired backend as an
+/// escape hatch.
 pub(crate) fn not_implemented(
     construct: &str,
     detail: impl Into<String>,
@@ -424,14 +430,13 @@ impl ConstVal {
 }
 
 /// A const-initializer fold failure (issue #521): `Unsupported` is a
-/// construct outside the constant-expression subset (surfaced as
-/// `LowerError::Unsupported`, which suggests `--codegen v1`), while
-/// `Invalid` is a well-formed constant expression whose evaluation is
-/// illegal — division by zero, an out-of-range shift, an unknown or
-/// cyclic constant reference, a value that violates the declared
-/// width. Those are program errors under every backend (v1 would hit
-/// C++ UB or silently mis-evaluate), so they surface as
-/// `LowerError::Invalid` with a precise diagnostic instead.
+/// construct outside the constant-expression subset, while `Invalid` is a
+/// well-formed constant expression whose evaluation is illegal — division by
+/// zero, an out-of-range shift, an unknown or cyclic constant reference, or a
+/// value that violates the declared width. Callers classify the former using
+/// measured legacy behavior; the latter is a program error under every
+/// backend (v1 would hit C++ UB or silently mis-evaluate), so it surfaces as
+/// `LowerError::Invalid` with a precise diagnostic.
 pub(crate) enum ConstFoldErr {
     Unsupported(String),
     Invalid(String),
@@ -7356,9 +7361,8 @@ pub(crate) fn reject_misplaced_named_args(
 /// v1 routes EVERY hooked `on` through that resolver and refuses
 /// anything else outright — "obj.method must resolve to a `hookable` on
 /// a known component type", or "`on <obj>.<method> phase post_eval` is
-/// not supported". So this is the line between a TB-IR subset gap
-/// (`Unsupported`, and `--codegen v1` is a real escape hatch) and
-/// `NotImplemented { Rejects }`.
+/// not supported". The distinction is retained as measured legacy behavior
+/// in `V1Status`; neither side presents the retired backend as a fallback.
 ///
 /// Deliberately structural, and it does its OWN walk rather than
 /// delegating to `components::dotted_path`. Two predicates were tried

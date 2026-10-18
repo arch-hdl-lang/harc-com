@@ -1848,13 +1848,16 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     // rejected here into an internal error. The scoreboard
                     // list decoder routes through the shared
                     // `field_scalar_width_ok`, so the two must agree.
-                    let valid_elem =
-                        matches!(elem, IrType::Bool | IrType::UInt(None) | IrType::SInt(None))
+                    fn valid_list_elem(ty: &IrType) -> bool {
+                        matches!(ty, IrType::Bool | IrType::UInt(None) | IrType::SInt(None))
                             || matches!(
-                                elem,
+                                ty,
                                 IrType::UInt(Some(width)) | IrType::SInt(Some(width))
                                     if (1..=crate::MAX_WIDTH_METHOD_BITS).contains(width)
-                            );
+                            )
+                            || matches!(ty, IrType::FixedVec { elem, .. } if valid_list_elem(elem))
+                    }
+                    let valid_elem = valid_list_elem(elem);
                     if !valid_elem {
                         errs.push(VerifyError::BadProgramRef {
                             what: format!(

@@ -829,7 +829,11 @@ pub(super) fn scoreboard_struct(
                 writeln!(out, "{INDENT}{cty} {}{{}};", f.name).ok();
             }
             crate::ir::ScoreboardFieldKind::List { elem, vec_len } => {
-                let elem = super::field_scalar_cty(elem);
+                let elem = if matches!(elem, crate::ir::IrType::FixedVec { .. }) {
+                    super::aggregate_value_cty(elem, records)
+                } else {
+                    super::field_scalar_cty(elem)
+                };
                 let elem = match vec_len {
                     Some(len) => format!("std::array<{elem}, {len}>"),
                     None => elem,

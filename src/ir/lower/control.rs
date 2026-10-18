@@ -2,7 +2,7 @@
 //! until` into the block shapes specified in docs/tb-ir-design.md
 //! §"Control flow".
 
-use super::{not_implemented, unsupported, FuncBuilder, LoopFrame, LowerError, V1Status};
+use super::{not_implemented, FuncBuilder, LoopFrame, LowerError, V1Status};
 use crate::ast::{
     Block, Expr as AstExpr, ExprKind, ForStmt, IfStmt, RepeatStmt, WaitTimeout, WaitUntilMode,
 };
@@ -576,9 +576,10 @@ impl FuncBuilder<'_> {
         for c in conditions {
             let prelude = self.expr_value_prelude_summary(c);
             if prelude.has_inline_statements() {
-                return Err(unsupported(
+                return Err(not_implemented(
                     "a value call requiring statement materialization inside a `wait until` predicate",
                     "the predicate is re-evaluated every cycle; use an explicit polling loop if a component call, queue pop, or record-valued queue front must run on each attempt",
+                    V1Status::WorksButRetired,
                 ));
             }
             // Ports stay inline — the scheduler re-samples the DUT on
@@ -597,10 +598,11 @@ impl FuncBuilder<'_> {
             if super::exprs::expr_has_bound_transactor_edge(&expr, &|field| {
                 self.ctx.bus_bindings.contains_key(field)
             }) {
-                return Err(unsupported(
+                return Err(not_implemented(
                     "a transactor method call inside a `wait until` predicate",
                     "the predicate is re-evaluated every cycle, so a call that advances time \
                      changes the timing; hoist the call into a `let` before the `wait until`",
+                    V1Status::WorksButRetired,
                 ));
             }
             preds.push(PredSrc {
