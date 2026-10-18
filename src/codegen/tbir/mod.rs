@@ -18,7 +18,7 @@ mod func;
 mod runtime;
 
 use crate::ast::SourceFile;
-use crate::codegen::cpp_tb::{EmitError, EmitOpts, GeneratedCppFile, SplitCppOutput};
+use crate::codegen::emission::{EmitError, EmitOpts, GeneratedCppFile, SplitCppOutput};
 use crate::ir::{self, TbProgram};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -249,7 +249,7 @@ pub struct SuiteScaffold {
     uses_constraint_solver: bool,
     problem_table_cpp: String,
     randomize_snippets: Vec<String>,
-    randomize_site_states: Vec<crate::codegen::cpp_tb::TbirRandomizeSiteState>,
+    randomize_site_states: Vec<crate::codegen::randomize::TbirRandomizeSiteState>,
     runtime_cells: ir::passes::runtime_cells::RuntimeCellPlan,
     dut_access: Option<ir::passes::dut_access::DutAccessPlan>,
     bus_access: Option<ir::passes::bus_access::BusAccessPlan>,
@@ -305,7 +305,7 @@ impl SuiteScaffold {
         // constraint codegen ("only the call site moves to the IR backend").
         // Empty when the program has no randomize site — the TB then never
         // links Z3, exactly like v1.
-        let randomize = crate::codegen::cpp_tb::plan_tbir_randomize_emission(
+        let randomize = crate::codegen::randomize::plan_tbir_randomize_emission(
             file,
             opts,
             &prog.constraint_sites,
@@ -324,7 +324,7 @@ impl SuiteScaffold {
         // sites. Include detection must follow the source/codegen decision,
         // not table non-emptiness, or a component-only kept struct emits Z3
         // calls without the runtime header.
-        let uses_constraint_solver = crate::codegen::cpp_tb::uses_constraint_solver(file);
+        let uses_constraint_solver = crate::codegen::randomize::uses_constraint_solver(file);
 
         // Probe reads/forces dereference `dut->rootp->...`, which needs the
         // root struct's full definition (`V<Top>___024root.h`) — the `rootp`
@@ -558,7 +558,7 @@ fn emit_selected_tests(
             .iter()
             .any(|field| matches!(field.ty, ir::IrType::Seq(_)))
     }) {
-        out.push_str(&crate::codegen::cpp_tb::emit_record_randomize_helpers(
+        out.push_str(&crate::codegen::randomize::emit_record_randomize_helpers(
             file,
             opts,
             &prog.records,
@@ -632,7 +632,7 @@ fn emit_selected_tests(
     if !helpers.is_empty() {
         writeln!(out).ok();
     }
-    crate::codegen::cpp_tb::emit_extern_fn_decls(&mut out, file);
+    crate::codegen::render_support::emit_extern_fn_decls(&mut out, file);
     for h in &helpers {
         func::emit_helper_function(&mut out, prog, h)?;
         writeln!(out).ok();
@@ -808,7 +808,7 @@ pub fn plan_split_tests(
             filename: if group_size == 1 {
                 format!(
                     "{file_prefix}test_{}.cpp",
-                    crate::codegen::cpp_tb::sanitize_file_component(&test_names[test_indices[0]])
+                    crate::codegen::common_artifacts::sanitize_file_component(&test_names[test_indices[0]])
                 )
             } else {
                 format!("{file_prefix}shard{}.cpp", index + 1)
@@ -1393,7 +1393,7 @@ pub fn check_gated_bus_access(
             if !decl.signals.iter().any(|s| s.gate.is_some()) {
                 continue;
             }
-            let env = crate::codegen::cpp_tb::bus_param_env_with_port_override(
+            let env = crate::codegen::render_support::bus_param_env_with_port_override(
                 decl,
                 bind_ty.get(b.field.as_str()).copied(),
                 opts.dut_bus_port_overrides.get(&b.field),
@@ -1455,7 +1455,7 @@ fn gated_off_error(
     };
     let g = gated.get(bind)?;
     let s = g.decl.signals.iter().find(|s| &s.name.name == sig)?;
-    if crate::codegen::cpp_tb::gate_passes(s.gate.as_ref(), &g.env) {
+    if crate::codegen::render_support::gate_passes(s.gate.as_ref(), &g.env) {
         return None;
     }
     Some(format!(
@@ -2458,7 +2458,7 @@ fn emit_component_runtime_reset(
         writeln!(out, "{pad}{inst_path}.{field} = 0;").ok();
     }
     if comp.kind == ir::ComponentKindTag::Sequencer {
-        let registry = crate::codegen::cpp_tb::component_unique_registry_name(
+        let registry = crate::codegen::render_support::component_unique_registry_name(
             comp.fields.iter().map(|field| field.name.as_str()),
         );
         writeln!(

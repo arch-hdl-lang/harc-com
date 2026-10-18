@@ -27,8 +27,9 @@ use super::expr::{
     scalar_assignment_expr_cpp, truthy_expr_cpp, wide_words_over_128, BusAdapterRenderBindings,
     CallableRenderBindings, ECx, RuntimeCellRenderBinding, TestbenchBusAdapterPlan,
 };
-use crate::codegen::cpp_tb::{
-    EmitError, TBIR_RANDOMIZE_CONTEXT_SENTINEL, TBIR_RANDOMIZE_SEQUENCER_SCOPE_SENTINEL,
+use crate::codegen::emission::EmitError;
+use crate::codegen::randomize::{
+    TBIR_RANDOMIZE_CONTEXT_SENTINEL, TBIR_RANDOMIZE_SEQUENCER_SCOPE_SENTINEL,
     TBIR_RANDOMIZE_STATE_SENTINEL, TBIR_RANDOMIZE_TARGET_SENTINEL,
     TBIR_RANDOMIZE_TSEQ_SCOPE_SENTINEL,
 };
@@ -244,7 +245,7 @@ fn randomize_snippet_for(
                 .is_some_and(|schema| schema.kind == crate::ir::ComponentKindTag::Sequencer) =>
         {
             let schema = &prog.components[component.index()];
-            let member = crate::codegen::cpp_tb::component_unique_registry_name(
+            let member = crate::codegen::render_support::component_unique_registry_name(
                 schema.fields.iter().map(|field| field.name.as_str()),
             );
             self_receiver
@@ -1598,7 +1599,7 @@ fn callable_value_cty(prog: &TbProgram, ty: &IrType) -> Result<String, EmitError
 #[cfg(test)]
 mod value_abi_type_tests {
     use super::super::field_scalar_cty;
-    use crate::codegen::cpp_tb::ir_vec_elem_class;
+    use crate::codegen::render_support::ir_vec_elem_class;
     use crate::ir::{sequence_element_compatible, value_abi_class, IrType, ValueAbiClass};
 
     #[test]

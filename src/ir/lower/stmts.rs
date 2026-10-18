@@ -390,7 +390,7 @@ impl FuncBuilder<'_> {
                 if let ExprKind::Call { callee, args } = &*e.kind {
                     if let ExprKind::Ident(id) = &*callee.kind {
                         if let Some(phase) =
-                            crate::codegen::cpp_tb::tb_lifecycle_marker_phase(&id.name)
+                            crate::codegen::source_transform::tb_lifecycle_marker_phase(&id.name)
                         {
                             if !args.is_empty() {
                                 return Err(LowerError::Invalid(format!(
@@ -5980,7 +5980,7 @@ impl FuncBuilder<'_> {
     /// is rejected rather than silently mis-lowered.
     fn with_check_body<T>(
         &mut self,
-        temporals: &[crate::codegen::cpp_tb::Temporal],
+        temporals: &[crate::codegen::source_transform::Temporal],
         construct: &str,
         f: impl FnOnce(&mut Self) -> Result<T, LowerError>,
     ) -> Result<T, LowerError> {
@@ -6076,7 +6076,7 @@ impl FuncBuilder<'_> {
     /// slot (v1's occurrence walk likewise does not recurse into operands).
     fn lower_temporal_slots(
         &mut self,
-        temporals: &[crate::codegen::cpp_tb::Temporal],
+        temporals: &[crate::codegen::source_transform::Temporal],
         construct: &str,
     ) -> Result<Vec<crate::ir::TemporalSlot>, LowerError> {
         let mut out = Vec::with_capacity(temporals.len());
@@ -6106,7 +6106,7 @@ impl FuncBuilder<'_> {
         };
         self.require_test_body(construct)?;
         let body = self.resolve_check_body(raw);
-        let temporals = crate::codegen::cpp_tb::collect_temporal_occurrences(&body);
+        let temporals = crate::codegen::source_transform::collect_temporal_occurrences(&body);
         let slots = self.lower_temporal_slots(&temporals, construct)?;
 
         let shape = match &*body.kind {
@@ -6162,7 +6162,7 @@ impl FuncBuilder<'_> {
             let id = crate::ir::PropertyCheckId(tables.property_checks.len() as u32);
             tables.property_checks.push(PropertyCheckSchema {
                 tag: format!("_p_{}_{}", raw.span.start, raw.span.end),
-                label: crate::codegen::cpp_tb::property_label(v, raw),
+                label: crate::codegen::source_transform::property_label(v, raw),
                 severity,
                 shape,
                 temporals: slots,
@@ -6203,7 +6203,7 @@ impl FuncBuilder<'_> {
             _ => format!("cov_{}_{}", raw.span.start, raw.span.end),
         };
         let body = self.resolve_check_body(raw);
-        let temporals = crate::codegen::cpp_tb::collect_temporal_occurrences(&body);
+        let temporals = crate::codegen::source_transform::collect_temporal_occurrences(&body);
         let slots = self.lower_temporal_slots(&temporals, construct)?;
         let cond = self.with_check_body(&temporals, construct, |b| b.lower_expr(&body))?;
         self.validate_truth_expr(&cond, "cover condition")?;
@@ -6235,7 +6235,7 @@ impl FuncBuilder<'_> {
         let Some(expr) = &v.expr else {
             return Err(LowerError::Invalid("assume without expression".to_string()));
         };
-        if crate::codegen::cpp_tb::is_concurrent_assertion(expr, &self.ctx.properties) {
+        if crate::codegen::source_transform::is_concurrent_assertion(expr, &self.ctx.properties) {
             return self.lower_property_check(crate::ir::PropertySeverity::AssumeFail, v, expr);
         }
         // Ports stay inline (lazy eval, like an immediate assert); a
@@ -6291,7 +6291,7 @@ impl FuncBuilder<'_> {
         // everything else is the immediate point-in-time check. The
         // legacy `property` keyword still parses but no longer changes
         // dispatch — same rule as v1's `is_concurrent_assertion`.
-        if crate::codegen::cpp_tb::is_concurrent_assertion(expr, &self.ctx.properties) {
+        if crate::codegen::source_transform::is_concurrent_assertion(expr, &self.ctx.properties) {
             return self.lower_property_check(crate::ir::PropertySeverity::Fail, v, expr);
         }
         // Ports stay inline (lazy assert eval), but a transactor-method
@@ -6659,7 +6659,7 @@ impl FuncBuilder<'_> {
     /// lockstep with `lower_fmt_impl`'s two materialization detectors, but it
     /// deliberately performs no IR lowering or builder mutation.
     fn fmt_requires_statement_materialization(&self, msg: &str) -> Result<bool, LowerError> {
-        let (_, captures) = crate::codegen::cpp_tb::process_interp(msg);
+        let (_, captures) = crate::codegen::source_transform::process_interp(msg);
         for capture in captures {
             let parsed = parse_fmt_capture(&capture.expr)?;
             if self.fmt_expr_has_hoistable_call(&parsed)?
@@ -6684,7 +6684,7 @@ impl FuncBuilder<'_> {
     }
 
     fn lower_fmt_impl(&mut self, msg: &str, hoist: bool) -> Result<FmtArgs, LowerError> {
-        let (fmt, caps) = crate::codegen::cpp_tb::process_interp(msg);
+        let (fmt, caps) = crate::codegen::source_transform::process_interp(msg);
         let mut parsed_caps = Vec::with_capacity(caps.len());
         for c in caps {
             // `Invalid`, not `Unsupported`. A capture that does not parse is

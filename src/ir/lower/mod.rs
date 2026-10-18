@@ -1590,11 +1590,11 @@ fn lower_program_impl(
     // testbench `TestbenchLifecycle` lowering below. Empty when the switch
     // is off (historical inlining folds the bodies into each test instead).
     let (file, shared_lifecycle_bodies) = if native_lifecycle_enabled() {
-        crate::codegen::cpp_tb::desugar_impl_for_test_sharing_lifecycle(file)
+        crate::codegen::source_transform::desugar_impl_for_test_sharing_lifecycle(file)
     } else {
         (
-            crate::codegen::cpp_tb::desugar_impl_for_test_in_file(file),
-            crate::codegen::cpp_tb::SharedLifecycleBodies::new(),
+            crate::codegen::source_transform::desugar_impl_for_test_in_file(file),
+            crate::codegen::source_transform::SharedLifecycleBodies::new(),
         )
     };
 
@@ -2108,7 +2108,7 @@ fn lower_program_impl(
     let bad_handle = |t: Option<&TypeExpr>| -> Option<String> {
         let t = t?;
         // A top-level handle is valid only for the DUT model itself.
-        if let Some(n) = crate::codegen::cpp_tb::verilated_handle_name(t) {
+        if let Some(n) = crate::codegen::source_transform::verilated_handle_name(t) {
             if !dut_types.contains(n) {
                 return Some(n.to_string());
             }
@@ -2117,7 +2117,7 @@ fn lower_program_impl(
         // types, so only emitted record schemas are valid. The DUT is not
         // an exception here: a container uses `Top`, while the available
         // model type is `VTop`.
-        let n = crate::codegen::cpp_tb::element_type_name(t)?;
+        let n = crate::codegen::source_transform::element_type_name(t)?;
         (!record_ids.contains_key(n)).then(|| n.to_string())
     };
     // File order, not `extern_fn_decls` order: that is a `HashMap`, so
@@ -2852,7 +2852,7 @@ fn lower_program_impl(
     let mut record_keeps: HashMap<String, Vec<crate::ast::Expr>> = HashMap::new();
     for (name, body) in &record_bodies {
         let keeps =
-            crate::codegen::cpp_tb::collect_record_keeps(body, &record_bodies, &record_fields);
+            crate::codegen::source_transform::collect_record_keeps(body, &record_bodies, &record_fields);
         if !keeps.is_empty() {
             record_keeps.insert(name.clone(), keeps);
         }
@@ -4401,7 +4401,7 @@ fn lower_test(
     // source-testbench name + phase), and the dedup map of the once-
     // lowered `TestbenchLifecycle` FunctionIds shared across binding tests.
     // Both empty when `HARC_TBIR_NATIVE_LIFECYCLE` is off.
-    shared_lifecycle_bodies: &crate::codegen::cpp_tb::SharedLifecycleBodies,
+    shared_lifecycle_bodies: &crate::codegen::source_transform::SharedLifecycleBodies,
     shared_lifecycle_fns: &mut HashMap<String, HashMap<crate::ast::LifecyclePhase, FunctionId>>,
     bound_initiator_templates: &HashMap<TransactorId, BoundInitiatorTemplate>,
     bound_component_templates: &HashMap<ir::ComponentId, BoundComponentTemplate>,
@@ -5487,7 +5487,7 @@ fn lower_test(
                         let mut hm = h.clone();
                         let params: HashSet<String> =
                             h.params.iter().map(|p| p.name.name.clone()).collect();
-                        crate::codegen::cpp_tb::rewrite_testbench_scope_body(
+                        crate::codegen::source_transform::rewrite_testbench_scope_body(
                             &mut hm.body,
                             c,
                             &params,
@@ -5537,7 +5537,7 @@ fn lower_test(
                             } else {
                                 HashSet::new()
                             };
-                        crate::codegen::cpp_tb::rewrite_testbench_scope_body(
+                        crate::codegen::source_transform::rewrite_testbench_scope_body(
                             &mut handler.body,
                             c,
                             &payload_names,
@@ -9004,7 +9004,7 @@ fn lower_tb_periodic_service_body<'a>(
     member: ir::TestHookMember,
 ) -> Result<TbFunction, LowerError> {
     let mut body = h.body.clone();
-    crate::codegen::cpp_tb::rewrite_testbench_scope_body(&mut body, tb, &HashSet::new());
+    crate::codegen::source_transform::rewrite_testbench_scope_body(&mut body, tb, &HashSet::new());
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.lower_block_stmts(&body)?;
     if !b.is_terminated() {
@@ -9049,7 +9049,7 @@ fn lower_tb_cycle_service_body<'a>(
         h.event.span,
         ctx.source_id,
     );
-    crate::codegen::cpp_tb::rewrite_testbench_scope_body(&mut trigger_wrapper, tb, &HashSet::new());
+    crate::codegen::source_transform::rewrite_testbench_scope_body(&mut trigger_wrapper, tb, &HashSet::new());
     trigger_wrapper.stmt_sources.remove(0);
     let StmtKind::Expr(rewritten) = trigger_wrapper.stmts.remove(0).kind else {
         unreachable!("trigger wrapper holds exactly the Expr statement we inserted");
@@ -9057,7 +9057,7 @@ fn lower_tb_cycle_service_body<'a>(
     trigger_expr = rewritten;
 
     let mut body = h.body.clone();
-    crate::codegen::cpp_tb::rewrite_testbench_scope_body(&mut body, tb, &HashSet::new());
+    crate::codegen::source_transform::rewrite_testbench_scope_body(&mut body, tb, &HashSet::new());
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     let trigger = b.lower_expr(&trigger_expr)?;
     b.validate_truth_expr(&trigger, "testbench cycle-handler trigger")?;

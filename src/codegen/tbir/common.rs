@@ -8,7 +8,8 @@
 use super::func;
 use crate::ast::SourceFile;
 use crate::codegen::common_artifacts::{self, AbiAnchor, CommonArtifactPlan};
-use crate::codegen::cpp_tb::{EmitError, EmitOpts, TbirRandomizeEmissionPlan};
+use crate::codegen::emission::{EmitError, EmitOpts};
+use crate::codegen::randomize::TbirRandomizeEmissionPlan;
 pub use crate::ir::passes::callable_placement::{
     CallableOwner, CallablePlacement, CapsulePlacementReason, ComponentCallableMember,
     InvalidPlacementReason,
@@ -475,7 +476,7 @@ pub fn plan_common_tests_with_source(
     let randomize = if prog.constraint_sites.is_empty() {
         None
     } else {
-        Some(crate::codegen::cpp_tb::plan_tbir_randomize_emission(
+        Some(crate::codegen::randomize::plan_tbir_randomize_emission(
             file,
             opts,
             &prog.constraint_sites,
@@ -483,7 +484,7 @@ pub fn plan_common_tests_with_source(
         )?)
     };
     let mut extern_declarations = String::new();
-    crate::codegen::cpp_tb::emit_extern_fn_decls(&mut extern_declarations, file);
+    crate::codegen::render_support::emit_extern_fn_decls(&mut extern_declarations, file);
     plan_common_tests_impl(prog, opts, file_prefix, randomize, extern_declarations)
 }
 
@@ -779,7 +780,7 @@ fn plan_common_tests_impl(
         program: prog.clone(),
         build_profile,
         interface_build_profile,
-        interface_abi_inputs: crate::codegen::cpp_tb::complete_common_abi_inputs(
+        interface_abi_inputs: crate::codegen::runtime_support::complete_common_abi_inputs(
             &opts.common_abi_inputs,
         ),
         runtime_build_profile,
