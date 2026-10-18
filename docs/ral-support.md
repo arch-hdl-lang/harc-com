@@ -1,7 +1,7 @@
 # Design doc: Register Abstraction Layer (RAL) support
 
 **Status:** Phase 1 largely shipped. Phase 2 + 3 still proposed.
-**Date logged:** 2026-05-13. Updated 2026-05-14 after Phase 1a–1e.
+**Date logged:** 2026-05-13. Updated 2026-10-18 for direct-bus regblock frontdoors.
 **Scope:** Add first-class register-block, address-map, and memory primitives
 to HARC v1 so a single declarative source compiles to a high-performance
 mirror + predict + frontdoor/backdoor + constraint layer — replacing the
@@ -11,7 +11,7 @@ runtime-metaprogramming model of UVM RAL.
 
 | Item | Status | Lands in |
 |---|---|---|
-| `regblock` decl + bind helper + register-level R/W frontdoor | **Shipped** | PR #95 (Phase 1a) |
+| `regblock` decl + bound helper or explicit-TLM bus + register-level R/W frontdoor | **Shipped** | Phase 1a + TBIR direct-bus follow-up |
 | Field-level decomposition (`field N : T @ POS`) | **Shipped** | PR #97 (Phase 1b) |
 | Read-side mirror predict | **Shipped** | PR #98 (Phase 1c) |
 | `rw` / `ro` / `wo` access policies | **Shipped** | PR #98 (Phase 1c) |
@@ -32,9 +32,11 @@ runtime-metaprogramming model of UVM RAL.
 
 The shipped Phase 1 surface delivers what the RFC framed as the MVP for
 real DV: typed register/field decls, frontdoor reads/writes routed
-through a helper transactor (`via Helper` clause), automatic mirror with
-read-side predict, register-level access policies that drop bus traffic
-appropriately, compile-time bit-bash, and chip-level composition.
+through a helper transactor or, for a flat regblock, an explicitly declared
+blocking-TLM bus (`via Helper` / `via Bus`), automatic mirror with read-side
+predict, register-level access policies that drop bus traffic appropriately,
+compile-time bit-bash, and chip-level composition. Addrmaps continue to use a
+helper transactor.
 
 ## 1. Motivation
 
@@ -102,11 +104,13 @@ compile-time POD struct + constant address table.
 
 ## 3. Surface — `regblock`  *(shipped, Phase 1a–1c)*
 
-What shipped: registers can be single-line or block-form (with
-fields); access policies `rw`/`ro`/`wo` are recognized; the helper
-that routes bus traffic is named with the `via <Transactor>` clause
-(not the RFC's original `bound to <Bus>` — see §10 for the
-rationale). The `endian` keyword is parsed but unused.
+What shipped: registers can be single-line or block-form (with fields), and
+access policies `rw`/`ro`/`wo` are recognized. `via <Transactor>` names a
+helper frontdoor; for a flat regblock, `via <Bus>` can instead name a bound bus
+that explicitly declares the blocking `write(addr, data)` and
+`read(addr) -> data` TLM methods. This is distinct from the RFC's implicit
+protocol-derived `bound to <Bus>` proposal (see §10). The `endian` keyword is
+parsed but unused.
 
 ```harc
 regblock AxiDmaRegs via AxilHelper width 32
@@ -291,7 +295,7 @@ See `tests/fixtures/regblock_record_test.harc` for the end-to-end shape.
 ## 4. Surface — `addrmap`  *(Phase 1e shipped, advanced composition pending)*
 
 What shipped: flat addrmap with multiple instances at distinct bases.
-Helper-routed (`via Helper`) like regblock. Access patterns
+Traffic is helper-routed (`via Helper`). Access patterns
 `chip.inst.REG` and `chip.inst.REG.FIELD` work end-to-end.
 
 ```harc
@@ -312,9 +316,10 @@ end addrmap SocRegs
 | Multiple addrmaps over the same regblock type at different bases | **Shipped** (just declare two addrmaps; each has its own mirror tree per `let` instance) |
 | Per-instance bus binding override | **Proposed** |
 
-`bound to <Bus>` (the original RFC vocabulary) is not what shipped;
-the helper transactor routes bus traffic via the `via <Helper>`
-clause on both `regblock` and `addrmap`. See §10 for the rationale.
+Addrmap traffic still routes through a helper transactor named by
+`via <Helper>`. Flat regblocks additionally support the explicit blocking-TLM
+bus ABI described in §7.4. The original RFC's implicit protocol-derived
+`bound to <Bus>` form has not shipped; see §10 for the rationale.
 
 ## 5. Surface — `mem`  *(Proposed — not yet implemented)*
 
@@ -386,9 +391,10 @@ of the HARC design, at the cost of recompilation when overrides change.
 The lowering sections below mix shipped and proposed material. Items
 covered by Phase 1a–1e (regblock + addrmap + field-level access +
 ro/wo + read predict + bitbash) match the production codegen
-mostly-faithfully — the one substantive divergence is `via Helper`
-vs `bound to <Bus>` for naming the protocol layer (§7.4). `mem`
-and backdoor lowering remain proposed.
+mostly-faithfully. Addrmaps use `via Helper`; flat regblocks can use either
+that helper route or an explicit blocking-TLM `via Bus` route. Neither form
+auto-derives a protocol adapter from the RFC's `bound to <Bus>` syntax
+(§7.4). `mem` and backdoor lowering remain proposed.
 
 ### 7.1 Mirror struct
 
@@ -456,18 +462,21 @@ mems.
 The `inline` escape hatch (`mirror dense inline`) is permitted only when
 `depth × width ≤ 128 bytes`; the compiler emits a warning above that.
 
-### 7.4 Frontdoor access  *(shipped, with one divergence from the RFC)*
+### 7.4 Frontdoor access  *(shipped for flat regblocks)*
 
-The shipped lowering routes through a user-supplied helper transactor
-named with the `via <Helper>` clause, **not** an auto-synthesized
-accessor on a `bound to <Bus>` decl. The helper exposes
-`write(addr, data)` and `read(addr) -> data` methods (typically a
-~20-line `hookable` pair against a stdlib bus type — see the
-existing `axilite_regs_full_test` and the new `regblock_*` fixtures
-for the convention). Auto-derived bus accessors from a `bound to`
-clause remain on the roadmap; the `via Helper` form ships now
-because it composes cleanly with the existing transactor machinery
-without teaching the codegen about each bus protocol.
+Flat regblocks support two explicit frontdoors. A user-supplied helper
+transactor named by `via <Helper>` may expose `write(addr, data)` and
+`read(addr) -> data` methods (typically a ~20-line `hookable` pair against a
+stdlib bus type). Alternatively, `via <Bus>` may name a concrete bound bus
+whose declaration provides blocking TLM methods with the same ABI: a void
+`write(addr, data)` and a value-returning `read(addr)`. The direct-bus route
+uses the scheduler-aware TLM call path and performs the same write-side mirror
+update and read-side prediction as the helper route. See the existing
+`axilite_regs_full_test` and `regblock_*` fixtures for both conventions.
+
+Addrmap frontdoors still require the helper-transactor form. Automatically
+deriving protocol-specific accessors from a `bound to <Bus>` declaration that
+does not expose the explicit TLM methods also remains on the roadmap.
 
 `regs.dma0.DMACR.RS = 1` (4-level addrmap+subfield) actually lowers
 to:
@@ -617,12 +626,12 @@ known DUT.
 3. **Address tables** — `constexpr <Regblock>_AddrTable[]` per
    regblock. Currently used for documentation; future `bitbash`
    variants and overlap checks will consume them. (PR #95)
-4. **Frontdoor R/W lowering** — via the `via <Helper>` clause and
-   the helper's `write(addr, data)` / `read(addr) -> data`
-   methods. The RFC's `bound to <Bus>` form is still on the
-   roadmap; helper-routed shipped first because it composes with
-   the existing transactor machinery without protocol-specific
-   codegen. (PR #95)
+4. **Frontdoor R/W lowering** — addrmaps use the `via <Helper>` clause and
+   the helper's `write(addr, data)` / `read(addr) -> data` methods. Flat
+   regblocks may use that route or bind `via <Bus>` to a bus declaring the
+   equivalent blocking TLM ABI. The RFC's implicit protocol-derived
+   `bound to <Bus>` form remains on the roadmap. (PR #95 plus the TBIR
+   direct-bus follow-up)
 5. **Read-side mirror predict** — every bus read updates the
    mirror via `(mirror = bus_read())` assignment expression form.
    (PR #98)
@@ -688,8 +697,9 @@ canonical when both maps are bound simultaneously. Defer to Phase 3.
 ### 11.3 Multi-bus chips
 
 A real SoC has AXI4-Lite on some IPs, APB on others, AHB elsewhere. The
-chip-level `addrmap` currently has one `bound to <Bus>` for the entire
-container. **Tentative answer:** allow per-instance `bound to` overrides:
+original RFC model gives a chip-level `addrmap` one `bound to <Bus>` for the
+entire container; the shipped surface instead has one `via Helper` frontdoor.
+**Tentative answer:** allow per-instance `bound to` overrides:
 
 ```harc
 addrmap SocRegs bound to BusAxiLite

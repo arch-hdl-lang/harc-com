@@ -1,0 +1,58 @@
+// A regblock frontdoor routed directly through a concrete bus binding.
+// The write method is remapped onto TlmMemory's existing `mem_poke_*`
+// protocol so this fixture proves the scheduler-aware TLM edge end-to-end.
+
+bus RegBus
+    tlm_method write(addr: uint<8>, data: uint<32>): blocking;
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus RegBus
+
+regblock DirectRegs via RegBus width 32
+    register R5 @ 5 reset 0 access rw
+    register R8 @ 8 reset 0 access rw
+end regblock DirectRegs
+
+testbench RegblockDirectBusTb
+    dut : TlmMemory
+end testbench RegblockDirectBusTb
+
+impl RegblockDirectBusTest for RegblockDirectBusTb
+    let mem : RegBus = bind dut with {
+        read.req_valid: "mem_read_req_valid",
+        read.req_ready: "mem_read_req_ready",
+        read.addr: "mem_read_addr",
+        read.rsp_valid: "mem_read_rsp_valid",
+        read.rsp_ready: "mem_read_rsp_ready",
+        read.rsp_data: "mem_read_rsp_data",
+        write.req_valid: "mem_poke_req_valid",
+        write.req_ready: "mem_poke_req_ready",
+        write.addr: "mem_poke_addr",
+        write.data: "mem_poke_data",
+        write.rsp_valid: "mem_poke_rsp_valid",
+        write.rsp_ready: "mem_poke_rsp_ready"
+    }
+    let regs : DirectRegs = bind mem
+
+    run
+        dut.rst = 1
+        dut.mem_read_req_valid = 0
+        dut.mem_read_rsp_ready = 0
+        dut.mem_read_ooo_req_valid = 0
+        dut.mem_read_ooo_rsp_ready = 0
+        dut.mem_poke_req_valid = 0
+        dut.mem_poke_rsp_ready = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        let initial = regs.R5
+        assert initial == 261
+            else fail("initial direct regblock read got 0x${initial:08x}")
+
+        regs.R8 = 3405691582
+        assert regs.R8 == 3405691582
+            else fail("direct regblock readback got 0x${regs.R8:08x}")
+
+        log(info, "ALL TESTS PASSED - regblock_direct_bus_test")
+    end run
+end impl RegblockDirectBusTest

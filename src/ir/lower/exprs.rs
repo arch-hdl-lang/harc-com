@@ -1131,7 +1131,7 @@ impl FuncBuilder<'_> {
             | ExprKind::Cast { expr: inner, .. } => self.expr_value_prelude_summary(inner),
             ExprKind::Field { target: inner, .. } => {
                 let summary = self.expr_value_prelude_summary(inner);
-                if self.is_queue_front_value(inner) {
+                if self.is_queue_front_value(inner) || self.bus_regblock_read_has_value_prelude(e) {
                     summary.merge(ValuePreludeSummary::INLINE_STATEMENTS)
                 } else {
                     summary

@@ -110,6 +110,7 @@ bound_component_split_bindings_test | DualByteSource | DualByteSource.sv |
 axilite_multi_payload_test | AxiLiteRegs | AxiLiteRegs.sv         |
 axilite_regs_full_test  | AxiLiteRegs    | AxiLiteRegs.sv         |
 regblock_basic_test     | AxiLiteRegs    | AxiLiteRegs.sv         |
+regblock_direct_bus_test | TlmMemory     | TlmMemory.sv           |
 regblock_fields_test    | AxiLiteRegs    | AxiLiteRegs.sv         |
 regblock_access_test    | AxiLiteRegs    | AxiLiteRegs.sv         |
 regblock_bitbash_test   | AxiLiteRegs    | AxiLiteRegs.sv         |

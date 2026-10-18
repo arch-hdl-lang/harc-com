@@ -28980,6 +28980,132 @@ end impl Test
     );
 }
 
+/// A regblock may route its frontdoor straight through a concrete bus
+/// binding. Writes reuse the ordinary blocking TLM statement edge; reads
+/// materialize the response before predicting the mirror, including reads in
+/// general expressions and lazy failure messages.
+#[test]
+fn regblock_direct_bus_frontdoor_uses_concrete_tlm_edges() {
+    let src = r#"
+bus RegBus
+    tlm_method write(addr: uint<8>, data: uint<32>): blocking;
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus RegBus
+regblock R via RegBus width 32
+    register A @ 0x10 access rw
+end regblock R
+testbench Tb
+    dut : Top
+end testbench Tb
+impl Test for Tb
+    let mem : RegBus = bind dut
+    let regs : R = bind mem
+    run
+        regs.A = 5
+        let v = regs.A
+        assert regs.A == v
+            else fail("readback ${regs.A}")
+    end run
+end impl Test
+"#;
+    let prog = lower_src(src).expect("a direct bus regblock frontdoor lowers");
+    verify::verify_program(&prog).expect("direct bus regblock frontdoor verifies");
+    let run = prog.function(prog.tests[0].run);
+    let mut calls = 0;
+    let mut predicts = 0;
+    let mut failure_block_calls = 0;
+    for block in &run.blocks {
+        let is_failure_block = block.stmts.iter().any(|stmt| {
+            matches!(
+                stmt,
+                ir::Stmt::AssertCheck {
+                    cond: ir::Expr::Literal {
+                        value: 0,
+                        ty: ir::IrType::Bool
+                    },
+                    ..
+                }
+            )
+        });
+        let mut block_calls = 0;
+        for stmt in &block.stmts {
+            match stmt {
+                ir::Stmt::Assign(
+                    _,
+                    ir::Expr::Call(
+                        ir::CallTarget::TransactorMethod {
+                            bus_field,
+                            target: ir::TransactorMethodTarget::ConcreteBusBinding { field, .. },
+                            ..
+                        },
+                        _,
+                    ),
+                ) => {
+                    assert_eq!(bus_field, "mem");
+                    assert_eq!(field, "mem");
+                    calls += 1;
+                    block_calls += 1;
+                }
+                ir::Stmt::RecordFieldWrite { local, field, .. }
+                    if run.local(*local).name == "regs" && field == "A" =>
+                {
+                    predicts += 1;
+                }
+                _ => {}
+            }
+            ir::visit::try_visit_stmt_exprs(stmt, &mut |expr| -> Result<(), ()> {
+                assert!(
+                    !matches!(expr, ir::Expr::RegRead { .. }),
+                    "a bus-backed read must not use the inline helper-lambda RegRead form"
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+        if is_failure_block {
+            failure_block_calls += block_calls;
+        }
+    }
+    assert_eq!(calls, 4, "write + let read + assert read + lazy message read");
+    assert_eq!(predicts, 4, "every frontdoor access updates the mirror");
+    assert_eq!(
+        failure_block_calls, 1,
+        "the lazy message read must execute only inside the failed-check block"
+    );
+
+    let wait = src.replace("        let v = regs.A", "        wait until regs.A == 5\n        let v = regs.A");
+    let error = lower_src(&wait).expect_err("a bus read cannot be hoisted out of a polling predicate");
+    assert!(
+        error.to_string().contains("statement materialization inside a `wait until` predicate"),
+        "{error}"
+    );
+
+    let ooo = src.replace(
+        "tlm_method read(addr: uint<8>) -> uint<32>: blocking;",
+        "tlm_method read(addr: uint<8>) -> uint<32>: out_of_order tags 2;",
+    );
+    let error = lower_src(&ooo).expect_err("a regblock frontdoor is synchronous/blocking");
+    assert!(error.to_string().contains("must be blocking"), "{error}");
+
+    let no_read_value = src.replace(
+        "tlm_method read(addr: uint<8>) -> uint<32>: blocking;",
+        "tlm_method read(addr: uint<8>): blocking;",
+    );
+    let error = lower_src(&no_read_value).expect_err("a regblock read needs a response value");
+    assert!(
+        error.to_string().contains("must return the register value"),
+        "{error}"
+    );
+
+    let write_returns_value = src.replace(
+        "tlm_method write(addr: uint<8>, data: uint<32>): blocking;",
+        "tlm_method write(addr: uint<8>, data: uint<32>) -> uint<32>: blocking;",
+    );
+    let error = lower_src(&write_returns_value)
+        .expect_err("a regblock write frontdoor must not discard a bus return value");
+    assert!(error.to_string().contains("must not return a value"), "{error}");
+}
+
 /// RO write suppresses the bus traffic (mirror update only); WO read
 /// serves from the mirror (no bus traffic).
 #[test]

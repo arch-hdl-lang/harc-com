@@ -460,9 +460,9 @@ pub struct ConstraintSite {
 /// decomposition, `bitbash`, the passive `record_write`/`record_read`
 /// API, per-register `on` callbacks, and `addrmap` composition are
 /// represented by the regblock lowering paths in `src/ir/lower/regblock.rs`.
-/// The `via` helper must be an unbound DUT-poking transactor; the
-/// bus-bound helper form is the documented residual blocker for the
-/// corpus `regblock_*` fixtures.
+/// The `via` helper may be an unbound DUT-poking transactor or a concrete
+/// bus binding whose `tlm_method` declarations provide the same
+/// `write(addr, data)` / `read(addr)` frontdoor ABI.
 #[derive(Debug, Clone)]
 pub struct RegblockSchema {
     pub name: String,
