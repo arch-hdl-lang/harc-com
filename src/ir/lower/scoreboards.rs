@@ -27,7 +27,7 @@
 
 use super::{not_implemented, LowerError, V1Status};
 use crate::ast::{BuiltinTy, ComponentDecl, ComponentItem, TypeArg, TypeExpr};
-use crate::codegen::cpp_tb::RecordLeafFate;
+use crate::codegen::source_transform::RecordLeafFate;
 use crate::ir::{IrType, RecordId, ScoreboardFieldKind, ScoreboardFieldSchema, ScoreboardSchema};
 use std::collections::HashMap;
 
@@ -481,7 +481,7 @@ fn scoreboard_field_kind(
                               scalar element type or a `queue<transaction|struct>` are \
                               lowered";
         let what = format!("scoreboard field `{sb}.{fname}` of an unsupported type");
-        let fate = crate::codegen::cpp_tb::record_leaf_fate(t, &|n| declared_records.contains(n));
+        let fate = crate::codegen::source_transform::record_leaf_fate(t, &|n| declared_records.contains(n));
         if fate == RecordLeafFate::Flattens {
             return not_implemented(
                 &what,
@@ -543,7 +543,7 @@ fn scoreboard_list_value_type_is_preserved(t: &TypeExpr) -> bool {
     if scoreboard_list_scalar_ir_type(t).is_some() {
         return true;
     }
-    crate::codegen::cpp_tb::fixed_vec_type_args(t)
+    crate::codegen::source_transform::fixed_vec_type_args(t)
         .is_some_and(|(elem, _)| scoreboard_list_value_type_is_preserved(elem))
 }
 

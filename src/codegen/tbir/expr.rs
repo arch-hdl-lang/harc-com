@@ -1,6 +1,6 @@
 //! TB-IR expression → C++ text.
 
-use crate::codegen::cpp_tb::EmitError;
+use crate::codegen::emission::EmitError;
 use crate::ir::{
     BinOp, CallTarget, Expr, FmtArg, FunctionId, PortRef, TbFunction, UnOp, WidthCastKind,
 };
@@ -761,7 +761,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             crate::ir::IrType::UInt(_) => format!("((uint64_t)({value}))"),
             _ => format!("{value}"),
         },
-        Expr::StringLiteral(value) => crate::codegen::cpp_tb::string_value_literal_cpp(value),
+        Expr::StringLiteral(value) => crate::codegen::source_transform::string_value_literal_cpp(value),
         // The framework-provided cycle counter — emitted as the in-scope
         // `cycle_count` (a captured `ctx.cycle_count` reference), matching
         // v1's bare-ident emission of `cycle_count`.

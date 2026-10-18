@@ -6,7 +6,14 @@
 
 pub mod common_artifacts;
 pub mod cpp_tb;
+pub mod dut_interface;
+pub mod emission;
 pub mod merge;
+pub(crate) mod native;
+pub mod randomize;
+pub(crate) mod render_support;
+pub(crate) mod source_transform;
+pub mod runtime_support;
 pub mod sv_stub;
 pub mod tbir;
 

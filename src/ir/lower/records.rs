@@ -120,7 +120,7 @@ fn non_scalar_record_leaf(
     ty: &TypeExpr,
     record_ids: &HashMap<String, RecordId>,
 ) -> LowerError {
-    use crate::codegen::cpp_tb::RecordLeafFate;
+    use crate::codegen::source_transform::RecordLeafFate;
     const SUBSET: &str = "only nonzero-width uint/sint/bits/bool/bit scalar fields, fixed \
                           `Vec<T, N>` arrays of such scalars or of supported \
                           struct/transaction records, and nested struct/transaction fields \
@@ -140,7 +140,7 @@ fn non_scalar_record_leaf(
             V1Status::SilentlyMisLowers,
         );
     }
-    match crate::codegen::cpp_tb::record_leaf_fate(ty, &|n| record_ids.contains_key(n)) {
+    match crate::codegen::source_transform::record_leaf_fate(ty, &|n| record_ids.contains_key(n)) {
         RecordLeafFate::Models => not_implemented(
             &what,
             format!(
@@ -255,7 +255,7 @@ pub(crate) fn lower_transaction(
                 )?;
             }
             TxnBodyItem::Keep(k) => {
-                keeps.push(crate::codegen::cpp_tb::expr_source_str(&k.expr));
+                keeps.push(crate::codegen::source_transform::expr_source_str(&k.expr));
             }
             TxnBodyItem::When(_) => {
                 // This arm has now been measured three times and the
@@ -354,7 +354,7 @@ pub(crate) fn lower_struct(
         match item {
             TxnBodyItem::Field(_) => {}
             TxnBodyItem::Keep(k) => {
-                keeps.push(crate::codegen::cpp_tb::expr_source_str(&k.expr));
+                keeps.push(crate::codegen::source_transform::expr_source_str(&k.expr));
             }
             TxnBodyItem::When(_) => {
                 // Measured: v1's `struct Rec` is BYTE-IDENTICAL to the

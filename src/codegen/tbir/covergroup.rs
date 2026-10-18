@@ -8,7 +8,7 @@
 //! runtime-observable (log lines + check-phase asserts), so both must
 //! match v1 exactly for the trace-equivalence gate.
 
-use crate::codegen::cpp_tb::EmitError;
+use crate::codegen::emission::EmitError;
 use crate::ir::passes::dut_access::DutAccessPlan;
 use crate::ir::{
     BinOp, CallTarget, CovBinBound, CovBinValue, CoverPointSchema, CovgroupSchema, Expr,

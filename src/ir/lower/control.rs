@@ -592,7 +592,7 @@ impl FuncBuilder<'_> {
             self.validate_truth_expr(&expr, "wait-until predicate")?;
             preds.push(PredSrc {
                 expr,
-                src_text: crate::codegen::cpp_tb::expr_source_str(c),
+                src_text: crate::codegen::source_transform::expr_source_str(c),
             });
         }
 
@@ -759,7 +759,7 @@ impl FuncBuilder<'_> {
             snapshots.push(snapshot);
             preds.push(PredSrc {
                 expr: Expr::Local(snapshot),
-                src_text: crate::codegen::cpp_tb::expr_source_str(condition),
+                src_text: crate::codegen::source_transform::expr_source_str(condition),
             });
         }
         self.terminate(Terminator::Jump(poll));
