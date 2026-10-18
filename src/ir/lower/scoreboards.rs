@@ -340,9 +340,10 @@ fn scoreboard_field_kind(
     enum_names: &std::collections::HashSet<String>,
 ) -> Result<ScoreboardFieldKind, LowerError> {
     if super::helpers::is_nested_string_type(Some(t)) {
-        return Err(unsupported(
+        return Err(super::not_implemented(
             &format!("scoreboard field `{sb}.{fname}` whose type contains `String`"),
-            "String containers and aggregates are not supported in persistent fields",
+            "String containers and aggregates are not supported in persistent fields; v1 erases nested String leaves to `uint64_t` storage",
+            super::V1Status::SilentlyMisLowers,
         ));
     }
     if let TypeExpr::Named { name, generics, .. } = t {

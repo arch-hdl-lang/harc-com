@@ -14,7 +14,7 @@ incorrectly classified as gaps even though v1 rejects the same source.
 
 The refreshed 2026-10-17 inventory is recorded in
 [`tbir-migration-manifest.md`](tbir-migration-manifest.md). After the current
-batch there are 73 executable constructors (74 textual matches including the
+batch there are 63 executable constructors (64 textual matches including the
 helper definition); the manifest separates positive runtime controls from
 diagnostic and deliberately deferred shapes.
 
@@ -636,6 +636,12 @@ not applicable before requesting review:
    persistent transactor state. The focused regression pins v1's emitted ABI
    at all ten landings. This leaves 74 textual matches (73 executable
    constructors plus the helper definition).
+   The next ten constructors finish the remaining nested-`String` declaration
+   gates, the target-TLM wire case where v1 erases a stream payload, and a
+   stale method-width rejection made unreachable by the exact-width
+   `HarcWide` method ABI. Direct emission probes pin the reachable erasure
+   outcomes, leaving 64 textual matches (63 executable constructors plus the
+   helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
