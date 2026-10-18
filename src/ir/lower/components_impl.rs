@@ -4472,12 +4472,35 @@ impl super::FuncBuilder<'_> {
                     return Ok(None);
                 };
                 if path.len() != 1 {
-                    return Err(unsupported(
-                        &format!(
-                            "a whole-component copy from a nested path rooted at component local `{root}`"
-                        ),
-                        "copy the component local itself; nested component-local bases are not represented yet",
-                    ));
+                    let nested = &path[1..];
+                    let inherited = self.component_local_instance_mode(local).flatten();
+                    let mut owner = component;
+                    let mut receiver = Vec::with_capacity(nested.len());
+                    for field in nested {
+                        let Some((resolved, _, activation)) =
+                            self.resolve_component_copy_subfield(owner, field)?
+                        else {
+                            return Ok(None);
+                        };
+                        self.require_component_activation(
+                            root,
+                            component,
+                            inherited,
+                            &receiver,
+                            activation,
+                            "sub-component field",
+                            field,
+                        )?;
+                        receiver.push(field.clone());
+                        owner = resolved;
+                    }
+                    return Ok(Some((
+                        ComponentBase::LocalPath {
+                            local,
+                            path: nested.to_vec(),
+                        },
+                        owner,
+                    )));
                 }
                 return Ok(Some((ComponentBase::Local(local), component)));
             }
@@ -4850,6 +4873,11 @@ impl super::FuncBuilder<'_> {
             ComponentBase::Local(_) => {
                 return Err(LowerError::Invalid(format!(
                     "internal error: queue `{queue}` resolved on a component-typed parameter"
+                )));
+            }
+            ComponentBase::LocalPath { .. } => {
+                return Err(LowerError::Invalid(format!(
+                    "internal error: queue `{queue}` uses a whole-value copy path"
                 )));
             }
         };

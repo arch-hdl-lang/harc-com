@@ -2919,6 +2919,20 @@ fn component_of_base<'a>(
             };
             prog.components.get(cid.index())
         }
+        crate::ir::ComponentBase::LocalPath { local, path } => {
+            let crate::ir::IrType::Component(cid) = cx.func.locals.get(local.index())?.ty else {
+                return None;
+            };
+            let mut component = prog.components.get(cid.index())?;
+            for segment in path {
+                let field = component.fields.iter().find(|field| field.name == *segment)?;
+                let crate::ir::ComponentFieldKind::Sub { component: nested, .. } = field.kind else {
+                    return None;
+                };
+                component = prog.components.get(nested.index())?;
+            }
+            Some(component)
+        }
         crate::ir::ComponentBase::Path(path) => {
             let (first, rest) = path.split_first()?;
             let test_root = owner_tb(cx).and_then(|tb| {
@@ -3081,6 +3095,12 @@ pub(super) fn comp_base_cpp_subst(
                 local.0
             )))
         }
+        crate::ir::ComponentBase::LocalPath { local, .. } => {
+            return Err(EmitError(format!(
+                "tbir: component local path rooted at %{} reached a renderer without typed local bindings",
+                local.0
+            )))
+        }
     })
 }
 
@@ -3094,6 +3114,12 @@ pub(super) fn comp_base_cpp_subst_cx(
 ) -> Result<String, EmitError> {
     match base {
         crate::ir::ComponentBase::Local(local) => local_cpp_name(cx, *local),
+        crate::ir::ComponentBase::LocalPath { local, path } => Ok(std::iter::once(
+            local_cpp_name(cx, *local)?,
+        )
+        .chain(path.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(".")),
         crate::ir::ComponentBase::Path(path) => {
             if let Some((head, tail)) = path.split_first() {
                 if let Some(binding) = cx

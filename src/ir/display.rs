@@ -1072,6 +1072,9 @@ fn comp_base_str(base: &crate::ir::ComponentBase) -> String {
         ComponentBase::SelfField => "self".to_string(),
         ComponentBase::Path(path) => path.join("."),
         ComponentBase::Local(l) => format!("local(l{})", l.0),
+        ComponentBase::LocalPath { local, path } => {
+            format!("local(l{}).{}", local.0, path.join("."))
+        }
     }
 }
 

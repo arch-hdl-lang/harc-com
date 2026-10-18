@@ -2390,6 +2390,14 @@ fn component_base_type(
             IrType::Component(component) => Some(component),
             _ => None,
         },
+        crate::ir::ComponentBase::LocalPath { local, path } => {
+            let IrType::Component(component) = function.locals.get(local.index())?.ty else {
+                return None;
+            };
+            crate::ir::resolve_component_path_mode(&prog.components, component, None, path)
+                .ok()
+                .map(|resolved| resolved.component)
+        }
         crate::ir::ComponentBase::SelfField => match function.kind {
             crate::ir::FunctionKind::ComponentMethod { component, .. } => Some(component),
             _ => None,

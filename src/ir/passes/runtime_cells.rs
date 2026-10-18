@@ -1227,6 +1227,9 @@ fn collect_expr_locals(expr: &crate::ir::Expr, locals: &mut BTreeSet<LocalId>) {
         Expr::ComponentValue {
             base: ComponentBase::Local(local),
         }
+        | Expr::ComponentValue {
+            base: ComponentBase::LocalPath { local, .. },
+        }
         | Expr::ComponentIdle {
             base: ComponentBase::Local(local),
             ..
