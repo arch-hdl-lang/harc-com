@@ -12,9 +12,9 @@ such sites in `src/codegen/tbir`. That raw count is an inventory, not a work
 queue: some sites cover several source shapes, and some diagnostics were
 incorrectly classified as gaps even though v1 rejects the same source.
 
-The refreshed 2026-09-30 inventory is recorded in
+The refreshed 2026-10-17 inventory is recorded in
 [`tbir-migration-manifest.md`](tbir-migration-manifest.md). After the current
-batch there are 83 executable constructors (84 textual matches including the
+batch there are 73 executable constructors (74 textual matches including the
 helper definition); the manifest separates positive runtime controls from
 diagnostic and deliberately deferred shapes.
 
@@ -630,6 +630,12 @@ not applicable before requesting review:
    The two dedicated hook-trigger constructors are removed. The impure-helper
    constructor remains for non-suspending helpers that v1 can run, leaving 84
    textual matches (83 executable constructors plus the helper definition).
+   Ten nested-`String` declaration gates then stop advertising v1 where its
+   aggregate renderers erase the String leaf to `uint64_t`: helper, tseq, and
+   extern parameter/return ABIs; component fields and method ABIs; and
+   persistent transactor state. The focused regression pins v1's emitted ABI
+   at all ten landings. This leaves 74 textual matches (73 executable
+   constructors plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

@@ -1748,9 +1748,10 @@ fn lower_state_field(
     let who = owner.label();
     if let Some(span) = helpers::nested_string_type_span(Some(&f.ty)) {
         record_ctx.diagnostics.record(record_ctx.source_id, span);
-        return Err(unsupported(
+        return Err(not_implemented(
             &format!("{who} field `{tname}.{fname}` whose type contains `String`"),
-            "String containers and aggregates are not supported in persistent fields",
+            "String containers and aggregates are not supported in persistent fields; v1 erases nested String leaves to `uint64_t` storage",
+            V1Status::SilentlyMisLowers,
         ));
     }
     if f.direction.is_some() {

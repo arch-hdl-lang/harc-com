@@ -50,7 +50,8 @@ use crate::ir::{
 
 use super::helpers::{ir_type_of, HelperRegistry};
 use super::{
-    unsupported, FuncBuilder, LowerCtx, LowerDiagnosticRecorder, LowerError, SideTables,
+    not_implemented, unsupported, FuncBuilder, LowerCtx, LowerDiagnosticRecorder, LowerError,
+    SideTables, V1Status,
 };
 
 /// The element name of a `tseq`'s `-> TSeq<T>` return type when `T` is a
@@ -153,19 +154,21 @@ pub(crate) fn collect_tseq_records(
             super::helpers::nested_string_type_span(param.ty.as_ref()).map(|span| (param, span))
         }) {
             diagnostics.record(file.item_source(item_index), span);
-            return Err(unsupported(
+            return Err(not_implemented(
                 &format!(
                     "tseq `{}` parameter `{}` whose type contains `String`",
                     decl.name.name, param.name.name
                 ),
-                "String containers and aggregates are not supported in transaction sequences",
+                "String containers and aggregates are not supported in transaction sequences; v1 erases a nested String leaf to `uint64_t` in queue, event, and fixed-vector parameters",
+                V1Status::SilentlyMisLowers,
             ));
         }
         if let Some(span) = super::helpers::nested_string_type_span(decl.return_ty.as_ref()) {
             diagnostics.record(file.item_source(item_index), span);
-            return Err(unsupported(
+            return Err(not_implemented(
                 &format!("tseq `{}` return type containing `String`", decl.name.name),
-                "String sequence elements and nested String containers are not supported",
+                "String sequence elements and nested String containers are not supported; v1 erases a nested String leaf to `uint64_t` in aggregate sequence elements",
+                V1Status::SilentlyMisLowers,
             ));
         }
         let elem = if let Some(scalar) = tseq_scalar_element(decl, record_ids, consts)? {

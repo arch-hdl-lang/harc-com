@@ -53829,7 +53829,7 @@ end test T"#;
     let string_sequence_param = string_param.replace("value: String", "value: TSeq<String>");
     let err =
         lower_src(&string_sequence_param).expect_err("TSeq<String> parameters must fail closed");
-    let message = assert_unsupported(&err);
+    let message = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
     assert!(message.contains("type contains `String`"), "{message}");
 
     let mut mutated_yield =
@@ -53901,37 +53901,51 @@ test T
     end run
 end test T
 "#;
-    for ty in [
-        "queue<String>",
-        "event<String>",
-        "Vec<String, 2>",
-        "TSeq<String>",
-        "queue<Vec<String, 2>>",
-    ] {
-        let source = format!(
-            "function bad(values: {ty}) -> uint<1>\n    return 1\nend function bad\n{test}"
-        );
-        let err = lower_src(&source).expect_err("a String container parameter must fail closed");
-        let message = assert_unsupported(&err);
-        assert!(
-            message.contains("function `bad` parameter `values`")
-                && message.contains("type contains `String`"),
-            "{ty}: {message}"
-        );
-    }
-
-    let cases = [
+    // Ten declaration landings used to return `Unsupported`, promising v1 as
+    // an escape hatch. At each landing v1 has a reachable aggregate spelling
+    // that recursively erases String to `uint64_t`; pin the emitted ABI before
+    // classifying the whole landing by its worst behavior.
+    let erased = [
+        (
+            "helper parameter",
+            format!(
+                "function bad(values: Vec<String, 2>) -> uint<1>\n    return 1\nend function bad\n{test}"
+            ),
+            "std::array<uint64_t, 2> values",
+        ),
         (
             "helper return",
-            format!("function bad() -> TSeq<String>\n    return 0\nend function bad\n{test}"),
+            format!("function bad() -> queue<String>\n    return 0\nend function bad\n{test}"),
+            "HarcQueue<uint64_t>&",
+        ),
+        (
+            "tseq parameter",
+            format!(
+                "tseq Bad(values: queue<String>) -> TSeq<uint<8>>\n    yield 1\nend tseq Bad\n{test}"
+            ),
+            "HarcQueue<uint64_t>& values",
+        ),
+        (
+            "tseq return",
+            format!(
+                "tseq Bad() -> TSeq<Vec<String, 2>>\n    yield 0\nend tseq Bad\n{test}"
+            ),
+            "std::vector<std::array<uint64_t, 2>>",
         ),
         (
             "extern parameter",
             format!("extern function bad(values: queue<String>) -> uint<1>\n{test}"),
+            "HarcQueue<uint64_t>& values",
         ),
         (
             "extern return",
-            format!("extern function bad() -> event<String>\n{test}"),
+            format!("extern function bad() -> queue<String>\n{test}"),
+            "HarcQueue<uint64_t>& bad()",
+        ),
+        (
+            "component field",
+            format!("agent Bad\n    values : Vec<String, 2>\nend agent Bad\n{test}"),
+            "std::array<uint64_t, 2> values",
         ),
         (
             "component method parameter",
@@ -53949,7 +53963,67 @@ test T
 end test T
 "#
             .to_string(),
+            "std::array<uint64_t, 2> values",
         ),
+        (
+            "component method return",
+            r#"agent Bad
+    function f() -> queue<String>
+        return 0
+    end function f
+end agent Bad
+test T
+    let dut : Top
+    let bad : Bad
+    run
+        wait 1 cycle
+    end run
+end test T
+"#
+            .to_string(),
+            "HarcQueue<uint64_t>&",
+        ),
+        (
+            "transactor state field",
+            r#"transactor Bad
+    dut : Top
+    values : queue<String>
+    when active
+        hookable f()
+        end f
+    end when
+end transactor Bad
+test T
+    let dut : Top
+    let bad : Bad active
+    run
+        bad.dut = dut
+        wait 1 cycle
+    end run
+end test T
+"#
+            .to_string(),
+            "HarcQueue<uint64_t> values",
+        ),
+    ];
+    for (case, source, erased_abi) in erased {
+        let v1 = cpp_tb::emit(&merged_src(&source)).expect("v1 emits nested String probe");
+        assert!(
+            v1.contains(erased_abi),
+            "{case}: v1 did not emit `{erased_abi}`:\n{v1}"
+        );
+        let err = lower_src(&source).expect_err("a nested String type must fail closed");
+        let message = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(
+            message.contains("type contains `String`")
+                || message.contains("type containing `String`"),
+            "{case}: {message}"
+        );
+    }
+
+    // Adjacent String-storage boundaries remain honest v1 fallbacks and keep
+    // `Unsupported`; they are separate constructors from the ten above.
+    let retained = [
         (
             "transactor method return",
             r#"transactor Bad
@@ -54003,12 +54077,8 @@ end test T
             "record field",
             format!("struct Bad\n    values : Vec<String, 2>\nend struct Bad\n{test}"),
         ),
-        (
-            "component field",
-            format!("scoreboard Bad\n    values : queue<String>\nend scoreboard Bad\n{test}"),
-        ),
     ];
-    for (case, source) in cases {
+    for (case, source) in retained {
         let err = lower_src(&source).expect_err("a nested String type must fail closed");
         let message = assert_unsupported(&err);
         assert!(

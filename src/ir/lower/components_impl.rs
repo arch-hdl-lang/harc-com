@@ -811,12 +811,13 @@ pub(crate) fn lower_component_schema(
                 ComponentItem::Field(f) => {
                     if let Some(span) = helpers::nested_string_type_span(Some(&f.ty)) {
                         diagnostics.record(source_id, span);
-                        return Err(unsupported(
+                        return Err(not_implemented(
                             &format!(
                                 "component field `{name}.{}` whose type contains `String`",
                                 f.name.name
                             ),
-                            "String containers and aggregates are not supported in persistent fields",
+                            "String containers and aggregates are not supported in persistent fields; v1 erases nested String leaves to `uint64_t` storage",
+                            V1Status::SilentlyMisLowers,
                         ));
                     }
                     let fk = lower_field(
@@ -856,22 +857,24 @@ pub(crate) fn lower_component_schema(
                             .map(|span| (param, span))
                     }) {
                         diagnostics.record(source_id, span);
-                        return Err(unsupported(
+                        return Err(not_implemented(
                             &format!(
                                 "component `{name}` method `{}` parameter `{}` whose type contains `String`",
                                 h.name.name, param.name.name
                             ),
-                            "String containers and aggregates are not supported; use exact top-level `String` for a callable parameter",
+                            "String containers and aggregates are not supported; v1 erases nested String leaves to `uint64_t` in component-method parameters",
+                            V1Status::SilentlyMisLowers,
                         ));
                     }
                     if let Some(span) = helpers::nested_string_type_span(h.return_ty.as_ref()) {
                         diagnostics.record(source_id, span);
-                        return Err(unsupported(
+                        return Err(not_implemented(
                             &format!(
                                 "component `{name}` method `{}` return type containing `String`",
                                 h.name.name
                             ),
-                            "String containers and aggregates are not supported; use exact top-level `String` for a callable return",
+                            "String containers and aggregates are not supported; v1 erases nested String leaves to `uint64_t` in component-method returns",
+                            V1Status::SilentlyMisLowers,
                         ));
                     }
                     let param_names: Vec<String> =
