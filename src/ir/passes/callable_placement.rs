@@ -1119,6 +1119,21 @@ fn component_receiver_for_base(
                 }
             }
         }
+        ComponentBase::LocalPath { local, path } => {
+            let Some(crate::ir::IrType::Component(component)) =
+                function.locals.get(local.index()).map(|slot| &slot.ty)
+            else {
+                return Err(PlacementError(format!(
+                    "time-effect analysis found an invalid component local %{} in fn{}",
+                    local.0, function.id.0
+                )));
+            };
+            let root = EffectReceiver::DetachedComponent {
+                component: *component,
+                mode: component_local_mode(function, *local),
+            };
+            component_connect_endpoint(prog, &root, path)?
+        }
         ComponentBase::Path(path) if path.first().is_some_and(|segment| segment == "self") => {
             component_connect_endpoint(prog, receiver, &path[1..])?
         }

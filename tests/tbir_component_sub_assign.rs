@@ -36,6 +36,12 @@ agent CopyOwner
         local_state.set(88)
     end load_via_local
 
+    hookable load_nested(input_owner: CopyOwner)
+        let nested_state : CopyCell = input_owner.primary
+        snapshot = input_owner.primary
+        nested_state.set(88)
+    end load_nested
+
     hookable clone()
         snapshot = primary
     end clone
@@ -61,15 +67,29 @@ agent CopyOwner
     end copy_into
 end agent CopyOwner
 
+agent CopyHarness
+    source_owner : CopyOwner
+    destination_owner : CopyOwner
+
+    hookable exercise_nested_copy()
+        destination_owner.load_nested(source_owner)
+    end exercise_nested_copy
+end agent CopyHarness
+
 test ComponentSubcopyValueTest
     let dut : Top
     let source : CopyCell
     let owner : CopyOwner
+    let harness : CopyHarness
     clock clk = SysDomain
 
     run
         source.set(41)
         owner.primary = source
+        harness.source_owner.primary.set(41)
+        harness.exercise_nested_copy()
+        assert harness.destination_owner.snapshot.value == 41
+            else fail("nested component assignment missed its source")
         owner.capture_primary_via_local()
         assert owner.snapshot.value == 41
             else fail("parameter-to-local copy aliased source")
@@ -419,6 +439,89 @@ fn lowers_typed_component_locals_as_value_copies() {
 }
 
 #[test]
+fn lowers_nested_component_local_sources_as_value_copies() {
+    let merged = merged_source(COPY_SOURCE);
+    let prog = lower::lower_program(&merged).expect("nested component-local copies lower");
+    verify::verify_program(&prog).expect("nested component-local copies verify");
+    let load_nested = method(&prog, "CopyOwner", "load_nested");
+    let input_owner = load_nested
+        .locals
+        .iter()
+        .position(|local| local.name == "input_owner")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("input owner");
+    assert!(statements(load_nested).any(|stmt| matches!(
+        stmt,
+        ir::Stmt::Assign(_, ir::Expr::ComponentValue {
+            base: ir::ComponentBase::LocalPath { local, path },
+        }) if *local == input_owner && path == &["primary"]
+    )));
+    assert!(statements(load_nested).any(|stmt| matches!(
+        stmt,
+        ir::Stmt::ComponentSubAssign {
+            src: ir::ComponentBase::LocalPath { local, path },
+            ..
+        } if *local == input_owner && path == &["primary"]
+    )));
+
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect("nested component-local copies emit");
+    for expected in [
+        "nested_state = input_owner.primary;",
+        "self.snapshot._harc_copy_user_state_from(input_owner.primary);",
+    ] {
+        assert!(cpp.contains(expected), "missing `{expected}` in:\n{cpp}");
+    }
+}
+
+#[test]
+fn nested_component_local_sources_check_every_activation_edge() {
+    let source = r#"
+agent CopyCell
+    value : uint<8> default 0
+end agent CopyCell
+
+agent Holder
+    slot : CopyCell
+
+    hookable clear()
+    end clear
+end agent Holder
+
+transactor GatedOwner
+    when active
+        holder : Holder
+
+        hookable touch()
+        end touch
+    end when
+end transactor GatedOwner
+
+env Root
+    gate : GatedOwner passive
+end env Root
+
+agent Consumer
+    hookable capture(input_owner : Root)
+        let snapshot : CopyCell = input_owner.gate.holder.slot
+    end capture
+end agent Consumer
+
+test T
+    let dut : Top
+    let consumer : Consumer
+    run
+    end run
+end test T
+"#;
+    let err = lower_source(source)
+        .expect_err("an active-only intermediate field needs an active local receiver");
+    let message = err.to_string();
+    assert!(message.contains("active-only sub-component field `holder`"), "{message}");
+    assert!(message.contains("input_owner"), "{message}");
+}
+
+#[test]
 fn tbir_component_locals_copy_values_at_runtime() {
     if !verilator_present() {
         eprintln!("skipping component-local runtime test: verilator not found on PATH");
@@ -589,20 +692,6 @@ fn rejects_mismatched_and_unknown_component_copy_operands() {
         "{err}"
     );
 
-    let unsupported_ownership =
-        COPY_SOURCE.replacen("snapshot = input_state", "snapshot = input_state.child", 1);
-    let err = lower_source(&unsupported_ownership)
-        .expect_err("nested paths rooted at a component parameter need an owned path base");
-    assert!(
-        matches!(err, lower::LowerError::Unsupported { .. }),
-        "{err:?}"
-    );
-    assert!(
-        err.to_string()
-            .contains("nested path rooted at component local"),
-        "{err}"
-    );
-
     let mismatched_local = COPY_SOURCE.replacen(
         "let local_state : CopyCell = input_state",
         "let local_state : OtherCell = input_state",
@@ -631,6 +720,89 @@ fn rejects_mismatched_and_unknown_component_copy_operands() {
 fn verifier_rejects_corrupt_component_copy_bases_fields_and_types() {
     let prog = lower_source(COPY_SOURCE).expect("component copies lower");
     verify::verify_program(&prog).expect("control verifies");
+
+    let mut empty_local_path = prog.clone();
+    let load_nested = empty_local_path
+        .components
+        .iter()
+        .find(|component| component.name == "CopyOwner")
+        .and_then(|component| component.method("load_nested"))
+        .map(|method| method.function)
+        .expect("load_nested method");
+    let path = empty_local_path.functions[load_nested.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::Assign(
+                _,
+                ir::Expr::ComponentValue {
+                    base: ir::ComponentBase::LocalPath { path, .. },
+                },
+            ) => Some(path),
+            _ => None,
+        })
+        .expect("nested component-local initializer");
+    path.clear();
+    let errors = verify::verify_program(&empty_local_path)
+        .expect_err("an empty nested component-local path must not verify");
+    assert!(format!("{errors:?}").contains("empty component local path"));
+
+    let mut local_path_call = prog.clone();
+    let load_nested = local_path_call
+        .components
+        .iter()
+        .find(|component| component.name == "CopyOwner")
+        .and_then(|component| component.method("load_nested"))
+        .map(|method| method.function)
+        .expect("load_nested method");
+    let input_owner = local_path_call.functions[load_nested.index()]
+        .locals
+        .iter()
+        .position(|local| local.name == "input_owner")
+        .map(|index| ir::LocalId(index as u32))
+        .expect("input owner");
+    let call_base = local_path_call.functions[load_nested.index()]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::ComponentCall { method, base, .. } if method == "set" => Some(base),
+            _ => None,
+        })
+        .expect("nested state set call");
+    *call_base = ir::ComponentBase::LocalPath {
+        local: input_owner,
+        path: vec!["primary".to_string()],
+    };
+    let errors = verify::verify_program(&local_path_call)
+        .expect_err("a whole-value local path must not become a call receiver");
+    assert!(
+        format!("{errors:?}").contains("cannot be component call receivers"),
+        "{errors:?}"
+    );
+
+    let mut missing_terminal = prog.clone();
+    let owner = missing_terminal
+        .components
+        .iter_mut()
+        .find(|component| component.name == "CopyOwner")
+        .expect("CopyOwner component");
+    let primary = owner
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "primary")
+        .expect("primary field");
+    let ir::ComponentFieldKind::Sub { component, .. } = &mut primary.kind else {
+        panic!("primary is a sub-component")
+    };
+    *component = ir::ComponentId(u32::MAX);
+    let errors = verify::verify_program(&missing_terminal)
+        .expect_err("a missing local-path terminal component must not verify or panic");
+    assert!(
+        format!("{errors:?}").contains("component c4294967295 does not resolve"),
+        "{errors:?}"
+    );
 
     let corrupt =
         |mut candidate: ir::TbProgram,

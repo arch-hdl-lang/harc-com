@@ -2316,6 +2316,18 @@ fn component_base_schema<'a>(
                 )))
             }
         },
+        ComponentBase::LocalPath { local, path } => {
+            let component = match cx.func.locals.get(local.index()).map(|l| &l.ty) {
+                Some(IrType::Component(component)) => *component,
+                _ => {
+                    return Err(EmitError(format!(
+                        "tbir: component value local %{} in {} has no component type",
+                        local.0, cx.func.name
+                    )))
+                }
+            };
+            (component, path)
+        }
         ComponentBase::SelfField => match cx.func.kind {
             FunctionKind::ComponentMethod { component, .. } => (component, &[]),
             _ => {

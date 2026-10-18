@@ -3368,6 +3368,7 @@ impl FuncBuilder<'_> {
             // for a CALL receiver. No `Expr::ComponentField` carries
             // one, so there is nothing here to resolve.
             crate::ir::ComponentBase::Local(_) => None,
+            crate::ir::ComponentBase::LocalPath { .. } => None,
         }
     }
 
@@ -6689,6 +6690,9 @@ pub(crate) fn check_literal_component_vec_index_bounds(
             format!("{}.{field}", path.join("."))
         }
         crate::ir::ComponentBase::Local(_) => field.to_string(),
+        crate::ir::ComponentBase::LocalPath { path, .. } => {
+            format!("{}.{field}", path.join("."))
+        }
     };
     if len == 0 {
         return Err(LowerError::Invalid(format!(

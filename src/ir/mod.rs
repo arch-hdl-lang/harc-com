@@ -3106,6 +3106,11 @@ pub enum ComponentBase {
     /// `observe(addr, model: ProtocolModel)`). The receiver is the local
     /// itself, passed by value. Emitted as the local's C++ name.
     Local(LocalId),
+    /// A nested sub-component reached from a component-typed local
+    /// (`env.source`, where `env` is a local component value). The local is
+    /// the owning value and `path` contains one or more `Sub` field names.
+    /// Emitted as the local's C++ name followed by the dot-joined path.
+    LocalPath { local: LocalId, path: Vec<String> },
 }
 
 /// A scoreboard mutation. The design doc pins this as a tagged enum

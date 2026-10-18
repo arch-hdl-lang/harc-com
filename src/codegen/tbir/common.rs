@@ -3150,7 +3150,9 @@ fn validate_component_base(
 ) -> Result<(), EmitError> {
     match base {
         ir::ComponentBase::SelfField | ir::ComponentBase::Path(_) => Ok(()),
-        ir::ComponentBase::Local(local) => validate_local(function, *local),
+        ir::ComponentBase::Local(local) | ir::ComponentBase::LocalPath { local, .. } => {
+            validate_local(function, *local)
+        }
     }
 }
 
@@ -3245,7 +3247,9 @@ fn validate_shared_component_base(
         ));
     };
     match base {
-        ir::ComponentBase::Local(local) => validate_local(function, *local),
+        ir::ComponentBase::Local(local) | ir::ComponentBase::LocalPath { local, .. } => {
+            validate_local(function, *local)
+        }
         ir::ComponentBase::Path(path) => {
             let Some(root) = path.first() else {
                 return Err(unsupported_function(

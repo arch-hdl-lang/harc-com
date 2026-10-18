@@ -3334,6 +3334,11 @@ fn resolve_component_queue_elem(
                 local.0
             ));
         }
+        ComponentBase::LocalPath { .. } => {
+            return Err(format!(
+                "component queue `{queue}` uses a whole-value copy path"
+            ));
+        }
     };
     let schema = prog
         .components
@@ -4240,6 +4245,9 @@ impl Checker<'_> {
                 "component field uses local base %{}; only method calls may use local component values",
                 local.0
             )),
+            ComponentBase::LocalPath { .. } => Err(
+                "component field uses a whole-value local copy path".to_string(),
+            ),
         }
     }
 
@@ -4456,6 +4464,59 @@ impl Checker<'_> {
             },
             ComponentBase::Path(path) => self.component_value_path_id(path),
             ComponentBase::SelfField => self.component_base_id(base),
+            ComponentBase::LocalPath { local, path } => {
+                let root = self.component_value_base_id(&ComponentBase::Local(*local))?;
+                if path.is_empty() {
+                    return Err("empty component local path".to_string());
+                }
+                let inherited = self
+                    .component_local_initializer(*local)?
+                    .and_then(|(_, mode)| mode);
+                let mut prefix = Vec::with_capacity(path.len());
+                let mut component = root;
+                for field in path {
+                    let resolved = resolve_component_path_mode(
+                        &self.prog.components,
+                        root,
+                        inherited,
+                        &prefix,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let owner = self
+                        .prog
+                        .components
+                        .get(resolved.component.index())
+                        .ok_or_else(|| {
+                            format!("component c{} does not resolve", resolved.component.0)
+                        })?;
+                    let schema = owner.field(field).ok_or_else(|| {
+                        format!("component `{}` has no field `{field}`", owner.name)
+                    })?;
+                    let ComponentFieldKind::Sub { component: child, .. } = schema.kind else {
+                        return Err(format!(
+                            "component local path `{}` does not end in a sub-component",
+                            path.join(".")
+                        ));
+                    };
+                    if !component_mode_includes_activation(
+                        resolved.effective_mode,
+                        schema.activation,
+                    ) {
+                        return Err(format!(
+                            "component local %{} path `{}` is disabled by its instance mode",
+                            local.0,
+                            path.join(".")
+                        ));
+                    }
+                    self.prog
+                        .components
+                        .get(child.index())
+                        .ok_or_else(|| format!("component c{} does not resolve", child.0))?;
+                    component = child;
+                    prefix.push(field.clone());
+                }
+                Ok(component)
+            }
         }
     }
 
@@ -4556,6 +4617,9 @@ impl Checker<'_> {
                     .map(|_| copied)
                     .ok_or_else(|| format!("component c{} does not resolve", copied.0))
             }
+            ComponentBase::LocalPath { .. } => {
+                Err("component subfield destination uses a whole-value copy path".to_string())
+            }
         }
     }
 
@@ -4598,7 +4662,6 @@ impl Checker<'_> {
                 }
             },
         };
-
         for (position, segment) in subpath.iter().enumerate() {
             let terminal = position + 1 == subpath.len();
             let Some(schema) = self.prog.components.get(component.index()) else {
@@ -4655,9 +4718,15 @@ impl Checker<'_> {
                         .map_err(|err| err.to_string())?;
                 (resolved.component, resolved.effective_mode)
             }
+            ComponentBase::LocalPath { .. } => {
+                return Err("component event uses a whole-value copy path".to_string());
+            }
             _ => (self.component_base_id(base)?, None),
         };
-        for segment in if matches!(base, ComponentBase::Local(_)) {
+        for segment in if matches!(
+            base,
+            ComponentBase::Local(_)
+        ) {
             &[][..]
         } else {
             subpath
@@ -4716,7 +4785,7 @@ impl Checker<'_> {
             }
             // The root binding mode of a component parameter is unknown, but
             // an explicit passive descendant mode is statically decisive.
-            ComponentBase::Local(_)
+            ComponentBase::Local(_) | ComponentBase::LocalPath { .. }
                 if matches!(field.activation, Activation::ActiveOnly)
                     && matches!(local_effective_mode, Some(ComponentInstanceMode::Passive)) =>
             {
@@ -4726,6 +4795,7 @@ impl Checker<'_> {
                 ));
             }
             ComponentBase::Local(_) => {}
+            ComponentBase::LocalPath { .. } => unreachable!("rejected above"),
         }
         Ok(payload)
     }
@@ -7125,7 +7195,13 @@ impl Checker<'_> {
                     args,
                     dest,
                 } => {
-                    match self.component_value_base_id(base) {
+                    let resolved = if matches!(base, ComponentBase::LocalPath { .. }) {
+                        Err("whole-value local copy paths cannot be component call receivers"
+                            .to_string())
+                    } else {
+                        self.component_value_base_id(base)
+                    };
+                    match resolved {
                         Ok(actual) if actual == *component => {
                             let schema = &self.prog.components[component.index()];
                             match schema.method(method) {
@@ -9363,8 +9439,12 @@ impl Checker<'_> {
             // typed value local. Replay path and activation resolution before
             // codegen trusts the base.
             Expr::ComponentValue { base } => {
-                if let crate::ir::ComponentBase::Local(local) = base {
-                    self.check_local(*local);
+                match base {
+                    crate::ir::ComponentBase::Local(local)
+                    | crate::ir::ComponentBase::LocalPath { local, .. } => {
+                        self.check_local(*local)
+                    }
+                    _ => {}
                 }
                 if let Err(detail) = self.component_value_base_id(base) {
                     self.report_bad_component_field(format!(
@@ -11165,7 +11245,9 @@ fn check_def_before_use(
                 Stmt::ComponentCall {
                     base, args, dest, ..
                 } => {
-                    if let ComponentBase::Local(local) = base {
+                    if let ComponentBase::Local(local)
+                    | ComponentBase::LocalPath { local, .. } = base
+                    {
                         if local.index() < nlocals && !bit_get(&defined, local.index()) {
                             errs.push(VerifyError::LocalUseBeforeDef {
                                 func: fid,
@@ -11208,7 +11290,9 @@ fn check_def_before_use(
                 }
                 Stmt::ComponentSubAssign { dst, src, .. } | Stmt::ComponentAssign { dst, src } => {
                     for base in [dst, src] {
-                        if let ComponentBase::Local(local) = base {
+                        if let ComponentBase::Local(local)
+                        | ComponentBase::LocalPath { local, .. } = base
+                        {
                             if local.index() < nlocals && !bit_get(&defined, local.index()) {
                                 errs.push(VerifyError::LocalUseBeforeDef {
                                     func: fid,
@@ -11287,6 +11371,9 @@ fn for_each_local(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | Expr::SeqIndex { seq: local, .. } => f(*local),
         Expr::ComponentValue {
             base: ComponentBase::Local(local),
+        }
+        | Expr::ComponentValue {
+            base: ComponentBase::LocalPath { local, .. },
         }
         | Expr::ComponentIdle {
             base: ComponentBase::Local(local),
