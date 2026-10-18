@@ -3,7 +3,7 @@
 //! args, DutRead/DutWrite operands, assert conditions) — everywhere
 //! else `lower_expr_no_ports` hoists DUT reads into `DutRead` temps.
 
-use super::{not_implemented, unsupported, FuncBuilder, LowerError, V1Status};
+use super::{not_implemented, FuncBuilder, LowerError, V1Status};
 use crate::ast::{
     BinaryOp, BuiltinTy, CallArg, Expr as AstExpr, ExprKind, TypeArg, TypeExpr, UnaryOp,
 };
@@ -764,8 +764,8 @@ impl super::FuncBuilder<'_> {
     ///
     /// The typed resolvers now carry supported mid-path and nested-vector
     /// selections. Reaching this fence means the remaining indexed shape is
-    /// still outside their representable record/component paths; v1 remains
-    /// the honest fallback for that residue.
+    /// still outside their representable record/component paths. Preserve the
+    /// measured legacy behavior without offering the retired v1 backend.
     pub(crate) fn reject_indexed_component_record_path(
         &self,
         e: &crate::ast::Expr,
@@ -807,10 +807,11 @@ impl super::FuncBuilder<'_> {
             return Ok(());
         }
         let segs = stripped.to_vec();
-        Err(unsupported(
+        Err(not_implemented(
             &format!("{what} an element selection inside `{}`", segs.join(".")),
             "this indexed component/state record shape is outside the typed path resolver; \
              use a supported fixed-vector leaf or `Vec<Record, N>` traversal",
+            V1Status::WorksButRetired,
         ))
     }
 

@@ -4,8 +4,8 @@
 //! MVP spine: the core types, a textual `Display` form (`display.rs`),
 //! a structural verifier (`verify.rs`), and AST → IR lowering for the
 //! core statement subset (`lower/`). Constructs outside the subset are
-//! rejected at lowering time with `LowerError::Unsupported` — the IR
-//! never silently mis-lowers.
+//! rejected at lowering time with a precise diagnostic — the IR never
+//! silently mis-lowers or redirects users to the retired v1 backend.
 
 pub mod display;
 pub mod lower;
@@ -772,7 +772,7 @@ impl RecordSchema {
 ///
 /// Subset (v0): a scoreboard is a *testbench field* holding data only.
 /// Scalar fields, whole value-record fields, `list<T>` fields with scalar or
-/// one-dimensional fixed-vector elements, and `queue<T>` fields where `T`
+/// recursively fixed-vector scalar elements, and `queue<T>` fields where `T`
 /// is `bool`, an explicitly sized `uint`/`sint` in the language range
 /// 1..=1024, or a value-record lower; the test body manipulates them through
 /// `Stmt::ScoreboardOp` (scalar/record read/write and queue push/pop), plus
@@ -811,8 +811,8 @@ pub enum ScoreboardFieldKind {
     /// `history : list<uint<8>>` / `lanes : list<Vec<uint<8>, 2>>` —
     /// dynamically-sized storage emitted as `std::vector<T>`. Lists expose
     /// read-only size/empty queries but not queue push/pop operations; this
-    /// schema preserves the declaration and its exact scalar or
-    /// one-dimensional fixed-vector element layout.
+    /// schema preserves the declaration and its exact scalar or recursive
+    /// fixed-vector element layout.
     List {
         elem: IrType,
         vec_len: Option<usize>,

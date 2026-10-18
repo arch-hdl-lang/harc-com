@@ -1,5 +1,5 @@
 //! TB-IR pipeline tests: AST → IR lowering snapshots, verifier checks,
-//! `LowerError::Unsupported` stubs, and tbir C++ emission smoke tests.
+//! precise lowering diagnostics, and tbir C++ emission smoke tests.
 //! The end-to-end v1-vs-tbir trace-equivalence gate runs out-of-band
 //! (`harc sim --codegen {v1,tbir}` + `harc trace-diff`); these tests
 //! lock the in-process shapes.
@@ -166,18 +166,20 @@ fn assert_wiring_matches_v1(src: &str, what: &str) {
     assert_eq!(v1, tb, "{what}: tbir must wire it exactly as v1 does");
 }
 
-/// The negative-test contract: every out-of-subset fixture must produce
-/// `LowerError::Unsupported` whose rendered message names the offending
-/// construct and points the user at `--codegen v1`.
-fn assert_unsupported(err: &lower::LowerError) -> String {
-    assert!(
-        matches!(err, lower::LowerError::Unsupported { .. }),
-        "must be LowerError::Unsupported: {err:?}"
-    );
+/// A real legacy-v1-only or shape-dependent gap must remain explicit without
+/// presenting the retired backend as an escape hatch.
+fn assert_retired_tbir_gap(err: &lower::LowerError) -> String {
+    match err {
+        lower::LowerError::NotImplemented {
+            v1: lower::V1Status::WorksButRetired | lower::V1Status::Unreliable,
+            ..
+        } => {}
+        _ => panic!("must be an explicit retired-v1 TB-IR gap: {err:?}"),
+    }
     let msg = err.to_string();
     assert!(
-        msg.contains("--codegen v1"),
-        "unsupported error must suggest --codegen v1: {msg}"
+        msg.contains("retired `--codegen v1`") && !msg.contains("re-run with"),
+        "retired-v1 gap must not offer the backend as a fallback: {msg}"
     );
     msg
 }
@@ -12096,7 +12098,7 @@ end impl T"#;
         "        wait until sb.q.pop() == 7",
         1,
     );
-    let msg = assert_unsupported(&lower_src(&wait).unwrap_err());
+    let msg = assert_retired_tbir_gap(&lower_src(&wait).unwrap_err());
     assert!(
         msg.contains("queue pop") && msg.contains("wait until"),
         "wait predicates keep their repeated-evaluation guard: {msg}"
@@ -16457,7 +16459,14 @@ end impl T"#
     );
     let nested_vec_list =
         prog("scoreboard Sb\n    l : list<Vec<Vec<uint<8>, 2>, 3>>\nend scoreboard Sb");
-    assert_unsupported(&lower_src(&nested_vec_list).unwrap_err());
+    let nested_prog = lower_src(&nested_vec_list).expect("recursive fixed-vector list lowers");
+    verify::verify_program(&nested_prog).expect("recursive fixed-vector list verifies");
+    let nested_cpp = emit_cpp_src(&nested_vec_list);
+    assert!(
+        nested_cpp.contains("std::vector<std::array<std::array<uint64_t, 2>, 3>> l{};"),
+        "recursive list element layout must be preserved:\n{nested_cpp}"
+    );
+    assert_cpp_typechecks("nested_scoreboard_vec_list", &nested_cpp);
     let defaulted_list = prog("scoreboard Sb\n    l : list<uint<8>> default 0\nend scoreboard Sb");
     assert_not_implemented(
         &lower_src(&defaulted_list).unwrap_err(),
@@ -19094,7 +19103,7 @@ end test PureLazyTest
         "        let free_and = false && nested_tick(dut)",
         "        wait until nested_tick(dut)",
     );
-    let msg = assert_unsupported(
+    let msg = assert_retired_tbir_gap(
         &lower_src(&waiting).expect_err("an impure helper cannot run inside wait-until"),
     );
     assert!(
@@ -31423,7 +31432,7 @@ fn component_call_in_message_stays_in_the_failure_branch() {
         "assert true else fail(\"untaken diagnostic call=${harness.inner.step(2)}\")",
         "wait until harness.inner.peek() == 66891",
     );
-    let msg = assert_unsupported(
+    let msg = assert_retired_tbir_gap(
         &lower_src(&wait).expect_err("component call in wait predicate must be rejected"),
     );
     assert!(msg.contains("`wait until` predicate"), "{msg}");
@@ -32594,7 +32603,7 @@ end test T"#;
     );
 
     let zero = src.replace("wait 1 cycle\n    return 1", "wait 0 cycles\n    return 1");
-    let msg = assert_unsupported(
+    let msg = assert_retired_tbir_gap(
         &lower_src(&zero).expect_err("a zero-wait helper still needs an unavailable CFG step"),
     );
     assert!(msg.contains("statement-level step"), "got: {msg}");
@@ -33451,7 +33460,7 @@ end test T"#,
     ];
     for src in cases {
         let err = lower_src(src).expect_err("a suspending handler body must not lower");
-        let msg = assert_unsupported(&err);
+        let msg = assert_retired_tbir_gap(&err);
         assert!(msg.contains("per-cycle checker pass"), "got: {msg}");
     }
 }
@@ -33557,8 +33566,8 @@ end test T"#;
         "            else\n",
         "            elsif true\n                log(info, \"taken\")\n            else\n",
     );
-    assert_unsupported(
-        &lower_src(&reachable_elsif).expect_err("a reachable elsif keeps the fallback"),
+    assert_retired_tbir_gap(
+        &lower_src(&reachable_elsif).expect_err("a reachable elsif remains a retired gap"),
     );
 }
 
@@ -33592,8 +33601,8 @@ end test T"#;
     assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
 
     let runtime_elsif = src.replace("            elsif false\n", "            elsif dut.rst == 1\n");
-    assert_unsupported(
-        &lower_src(&runtime_elsif).expect_err("a runtime-dependent elsif keeps the fallback"),
+    assert_retired_tbir_gap(
+        &lower_src(&runtime_elsif).expect_err("a runtime-dependent elsif remains a retired gap"),
     );
 }
 
@@ -33623,9 +33632,11 @@ end test T"#;
     assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
 
     let zero = src.replace("            repeat 2\n", "            repeat 0\n");
-    assert_unsupported(&lower_src(&zero).expect_err("a zero repeat keeps the fallback"));
+    assert_retired_tbir_gap(&lower_src(&zero).expect_err("a zero repeat remains a retired gap"));
     let runtime = src.replace("            repeat 2\n", "            repeat dut.rst\n");
-    assert_unsupported(&lower_src(&runtime).expect_err("a runtime repeat keeps the fallback"));
+    assert_retired_tbir_gap(
+        &lower_src(&runtime).expect_err("a runtime repeat remains a retired gap"),
+    );
 }
 
 #[test]
@@ -33657,8 +33668,8 @@ end test T"#;
         "                wait 1 cycle on aux\n",
         "                if dut.rst == 1\n                    wait 1 cycle on aux\n                end if\n",
     );
-    assert_unsupported(
-        &lower_src(&conditional).expect_err("a conditional loop-entry wait keeps the fallback"),
+    assert_retired_tbir_gap(
+        &lower_src(&conditional).expect_err("a conditional loop-entry wait remains a retired gap"),
     );
 
     let uncompilable = src.replace(
@@ -33736,8 +33747,8 @@ end test T"#;
     assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
 
     let runtime_first = src.replace("            elsif false\n", "            elsif dut.rst == 1\n");
-    assert_unsupported(
-        &lower_src(&runtime_first).expect_err("an earlier runtime elsif keeps the fallback"),
+    assert_retired_tbir_gap(
+        &lower_src(&runtime_first).expect_err("an earlier runtime elsif remains a retired gap"),
     );
 }
 
@@ -33767,9 +33778,11 @@ end test T"#;
     assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
 
     let runtime = src.replace("            while (true)\n", "            while dut.rst == 1\n");
-    assert_unsupported(&lower_src(&runtime).expect_err("a runtime while keeps the fallback"));
+    assert_retired_tbir_gap(
+        &lower_src(&runtime).expect_err("a runtime while remains a retired gap"),
+    );
     let never = src.replace("            while (true)\n", "            while false\n");
-    assert_unsupported(&lower_src(&never).expect_err("a false while keeps the fallback"));
+    assert_retired_tbir_gap(&lower_src(&never).expect_err("a false while remains a retired gap"));
 }
 
 #[test]
@@ -33798,9 +33811,11 @@ end test T"#;
     assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
 
     let empty = src.replace("for i in 0 .. 2", "for i in 2 .. 0");
-    assert_unsupported(&lower_src(&empty).expect_err("an empty range keeps the fallback"));
+    assert_retired_tbir_gap(&lower_src(&empty).expect_err("an empty range remains a retired gap"));
     let runtime = src.replace("for i in 0 .. 2", "for i in 0 .. dut.count");
-    assert_unsupported(&lower_src(&runtime).expect_err("a runtime range keeps the fallback"));
+    assert_retired_tbir_gap(
+        &lower_src(&runtime).expect_err("a runtime range remains a retired gap"),
+    );
 }
 
 #[test]
@@ -33834,14 +33849,16 @@ end test T"#;
         "            else\n                wait 2 cycles on aux\n",
         "",
     );
-    assert_unsupported(
-        &lower_src(&missing_else).expect_err("a missing else keeps the fallback path"),
+    assert_retired_tbir_gap(
+        &lower_src(&missing_else).expect_err("a missing else remains a retired gap"),
     );
     let open_then = src.replace(
         "                wait 1 cycle on aux",
         "                log(info, \"open\")",
     );
-    assert_unsupported(&lower_src(&open_then).expect_err("an open then arm keeps the fallback"));
+    assert_retired_tbir_gap(
+        &lower_src(&open_then).expect_err("an open then arm remains a retired gap"),
+    );
 }
 
 #[test]
@@ -33878,15 +33895,15 @@ end test T"#;
         "                wait 2 cycles on aux",
         "                log(info, \"open\")",
     );
-    assert_unsupported(
-        &lower_src(&open_elsif).expect_err("an open elsif arm keeps the fallback"),
+    assert_retired_tbir_gap(
+        &lower_src(&open_elsif).expect_err("an open elsif arm remains a retired gap"),
     );
     let missing_else = src.replace(
         "            else\n                wait 4 cycles on aux\n",
         "",
     );
-    assert_unsupported(
-        &lower_src(&missing_else).expect_err("an elsif chain without else keeps the fallback"),
+    assert_retired_tbir_gap(
+        &lower_src(&missing_else).expect_err("an elsif chain without else remains a retired gap"),
     );
 }
 
@@ -34047,12 +34064,12 @@ end test T"#;
     );
 
     let periodic = src.replace("on true", "on 1 cycles");
-    assert_unsupported(
-        &lower_src(&periodic).expect_err("periodic helper waits retain the fallback"),
+    assert_retired_tbir_gap(
+        &lower_src(&periodic).expect_err("periodic helper waits remain a retired gap"),
     );
     let post_eval = src.replace("on true", "on true phase post_eval");
-    assert_unsupported(
-        &lower_src(&post_eval).expect_err("post-eval helper waits retain the fallback"),
+    assert_retired_tbir_gap(
+        &lower_src(&post_eval).expect_err("post-eval helper waits remain a retired gap"),
     );
 
     let runtime = r#"function delay_count(n: uint<8>)
@@ -34068,8 +34085,8 @@ test T
         wait 2 cycles
     end run
 end test T"#;
-    assert_unsupported(
-        &lower_src(runtime).expect_err("runtime-count helper waits retain the fallback"),
+    assert_retired_tbir_gap(
+        &lower_src(runtime).expect_err("runtime-count helper waits remain a retired gap"),
     );
 
     let conditional = r#"function maybe_delay()
@@ -34087,8 +34104,8 @@ test T
         wait 2 cycles
     end run
 end test T"#;
-    assert_unsupported(
-        &lower_src(conditional).expect_err("conditional helper waits retain the fallback"),
+    assert_retired_tbir_gap(
+        &lower_src(conditional).expect_err("conditional helper waits remain a retired gap"),
     );
 
     let changed_trigger = r#"function clear_then_delay(d: Top)
@@ -34105,9 +34122,9 @@ test T
         wait 2 cycles
     end run
 end test T"#;
-    assert_unsupported(
+    assert_retired_tbir_gap(
         &lower_src(changed_trigger)
-            .expect_err("a helper that changes its trigger retains the fallback"),
+            .expect_err("a helper that changes its trigger remains a retired gap"),
     );
 }
 
@@ -34263,7 +34280,7 @@ end test T"#;
     );
 
     let zero = src.replace("wait 1 cycle", "wait 0 cycles");
-    let msg = assert_unsupported(
+    let msg = assert_retired_tbir_gap(
         &lower_src(&zero).expect_err("a zero-wait trigger still needs an unavailable CFG step"),
     );
     assert!(msg.contains("statement-level step"), "{msg}");
@@ -35725,7 +35742,7 @@ impl T for Tb
         wait 1 cycle
     end run
 end impl T"#;
-    let message = assert_unsupported(
+    let message = assert_retired_tbir_gap(
         &lower_src(effectful)
             .expect_err("a concurrent message cannot materialize an effectful helper call"),
     );
@@ -42256,7 +42273,7 @@ env AnalysisEnv"#;
     let declared = fixture
         .replace(ANCHOR, &format!("{ANCHOR}\n    weird  : ExtraCov"))
         .replacen("env AnalysisEnv", EXTRA_COV, 1);
-    let msg = assert_unsupported(&lower_src(&declared).unwrap_err());
+    let msg = assert_retired_tbir_gap(&lower_src(&declared).unwrap_err());
     assert!(msg.contains("sub-component field"), "{msg}");
 
     // An ENUM is the case the first draft broke: the declared-type set
@@ -47363,7 +47380,7 @@ end impl SpTest"#
     );
 
     let zero_composite = composite.replace("wait 1 cycle", "wait 0 cycles");
-    let msg = assert_unsupported(
+    let msg = assert_retired_tbir_gap(
         &lower_src(&zero_composite)
             .expect_err("a zero-wait composite still needs an unavailable CFG step"),
     );
@@ -48729,9 +48746,9 @@ fn a_covergroup_hook_trigger_has_two_reachable_shape_arms() {
             "env DormantCoverOwner\n    cov : StepCov\nend env DormantCoverOwner\n\ntestbench CovHookTriggerTb",
             1,
         );
-        let msg = assert_unsupported(
+        let msg = assert_retired_tbir_gap(
             &lower_src(&dormant_owner)
-                .expect_err("component-only covergroup references retain the v1 fallback"),
+                .expect_err("component-only covergroup references remain a retired gap"),
         );
         assert!(msg.contains("DormantCoverOwner.cov"), "{trigger}: {msg}");
     }
@@ -48803,9 +48820,9 @@ end test T
         "env DormantCoverOwner\n    point_cov : PointCov\nend env DormantCoverOwner\n\ntest T",
         1,
     );
-    let msg = assert_unsupported(
+    let msg = assert_retired_tbir_gap(
         &lower_src(&dormant_owner)
-            .expect_err("component-only covergroup references retain the v1 fallback"),
+            .expect_err("component-only covergroup references remain a retired gap"),
     );
     assert!(msg.contains("DormantCoverOwner.point_cov"), "{msg}");
 
@@ -48835,10 +48852,11 @@ end test T
     }
 
     // Non-suspending helpers are also "impure" to TB-IR when they read the
-    // DUT, but v1 can execute this sampler. Keep the working fallback instead
-    // of generalizing the cycle-wait crash classification to every helper.
+    // DUT, but v1 could execute this sampler. Preserve that measured legacy
+    // behavior without generalizing the cycle-wait crash classification to
+    // every helper or offering the retired backend as a fallback.
     let v1_src = src.replacen("    run\n", "    let cov : V1Cov\n    run\n", 1);
-    let msg = assert_unsupported(&lower_src(&v1_src).unwrap_err());
+    let msg = assert_retired_tbir_gap(&lower_src(&v1_src).unwrap_err());
     assert!(msg.contains("impure helper call `read_value`"), "{msg}");
     let v1_cpp = cpp_tb::emit(&merged_src(&v1_src)).expect("v1 emits the DUT-reading sampler");
     assert_cpp_typechecks("nonsuspending_impure_cover_helper", &v1_cpp);

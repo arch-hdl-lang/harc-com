@@ -10,7 +10,8 @@
 //! `Expr::ScoreboardQuery` (size/empty/value-read).
 //!
 //! Out-of-scope shapes are explicit rejections, never silent drops.
-//! `Unsupported` (v1 runs the program):
+//! `NotImplemented { v1: WorksButRetired }` (v1 used to run the program,
+//! but is no longer offered as a fallback):
 //!   - scoreboard `hookable`/`function` methods (need per-instance state
 //!     materialization — rejected at the call site, but the declaration
 //!     itself is also rejected here so an unreferenced method-bearing
@@ -24,7 +25,7 @@
 //!   - `connect` / `on` event wiring, which v1 drops in a transactor
 //!     container. See the measurement at each arm.
 
-use super::{not_implemented, unsupported, LowerError, V1Status};
+use super::{not_implemented, LowerError, V1Status};
 use crate::ast::{BuiltinTy, ComponentDecl, ComponentItem, ExprKind, TypeArg, TypeExpr};
 use crate::codegen::cpp_tb::RecordLeafFate;
 use crate::ir::{IrType, RecordId, ScoreboardFieldKind, ScoreboardFieldSchema, ScoreboardSchema};
@@ -388,9 +389,10 @@ fn scoreboard_field_kind(
                         V1Status::SilentlyMisLowers,
                     )
                 } else {
-                    scoreboard_subset_gap(
+                    not_implemented(
                         &what,
-                        "only scalar list elements and one-dimensional `Vec<scalar, N>` elements are lowered",
+                        "only scalar and recursively fixed-vector scalar list elements are lowered",
+                        V1Status::WorksButRetired,
                     )
                 }
             };
@@ -406,7 +408,7 @@ fn scoreboard_field_kind(
                     ..
                 } => {
                     let elem = match args.first() {
-                        Some(TypeArg::Type(ty)) => scoreboard_list_scalar_ir_type(ty),
+                        Some(TypeArg::Type(ty)) => scoreboard_list_value_ir_type(ty),
                         _ => None,
                     }
                     .ok_or_else(&unsupported_elem)?;
@@ -422,9 +424,10 @@ fn scoreboard_field_kind(
                             "scoreboard list field `{sb}.{fname}` with an invalid fixed-vector length"
                         );
                         if scoreboard_list_value_type_is_preserved(elem_ty) {
-                            scoreboard_subset_gap(
+                            not_implemented(
                                 &what,
                                 "use a decimal compile-time literal for the fixed-vector length",
+                                V1Status::WorksButRetired,
                             )
                         } else {
                             not_implemented(
@@ -503,7 +506,7 @@ fn scoreboard_field_kind(
                 V1Status::SilentlyMisLowers,
             );
         }
-        scoreboard_subset_gap(&what, SUBSET)
+        not_implemented(&what, SUBSET, V1Status::WorksButRetired)
     })?;
     Ok(ScoreboardFieldKind::Scalar {
         ty,
@@ -537,6 +540,39 @@ fn scoreboard_list_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     .flatten()
 }
 
+/// Exact scalar or recursively fixed-vector value carried by a scoreboard
+/// list element. The outermost fixed-vector length remains in
+/// `ScoreboardFieldKind::List::vec_len` for compatibility; deeper dimensions
+/// use the ordinary recursive `IrType::FixedVec` representation.
+fn scoreboard_list_value_ir_type(t: &TypeExpr) -> Option<IrType> {
+    if let Some(scalar) = scoreboard_list_scalar_ir_type(t) {
+        return Some(scalar);
+    }
+    let TypeExpr::Builtin {
+        name: BuiltinTy::Vec,
+        args,
+        ..
+    } = t
+    else {
+        return None;
+    };
+    let elem = match args.first() {
+        Some(TypeArg::Type(elem)) => scoreboard_list_value_ir_type(elem)?,
+        _ => return None,
+    };
+    let len = match args.get(1) {
+        Some(TypeArg::Expr(expr)) => match &*expr.kind {
+            ExprKind::Int(text) => text.replace('_', "").parse::<usize>().ok()?,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(IrType::FixedVec {
+        elem: Box::new(elem),
+        len,
+    })
+}
+
 /// Whether v1's declaration-only scoreboard member preserves this value type.
 /// This differs from `record_leaf_fate`, which also accounts for the
 /// transaction randomize body that scoreboards never emit. Nested fixed
@@ -548,13 +584,6 @@ fn scoreboard_list_value_type_is_preserved(t: &TypeExpr) -> bool {
     }
     crate::codegen::cpp_tb::fixed_vec_type_args(t)
         .is_some_and(|(elem, _)| scoreboard_list_value_type_is_preserved(elem))
-}
-
-/// Keep all scoreboard field-shape migration gaps on the existing shared
-/// Unsupported constructor. Source-shape branches call this classifier rather
-/// than multiplying raw inventory sites.
-fn scoreboard_subset_gap(what: &str, detail: impl Into<String>) -> LowerError {
-    unsupported(what, detail)
 }
 
 /// A scoreboard field's `default` — same rule as the component form

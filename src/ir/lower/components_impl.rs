@@ -21,7 +21,7 @@
 //! value-record, and recursively nested fixed-scalar vectors. Those
 //! gate on the agent/sequencer/event slices.
 
-use super::{helpers, not_implemented, unsupported, FuncBuilder, LowerCtx, LowerError, V1Status};
+use super::{helpers, not_implemented, FuncBuilder, LowerCtx, LowerError, V1Status};
 use crate::ast::{
     BuiltinTy, ComponentDecl, ComponentField, ComponentItem, ConnectEdge, ExprKind, HookableMethod,
     TransactorDecl, TransactorMode, TypeArg, TypeExpr,
@@ -1871,9 +1871,10 @@ fn lower_field(
             //   * a DECLARED type that is not a supported sub-component
             //     kind (a `covergroup`, say) — v1 emits
             //     `AnalysisCovCollector2 weird;` and wires its sampling
-            //     (`env.weird.cp.b0++`). That is a working feature, so
-            //     `--codegen v1` is a real escape hatch and the
-            //     classification stays `Unsupported`.
+            //     (`env.weird.cp.b0++`). That was a working legacy
+            //     feature, so preserve the evidence as
+            //     `NotImplemented { WorksButRetired }` without offering
+            //     the retired backend as an escape hatch.
             //
             //   * a name that is declared NOWHERE — v1 assumes a
             //     Verilated DUT handle and emits
@@ -1906,10 +1907,11 @@ fn lower_field(
                     V1Status::EmitsUncompilable,
                 ));
             }
-            Err(unsupported(
+            Err(not_implemented(
                 &format!("sub-component field `{comp}.{fname}` of type `{simple}`"),
                 "only env/method-scoreboard/data-scoreboard/analysis-source \
                  sub-components are lowered",
+                V1Status::WorksButRetired,
             ))
         }
     }

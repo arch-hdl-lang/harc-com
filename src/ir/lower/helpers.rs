@@ -18,13 +18,13 @@
 //!
 //! The categorization is deliberately conservative: an expression or
 //! statement form the scanner does not recognize marks the helper
-//! impure, deferring the precise `Unsupported` error to call-site
+//! impure, deferring the precise lowering diagnostic to call-site
 //! lowering — so an *uncalled* impure helper with exotic contents
 //! never errors (v1 likewise emits every helper lambda and lets the
 //! C++ compiler ignore the uncalled ones). Helpers classified pure
 //! lower eagerly, so the rare scan-recognized-but-unlowerable form
 //! (e.g. a Verilog-sized literal) errors even when uncalled — still an
-//! explicit `Unsupported`, never a mis-lower.
+//! explicit diagnostic, never a mis-lower.
 //!
 //! Recursion (direct or mutual) is rejected up front via a DFS over
 //! the helper-to-helper call graph, and again at inline time via the

@@ -15,7 +15,7 @@
 //! `Vec<T, N>` field lowers when `T` is a supported scalar or a
 //! supported record (`IrType::Record` element + `vec_len`, v1's
 //! `std::array<T, N>` member). Out-of-scope shapes are explicit
-//! `Unsupported` rejections, never silent drops: `when` subtype blocks,
+//! `NotImplemented` diagnostics, never silent drops: `when` subtype blocks,
 //! `Vec` of any other element (enums and `Vec`-of-`Vec`),
 //! string/object/dynamic leaves,
 //! widths above 64 bits, and non-literal field defaults. Recursive /
@@ -26,7 +26,7 @@
 //! Enum-typed fields lower as scalar variant indices (v1's `int64_t`
 //! member shape).
 
-use super::{not_implemented, unsupported, LowerError, V1Status};
+use super::{not_implemented, LowerError, V1Status};
 use crate::ast::{
     BuiltinTy, ExprKind, Field, StructDecl, TransactionDecl, TxnBodyItem, TypeArg, TypeExpr,
 };
@@ -141,7 +141,7 @@ fn non_scalar_record_leaf(
         );
     }
     match crate::codegen::cpp_tb::record_leaf_fate(ty, &|n| record_ids.contains_key(n)) {
-        RecordLeafFate::Models => unsupported(&what, SUBSET),
+        RecordLeafFate::Models => not_implemented(&what, SUBSET, V1Status::WorksButRetired),
         RecordLeafFate::Flattens => not_implemented(
             &what,
             format!(
