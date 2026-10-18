@@ -109,6 +109,10 @@ pub enum V1Status {
     /// says — the worst outcome, and the reason TB-IR refuses rather
     /// than matching it.
     SilentlyMisLowers,
+    /// v1 never validates the declaration itself: it ignores the construct
+    /// while its owner is unreachable, but fails once that owner is
+    /// instantiated. This is not a usable backend fallback.
+    ReachabilityDependent,
 }
 
 impl V1Status {
@@ -120,6 +124,9 @@ impl V1Status {
             }
             V1Status::SilentlyMisLowers => {
                 "`--codegen v1` accepts it but silently emits something else"
+            }
+            V1Status::ReachabilityDependent => {
+                "`--codegen v1` only ignores it while its owner is unreachable and fails once the owner is instantiated"
             }
         }
     }

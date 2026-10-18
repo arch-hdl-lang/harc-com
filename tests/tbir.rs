@@ -4459,8 +4459,8 @@ end impl QueueBoundaryTest
 /// earns, which is not the same grade for all of them. Fully specified
 /// `Vec<scalar, N>` elements are covered by the fixed-vector queue test below.
 ///
-/// Bare `Vec` and `list` keep `Unsupported`: v1 gives them a C++
-/// element type and builds. An ENUM does not — v1 emits the bare name
+/// Bare `Vec` and `list` are silent v1 type erasures: v1 gives them a
+/// fallback C++ element type and builds. An ENUM does not — v1 emits the bare name
 /// into `HarcQueue<Color>` and declares no C++ enum, so g++ refuses and
 /// `--codegen v1` is a dead end. One label used to cover all three.
 #[test]
@@ -4496,13 +4496,20 @@ end impl AggregateQueueTest
     );
 
     for elem in ["Vec", "list"] {
-        let msg = assert_unsupported(&lower_src(&prog(elem)).unwrap_err());
+        let msg = assert_not_implemented(
+            &lower_src(&prog(elem)).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
         assert!(
             msg.contains("non-scalar queue element")
-                && msg.contains("has no typed queue representation yet"),
-            "`queue<{elem}>` must stay explicitly unsupported: {msg}"
+                && msg.contains("does not preserve the declared value shape"),
+            "`queue<{elem}>` must report the v1 type erasure: {msg}"
         );
-        cpp_tb::emit(&merged_src(&prog(elem))).expect("v1 emits these, which keeps it honest");
+        let v1 = cpp_tb::emit(&merged_src(&prog(elem))).expect("v1 emits the erased queue");
+        assert!(
+            v1.contains("HarcQueue<uint64_t> values"),
+            "v1 must erase `queue<{elem}>` to a scalar element: {v1}"
+        );
     }
 }
 
@@ -13299,8 +13306,8 @@ end impl T
     // emits the bare name for a record or an enum, v1 declares the
     // records it emits and no C++ enum at all, so `Color` is undeclared
     // in the subscriber signature. Every OTHER non-record payload goes
-    // through `record_field_c_type`, gets a real C++ type, and builds —
-    // so it keeps the honest `Unsupported`. One label used to cover
+    // through `record_field_c_type`, gets a fallback C++ type, and builds —
+    // but that type does not preserve the declaration. One label used to cover
     // both and promised a v1 that cannot build the enum half; splitting
     // it on "is it a NAMED type" instead got `string` wrong the other
     // way, since `string` parses as a named type and v1 builds it.
@@ -13317,16 +13324,19 @@ end impl T
         "    ev : out event<string>",
         "    ev : out event<queue<uint<8>>>",
     ] {
-        let msg = assert_unsupported(&lower_src(&prog(still_refused)).unwrap_err());
+        let msg = assert_not_implemented(
+            &lower_src(&prog(still_refused)).unwrap_err(),
+            lower::V1Status::SilentlyMisLowers,
+        );
         assert!(!msg.is_empty(), "`{still_refused}` keeps a reason");
-        cpp_tb::emit(&merged_src(&prog(still_refused))).expect("v1 emits and builds these");
+        cpp_tb::emit(&merged_src(&prog(still_refused))).expect("v1 emits the erased payload");
     }
     assert!(
         cpp_tb::emit(&merged_src(&prog("    ev : out event<string>")))
             .expect("v1 emits")
             .contains("std::vector<std::function<void(uint64_t)>> ev;"),
-        "…flattening the payload to a 64-bit integer, which is why the \
-         suggestion stays honest there"
+        "…flattening the payload to a 64-bit integer, which is why v1 is not \
+         a semantic fallback there"
     );
 
     // A `default` on an event field: pasted into the subscriber
@@ -37038,7 +37048,7 @@ end impl T"#,
     );
 }
 
-/// A malformed `connect` endpoint keeps its `--codegen v1` suggestion,
+/// A malformed `connect` endpoint does not offer v1 as a fallback,
 /// and the reason is the whole point of the class system: what v1 does
 /// with a bad edge depends on where the edge SITS, not on how it is
 /// malformed.
@@ -37053,10 +37063,10 @@ end impl T"#,
 ///     resolves `connect` for every env in the merged file, so it sees
 ///     edges v1 never reaches.
 ///
-/// One site, three outcomes. No single `V1Status` is honest, so the
-/// suggestion stays — it is true somewhere.
+/// One site, three outcomes. `ReachabilityDependent` records that split
+/// without presenting v1 as a usable fallback.
 #[test]
-fn a_malformed_connect_endpoint_keeps_its_v1_suggestion() {
+fn a_malformed_connect_endpoint_reports_reachability_dependent_v1_behavior() {
     let src = |edge: &str, inst: &str| {
         format!(
             r#"transactor Src
@@ -37112,6 +37122,30 @@ end impl T"#
         "{msg}"
     );
 
+    // Non-path endpoint expressions take a different instantiated-v1
+    // failure route: v1 rejects them directly instead of emitting malformed
+    // member access. Uninstantiated owners are still skipped, so both sites
+    // have the same reachability-dependent availability grade.
+    for edge in [
+        "src.observed + 0 -> sink.take",
+        "src.observed -> sink.take + 0",
+    ] {
+        let err = lower_src(&src(edge, "    top : E")).unwrap_err();
+        assert_not_implemented(&err, lower::V1Status::ReachabilityDependent);
+        let v1 = cpp_tb::emit(&merged_src(&src(edge, "    top : E")))
+            .expect_err("instantiated non-path connect endpoint must fail in v1");
+        assert!(
+            v1.to_string()
+                .contains("connect: edge endpoints must be plain field paths"),
+            "`{edge}`: {v1}"
+        );
+
+        let err = lower_src(&src(edge, "")).unwrap_err();
+        assert_not_implemented(&err, lower::V1Status::ReachabilityDependent);
+        cpp_tb::emit(&merged_src(&src(edge, "")))
+            .expect("v1 skips a non-path edge in an uninstantiated owner");
+    }
+
     for (edge, want) in [
         // Reported against the OWNER now: a single-segment source is a
         // real spelling (see the owner-relative test below), so `src`
@@ -37143,15 +37177,15 @@ end impl T"#
             continue;
         }
         let err = lower_src(&src(edge, "    top : E")).unwrap_err();
-        let msg = assert_unsupported(&err);
+        let msg = assert_not_implemented(&err, lower::V1Status::ReachabilityDependent);
         assert!(msg.contains(want), "`{edge}`: {msg}");
 
         // The SAME edge in an UNINSTANTIATED env: v1 emits no wiring
         // there at all, so it succeeds where tbir still rejects. This
-        // is the landing that makes any `NotImplemented` claim on these
-        // sites false.
+        // is the landing that makes a simple `EmitsUncompilable` claim on
+        // these sites false.
         let err = lower_src(&src(edge, "")).unwrap_err();
-        assert_unsupported(&err);
+        assert_not_implemented(&err, lower::V1Status::ReachabilityDependent);
     }
 }
 

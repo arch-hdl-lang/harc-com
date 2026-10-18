@@ -1287,6 +1287,24 @@ impl FuncBuilder<'_> {
                     }
                     let id = self.declare(&l.name.name);
                     self.set_local_type(id, IrType::Component(component));
+                    // Component assignment copies user state only; runtime
+                    // callback vectors belong to the destination instance.
+                    // Install that destination graph before applying the
+                    // source snapshot whenever this component's local
+                    // runtime surface is supported.
+                    if crate::ir::component_local_runtime_requirement(
+                        &self.ctx.components,
+                        component,
+                    )
+                    .is_none()
+                    {
+                        self.component_local_modes.insert(id, None);
+                        self.push(Stmt::ComponentInit {
+                            local: id,
+                            component,
+                            mode: None,
+                        });
+                    }
                     self.push(Stmt::Assign(id, Expr::ComponentValue { base }));
                     return Ok(());
                 }
@@ -1317,7 +1335,7 @@ impl FuncBuilder<'_> {
                             l.name.name, self.ctx.components[component.index()].name
                         ),
                         format!(
-                            "v1 installs per-instance runtime infrastructure for {detail}; TB-IR component locals currently support state and method-only component trees"
+                            "v1 installs per-instance runtime infrastructure for {detail}; TB-IR component locals currently support state, methods, event subscriptions, and internal connect graphs"
                         ),
                     ));
                 }

@@ -14,7 +14,7 @@ incorrectly classified as gaps even though v1 rejects the same source.
 
 The refreshed 2026-10-18 inventory is recorded in
 [`tbir-migration-manifest.md`](tbir-migration-manifest.md). After the current
-batch there are 22 executable constructors (23 textual matches including the
+batch there are 13 executable constructors (14 textual matches including the
 helper definition); the manifest separates positive runtime controls from
 diagnostic and deliberately deferred shapes.
 
@@ -166,6 +166,12 @@ family of rejections over a one-site exception. Current implementation order:
 - [x] Zero-length fixed vectors as typed empty value aggregates across record
   fields, component/transactor state, queues, events, helper and component
   method ABIs, with exact `std::array<T, 0>` storage and verifier metadata.
+- [x] Function-local component runtime graphs whose lifetime is self-owned:
+  event subscriptions and internal `connect` bridges install at
+  `ComponentInit`, including nested sub-components. Repeated initialization
+  resets heartbeat and hook state and replaces old subscribers;
+  component-value locals install a destination graph before copying source
+  state.
 
 This list intentionally excludes v1 failures such as a blocking bus call
 nested in an expression. Those may still be useful TB-IR enhancements, but
@@ -665,7 +671,13 @@ not applicable before requesting review:
    failures and type erasures receive `NotImplemented` grades. The source
    inventory is now 23 textual matches (22 executable constructors plus the
    helper definition).
-9. Before a PR, obtain the independent findings-first review required by
+9. Function-local components now install self-owned event subscriptions and
+   internal `connect` bridges at `ComponentInit`. Malformed `connect`
+   declarations no longer advertise a placement-dependent v1 escape hatch,
+   and incomplete queue/event payloads report v1's scalar type erasure. The
+   source inventory is now 14 textual matches (13 executable constructors
+   plus the helper definition).
+10. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.
 

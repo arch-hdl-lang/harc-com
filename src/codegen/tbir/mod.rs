@@ -2236,7 +2236,10 @@ fn emit_on_handler_regs(
     bound_bus: Option<&ir::BusBindingSchema>,
     bus_adapters: Option<&[expr::TestbenchBusAdapterPlan]>,
     run_context: Option<&str>,
+    depth: usize,
 ) -> Result<(), EmitError> {
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
     let comp = &prog.components[component.index()];
     let input_heartbeat = runtime::component_heartbeat_field(
         comp,
@@ -2262,22 +2265,22 @@ fn emit_on_handler_regs(
                 let capture = persistent_setup_capture(run_context);
                 writeln!(
                     out,
-                    "{INDENT}{inst_path}.{}.push_back([{capture}](auto _t) {{",
+                    "{pad}{inst_path}.{}.push_back([{capture}](auto _t) {{",
                     oh.event
                 )
                 .ok();
-                emit_persistent_setup_bindings(out, 2, run_context);
+                emit_persistent_setup_bindings(out, depth + 1, run_context);
                 writeln!(
                     out,
-                    "{INDENT}{INDENT}{inst_path}.{input_heartbeat} = (uint64_t)cycle_count;"
+                    "{pad1}{inst_path}.{input_heartbeat} = (uint64_t)cycle_count;"
                 )
                 .ok();
-                writeln!(out, "{INDENT}{INDENT}{call};").ok();
-                writeln!(out, "{INDENT}}});").ok();
+                writeln!(out, "{pad1}{call};").ok();
+                writeln!(out, "{pad}}});").ok();
             } else {
                 writeln!(
                     out,
-                    "{INDENT}{inst_path}.{}.push_back([&](auto _t) {{ {inst_path}.{input_heartbeat} = (uint64_t)cycle_count; {call}; }});",
+                    "{pad}{inst_path}.{}.push_back([&](auto _t) {{ {inst_path}.{input_heartbeat} = (uint64_t)cycle_count; {call}; }});",
                     oh.event
                 )
                 .ok();
@@ -2305,10 +2308,82 @@ fn emit_on_handler_regs(
                 bound_bus,
                 bus_adapters,
                 run_context,
+                depth,
             )?;
         }
     }
     Ok(())
+}
+
+/// Restore runtime-only state owned by `component` and its nested by-value
+/// sub-components. Component assignment deliberately copies only user state,
+/// so a `ComponentInit` reached again through a loop must reset heartbeats,
+/// subscriber/hook vectors, and sequencer uniqueness state before installing
+/// the new instance's runtime graph.
+fn emit_component_runtime_reset(
+    out: &mut String,
+    prog: &TbProgram,
+    component: ir::ComponentId,
+    inst_path: &str,
+    depth: usize,
+) {
+    let pad = INDENT.repeat(depth);
+    let comp = &prog.components[component.index()];
+    for heartbeat in [
+        ir::passes::runtime_cells::ComponentHeartbeat::Input,
+        ir::passes::runtime_cells::ComponentHeartbeat::Output,
+    ] {
+        let field = runtime::component_heartbeat_field(comp, heartbeat);
+        writeln!(out, "{pad}{inst_path}.{field} = 0;").ok();
+    }
+    if comp.kind == ir::ComponentKindTag::Sequencer {
+        let registry = crate::codegen::cpp_tb::component_unique_registry_name(
+            comp.fields.iter().map(|field| field.name.as_str()),
+        );
+        writeln!(
+            out,
+            "{pad}{inst_path}.{registry} = decltype({inst_path}.{registry}){{}};"
+        )
+        .ok();
+    }
+    for method in &comp.methods {
+        if method.hookable {
+            for side in ["pre", "post"] {
+                let field = runtime::component_internal_member_name(
+                    comp,
+                    &format!("_harc_hook_{}_{side}", method.name),
+                );
+                writeln!(out, "{pad}{inst_path}.{field}.clear();").ok();
+            }
+        }
+        if !method.cov_hook_subs.is_empty() {
+            for side in ["pre", "post"] {
+                writeln!(
+                    out,
+                    "{pad}{inst_path}._harc_cov_{}_{side}.clear();",
+                    method.name
+                )
+                .ok();
+            }
+        }
+    }
+    for field in &comp.fields {
+        match &field.kind {
+            ir::ComponentFieldKind::Event { .. } => {
+                writeln!(out, "{pad}{inst_path}.{}.clear();", field.name).ok();
+            }
+            ir::ComponentFieldKind::Sub { component: sub, .. } => {
+                emit_component_runtime_reset(
+                    out,
+                    prog,
+                    *sub,
+                    &format!("{inst_path}.{}", field.name),
+                    depth,
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2352,7 +2427,10 @@ fn emit_one_connect(
     inst_path: &str,
     edge: &ir::ConnectEdgeSchema,
     run_context: Option<&str>,
+    depth: usize,
 ) {
+    let pad = INDENT.repeat(depth);
+    let pad1 = INDENT.repeat(depth + 1);
     let prefix = (!inst_path.is_empty()).then(|| inst_path.to_string());
     let src = prefix
         .iter()
@@ -2376,17 +2454,17 @@ fn emit_one_connect(
                 let capture = persistent_setup_capture(run_context);
                 writeln!(
                     out,
-                    "{INDENT}{src}.{}.push_back([{capture}](auto _t) {{",
+                    "{pad}{src}.{}.push_back([{capture}](auto _t) {{",
                     edge.src_event
                 )
                 .ok();
-                emit_persistent_setup_bindings(out, 2, run_context);
-                writeln!(out, "{INDENT}{INDENT}{call};").ok();
-                writeln!(out, "{INDENT}}});").ok();
+                emit_persistent_setup_bindings(out, depth + 1, run_context);
+                writeln!(out, "{pad1}{call};").ok();
+                writeln!(out, "{pad}}});").ok();
             } else {
                 writeln!(
                     out,
-                    "{INDENT}{src}.{}.push_back([&](auto _t) {{ {call}; }});",
+                    "{pad}{src}.{}.push_back([&](auto _t) {{ {call}; }});",
                     edge.src_event
                 )
                 .ok();
@@ -2401,21 +2479,21 @@ fn emit_one_connect(
                 let capture = persistent_setup_capture(run_context);
                 writeln!(
                     out,
-                    "{INDENT}{src}.{}.push_back([{capture}](auto _t) {{",
+                    "{pad}{src}.{}.push_back([{capture}](auto _t) {{",
                     edge.src_event
                 )
                 .ok();
-                emit_persistent_setup_bindings(out, 2, run_context);
+                emit_persistent_setup_bindings(out, depth + 1, run_context);
                 writeln!(
                     out,
-                    "{INDENT}{INDENT}for (auto& _s : {sink}.{event}) _s(_t);"
+                    "{pad1}for (auto& _s : {sink}.{event}) _s(_t);"
                 )
                 .ok();
-                writeln!(out, "{INDENT}}});").ok();
+                writeln!(out, "{pad}}});").ok();
             } else {
                 writeln!(
                     out,
-                    "{INDENT}{src}.{}.push_back([&](auto _t) {{ for (auto& _s : {sink}.{event}) _s(_t); }});",
+                    "{pad}{src}.{}.push_back([&](auto _t) {{ for (auto& _s : {sink}.{event}) _s(_t); }});",
                     edge.src_event
                 )
                 .ok();
@@ -2438,6 +2516,7 @@ fn emit_nested_connects(
     inst_path: &str,
     mode: Option<ir::ComponentInstanceMode>,
     run_context: Option<&str>,
+    depth: usize,
 ) {
     let comp = &prog.components[component.index()];
     for f in &comp.fields {
@@ -2454,10 +2533,10 @@ fn emit_nested_connects(
             .effective_mode;
             for edge in &sub_comp.connects {
                 if edge_is_enabled(prog, *sub, sub_mode, edge) {
-                    emit_one_connect(out, prog, &sub_path, edge, run_context);
+                    emit_one_connect(out, prog, &sub_path, edge, run_context, depth);
                 }
             }
-            emit_nested_connects(out, prog, *sub, &sub_path, sub_mode, run_context);
+            emit_nested_connects(out, prog, *sub, &sub_path, sub_mode, run_context, depth);
         }
     }
 }
@@ -3473,7 +3552,7 @@ fn emit_test(
     // declared above. Keep this after component method lambdas so connect
     // closures can call `<SinkComp>_<method>(...)`.
     for edge in &tb.connects {
-        emit_one_connect(out, prog, "", edge, None);
+        emit_one_connect(out, prog, "", edge, None, 1);
     }
     for cf in &tb.component_fields {
         // The top component's own `connect` edges (an env's source→sink, or
@@ -3482,10 +3561,10 @@ fn emit_test(
         // `sequencer.dispatched -> drv.req` bridge must be installed).
         for edge in &cf.connects {
             if edge_is_enabled(prog, cf.component, cf.mode, edge) {
-                emit_one_connect(out, prog, &cf.field, edge, None);
+                emit_one_connect(out, prog, &cf.field, edge, None, 1);
             }
         }
-        emit_nested_connects(out, prog, cf.component, &cf.field, cf.mode, None);
+        emit_nested_connects(out, prog, cf.component, &cf.field, cf.mode, None, 1);
         // An `active` bound event-driven transactor (`let drv : X active =
         // bind axil`) re-lowers its `on <ev>` driver into a queue-fed
         // worker-coroutine actor on its own `ThreadScheduler` under `--mt`,
@@ -3548,6 +3627,7 @@ fn emit_test(
             bound_bus,
             None,
             None,
+            1,
         )?;
         // `on <N> cycles` periodic + `watchdog` lifecycle `_checkers`
         // closures, for this component and any nested sub-components.

@@ -7394,7 +7394,7 @@ fn render_common_capsule_template(
             )?;
         }
         for edge in &tb.connects {
-            super::emit_one_connect(&mut out, prog, "_harc_run_state", edge, Some("ctx"));
+            super::emit_one_connect(&mut out, prog, "_harc_run_state", edge, Some("ctx"), 1);
         }
         for binding in &tb.component_fields {
             let instance = format!("_harc_run_state.{}", binding.field);
@@ -7403,7 +7403,7 @@ fn render_common_capsule_template(
                 .map_err(|detail| EmitError(format!("tbir: test `{}`: {detail}", test.name)))?;
             for edge in &binding.connects {
                 if super::edge_is_enabled(prog, binding.component, binding.mode, edge) {
-                    super::emit_one_connect(&mut out, prog, &instance, edge, Some("ctx"));
+                    super::emit_one_connect(&mut out, prog, &instance, edge, Some("ctx"), 1);
                 }
             }
             super::emit_nested_connects(
@@ -7413,6 +7413,7 @@ fn render_common_capsule_template(
                 &instance,
                 binding.mode,
                 Some("ctx"),
+                1,
             );
             super::emit_on_handler_regs(
                 &mut out,
@@ -7424,6 +7425,7 @@ fn render_common_capsule_template(
                 bound_bus,
                 Some(&plan.bus_adapters),
                 Some("ctx"),
+                1,
             )?;
             super::emit_lifecycle_checkers(
                 &mut out,

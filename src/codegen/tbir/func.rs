@@ -2147,16 +2147,37 @@ fn emit_helper_function_with_linkage(
                     writeln!(out, "{pad3}{name} = decltype({name}){{}};").ok();
                 }
                 Stmt::ComponentInit {
-                    local, component, ..
+                    local,
+                    component,
+                    mode,
                 } => {
                     let name = &names[local.index()];
-                    prog.components.get(component.index()).ok_or_else(|| {
+                    let schema = prog.components.get(component.index()).ok_or_else(|| {
                         EmitError(format!(
                             "tbir: ComponentInit of `{name}` in pure helper {} references missing component c{}",
                             func.name, component.0
                         ))
                     })?;
                     writeln!(out, "{pad3}{name} = decltype({name}){{}};").ok();
+                    super::emit_component_runtime_reset(out, prog, *component, name, 3);
+                    super::emit_on_handler_regs(
+                        out,
+                        prog,
+                        *component,
+                        name,
+                        false,
+                        *mode,
+                        None,
+                        None,
+                        None,
+                        3,
+                    )?;
+                    for edge in &schema.connects {
+                        if super::edge_is_enabled(prog, *component, *mode, edge) {
+                            super::emit_one_connect(out, prog, name, edge, None, 3);
+                        }
+                    }
+                    super::emit_nested_connects(out, prog, *component, name, *mode, None, 3);
                 }
                 Stmt::RecordFieldWrite { .. } => {
                     emit_stmt(out, prog, &cx, &prog.records, &[], s, 3)?;
@@ -2987,16 +3008,37 @@ fn emit_stmt(
             writeln!(out, "{pad}{name} = decltype({name}){{}};").ok();
         }
         Stmt::ComponentInit {
-            local, component, ..
+            local,
+            component,
+            mode,
         } => {
             let name = local_cpp_name(cx, *local)?;
-            prog.components.get(component.index()).ok_or_else(|| {
+            let schema = prog.components.get(component.index()).ok_or_else(|| {
                 EmitError(format!(
                     "tbir: ComponentInit of `{name}` in {} references missing component c{}",
                     func.name, component.0
                 ))
             })?;
             writeln!(out, "{pad}{name} = decltype({name}){{}};").ok();
+            super::emit_component_runtime_reset(out, prog, *component, &name, depth);
+            super::emit_on_handler_regs(
+                out,
+                prog,
+                *component,
+                &name,
+                false,
+                *mode,
+                None,
+                None,
+                None,
+                depth,
+            )?;
+            for edge in &schema.connects {
+                if super::edge_is_enabled(prog, *component, *mode, edge) {
+                    super::emit_one_connect(out, prog, &name, edge, None, depth);
+                }
+            }
+            super::emit_nested_connects(out, prog, *component, &name, *mode, None, depth);
         }
         Stmt::TransactorCall { dest, call } => {
             let Expr::Call(
