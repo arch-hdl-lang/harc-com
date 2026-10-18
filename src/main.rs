@@ -2013,7 +2013,7 @@ fn emit_probe_stub_if_needed(
     outdir: &Path,
     file: &harc::ast::SourceFile,
 ) -> Result<Option<PathBuf>> {
-    let Some((dut_ty, probes)) = harc::codegen::dut_interface::dut_probes(file)
+    let Some((dut_ty, probes)) = harc::codegen::probe_catalog::dut_probes(file)
         .map_err(|e| miette::miette!("probe catalog validation failed: {e}"))?
     else {
         return Ok(None);
@@ -2862,7 +2862,7 @@ fn cmd_sim(
         // backend; the harness reaches its signals hierarchically. Only
         // the accessor width is constrained (<= 64 bits, like ports).
         let mut probes = Vec::new();
-        if let Some((_, probe_decls)) = harc::codegen::dut_interface::dut_probes(&codegen_source)
+        if let Some((_, probe_decls)) = harc::codegen::probe_catalog::dut_probes(&codegen_source)
             .map_err(|e| miette::miette!("probe catalog validation failed: {e}"))?
         {
             for pr in &probe_decls {
@@ -2942,7 +2942,7 @@ fn cmd_sim(
         "top={}",
         top_for_interface.as_deref().unwrap_or_default()
     ));
-    if let Some((dut_type, probes)) = harc::codegen::dut_interface::dut_probes(&codegen_source)
+    if let Some((dut_type, probes)) = harc::codegen::probe_catalog::dut_probes(&codegen_source)
         .map_err(|error| miette::miette!("probe catalog validation failed: {error}"))?
     {
         let probe_stub = harc::codegen::sv_stub::emit_stub(&dut_type, &probes)
