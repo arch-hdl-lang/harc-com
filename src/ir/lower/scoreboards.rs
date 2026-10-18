@@ -406,7 +406,7 @@ fn scoreboard_field_kind(
                     name: BuiltinTy::Vec,
                     ..
                 } => {
-                    let value_ty = match super::components::fixed_vec_ir_type_with_records_and_consts(
+                    let value_ty = match super::records::persistent_fixed_vec_ir_type(
                         elem_ty,
                         &HashMap::new(),
                         consts,
@@ -454,7 +454,7 @@ fn scoreboard_field_kind(
             });
         }
     }
-    let ty = super::components::scalar_field_ir_type(t).ok_or_else(|| {
+    let ty = super::components::decoded_scalar_ir_type(t).ok_or_else(|| {
         // Same question as the record-field arm, asked with the same
         // predicate rather than a second copy of it: what does v1 do
         // with this leaf? Measured here too, because a scoreboard's
@@ -523,11 +523,10 @@ fn scoreboard_list_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
             | BuiltinTy::BoolLower
             | BuiltinTy::Bit
     )
-    // `components::scalar_field_ir_type`, not a local copy: unsigned
-    // to `MAX_WIDTH_METHOD_BITS`, signed capped at 64. That cap is
-    // `main`'s and is right; it lives in one decoder now, and the copy
-    // written here to hold it has been folded back in twice.
-    .then(|| super::components::scalar_field_ir_type(t))
+    // Persistent scoreboard storage uses the same width-aware C++ carrier as
+    // records (`_harc_u128`, then `HarcWide<N>`), so it need not inherit the
+    // expression-method width ceiling.
+    .then(|| super::components::decoded_scalar_ir_type(t))
     .flatten()
 }
 

@@ -3046,15 +3046,30 @@ fn emit_stmt(
                 *mode,
                 None,
                 None,
-                None,
+                cx.bindings.run_context,
                 depth,
             )?;
             for edge in &schema.connects {
                 if super::edge_is_enabled(prog, *component, *mode, edge) {
-                    super::emit_one_connect(out, prog, &name, edge, None, depth);
+                    super::emit_one_connect(
+                        out,
+                        prog,
+                        &name,
+                        edge,
+                        cx.bindings.run_context,
+                        depth,
+                    );
                 }
             }
-            super::emit_nested_connects(out, prog, *component, &name, *mode, None, depth);
+            super::emit_nested_connects(
+                out,
+                prog,
+                *component,
+                &name,
+                *mode,
+                cx.bindings.run_context,
+                depth,
+            );
             let dut_receiver = cx.bindings.dut_receiver.unwrap_or("dut");
             super::emit_component_dut_bindings(
                 out,

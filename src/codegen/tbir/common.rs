@@ -1167,9 +1167,16 @@ fn plan_shared_types(prog: &TbProgram) -> Result<Vec<CommonSharedTypePlan>, Emit
                                 &mut deps,
                             )?
                         }
+                        ir::ComponentFieldKind::Covgroup { covgroup } => push_type_dependency(
+                            index,
+                            CommonSharedTypeKind::Covergroup(*covgroup),
+                            &format!("covergroup cg{} for field `{}`", covgroup.0, field.name),
+                            &nodes,
+                            &by_kind,
+                            &mut deps,
+                        )?,
                         ir::ComponentFieldKind::Event { .. }
-                        | ir::ComponentFieldKind::Dut { .. }
-                        | ir::ComponentFieldKind::Covgroup { .. } => {}
+                        | ir::ComponentFieldKind::Dut { .. } => {}
                     }
                 }
             }
@@ -7436,6 +7443,15 @@ fn render_common_capsule_template(
                 Some(&plan.bus_adapters),
                 Some("ctx"),
                 1,
+            )?;
+            super::emit_component_covergroup_registrations(
+                &mut out,
+                prog,
+                binding.component,
+                &instance,
+                &plan.vec_lane_widths,
+                &plan.vec_lane_widths,
+                Some(&plan.dut_access),
             )?;
             super::emit_lifecycle_checkers(
                 &mut out,

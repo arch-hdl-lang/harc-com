@@ -629,15 +629,87 @@ pub(super) fn record_list_elem_ir_type(
             | BuiltinTy::BoolLower
             | BuiltinTy::Bit
     )
-    .then(|| super::components::scalar_field_ir_type(elem))
+    .then(|| super::components::decoded_scalar_ir_type(elem))
     .flatten()?;
     matches!(
         ty,
         IrType::Bool
-            | IrType::UInt(Some(1..=crate::MAX_WIDTH_METHOD_BITS))
-            | IrType::SInt(Some(1..=64))
+            | IrType::UInt(Some(1..))
+            | IrType::SInt(Some(1..))
     )
     .then_some(ty)
+}
+
+/// Decode a persistent fixed-vector value without applying the 1024-bit
+/// expression-method ceiling. Record and scoreboard storage render arbitrary
+/// nonzero scalar widths with `HarcWide<N>`, matching the legacy value shape.
+pub(super) fn persistent_fixed_vec_ir_type(
+    t: &TypeExpr,
+    record_ids: &HashMap<String, RecordId>,
+    consts: &HashMap<String, super::ConstVal>,
+) -> Result<Option<IrType>, LowerError> {
+    let TypeExpr::Builtin {
+        name: BuiltinTy::Vec,
+        args,
+        ..
+    } = t
+    else {
+        if let Some(record) = named_record_id(t, record_ids) {
+            return Ok(Some(IrType::Record(record)));
+        }
+        return Ok(super::components::decoded_scalar_ir_type(t).filter(|ty| {
+            matches!(ty, IrType::Bool)
+                || matches!(ty, IrType::UInt(Some(1..)) | IrType::SInt(Some(1..)))
+        }));
+    };
+    let Some(first) = args.first() else {
+        return Ok(None);
+    };
+    let elem = match first {
+        TypeArg::Type(elem) => {
+            let Some(elem) = persistent_fixed_vec_ir_type(elem, record_ids, consts)? else {
+                return Ok(None);
+            };
+            elem
+        }
+        TypeArg::Expr(expr) => {
+            let ExprKind::Ident(id) = &*expr.kind else {
+                return Ok(None);
+            };
+            let Some(record) = record_ids.get(&id.name) else {
+                return Ok(None);
+            };
+            IrType::Record(*record)
+        }
+        TypeArg::Named { .. } => return Ok(None),
+    };
+    let Some(TypeArg::Expr(len_expr)) = args.get(1) else {
+        return Ok(None);
+    };
+    let folded = super::fold_const(len_expr, consts, "").map_err(|error| match error {
+        super::ConstFoldErr::Unsupported(detail) => not_implemented(
+            "a persistent fixed-vector length outside the constant-expression subset",
+            detail,
+            V1Status::EmitsUncompilable,
+        ),
+        super::ConstFoldErr::Invalid(detail) => {
+            LowerError::Invalid(format!("persistent fixed-vector length is invalid: {detail}"))
+        }
+    })?;
+    if folded.is_negative() {
+        return Err(LowerError::Invalid(
+            "persistent fixed-vector length is negative".to_string(),
+        ));
+    }
+    let len = usize::try_from(folded.bits).map_err(|_| {
+        LowerError::Invalid(
+            "persistent fixed-vector length does not fit the host index size".to_string(),
+        )
+    })?;
+    Ok(Some(IrType::FixedVec {
+        elem: Box::new(elem),
+        len,
+    }))
 }
 
 /// Recognize a `Vec<T, N>` field whose element `T` this slice can
@@ -723,9 +795,7 @@ fn fixed_vec_field(
             ..
         }
     ) {
-        let Some(ty) = super::components::fixed_vec_ir_type_with_records_and_consts(
-            elem, record_ids, consts,
-        )? else {
+        let Some(ty) = persistent_fixed_vec_ir_type(elem, record_ids, consts)? else {
             return Ok(None);
         };
         ty

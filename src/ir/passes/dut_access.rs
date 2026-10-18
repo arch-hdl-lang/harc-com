@@ -1,10 +1,35 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::{
-    Activation, ComponentId, Expr, FunctionId, IrType, LaneIndex, LocalId, PortAccess,
+    Activation, ComponentId, CovgroupId, Expr, FunctionId, IrType, LaneIndex, LocalId, PortAccess,
     PortDirection, PortOrigin, PortRef, ProbeId, ProbeScalarType, Stmt, TbProgram, TestId,
     TestbenchId,
 };
+
+fn collect_component_covergroups(
+    prog: &TbProgram,
+    component: ComponentId,
+    out: &mut BTreeSet<CovgroupId>,
+) -> Result<(), DutAccessPlanError> {
+    let schema = prog.components.get(component.index()).ok_or_else(|| {
+        DutAccessPlanError(format!(
+            "component covergroup walk references missing component c{}",
+            component.0
+        ))
+    })?;
+    for field in &schema.fields {
+        match &field.kind {
+            crate::ir::ComponentFieldKind::Covgroup { covgroup } => {
+                out.insert(*covgroup);
+            }
+            crate::ir::ComponentFieldKind::Sub {
+                component: child, ..
+            } => collect_component_covergroups(prog, *child, out)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DutAccessIdentity {
@@ -939,6 +964,75 @@ fn analyze_impl(
                 DutAccessOperation::Write,
                 None,
             )?;
+        }
+
+        // Component-owned covergroups are sampled directly from setup code,
+        // so they have no SamplerAuto function to contribute their DUT reads.
+        // Attribute the instantiated covergroups to this test's run site: the
+        // common-layout capsule already owns that site, and unused component
+        // declarations do not pollute the access plan.
+        let mut component_covgroups = BTreeSet::new();
+        for binding in &testbench.component_fields {
+            collect_component_covergroups(
+                prog,
+                binding.component,
+                &mut component_covgroups,
+            )?;
+        }
+        for covgroup in component_covgroups {
+            let schema = prog.covgroups.get(covgroup.index()).ok_or_else(|| {
+                DutAccessPlanError(format!(
+                    "component covergroup registration references missing cg{}",
+                    covgroup.0
+                ))
+            })?;
+            for point in &schema.points {
+                record_expr_reads_at(
+                    prog,
+                    interface,
+                    &mut entries,
+                    DutAccessSite::Function(run.id),
+                    run.id,
+                    &run.name,
+                    0,
+                    &point.target,
+                )?;
+                for bin in &point.bins {
+                    for value in &bin.values {
+                        match value {
+                            crate::ir::CovBinValue::Eq(crate::ir::CovBinBound::Runtime(expr)) => {
+                                record_expr_reads_at(
+                                    prog,
+                                    interface,
+                                    &mut entries,
+                                    DutAccessSite::Function(run.id),
+                                    run.id,
+                                    &run.name,
+                                    0,
+                                    expr,
+                                )?;
+                            }
+                            crate::ir::CovBinValue::Range { lo, hi } => {
+                                for bound in [lo, hi].into_iter().flatten() {
+                                    if let crate::ir::CovBinBound::Runtime(expr) = bound {
+                                        record_expr_reads_at(
+                                            prog,
+                                            interface,
+                                            &mut entries,
+                                            DutAccessSite::Function(run.id),
+                                            run.id,
+                                            &run.name,
+                                            0,
+                                            expr,
+                                        )?;
+                                    }
+                                }
+                            }
+                            crate::ir::CovBinValue::Eq(crate::ir::CovBinBound::Const(_)) => {}
+                        }
+                    }
+                }
+            }
         }
     }
 

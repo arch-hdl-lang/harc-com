@@ -668,6 +668,15 @@ fn fixed_vec_elem_valid(ty: &IrType) -> bool {
     }
 }
 
+fn persistent_fixed_vec_elem_valid(ty: &IrType) -> bool {
+    match ty {
+        IrType::Bool | IrType::Record(_) => true,
+        IrType::UInt(Some(width)) | IrType::SInt(Some(width)) => *width > 0,
+        IrType::FixedVec { elem, .. } => persistent_fixed_vec_elem_valid(elem),
+        _ => false,
+    }
+}
+
 fn ir_type_contains_string(ty: &IrType) -> bool {
     match ty {
         IrType::String => true,
@@ -745,8 +754,8 @@ fn verify_queue_elem_schema(
             let valid = matches!(
                 elem.as_ref(),
                 IrType::Bool
-                    | IrType::UInt(Some(1..=crate::MAX_WIDTH_METHOD_BITS))
-                    | IrType::SInt(Some(1..=64))
+                    | IrType::UInt(Some(1..))
+                    | IrType::SInt(Some(1..))
             ) || matches!(elem.as_ref(), IrType::Record(record) if record.index() < record_count);
             if !valid {
                 errs.push(VerifyError::BadProgramRef {
@@ -765,23 +774,17 @@ fn verify_scoreboard_scalar_schema(
     what: String,
     errs: &mut Vec<VerifyError>,
 ) {
-    // Signed and unsigned share the width ceiling now (harc#657): the
-    // emitter routes signed wide operators through the two's-complement
-    // helpers, so a `sint` past 64 is a real supported type, not the
-    // unsigned-by-magnitude carrier the cap once guarded against.
+    // Persistent scoreboard storage uses `_harc_u128` / `HarcWide<N>` and
+    // therefore has no expression-method width ceiling.
     let valid = match ty {
         IrType::Bool | IrType::UInt(None) | IrType::SInt(None) => true,
-        IrType::UInt(Some(width)) | IrType::SInt(Some(width)) => {
-            (1..=crate::MAX_WIDTH_METHOD_BITS).contains(width)
-        }
+        IrType::UInt(Some(width)) | IrType::SInt(Some(width)) => *width > 0,
         _ => false,
     };
     if !valid {
         errs.push(VerifyError::BadProgramRef {
             what: format!(
-                "{what} has invalid scalar type {ty:?}; expected bool or a scalar of \
-                 width 1..={} (signed or unsigned)",
-                crate::MAX_WIDTH_METHOD_BITS
+                "{what} has invalid scalar type {ty:?}; expected bool or a nonzero-width scalar"
             ),
         });
     }
@@ -1189,8 +1192,8 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                     let valid_elem = matches!(
                         elem.as_ref(),
                         IrType::Bool
-                            | IrType::UInt(Some(1..=crate::MAX_WIDTH_METHOD_BITS))
-                            | IrType::SInt(Some(1..=64))
+                            | IrType::UInt(Some(1..))
+                            | IrType::SInt(Some(1..))
                     );
                     if field.vec_len.is_some() || field.default.is_some() || !valid_elem {
                         errs.push(VerifyError::BadProgramRef {
@@ -1209,7 +1212,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 IrType::FixedVec { .. }
                     if field.vec_len.is_none()
                         || field.default.is_some()
-                        || !fixed_vec_elem_valid(&field.ty) =>
+                        || !persistent_fixed_vec_elem_valid(&field.ty) =>
                 {
                     errs.push(VerifyError::BadProgramRef {
                         what: format!(
@@ -1854,7 +1857,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                             || matches!(
                                 ty,
                                 IrType::UInt(Some(width)) | IrType::SInt(Some(width))
-                                    if (1..=crate::MAX_WIDTH_METHOD_BITS).contains(width)
+                                    if *width > 0
                             )
                             || matches!(ty, IrType::FixedVec { elem, .. } if valid_list_elem(elem))
                     }

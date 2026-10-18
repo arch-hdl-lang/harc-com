@@ -2277,12 +2277,25 @@ fn edge_is_enabled(
     ir::component_connect_modes_enabled(source_mode, sink_mode, edge)
 }
 
-fn persistent_setup_capture(run_context: Option<&str>) -> String {
-    run_context
-        .map(|context| {
-            format!("_harc_callback_state = &_harc_run_state, _harc_callback_context = &{context}")
-        })
-        .unwrap_or_else(|| "&".to_string())
+fn persistent_setup_capture(run_context: Option<&str>, referenced_path: Option<&str>) -> String {
+    let Some(context) = run_context else {
+        return "&".to_string();
+    };
+    let mut capture =
+        format!("_harc_callback_state = &_harc_run_state, _harc_callback_context = &{context}");
+    // Common-layout callbacks normally reach component instances through the
+    // captured run state. A component constructed in a function local is the
+    // exception: its durable callback body names that local directly, so the
+    // root object must also be captured explicitly. Nested paths only need
+    // their first C++ identifier (`watcher.child` -> `watcher`).
+    if let Some(root) = referenced_path
+        .and_then(|path| path.split('.').next())
+        .filter(|root| !root.is_empty() && *root != "_harc_run_state")
+    {
+        capture.push_str(", &");
+        capture.push_str(root);
+    }
+    capture
 }
 
 fn emit_persistent_setup_bindings(out: &mut String, depth: usize, run_context: Option<&str>) {
@@ -2370,7 +2383,7 @@ fn emit_on_handler_regs(
                 run_context,
             )?;
             if run_context.is_some() {
-                let capture = persistent_setup_capture(run_context);
+                let capture = persistent_setup_capture(run_context, Some(inst_path));
                 writeln!(
                     out,
                     "{pad}{inst_path}.{}.push_back([{capture}](auto _t) {{",
@@ -2559,7 +2572,7 @@ fn emit_one_connect(
                 .map(|context| format!("{sink_comp}_{method}({context}, {sink}, _t)"))
                 .unwrap_or_else(|| format!("{sink_comp}_{method}({sink}, _t)"));
             if run_context.is_some() {
-                let capture = persistent_setup_capture(run_context);
+                let capture = persistent_setup_capture(run_context, Some(inst_path));
                 writeln!(
                     out,
                     "{pad}{src}.{}.push_back([{capture}](auto _t) {{",
@@ -2584,7 +2597,7 @@ fn emit_one_connect(
             // registered `on <ev>` handler(s). Mirrors v1's
             // `for (auto& _s : <sink>.<event>) _s(_t);` bridge closure.
             if run_context.is_some() {
-                let capture = persistent_setup_capture(run_context);
+                let capture = persistent_setup_capture(run_context, Some(inst_path));
                 writeln!(
                     out,
                     "{pad}{src}.{}.push_back([{capture}](auto _t) {{",
@@ -2681,7 +2694,7 @@ pub(in crate::codegen::tbir) fn emit_lifecycle_checkers(
     let pad2 = INDENT.repeat(depth + 2);
     let pad3 = INDENT.repeat(depth + 3);
     let comp = &prog.components[component.index()];
-    let callback_capture = persistent_setup_capture(run_context);
+    let callback_capture = persistent_setup_capture(run_context, Some(inst_path));
     // A valid C++ identifier for the static tag (`env.agent` → `env_agent`).
     let inst_tag = inst_path.replace('.', "_");
 
@@ -3006,7 +3019,7 @@ fn emit_tb_periodic_services(
     runtime_cells: expr::RuntimeCellRenderBinding<'_>,
     run_context: Option<&str>,
 ) -> Result<(), EmitError> {
-    let callback_capture = persistent_setup_capture(run_context);
+    let callback_capture = persistent_setup_capture(run_context, None);
     for svc in &tb.periodic_services {
         let lambda = runtime_cells.test_hook(svc.function)?;
         let kind = ir::passes::runtime_cells::RuntimeCellKind::TestbenchPeriodicLast {
@@ -3045,7 +3058,7 @@ fn emit_tb_cycle_services(
     runtime_cells: expr::RuntimeCellRenderBinding<'_>,
     run_context: Option<&str>,
 ) -> Result<(), EmitError> {
-    let callback_capture = persistent_setup_capture(run_context);
+    let callback_capture = persistent_setup_capture(run_context, None);
     for svc in &tb.cycle_services {
         let lambda = runtime_cells.test_hook(svc.function)?;
         let trigger = func::tb_service_expr_cpp(

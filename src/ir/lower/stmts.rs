@@ -5914,6 +5914,30 @@ impl FuncBuilder<'_> {
             self.ctx.owner,
         )?;
 
+        let suspends = f.blocks.iter().any(|block| {
+            matches!(
+                block.terminator,
+                Terminator::WaitCycles(..)
+                    | Terminator::WaitCyclesSync(..)
+                    | Terminator::WaitUntil { .. }
+                    | Terminator::WaitUntilTimeout { .. }
+                    | Terminator::WaitTimePs(..)
+            )
+        });
+        if suspends {
+            let unsupported = f.blocks.iter().find_map(|block| match &block.terminator {
+                Terminator::Randomize { .. } => Some("randomize"),
+                Terminator::TbLifecycleCall { .. } => Some("a testbench lifecycle call"),
+                Terminator::Fatal(_) => Some("fatal termination"),
+                _ => None,
+            });
+            if let Some(operation) = unsupported {
+                return Err(LowerError::Invalid(format!(
+                    "a suspending statement-position `on` handler cannot contain {operation}"
+                )));
+            }
+        }
+
         self.commit_pending_function(pending_id, f);
         let id = {
             let mut tables = self.side_tables.borrow_mut();

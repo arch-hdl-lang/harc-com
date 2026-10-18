@@ -3155,11 +3155,7 @@ fn scoreboard_scalar_schema_and_write_width_are_verified() {
 
     for bad_ty in [
         ir::IrType::UInt(Some(0)),
-        ir::IrType::UInt(Some(harc::MAX_WIDTH_METHOD_BITS + 1)),
-        // Signed now shares the unsigned ceiling (harc#657): `sint<65>`
-        // is a valid field, so the invalid signed case is one past the
-        // ceiling, same as the unsigned row above it.
-        ir::IrType::SInt(Some(harc::MAX_WIDTH_METHOD_BITS + 1)),
+        ir::IrType::SInt(Some(0)),
         ir::IrType::Record(ir::RecordId(0)),
     ] {
         let mut broken = prog.clone();
@@ -15989,6 +15985,42 @@ end test T"#
     }
 }
 
+#[test]
+fn persistent_records_and_scoreboards_preserve_scalars_beyond_the_method_ceiling() {
+    let source = r#"struct WideRecord
+    values : list<sint<2048>>
+    nested : Vec<Vec<uint<2048>, 2>, 3>
+end struct WideRecord
+
+scoreboard WideBoard
+    scalar : uint<2048> default 0
+    values : list<sint<2048>>
+    nested : list<Vec<uint<2048>, 2>>
+end scoreboard WideBoard
+
+testbench Tb
+    dut : Top
+    board : WideBoard
+end testbench Tb
+
+impl PersistentWide for Tb
+    run
+        let value : WideRecord
+        wait 1 cycle
+    end run
+end impl PersistentWide"#;
+    let program = lower_src(source).expect("persistent wide values lower");
+    verify::verify_program(&program).expect("persistent wide values verify");
+    let cpp = tbir::emit(&program, &merged_src(source), &cpp_tb::EmitOpts::default())
+        .expect("persistent wide values emit");
+    assert!(
+        cpp.contains("std::vector<harc_rt::HarcWide<64>> values")
+            && cpp.contains("harc_rt::HarcWide<64> scalar")
+            && cpp.contains("std::array<harc_rt::HarcWide<64>, 2>"),
+        "{cpp}"
+    );
+}
+
 /// The other `records.rs` arms, each measured on its own.
 ///
 /// | construct | v1 | verdict |
@@ -23352,8 +23384,8 @@ end impl XtWaitUntilSelfCallTest
 
     let cpp = emit_cpp_src(&fixture("transactor_wait_self_predicate_test.harc"));
     assert!(
-        cpp.contains("__t0 = harc_rt::harc_read(dut->count_out);")
-            && cpp.contains("CounterWaiter_reached(self_state, __t0)"),
+        cpp.contains("= harc_rt::harc_read(dut->count_out);")
+            && cpp.contains("CounterWaiter_reached(self_state, __t"),
         "a sibling predicate forwards state and re-reads its DUT argument on every polling pass:\n{cpp}"
     );
 }
@@ -31463,6 +31495,44 @@ fn component_call_in_message_stays_in_the_failure_branch() {
         stmt,
         ir::Stmt::ComponentCall { method, .. } if method == "peek"
     ))), "the predicate call remains in the repeated loop body:\n{wait_run}");
+
+    // `all of` and `any of` retain source-order short-circuiting even when a
+    // later predicate needs statement-level materialization. The component
+    // call block must only be reached through the undecided edge.
+    for (mode, first, call_on_true_edge) in
+        [("all", "false", true), ("any", "true", false)]
+    {
+        let source = fixture("component_value_expression_test.harc").replace(
+            "assert true else fail(\"untaken diagnostic call=${harness.inner.step(2)}\")",
+            &format!(
+                "wait until {mode} of {first}, harness.inner.peek() == 66891 timeout 1 cycle"
+            ),
+        );
+        let program = lower_src(&source)
+            .unwrap_or_else(|error| panic!("effectful `{mode} of` lowers: {error}"));
+        verify::verify_program(&program)
+            .unwrap_or_else(|error| panic!("effectful `{mode} of` verifies: {error:?}"));
+        let run = program.function(program.tests[0].run);
+        let call_block = run
+            .blocks
+            .iter()
+            .rposition(|block| {
+                block.stmts.iter().any(|stmt| {
+                    matches!(stmt, ir::Stmt::ComponentCall { method, .. } if method == "peek")
+                })
+            })
+            .map(|index| ir::BlockId(index as u32))
+            .expect("later predicate call block");
+        assert!(run.blocks.iter().any(|block| match block.terminator {
+            ir::Terminator::Branch(_, on_true, on_false) if call_on_true_edge => {
+                on_true == call_block && on_false != call_block
+            }
+            ir::Terminator::Branch(_, on_true, on_false) => {
+                on_false == call_block && on_true != call_block
+            }
+            _ => false,
+        }), "`{mode} of` must bypass the effectful predicate once decided:\n{run}");
+    }
 }
 
 #[test]
@@ -33964,6 +34034,35 @@ end test T"#;
     assert!(
         checker_window.contains("co_await harc_rt::wait_until_timeout(_slot"),
         "v1 emits the nested timed coroutine await inside the checker callback: {checker_window}"
+    );
+}
+
+#[test]
+fn a_suspending_statement_handler_rejects_unemittable_terminators_during_lowering() {
+    let source = r#"transaction Item
+    value : uint<8>
+end transaction Item
+
+testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    run
+        on true
+            let item : Item
+            wait 1 cycle
+            randomize(item)
+        end on
+        wait 2 cycles
+    end run
+end impl T"#;
+    let error = lower_src(source).expect_err("mixed suspending handler must fail in lowering");
+    let message = assert_invalid(&error);
+    assert!(
+        message.contains("suspending statement-position `on` handler")
+            && message.contains("randomize"),
+        "the diagnostic must identify the unsupported mixed handler shape: {message}"
     );
 }
 
@@ -51939,8 +52038,8 @@ end impl T"#
 
     let cpp = emit_cpp_src(&fixture("transactor_wait_bound_predicate_test.harc"));
     assert!(
-        cpp.contains("__t0 = harc_rt::harc_read(dut->count_out);")
-            && cpp.contains("CounterPredicate_reached(pred, __t0)"),
+        cpp.contains("= harc_rt::harc_read(dut->count_out);")
+            && cpp.contains("CounterPredicate_reached(pred, __t"),
         "the direct bound predicate must forward instance state and re-read its DUT argument on every polling pass: {cpp}"
     );
 }
@@ -52113,8 +52212,8 @@ end impl CTest
             .unwrap_or_else(|e| panic!("{owner}: a signed wide field must verify: {e:?}"));
     }
 
-    // Width boundaries still hold: `sint` past the 1024-bit ceiling is
-    // still refused, same as unsigned.
+    // Persistent scoreboard storage is not an expression method: its
+    // `HarcWide<N>` carrier preserves widths beyond the method ceiling.
     let too_wide = "scoreboard Ov
     v : sint<1025> default 0
 end scoreboard Ov
@@ -52130,10 +52229,11 @@ end testbench T
     end run
 end impl I
 ";
-    assert!(
-        lower_src(too_wide).is_err(),
-        "a signed field past the 1024-bit ceiling must still be refused"
-    );
+    let wide = lower_src(too_wide).expect("a modeled persistent wide field lowers");
+    verify::verify_program(&wide).expect("a modeled persistent wide field verifies");
+    let cpp = tbir::emit(&wide, &merged_src(too_wide), &cpp_tb::EmitOpts::default())
+        .expect("a modeled persistent wide field emits");
+    assert!(cpp.contains("harc_rt::HarcWide<33> v"), "{cpp}");
 }
 
 /// A no-payload `on <event>()` handler lowers exactly as the one-argument

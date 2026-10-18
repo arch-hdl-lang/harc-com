@@ -3683,7 +3683,7 @@ fn type_arg_simple_name(t: &TypeExpr) -> Option<&str> {
 
 // --- shared scalar-field helpers (mirroring scoreboards.rs) ---
 
-fn decoded_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
+pub(crate) fn decoded_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
     let TypeExpr::Builtin { name, args, .. } = t else {
         return None;
     };

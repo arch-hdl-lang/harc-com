@@ -4878,6 +4878,9 @@ fn common_capsule_supports_test_local_component_values() {
     let source = parse_source(
         r#"transactor Model
     value : uint<8> default 0
+    on value > 100
+        value = 0
+    end on
     function set(value_in: uint<8>)
         value = value_in
     end set
@@ -4912,6 +4915,61 @@ end test LocalModel"#,
     assert!(runtime.contains("void Model_set("), "{runtime}");
     assert!(runtime.contains("uint64_t Model_get("), "{runtime}");
     assert!(capsule.contains("Model model{};"), "{capsule}");
+    assert!(
+        capsule.contains("_harc_callback_context = &ctx, &model"),
+        "durable callbacks must capture a function-local component root:\n{capsule}"
+    );
+}
+
+#[test]
+fn common_component_covergroups_are_ordered_and_registered() {
+    let source = parse_source(
+        r#"covergroup NestedCov @(posedge dut.clk)
+    cp : cover dut.q
+        bins
+            zero = {0}
+        end bins
+end covergroup NestedCov
+
+env CommonEnv
+    cov : NestedCov
+end env CommonEnv
+
+testbench CommonTb
+    dut : CommonReg
+    env : CommonEnv
+end testbench CommonTb
+
+impl CommonNestedCov for CommonTb
+    clock clk = 10ns
+    run
+        wait 1 cycle
+    end run
+end impl CommonNestedCov"#,
+    )
+    .expect("nested common covergroup source parses");
+    let program = lower::lower_program(&source).expect("nested common covergroup lowers");
+    verify::verify_program(&program).expect("nested common covergroup verifies");
+    let mut opts = cpp_tb::EmitOpts::default();
+    set_common_reg_interface(&mut opts);
+    let plan = tbir::common::plan_common_tests(&program, &opts, "nested_cov__")
+        .expect("nested common covergroup plans");
+    let types = plan
+        .shared_types()
+        .iter()
+        .map(|ty| ty.name())
+        .collect::<Vec<_>>();
+    let cov = types.iter().position(|name| *name == "NestedCov").unwrap();
+    let env = types.iter().position(|name| *name == "CommonEnv").unwrap();
+    assert!(
+        cov < env,
+        "covergroup definition must precede its by-value component field: {types:?}"
+    );
+    let capsule = tbir::common::emit_common_capsule(&plan, 0).expect("capsule emits");
+    assert!(
+        capsule.contains("_harc_run_state.env.cov.cp.zero++"),
+        "common setup must register the nested component sampler:\n{capsule}"
+    );
 }
 
 #[test]

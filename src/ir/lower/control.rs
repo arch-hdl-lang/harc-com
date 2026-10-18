@@ -746,19 +746,37 @@ impl FuncBuilder<'_> {
         let poll = self.new_block();
         let satisfied = self.new_block();
         let not_satisfied = self.new_block();
+
+        // Timeout diagnostics report the most recent value observed for each
+        // predicate. Initialize every slot on each polling attempt so a
+        // short-circuited predicate has a deterministic identity value rather
+        // than an uninitialized local (true for `all of`, false otherwise).
+        let mut preds = Vec::with_capacity(conditions.len());
+        let mut snapshots = Vec::with_capacity(conditions.len());
+        for condition in conditions {
+            let snapshot = self.fresh_temp();
+            self.set_local_type(snapshot, IrType::Bool);
+            snapshots.push(snapshot);
+            preds.push(PredSrc {
+                expr: Expr::Local(snapshot),
+                src_text: crate::codegen::cpp_tb::expr_source_str(condition),
+            });
+        }
         self.terminate(Terminator::Jump(poll));
         self.start_block(poll);
+        let identity = u64::from(matches!(mode, WaitMode::AllOf));
+        for snapshot in &snapshots {
+            self.push(Stmt::Assign(*snapshot, lit(identity)));
+        }
 
-        let mut preds = Vec::with_capacity(conditions.len());
-        let mut predicate_values = Vec::with_capacity(conditions.len());
-        for condition in conditions {
+        for (index, (condition, snapshot)) in
+            conditions.iter().zip(snapshots.iter().copied()).enumerate()
+        {
             // This is intentionally NOT marked `in_reevaluated_predicate`:
             // ordinary expression lowering must materialize every effect into
             // this loop body. The back-edge below supplies re-evaluation.
             let value = self.lower_expr_no_ports(condition)?;
             self.validate_truth_expr(&value, "wait-until predicate")?;
-            let snapshot = self.fresh_temp();
-            self.set_local_type(snapshot, IrType::Bool);
             let truth = Expr::Binary(
                 BinOp::Ne,
                 Box::new(value),
@@ -768,22 +786,32 @@ impl FuncBuilder<'_> {
                 }),
             );
             self.push(Stmt::Assign(snapshot, truth));
-            let snapshot_expr = Expr::Local(snapshot);
-            predicate_values.push(snapshot_expr.clone());
-            preds.push(PredSrc {
-                expr: snapshot_expr,
-                src_text: crate::codegen::cpp_tb::expr_source_str(condition),
-            });
+            let last = index + 1 == conditions.len();
+            let next = (!last).then(|| self.new_block());
+            match mode {
+                WaitMode::Single => {
+                    debug_assert!(last, "single wait predicate has exactly one condition");
+                    self.terminate(Terminator::Branch(
+                        Expr::Local(snapshot),
+                        satisfied,
+                        not_satisfied,
+                    ));
+                }
+                WaitMode::AllOf => self.terminate(Terminator::Branch(
+                    Expr::Local(snapshot),
+                    next.unwrap_or(satisfied),
+                    not_satisfied,
+                )),
+                WaitMode::AnyOf => self.terminate(Terminator::Branch(
+                    Expr::Local(snapshot),
+                    satisfied,
+                    next.unwrap_or(not_satisfied),
+                )),
+            }
+            if let Some(next) = next {
+                self.start_block(next);
+            }
         }
-        let op = match mode {
-            WaitMode::Single | WaitMode::AllOf => BinOp::And,
-            WaitMode::AnyOf => BinOp::Or,
-        };
-        let combined = predicate_values
-            .into_iter()
-            .reduce(|lhs, rhs| Expr::Binary(op, Box::new(lhs), Box::new(rhs)))
-            .expect("wait-until has at least one predicate");
-        self.terminate(Terminator::Branch(combined, satisfied, not_satisfied));
 
         self.start_block(not_satisfied);
         let timeout_block = if let Some((_, remaining)) = budget {
