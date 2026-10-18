@@ -26,7 +26,7 @@
 //!     container. See the measurement at each arm.
 
 use super::{not_implemented, LowerError, V1Status};
-use crate::ast::{BuiltinTy, ComponentDecl, ComponentItem, ExprKind, TypeArg, TypeExpr};
+use crate::ast::{BuiltinTy, ComponentDecl, ComponentItem, TypeArg, TypeExpr};
 use crate::codegen::cpp_tb::RecordLeafFate;
 use crate::ir::{IrType, RecordId, ScoreboardFieldKind, ScoreboardFieldSchema, ScoreboardSchema};
 use std::collections::HashMap;
@@ -151,6 +151,7 @@ pub(crate) fn lower_scoreboard(
                     record_ids,
                     declared_records,
                     enum_names,
+                    consts,
                 )?;
                 let kind = match kind {
                     ScoreboardFieldKind::Scalar { ty, .. } => {
@@ -352,6 +353,7 @@ fn scoreboard_field_kind(
     record_ids: &HashMap<String, RecordId>,
     declared_records: &std::collections::HashSet<String>,
     enum_names: &std::collections::HashSet<String>,
+    consts: &HashMap<String, super::ConstVal>,
 ) -> Result<ScoreboardFieldKind, LowerError> {
     if super::helpers::is_nested_string_type(Some(t)) {
         return Err(super::not_implemented(
@@ -389,11 +391,9 @@ fn scoreboard_field_kind(
                         V1Status::SilentlyMisLowers,
                     )
                 } else {
-                    not_implemented(
-                        &what,
-                        "only scalar and recursively fixed-vector scalar list elements are lowered",
-                        V1Status::WorksButRetired,
-                    )
+                    LowerError::Invalid(format!(
+                        "internal: {what} is preserved by the legacy backend but was not decoded by TB-IR"
+                    ))
                 }
             };
             let unsupported_elem = || {
@@ -404,40 +404,26 @@ fn scoreboard_field_kind(
             let (elem, vec_len) = match elem_ty {
                 TypeExpr::Builtin {
                     name: BuiltinTy::Vec,
-                    args,
                     ..
                 } => {
-                    let elem = match args.first() {
-                        Some(TypeArg::Type(ty)) => scoreboard_list_value_ir_type(ty),
-                        _ => None,
-                    }
-                    .ok_or_else(&unsupported_elem)?;
-                    let len = match args.get(1) {
-                        Some(TypeArg::Expr(e)) => match &*e.kind {
-                            ExprKind::Int(s) => s.replace('_', "").parse::<usize>().ok(),
-                            _ => None,
-                        },
-                        _ => None,
-                    }
-                    .ok_or_else(|| {
-                        let what = format!(
-                            "scoreboard list field `{sb}.{fname}` with an invalid fixed-vector length"
-                        );
-                        if scoreboard_list_value_type_is_preserved(elem_ty) {
-                            not_implemented(
-                                &what,
-                                "use a decimal compile-time literal for the fixed-vector length",
-                                V1Status::WorksButRetired,
-                            )
-                        } else {
-                            not_implemented(
-                                &what,
-                                "v1 changes or flattens this list element's C++ storage, so values do not preserve the declared element type",
-                                V1Status::SilentlyMisLowers,
-                            )
+                    let value_ty = match super::components::fixed_vec_ir_type_with_records_and_consts(
+                        elem_ty,
+                        &HashMap::new(),
+                        consts,
+                    ) {
+                        Ok(Some(ty)) => ty,
+                        Ok(None) => return Err(unsupported_elem()),
+                        Err(_) => {
+                            let what = format!(
+                                "scoreboard list field `{sb}.{fname}` with an invalid fixed-vector length"
+                            );
+                            return Err(classify_list_gap(what));
                         }
-                    })?;
-                    (elem, Some(len))
+                    };
+                    let IrType::FixedVec { elem, len } = value_ty else {
+                        unreachable!("the fixed-vector decoder returned a non-vector")
+                    };
+                    (*elem, Some(len))
                 }
                 other => {
                     let elem =
@@ -506,7 +492,12 @@ fn scoreboard_field_kind(
                 V1Status::SilentlyMisLowers,
             );
         }
-        not_implemented(&what, SUBSET, V1Status::WorksButRetired)
+        // Every shape that v1 models faithfully is decoded above. Reaching
+        // this arm with a non-flattening leaf is an internal decoder drift,
+        // not a user-visible backend gap.
+        LowerError::Invalid(format!(
+            "internal: {what} is modeled by the legacy backend but has no TB-IR field decoder ({SUBSET})"
+        ))
     })?;
     Ok(ScoreboardFieldKind::Scalar {
         ty,
@@ -544,35 +535,6 @@ fn scoreboard_list_scalar_ir_type(t: &TypeExpr) -> Option<IrType> {
 /// list element. The outermost fixed-vector length remains in
 /// `ScoreboardFieldKind::List::vec_len` for compatibility; deeper dimensions
 /// use the ordinary recursive `IrType::FixedVec` representation.
-fn scoreboard_list_value_ir_type(t: &TypeExpr) -> Option<IrType> {
-    if let Some(scalar) = scoreboard_list_scalar_ir_type(t) {
-        return Some(scalar);
-    }
-    let TypeExpr::Builtin {
-        name: BuiltinTy::Vec,
-        args,
-        ..
-    } = t
-    else {
-        return None;
-    };
-    let elem = match args.first() {
-        Some(TypeArg::Type(elem)) => scoreboard_list_value_ir_type(elem)?,
-        _ => return None,
-    };
-    let len = match args.get(1) {
-        Some(TypeArg::Expr(expr)) => match &*expr.kind {
-            ExprKind::Int(text) => text.replace('_', "").parse::<usize>().ok()?,
-            _ => return None,
-        },
-        _ => return None,
-    };
-    Some(IrType::FixedVec {
-        elem: Box::new(elem),
-        len,
-    })
-}
-
 /// Whether v1's declaration-only scoreboard member preserves this value type.
 /// This differs from `record_leaf_fate`, which also accounts for the
 /// transaction randomize body that scoreboards never emit. Nested fixed

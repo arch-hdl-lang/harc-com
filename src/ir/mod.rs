@@ -1411,10 +1411,9 @@ pub fn validate_component_binding_modes(
 }
 
 /// Return the first constructor-time facility that prevents a component tree
-/// from being represented as a function-local value. Event subscribers and
-/// internal `connect` bridges are owned by the local component's own event
-/// vectors and can be installed at `ComponentInit`. Scheduler-global lifecycle
-/// services and DUT/bus bindings still require testbench-owned setup.
+/// from being represented as a function-local value. ComponentInit installs
+/// event/connect, DUT, lifecycle, and covergroup registrations at the source
+/// declaration point. A bound bus still needs a separately planned adapter.
 pub(crate) fn component_local_runtime_requirement(
     components: &[ComponentSchema],
     component: ComponentId,
@@ -1430,17 +1429,6 @@ pub(crate) fn component_local_runtime_requirement(
         let schema = components.get(component.index())?;
         let reason = if schema.bound_bus.is_some() {
             Some(format!("bound-bus setup on `{}`", schema.name))
-        } else if !schema.periodic_handlers.is_empty()
-            || !schema.cycle_handlers.is_empty()
-            || schema.watchdog.is_some()
-        {
-            Some(format!("lifecycle registration on `{}`", schema.name))
-        } else if schema
-            .fields
-            .iter()
-            .any(|field| matches!(field.kind, ComponentFieldKind::Dut { .. }))
-        {
-            Some(format!("a DUT binding on `{}`", schema.name))
         } else {
             schema.fields.iter().find_map(|field| match field.kind {
                 ComponentFieldKind::Sub {
@@ -1518,6 +1506,8 @@ pub enum ComponentFieldKind {
     /// selects the C payload type (scalar `uint64_t`/`int64_t` or a
     /// value-record struct). Sinks subscribe via `connect`.
     Event { payload: EventPayload },
+    /// A covergroup held by value inside a component instance.
+    Covgroup { covgroup: CovgroupId },
     /// `source : AnalysisSource passive` / `sb : AnalysisSb` — a nested
     /// by-value sub-component. `component` indexes
     /// `TbProgram::components`.
@@ -2879,6 +2869,12 @@ pub enum Stmt {
         guard: Option<Expr>,
         args: FmtArgs,
     },
+    /// Increment the current run's error count without emitting a line.
+    /// Used when lowering an effectful timed wait into an explicit polling
+    /// CFG: the ordinary `WaitUntilTimeout` terminator owns this increment
+    /// for compact predicates, while the expanded form reaches it as a
+    /// statement on its timeout edge.
+    ErrorIncrement,
     /// A statement-position scoreboard mutation on a scoreboard-typed
     /// testbench field (`sb.expected.push(x)`, `sb.writes = ...`). The
     /// design doc's `Stmt::ScoreboardOp(ScoreboardId, ScoreboardOp)`,

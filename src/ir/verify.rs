@@ -1721,6 +1721,7 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 ComponentFieldKind::Queue { elem } => queue_elem_contains_string(elem),
                 ComponentFieldKind::Record { .. }
                 | ComponentFieldKind::Event { .. }
+                | ComponentFieldKind::Covgroup { .. }
                 | ComponentFieldKind::Sub { .. }
                 | ComponentFieldKind::Dut { .. }
                 | ComponentFieldKind::ScoreboardSub { .. } => false,
@@ -4889,6 +4890,7 @@ impl Checker<'_> {
             }
             ComponentFieldKind::Queue { .. }
             | ComponentFieldKind::Event { .. }
+            | ComponentFieldKind::Covgroup { .. }
             | ComponentFieldKind::Sub { .. }
             | ComponentFieldKind::ScoreboardSub { .. }
             | ComponentFieldKind::Dut { .. } => Err(format!(
@@ -7874,6 +7876,7 @@ impl Checker<'_> {
                         );
                     }
                 }
+                Stmt::ErrorIncrement => {}
             }
         }
         match &b.terminator {
@@ -11325,6 +11328,7 @@ fn check_def_before_use(
                         }
                     }
                 }
+                Stmt::ErrorIncrement => {}
             }
         }
         match &b.terminator {

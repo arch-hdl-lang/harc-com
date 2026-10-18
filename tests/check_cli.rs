@@ -128,7 +128,7 @@ fn check_rejects_zero_and_nonconstant_width_methods() {
 }
 
 #[test]
-fn dump_ir_locates_an_unsupported_component_call_in_wait_predicate() {
+fn dump_ir_accepts_a_component_call_in_wait_predicate() {
     let definitions = source_file(
         "located_call_defs.harc",
         r#"sequencer Counter
@@ -156,17 +156,17 @@ end impl LocatedCallTest
     );
 
     let output = dump_ir(&[&definitions, &test]);
-    let stderr = assert_source_diagnostic(
-        &output,
-        &test,
-        4,
-        9,
-        "wait until counter.next() == 1",
-        "value call requiring statement",
-    );
     assert!(
-        stderr.contains("--codegen v1"),
-        "unsupported diagnostics must preserve the v1 escape hatch:\n{stderr}"
+        output.status.success(),
+        "dump-ir must accept a component call materialized inside the polling CFG:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("ComponentCall")
+            && stdout.contains("counter.c0::next")
+            && stdout.contains("WaitCycles(1"),
+        "dump-ir must place the component call before the polling branch and retry wait:\n{stdout}"
     );
 }
 
@@ -209,8 +209,10 @@ end impl LocatedTransactorWaitTest
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("WaitUntil") && stdout.contains("xact.ready"),
-        "dump-ir must preserve the nested call in the wait predicate:\n{stdout}"
+        stdout.contains("TransactorCall")
+            && stdout.contains("xact.ready")
+            && stdout.contains("WaitCycles(1"),
+        "dump-ir must materialize the nested call inside the polling CFG:\n{stdout}"
     );
 }
 

@@ -572,16 +572,14 @@ impl FuncBuilder<'_> {
                 "wait until: at least one condition required".to_string(),
             ));
         }
+        if conditions
+            .iter()
+            .any(|condition| self.expr_value_prelude_summary(condition).emits_statements())
+        {
+            return self.lower_effectful_wait_until(ir_mode, conditions, timeout);
+        }
         let mut preds = Vec::with_capacity(conditions.len());
         for c in conditions {
-            let prelude = self.expr_value_prelude_summary(c);
-            if prelude.has_inline_statements() {
-                return Err(not_implemented(
-                    "a value call requiring statement materialization inside a `wait until` predicate",
-                    "the predicate is re-evaluated every cycle; use an explicit polling loop if a component call, queue pop, or record-valued queue front must run on each attempt",
-                    V1Status::WorksButRetired,
-                ));
-            }
             // Ports stay inline — the scheduler re-samples the DUT on
             // every cycle inside the predicate closure. The source
             // text rides along for the timeout breakdown, rendered by
@@ -592,19 +590,6 @@ impl FuncBuilder<'_> {
             self.in_reevaluated_predicate = previous;
             let expr = lowered?;
             self.validate_truth_expr(&expr, "wait-until predicate")?;
-            // Synchronous sibling and testbench-instance methods remain inline
-            // and are re-evaluated on every predicate attempt, matching v1.
-            // Bus/TLM calls still require the statement-level handshake seam.
-            if super::exprs::expr_has_bound_transactor_edge(&expr, &|field| {
-                self.ctx.bus_bindings.contains_key(field)
-            }) {
-                return Err(not_implemented(
-                    "a transactor method call inside a `wait until` predicate",
-                    "the predicate is re-evaluated every cycle, so a call that advances time \
-                     changes the timing; hoist the call into a `let` before the `wait until`",
-                    V1Status::WorksButRetired,
-                ));
-            }
             preds.push(PredSrc {
                 expr,
                 src_text: crate::codegen::cpp_tb::expr_source_str(c),
@@ -726,6 +711,183 @@ impl FuncBuilder<'_> {
         }
         self.terminate(Terminator::Jump(on_fire));
         self.start_block(on_fire);
+        Ok(())
+    }
+
+    /// Expand a re-evaluated wait predicate that needs statement-level value
+    /// materialization into an ordinary polling CFG. Keeping the calls in the
+    /// loop body is the important semantic point: component methods, queue
+    /// pops/fronts, helpers that read the DUT, and bus/TLM calls execute once
+    /// per attempt instead of being hoisted once before the wait.
+    fn lower_effectful_wait_until(
+        &mut self,
+        mode: WaitMode,
+        conditions: &[AstExpr],
+        timeout: Option<&WaitTimeout>,
+    ) -> Result<(), LowerError> {
+        let lit = |value| Expr::Literal {
+            value,
+            ty: IrType::UInt(None),
+        };
+        let budget = if let Some(to) = timeout {
+            let cycles = self.lower_expr_no_ports(&to.cycles)?;
+            self.validate_numeric_expr(&cycles, "wait-until timeout count")?;
+            let original = self.fresh_temp();
+            self.set_local_type(original, IrType::UInt(None));
+            self.push(Stmt::Assign(original, cycles));
+            let remaining = self.fresh_temp();
+            self.set_local_type(remaining, IrType::UInt(None));
+            self.push(Stmt::Assign(remaining, Expr::Local(original)));
+            Some((original, remaining))
+        } else {
+            None
+        };
+
+        let poll = self.new_block();
+        let satisfied = self.new_block();
+        let not_satisfied = self.new_block();
+        self.terminate(Terminator::Jump(poll));
+        self.start_block(poll);
+
+        let mut preds = Vec::with_capacity(conditions.len());
+        let mut predicate_values = Vec::with_capacity(conditions.len());
+        for condition in conditions {
+            // This is intentionally NOT marked `in_reevaluated_predicate`:
+            // ordinary expression lowering must materialize every effect into
+            // this loop body. The back-edge below supplies re-evaluation.
+            let value = self.lower_expr_no_ports(condition)?;
+            self.validate_truth_expr(&value, "wait-until predicate")?;
+            let snapshot = self.fresh_temp();
+            self.set_local_type(snapshot, IrType::Bool);
+            let truth = Expr::Binary(
+                BinOp::Ne,
+                Box::new(value),
+                Box::new(Expr::Literal {
+                    value: 0,
+                    ty: IrType::Unknown,
+                }),
+            );
+            self.push(Stmt::Assign(snapshot, truth));
+            let snapshot_expr = Expr::Local(snapshot);
+            predicate_values.push(snapshot_expr.clone());
+            preds.push(PredSrc {
+                expr: snapshot_expr,
+                src_text: crate::codegen::cpp_tb::expr_source_str(condition),
+            });
+        }
+        let op = match mode {
+            WaitMode::Single | WaitMode::AllOf => BinOp::And,
+            WaitMode::AnyOf => BinOp::Or,
+        };
+        let combined = predicate_values
+            .into_iter()
+            .reduce(|lhs, rhs| Expr::Binary(op, Box::new(lhs), Box::new(rhs)))
+            .expect("wait-until has at least one predicate");
+        self.terminate(Terminator::Branch(combined, satisfied, not_satisfied));
+
+        self.start_block(not_satisfied);
+        let timeout_block = if let Some((_, remaining)) = budget {
+            let timed_out = self.new_block();
+            let wait = self.new_block();
+            self.terminate(Terminator::Branch(
+                Expr::Binary(
+                    BinOp::Le,
+                    Box::new(Expr::Local(remaining)),
+                    Box::new(lit(0)),
+                ),
+                timed_out,
+                wait,
+            ));
+            self.start_block(wait);
+            self.push(Stmt::Assign(
+                remaining,
+                Expr::Binary(
+                    BinOp::Sub,
+                    Box::new(Expr::Local(remaining)),
+                    Box::new(lit(1)),
+                ),
+            ));
+            if self.inline_frames.is_empty() {
+                self.terminate(Terminator::WaitCycles(lit(1), None, poll));
+            } else {
+                self.terminate(Terminator::WaitCyclesSync(lit(1), poll));
+            }
+            Some(timed_out)
+        } else {
+            if self.inline_frames.is_empty() {
+                self.terminate(Terminator::WaitCycles(lit(1), None, poll));
+            } else {
+                self.terminate(Terminator::WaitCyclesSync(lit(1), poll));
+            }
+            None
+        };
+
+        if let (Some(to), Some(timeout_block), Some((budget, _))) =
+            (timeout, timeout_block, budget)
+        {
+            self.start_block(timeout_block);
+            self.push(Stmt::ErrorIncrement);
+            let header = match &to.message {
+                Some(message) => match &*message.kind {
+                    ExprKind::String(text) => self.lower_fmt_hoisting(text)?,
+                    _ => {
+                        return Err(not_implemented(
+                            "non-string-literal timeout `fail(...)` message",
+                            "v1 silently replaces it with a generic \"wait until timed out\" line, so the message written here never appears",
+                            V1Status::SilentlyMisLowers,
+                        ));
+                    }
+                },
+                None => {
+                    let label = match mode {
+                        WaitMode::Single => "wait until",
+                        WaitMode::AllOf => "wait until all of",
+                        WaitMode::AnyOf => "wait until any of",
+                    };
+                    FmtArgs {
+                        fmt: format!("{label} timed out after %lld cycles"),
+                        args: vec![FmtArg {
+                            expr: Expr::Local(budget),
+                            wide_hex: None,
+                        }],
+                    }
+                }
+            };
+            self.push(Stmt::FailDiag {
+                guard: None,
+                args: header,
+            });
+            match mode {
+                WaitMode::Single | WaitMode::AllOf => {
+                    for pred in &preds {
+                        self.push(Stmt::FailDiag {
+                            guard: Some(pred.expr.clone()),
+                            args: FmtArgs {
+                                fmt: format!("  not yet true: {}", pred.src_text),
+                                args: Vec::new(),
+                            },
+                        });
+                    }
+                }
+                WaitMode::AnyOf => self.push(Stmt::FailDiag {
+                    guard: None,
+                    args: FmtArgs {
+                        fmt: format!(
+                            "  none of: {}",
+                            preds
+                                .iter()
+                                .map(|pred| pred.src_text.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        args: Vec::new(),
+                    },
+                }),
+            }
+            self.terminate(Terminator::Jump(satisfied));
+        }
+
+        self.start_block(satisfied);
         Ok(())
     }
 

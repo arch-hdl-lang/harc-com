@@ -951,6 +951,9 @@ impl FuncBuilder<'_> {
         };
         let n = self.lower_expr_no_ports(duration)?;
         self.validate_numeric_expr(&n, "wait cycle count")?;
+        if matches!(n, Expr::Literal { value: 0, .. }) {
+            return Ok(());
+        }
         // A wide cycle count lowers: the emitter narrows it to the
         // `uint32_t` the terminator takes.
         //
@@ -1329,16 +1332,12 @@ impl FuncBuilder<'_> {
                 if let Some(detail) =
                     crate::ir::component_local_runtime_requirement(&self.ctx.components, component)
                 {
-                    return Err(not_implemented(
-                        &format!(
-                            "default-constructed component local `{}` of type `{}`",
-                            l.name.name, self.ctx.components[component.index()].name
-                        ),
-                        format!(
-                            "v1 installs per-instance runtime infrastructure for {detail}; TB-IR component locals currently support state, methods, event subscriptions, and internal connect graphs"
-                        ),
-                        V1Status::WorksButRetired,
-                    ));
+                    return Err(LowerError::Invalid(format!(
+                        "default-constructed component local `{}` of type `{}` requires \
+                         {detail}; declare a concrete `= bind <bus>` instance at testbench \
+                         scope so the bus adapter and lifetime are explicit",
+                        l.name.name, self.ctx.components[component.index()].name
+                    )));
                 }
                 let id = self.declare(&l.name.name);
                 self.set_local_type(id, IrType::Component(component));
@@ -2657,6 +2656,57 @@ impl FuncBuilder<'_> {
         value: &crate::ast::Expr,
     ) -> Result<(), LowerError> {
         self.reject_inactive_target_state_root(target)?;
+        // Scoreboard value write. Resolve this before generic component
+        // paths: data-only scoreboard bindings are structural owners too,
+        // but their value schema lives in `ScoreboardSchema`.
+        if let ExprKind::Field { target: ft, name } = &*target.kind {
+            if let Some((sb, field, nested_path)) = self.scoreboard_root(ft) {
+                let scalar = self.scoreboard_scalar_field(sb, &name.name)?;
+                let expected = self.scoreboard_scalar_type(sb, &name.name)?;
+                let e = if let IrType::FixedVec { elem, len } = &expected {
+                    self.whole_vec_copy_rhs((*len, (**elem).clone()), value)?
+                        .ok_or_else(|| {
+                            LowerError::Invalid(format!(
+                                "scoreboard fixed-vector field `{}` requires a matching Vec value",
+                                name.name
+                            ))
+                        })?
+                } else {
+                    self.lower_expr_no_ports(value)?
+                };
+                match expected {
+                    IrType::Record(record) => {
+                        if self.record_id_of_expr(&e) != Some(record) {
+                            return Err(self.record_assign_mismatch(
+                                &e,
+                                record,
+                                format!("scoreboard record field `{}`", name.name),
+                                "assign a value of the same record type",
+                            ));
+                        }
+                    }
+                    IrType::FixedVec { .. } => {}
+                    _ => {
+                        self.reject_record_into_scalar(
+                            &e,
+                            &format!("scoreboard field `{}`", name.name),
+                        )?;
+                        self.check_owner_scalar_field_write(
+                            &e,
+                            &expected,
+                            &format!("scoreboard field `{}`", name.name),
+                        )?;
+                    }
+                }
+                self.push(Stmt::ScoreboardOp {
+                    sb,
+                    field,
+                    op: crate::ir::ScoreboardOp::ScalarWrite { scalar, value: e },
+                    nested_path,
+                });
+                return Ok(());
+            }
+        }
         if let Some(port) = self.as_port_ref(target)? {
             // Writing a read-only `probe` is a hard error: only a
             // `probe force` declaration opts into the SV procedural-force
@@ -3117,45 +3167,6 @@ impl FuncBuilder<'_> {
         // lowering resolves and schema-checks both bases.
         if self.lower_component_sub_assign(target, value)? {
             return Ok(());
-        }
-        // Scoreboard scalar/whole-record write: `sb.writes = sb.writes + 1`
-        // or `sb.last = item` (classic), plus `_tb.sb...` after impl desugar.
-        if let ExprKind::Field { target: ft, name } = &*target.kind {
-            if let Some((sb, field, nested_path)) = self.scoreboard_root(ft) {
-                let scalar = self.scoreboard_scalar_field(sb, &name.name)?;
-                let e = self.lower_expr_no_ports(value)?;
-                let expected = self.scoreboard_scalar_type(sb, &name.name)?;
-                match expected {
-                    IrType::Record(record) => {
-                        if self.record_id_of_expr(&e) != Some(record) {
-                            return Err(self.record_assign_mismatch(
-                                &e,
-                                record,
-                                format!("scoreboard record field `{}`", name.name),
-                                "assign a value of the same record type",
-                            ));
-                        }
-                    }
-                    _ => {
-                        self.reject_record_into_scalar(
-                            &e,
-                            &format!("scoreboard field `{}`", name.name),
-                        )?;
-                        self.check_owner_scalar_field_write(
-                            &e,
-                            &expected,
-                            &format!("scoreboard field `{}`", name.name),
-                        )?;
-                    }
-                }
-                self.push(Stmt::ScoreboardOp {
-                    sb,
-                    field,
-                    op: crate::ir::ScoreboardOp::ScalarWrite { scalar, value: e },
-                    nested_path,
-                });
-                return Ok(());
-            }
         }
         // RAL frontdoor register-level write: `regs.NAME = expr`.
         if self.try_lower_regblock_write(target, value)? {
@@ -5667,32 +5678,6 @@ impl FuncBuilder<'_> {
     /// hook vectors the component path owns, and event subscriptions
     /// (`on <ev>(arg)`) need a subscriber list on a component field.
     fn lower_on_handler(&mut self, h: &crate::ast::OnHandler) -> Result<(), LowerError> {
-        // Preserve the source/emission distinction that TBIR helper inlining
-        // otherwise erases. v1 emits a top-level wait written directly in a
-        // run-body handler under coroutine mode. A handler defined inside a
-        // helper, or a helper-mediated wait in the handler body, is emitted
-        // through an ordinary synchronous lambda instead.
-        let direct_coroutine_untimed_wait_until = self.inline_frames.is_empty()
-            && h.body
-                .stmts
-                .iter()
-                .any(|s| matches!(&s.kind, StmtKind::WaitUntil { timeout: None, .. }));
-        let direct_coroutine_timed_wait_until = self.inline_frames.is_empty()
-            && h.body.stmts.iter().any(|s| {
-                matches!(
-                    &s.kind,
-                    StmtKind::WaitUntil {
-                        timeout: Some(_),
-                        ..
-                    }
-                )
-            });
-        let nested_direct_coroutine_untimed_wait_until = self.inline_frames.is_empty()
-            && !direct_coroutine_untimed_wait_until
-            && block_contains_wait_until(&h.body, false);
-        let nested_direct_coroutine_timed_wait_until = self.inline_frames.is_empty()
-            && !direct_coroutine_timed_wait_until
-            && block_contains_wait_until(&h.body, true);
         use crate::ir::{CycleHandlerKind, CycleHandlerSchema};
         self.require_test_body("an `on ... end on` handler")?;
         if h.hook.is_some() {
@@ -5929,215 +5914,6 @@ impl FuncBuilder<'_> {
             self.ctx.owner,
         )?;
 
-        // The handler runs from a void per-cycle checker callback. v1 lowers
-        // an unqualified cycle wait to `co_await` inside that callback, which
-        // cannot be a coroutine under its void ABI and therefore does not
-        // compile. A named-clock wait takes a different broken path: v1 emits
-        // an explicit checker pass after the wait, recursively invoking this
-        // same handler while it is already running.
-        if f.blocks
-            .iter()
-            .any(|b| matches!(b.terminator, Terminator::WaitCycles(_, None, _)))
-        {
-            return Err(super::not_implemented(
-                "an unqualified cycle `wait` inside a statement-position `on` handler body",
-                "the body runs from a void per-cycle checker callback; v1 emits `co_await` \
-                     inside that callback and the generated C++ does not compile — move the \
-                     wait into the run body, or gate the run body on the same condition with \
-                     `wait until`",
-                super::V1Status::EmitsUncompilable,
-            ));
-        }
-        // This recursion proof is deliberately narrow. The entry terminator
-        // makes the named wait unconditional; a checker-phase boolean handler
-        // has not updated its edge state before running the body, so the
-        // nested checker pass fires the same handler again. Periodic handlers
-        // update their last-fired stamp first, and post-eval handlers live in
-        // a different service vector, so those shapes retain the fallback.
-        let guaranteed_reentrant_named_wait = !h.periodic
-            && matches!(h.phase, crate::ast::OnPhase::Checker)
-            && !direct_coroutine_untimed_wait_until
-            && !direct_coroutine_timed_wait_until
-            && !nested_direct_coroutine_untimed_wait_until
-            && !nested_direct_coroutine_timed_wait_until
-            && matches!(
-                &f.blocks[f.entry.index()].terminator,
-                Terminator::WaitCycles(_, Some(_), _)
-            );
-        if guaranteed_reentrant_named_wait {
-            return Err(super::not_implemented(
-                "a named-clock `wait` inside a statement-position `on` handler body",
-                "v1 runs the body from a per-cycle checker and emits another complete checker \
-                 pass after the named-clock wait, recursively re-entering the same handler — \
-                 move the wait into the run body, or gate the run body on the same condition \
-                 with `wait until`",
-                super::V1Status::SilentlyMisLowers,
-            ));
-        }
-        let guaranteed_reentrant_nested_named_wait = !h.periodic
-            && matches!(h.phase, crate::ast::OnPhase::Checker)
-            && !direct_coroutine_untimed_wait_until
-            && !direct_coroutine_timed_wait_until
-            && !nested_direct_coroutine_untimed_wait_until
-            && !nested_direct_coroutine_timed_wait_until
-            && matches!(h.edge, crate::ast::EdgeMode::Rising)
-            && literal_bool_value(&h.event) == Some(true)
-            && block_entry_guarantees_named_wait(&h.body);
-        if guaranteed_reentrant_nested_named_wait {
-            return Err(super::not_implemented(
-                "a guaranteed nested named-clock `wait` inside a statement-position `on` handler body",
-                "v1 reaches the named-clock wait through unconditional control flow, then runs \
-                 the checker list again before updating this constant-true rising handler's edge \
-                 state, recursively firing the same handler — move the wait into the run body",
-                super::V1Status::SilentlyMisLowers,
-            ));
-        }
-        if direct_coroutine_untimed_wait_until {
-            return Err(super::not_implemented(
-                "an untimed `wait until` inside a statement-position `on` handler body",
-                "the body runs from a void checker/service callback; v1 emits a coroutine \
-                 `co_await wait_until` inside that callback and the generated C++ does not \
-                 compile — move the wait into the run body, or gate the run body on the same \
-                 condition",
-                super::V1Status::EmitsUncompilable,
-            ));
-        }
-        if nested_direct_coroutine_untimed_wait_until {
-            return Err(super::not_implemented(
-                "an untimed `wait until` nested inside control flow in a statement-position `on` handler body",
-                "v1 still emits the nested coroutine `co_await wait_until` inside the handler's \
-                 void checker/service callback, so the generated C++ does not compile — move the \
-                 wait into the run body, or gate the run body on the same condition",
-                super::V1Status::EmitsUncompilable,
-            ));
-        }
-        if direct_coroutine_timed_wait_until {
-            return Err(super::not_implemented(
-                "a timed `wait until` inside a statement-position `on` handler body",
-                "the body runs from a void checker/service callback; v1 emits a coroutine \
-                 `co_await wait_until_timeout` inside that callback and the generated C++ \
-                 does not compile — move the wait into the run body, or gate the run body \
-                 on the same condition",
-                super::V1Status::EmitsUncompilable,
-            ));
-        }
-        if nested_direct_coroutine_timed_wait_until {
-            return Err(super::not_implemented(
-                "a timed `wait until` nested inside control flow in a statement-position `on` handler body",
-                "v1 still emits the nested coroutine `co_await wait_until_timeout` inside the \
-                 handler's void checker/service callback, so the generated C++ does not compile — \
-                 move the wait into the run body, or gate the run body on the same condition",
-                super::V1Status::EmitsUncompilable,
-            ));
-        }
-        let guaranteed_reentrant_helper_untimed_wait = self.inline_frames.is_empty()
-            && !h.periodic
-            && matches!(h.phase, crate::ast::OnPhase::Checker)
-            && matches!(h.edge, crate::ast::EdgeMode::Rising)
-            && matches!(&*h.event.kind, ExprKind::Bool(true))
-            && !block_contains_wait_until(&h.body, false)
-            && matches!(
-                &f.blocks[f.entry.index()].terminator,
-                Terminator::WaitUntil { preds, .. }
-                    if preds.len() == 1
-                        && matches!(preds[0].expr, Expr::Literal { value: 0, .. })
-            );
-        if guaranteed_reentrant_helper_untimed_wait {
-            return Err(super::not_implemented(
-                "an untimed synchronous helper wait inside a statement-position `on` handler body",
-                "v1 polls the helper's always-false predicate with synchronous `tick()` calls; \
-                 the first tick re-enters the same constant-true rising handler before its edge \
-                 state is updated, causing unbounded recursion — move the helper call into the \
-                 run body",
-                super::V1Status::SilentlyMisLowers,
-            ));
-        }
-        let guaranteed_reentrant_helper_timed_wait = self.inline_frames.is_empty()
-            && !h.periodic
-            && matches!(h.phase, crate::ast::OnPhase::Checker)
-            && matches!(h.edge, crate::ast::EdgeMode::Rising)
-            && matches!(&*h.event.kind, ExprKind::Bool(true))
-            && !block_contains_wait_until(&h.body, true)
-            && entry_has_false_positive_timed_wait(&f);
-        if guaranteed_reentrant_helper_timed_wait {
-            return Err(super::not_implemented(
-                "a timed synchronous helper wait inside a statement-position `on` handler body",
-                "v1 polls the helper's always-false predicate with at least one synchronous \
-                 `tick()`; that tick re-enters the same constant-true rising handler before \
-                 its edge state is updated, causing unbounded recursion — move the helper \
-                 call into the run body",
-                super::V1Status::SilentlyMisLowers,
-            ));
-        }
-        let guaranteed_reentrant_helper_defined_untimed_wait = !self.inline_frames.is_empty()
-            && !h.periodic
-            && matches!(h.phase, crate::ast::OnPhase::Checker)
-            && matches!(h.edge, crate::ast::EdgeMode::Rising)
-            && matches!(&*h.event.kind, ExprKind::Bool(true))
-            && block_contains_wait_until(&h.body, false)
-            && matches!(
-                &f.blocks[f.entry.index()].terminator,
-                Terminator::WaitUntil { preds, .. }
-                    if preds.len() == 1
-                        && matches!(preds[0].expr, Expr::Literal { value: 0, .. })
-            );
-        if guaranteed_reentrant_helper_defined_untimed_wait {
-            return Err(super::not_implemented(
-                "an untimed wait in a helper-defined statement-position `on` handler",
-                "v1 emits the helper-defined handler as a synchronous callback; its \
-                 always-false wait polls with `tick()`, recursively firing the same \
-                 constant-true rising handler before edge state is updated — install the \
-                 handler directly in the run body and move its wait into run control flow",
-                super::V1Status::SilentlyMisLowers,
-            ));
-        }
-        let guaranteed_reentrant_helper_defined_timed_wait = !self.inline_frames.is_empty()
-            && !h.periodic
-            && matches!(h.phase, crate::ast::OnPhase::Checker)
-            && matches!(h.edge, crate::ast::EdgeMode::Rising)
-            && matches!(&*h.event.kind, ExprKind::Bool(true))
-            && block_contains_wait_until(&h.body, true)
-            && entry_has_false_positive_timed_wait(&f);
-        if guaranteed_reentrant_helper_defined_timed_wait {
-            return Err(super::not_implemented(
-                "a timed wait in a helper-defined statement-position `on` handler",
-                "v1 emits the helper-defined handler synchronously; its positive-timeout, \
-                 always-false wait executes `tick()` and recursively fires the same \
-                 constant-true rising handler before edge state is updated — install the \
-                 handler directly in the run body and move its wait into run control flow",
-                super::V1Status::SilentlyMisLowers,
-            ));
-        }
-        let guaranteed_reentrant_helper_wait = !h.periodic
-            && matches!(h.phase, crate::ast::OnPhase::Checker)
-            && matches!(h.edge, crate::ast::EdgeMode::Rising)
-            && matches!(&*h.event.kind, ExprKind::Bool(true))
-            && matches!(
-                &f.blocks[f.entry.index()].terminator,
-                Terminator::WaitCyclesSync(
-                    Expr::Literal { value, .. },
-                    _
-                ) if *value > 0
-            );
-        if guaranteed_reentrant_helper_wait {
-            return Err(super::not_implemented(
-                "a synchronously suspending helper inside a statement-position `on` handler body",
-                "v1 calls the helper from a per-cycle checker; its positive synchronous \
-                 `tick()` re-enters the same boolean trigger before the trigger state is \
-                 updated, causing unbounded recursion — move the helper call into the run \
-                 body, or gate the run body on the same condition",
-                super::V1Status::SilentlyMisLowers,
-            ));
-        }
-        if super::function_suspends(&f) {
-            return Err(not_implemented(
-                "a `wait` inside a statement-position `on` handler body",
-                "the body runs from the per-cycle checker pass, and waits are not yet \
-                 represented safely there — move the wait into the run body, or gate the \
-                 run body on the same condition with `wait until`",
-                V1Status::Unreliable,
-            ));
-        }
         self.commit_pending_function(pending_id, f);
         let id = {
             let mut tables = self.side_tables.borrow_mut();
@@ -6302,13 +6078,11 @@ impl FuncBuilder<'_> {
                     V1Status::SilentlyMisLowers,
                 ));
             }
-            return Err(not_implemented(
-                construct,
-                "the body needs a statement-level step (a hoisted DUT read, an inlined \
-                 helper, or a transactor call), which cannot run inside a per-cycle \
-                 concurrent check",
-                V1Status::Unreliable,
-            ));
+            return Err(LowerError::Invalid(format!(
+                "{construct} must be a side-effect-free per-cycle expression; this body \
+                 needs a statement-level step (a hoisted DUT read, an inlined helper, or \
+                 a transactor call)"
+            )));
         }
         Ok(out)
     }
@@ -7071,6 +6845,7 @@ impl FuncBuilder<'_> {
             let call = std::mem::replace(e, AstExpr::new(ExprKind::Bool(false), e.span));
             let span = call.span;
             let lowered = self.lower_expr(&call)?;
+            let lowered = self.hoist_fmt_ports(lowered);
             let ty = self.expr_type(&lowered).unwrap_or(IrType::Unknown);
             // Use a source name that is unique BEFORE `declare` sees it, so
             // `declare` stores it verbatim (no dedup suffix) and scope-keys
@@ -7426,153 +7201,6 @@ impl FuncBuilder<'_> {
     }
 }
 
-/// Whether `block` contains a source-written `wait until` of the requested
-/// timeout shape, descending ordinary control flow but not nested handlers.
-/// This preserves source provenance that is lost after helper CFG inlining.
-fn block_contains_wait_until(block: &crate::ast::Block, timed: bool) -> bool {
-    fn stmt_contains(s: &AstStmt, timed: bool) -> bool {
-        match &s.kind {
-            StmtKind::WaitUntil { timeout, .. } => timeout.is_some() == timed,
-            StmtKind::For(s) => block_contains_wait_until(&s.body, timed),
-            StmtKind::Repeat(s) => block_contains_wait_until(&s.body, timed),
-            StmtKind::Loop(b) => block_contains_wait_until(b, timed),
-            StmtKind::While { body, .. } => block_contains_wait_until(body, timed),
-            StmtKind::If(s) => {
-                block_contains_wait_until(&s.then_block, timed)
-                    || s.elsifs
-                        .iter()
-                        .any(|(_, b)| block_contains_wait_until(b, timed))
-                    || s.else_block
-                        .as_ref()
-                        .is_some_and(|b| block_contains_wait_until(b, timed))
-            }
-            StmtKind::After { body, .. } => block_contains_wait_until(body, timed),
-            StmtKind::Fork(s) => s
-                .branches
-                .iter()
-                .any(|b| block_contains_wait_until(b, timed)),
-            StmtKind::Parallel(bs) | StmtKind::Schedule(bs) => bs
-                .iter()
-                .any(|b| block_contains_wait_until(b, timed)),
-            StmtKind::Select(arms) => arms
-                .iter()
-                .any(|a| block_contains_wait_until(&a.action, timed)),
-            // A nested `on` owns a different callback and is classified when
-            // that handler itself is lowered.
-            StmtKind::On(_) => false,
-            _ => false,
-        }
-    }
-
-    block.stmts.iter().any(|s| stmt_contains(s, timed))
-}
-
-fn block_entry_guarantees_named_wait(block: &crate::ast::Block) -> bool {
-    let Some(first) = block.stmts.first() else {
-        return false;
-    };
-    match &first.kind {
-        StmtKind::Wait { clock: Some(_), .. } => true,
-        StmtKind::If(s) => literal_if_taken_block(s)
-            .is_some_and(block_entry_guarantees_named_wait)
-            || if_all_paths_guarantee_named_wait(s),
-        StmtKind::Repeat(s) if positive_int_literal(&s.count) => {
-            block_entry_guarantees_named_wait(&s.body)
-        }
-        StmtKind::Loop(body) => block_entry_guarantees_named_wait(body),
-        StmtKind::While { cond, body, .. } if literal_bool_value(cond) == Some(true) => {
-            block_entry_guarantees_named_wait(body)
-        }
-        StmtKind::For(s) if literal_range_non_empty(&s.iter) => {
-            block_entry_guarantees_named_wait(&s.body)
-        }
-        _ => false,
-    }
-}
-
-fn if_all_paths_guarantee_named_wait(stmt: &crate::ast::IfStmt) -> bool {
-    block_entry_guarantees_named_wait(&stmt.then_block)
-        && stmt
-            .elsifs
-            .iter()
-            .all(|(_, block)| block_entry_guarantees_named_wait(block))
-        && stmt
-            .else_block
-            .as_ref()
-            .is_some_and(block_entry_guarantees_named_wait)
-}
-
-fn literal_if_taken_block(stmt: &crate::ast::IfStmt) -> Option<&crate::ast::Block> {
-    match literal_bool_value(&stmt.cond)? {
-        true => return Some(&stmt.then_block),
-        false => {}
-    }
-    for (cond, block) in &stmt.elsifs {
-        match literal_bool_value(cond)? {
-            true => return Some(block),
-            false => {}
-        }
-    }
-    stmt.else_block.as_ref()
-}
-
-fn literal_bool_value(expr: &AstExpr) -> Option<bool> {
-    match &*expr.kind {
-        ExprKind::Bool(value) => Some(*value),
-        ExprKind::Paren(inner) => literal_bool_value(inner),
-        _ => None,
-    }
-}
-
-fn positive_int_literal(expr: &AstExpr) -> bool {
-    match &*expr.kind {
-        ExprKind::Int(s) => super::exprs::parse_int_literal_expr(expr)
-            .or_else(|| super::exprs::parse_sized_int_literal(s))
-            .is_some_and(|value| value > 0),
-        ExprKind::Paren(inner) => positive_int_literal(inner),
-        _ => false,
-    }
-}
-
-fn literal_range_non_empty(expr: &AstExpr) -> bool {
-    fn value(expr: &AstExpr) -> Option<u64> {
-        match &*expr.kind {
-            ExprKind::Int(s) => super::exprs::parse_int_literal_expr(expr)
-                .or_else(|| super::exprs::parse_sized_int_literal(s)),
-            ExprKind::Paren(inner) => value(inner),
-            _ => None,
-        }
-    }
-
-    let ExprKind::RangeLit {
-        lo: Some(lo),
-        hi: Some(hi),
-    } = &*expr.kind
-    else {
-        return false;
-    };
-    matches!((value(lo), value(hi)), (Some(lo), Some(hi)) if lo <= hi)
-}
-
-fn entry_has_false_positive_timed_wait(f: &crate::ir::TbFunction) -> bool {
-    let entry = &f.blocks[f.entry.index()];
-    let Terminator::WaitUntilTimeout { preds, cycles, .. } = &entry.terminator else {
-        return false;
-    };
-    if preds.len() != 1 || !matches!(preds[0].expr, Expr::Literal { value: 0, .. }) {
-        return false;
-    }
-    let Expr::Local(budget) = cycles else {
-        return false;
-    };
-    entry.stmts.iter().any(|s| {
-        matches!(
-            s,
-            Stmt::Assign(id, Expr::Literal { value, .. }) if id == budget && *value > 0
-        )
-    })
-}
-
 /// Children of an AST expression to visit when hoisting message calls,
 /// in source (left-to-right) evaluation order. Deliberately does NOT
 /// descend into a `Call`'s own subtree — the caller decides per-node
@@ -7669,11 +7297,10 @@ fn parse_fmt_capture(capture: &str) -> Result<AstExpr, LowerError> {
 }
 
 pub(crate) fn lazy_message_call_error(what: &str) -> LowerError {
-    not_implemented(
-        &format!("{what} inside a message"),
-        "the call is conditionally evaluated; bind the lazy expression to a `let` before formatting it",
-        V1Status::Unreliable,
-    )
+    LowerError::Invalid(format!(
+        "{what} inside a message cannot be represented by the lazy failure-side CFG; \
+         bind the expression to a `let` before formatting it"
+    ))
 }
 
 /// The `callee` of a `let ... = <callee>(...)` initializer when the RHS is

@@ -1168,7 +1168,8 @@ fn plan_shared_types(prog: &TbProgram) -> Result<Vec<CommonSharedTypePlan>, Emit
                             )?
                         }
                         ir::ComponentFieldKind::Event { .. }
-                        | ir::ComponentFieldKind::Dut { .. } => {}
+                        | ir::ComponentFieldKind::Dut { .. }
+                        | ir::ComponentFieldKind::Covgroup { .. } => {}
                     }
                 }
             }
@@ -4595,6 +4596,7 @@ fn validate_stmt(
             validate_local(function, *local)?;
             validate_expr(opts, test, function, block, value)
         }
+        Stmt::ErrorIncrement => Ok(()),
         Stmt::TransactorStateWrite { .. }
         | Stmt::TransactorStateRecordFieldWrite { .. }
         | Stmt::TransactorStateQueuePush { .. }
@@ -5353,6 +5355,7 @@ fn stmt_kind(stmt: &Stmt) -> &'static str {
         Stmt::CovReport(_) => "coverage report",
         Stmt::TransactorCall { .. } | Stmt::TransactorSelfCall { .. } => "transactor call",
         Stmt::FailDiag { .. } => "wait diagnostic",
+        Stmt::ErrorIncrement => "error increment",
         Stmt::ScoreboardOp { .. } => "scoreboard operation",
         Stmt::ComponentFieldWrite { .. }
         | Stmt::ComponentVecElementWrite { .. }
@@ -5417,6 +5420,7 @@ fn stmt_ticket(stmt: &Stmt) -> &'static str {
         | Stmt::Log { .. }
         | Stmt::AssertCheck { .. }
         | Stmt::AssumeCheck { .. } => "ticket 02",
+        Stmt::ErrorIncrement => "ticket 02",
     }
 }
 
@@ -7394,6 +7398,8 @@ fn render_common_capsule_template(
                     runtime_cells: runtime_cell_binding,
                     common_contextual_tseqs: Some(&plan.contextual_tseqs),
                     durable_capture: true,
+                    async_scheduler: "ctx.scheduler",
+                    async_slots: "ctx.actor_slots",
                 },
             )?;
         }
@@ -7434,7 +7440,6 @@ fn render_common_capsule_template(
             super::emit_lifecycle_checkers(
                 &mut out,
                 prog,
-                &plan.runtime_cells,
                 binding.component,
                 &instance,
                 binding.mode,
@@ -7444,6 +7449,7 @@ fn render_common_capsule_template(
                 bound_bus,
                 Some(&plan.bus_adapters),
                 Some("ctx"),
+                1,
             )?;
         }
         if !tb.periodic_services.is_empty() || !tb.cycle_services.is_empty() {

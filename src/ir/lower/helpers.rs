@@ -406,6 +406,37 @@ impl FuncBuilder<'_> {
         }
 
         // ── CFG inline ──────────────────────────────────────────────
+        // A single returned DUT expression needs no statement seam. Keep it
+        // inline so per-cycle property checks and lazy failure messages can
+        // evaluate the live port value in their callback rather than caching
+        // it at registration time.
+        if let Some(value) = helper_expression_return(&decl.body) {
+                let dut_aliases: HashMap<String, String> = decl
+                    .params
+                    .iter()
+                    .zip(&arg_exprs)
+                    .filter_map(|(param, arg)| {
+                        dut_ident_receiver(self, arg)
+                            .map(|receiver| (param.name.name.clone(), receiver))
+                    })
+                    .collect();
+                if dut_aliases.len() == decl.params.len() && helper_inline_expr_is_call_free(value) {
+                    self.inline_frames.push(InlineFrame {
+                        name: name.to_string(),
+                        dut_aliases,
+                        // This expression-only path never lowers a Return
+                        // statement, so the return destination/continuation
+                        // are intentionally inert frame metadata.
+                        ret_dest: crate::ir::LocalId(0),
+                        ret_cont: crate::ir::BlockId(self.current as u32),
+                        scope_floor: self.scope_depth(),
+                        loop_floor: self.loop_stack.len(),
+                    });
+                    let lowered = self.lower_expr(value);
+                    self.inline_frames.pop();
+                    return lowered;
+                }
+        }
         if self.in_fmt_args {
             return Err(super::stmts::lazy_message_call_error(&format!(
                 "DUT/sync-touching helper call `{name}(...)`"
@@ -1066,6 +1097,54 @@ impl FuncBuilder<'_> {
             )),
         }
     }
+}
+
+fn helper_inline_expr_is_call_free(expr: &AstExpr) -> bool {
+    match &*expr.kind {
+        ExprKind::Call { .. }
+        | ExprKind::ForkCall { .. }
+        | ExprKind::Randomize { .. }
+        | ExprKind::SystemCall { .. } => false,
+        ExprKind::Field { target, .. }
+        | ExprKind::Cast { expr: target, .. }
+        | ExprKind::Unary { expr: target, .. }
+        | ExprKind::Paren(target) => helper_inline_expr_is_call_free(target),
+        ExprKind::Index { target, index } => {
+            helper_inline_expr_is_call_free(target) && helper_inline_expr_is_call_free(index)
+        }
+        ExprKind::BitSlice { target, hi, lo } => {
+            helper_inline_expr_is_call_free(target)
+                && helper_inline_expr_is_call_free(hi)
+                && helper_inline_expr_is_call_free(lo)
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            helper_inline_expr_is_call_free(lhs) && helper_inline_expr_is_call_free(rhs)
+        }
+        ExprKind::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            helper_inline_expr_is_call_free(cond)
+                && helper_inline_expr_is_call_free(then_branch)
+                && helper_inline_expr_is_call_free(else_branch)
+        }
+        _ => true,
+    }
+}
+
+fn helper_expression_return(block: &Block) -> Option<&AstExpr> {
+    let (last, prefix) = block.stmts.split_last()?;
+    let StmtKind::Return(Some(value)) = &last.kind else {
+        return None;
+    };
+    let zero_waits = prefix.iter().all(|stmt| match &stmt.kind {
+        StmtKind::Wait { duration, .. } => {
+            super::exprs::parse_int_literal_expr(duration) == Some(0)
+        }
+        _ => false,
+    });
+    zero_waits.then_some(value)
 }
 
 fn dut_ident_receiver(b: &FuncBuilder<'_>, e: &AstExpr) -> Option<String> {

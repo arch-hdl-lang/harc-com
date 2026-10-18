@@ -325,7 +325,8 @@ pub fn try_visit_stmt_exprs<E>(
         | Stmt::ComponentQueuePop { .. }
         | Stmt::ComponentInit { .. }
         | Stmt::ComponentSubAssign { .. }
-        | Stmt::ComponentAssign { .. } => Ok(()),
+        | Stmt::ComponentAssign { .. }
+        | Stmt::ErrorIncrement => Ok(()),
     }
 }
 
@@ -446,7 +447,8 @@ pub fn visit_stmt_exprs_mut(stmt: &mut Stmt, visit: &mut impl FnMut(&mut Expr)) 
         | Stmt::ComponentQueuePop { .. }
         | Stmt::ComponentInit { .. }
         | Stmt::ComponentSubAssign { .. }
-        | Stmt::ComponentAssign { .. } => {}
+        | Stmt::ComponentAssign { .. }
+        | Stmt::ErrorIncrement => {}
     }
 }
 

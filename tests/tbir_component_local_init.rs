@@ -313,6 +313,43 @@ end test LocalConnectTest
 }
 
 #[test]
+fn runtime_rich_component_locals_bind_dut_and_install_cycle_services() {
+    let source = r#"
+transactor LocalWatcher
+    dut : Top
+    seen : uint<8> default 0
+
+    on dut.rst == 1
+        seen = seen + 1
+    end on
+
+    hookable read() -> uint<8>
+        return seen
+    end read
+end transactor LocalWatcher
+
+test LocalWatcherTest
+    let dut : Top
+    run
+        let watcher : LocalWatcher passive
+        wait 1 cycle
+        assert watcher.read() >= 0
+    end run
+end test LocalWatcherTest
+"#;
+    let merged = merged_source(source);
+    let program = lower::lower_program(&merged).expect("runtime-rich local lowers");
+    verify::verify_program(&program).expect("runtime-rich local verifies");
+    let cpp = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default())
+        .expect("runtime-rich local emits");
+    assert!(cpp.contains("watcher.dut = dut;"), "{cpp}");
+    assert!(
+        cpp.contains("_checkers.push_back") && cpp.contains("LocalWatcher"),
+        "local cycle service must be registered at ComponentInit:\n{cpp}"
+    );
+}
+
+#[test]
 fn initialized_component_local_owns_its_runtime_graph() {
     let source = r#"
 agent Listener
