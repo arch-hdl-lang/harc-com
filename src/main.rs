@@ -10,7 +10,11 @@ use std::time::Instant;
 mod trace_merge;
 
 #[derive(Parser, Debug)]
-#[command(name = "harc", version, about = "HARC verification language compiler")]
+#[command(
+    name = "harc",
+    version = env!("HARC_BUILD_VERSION"),
+    about = "HARC verification language compiler"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
