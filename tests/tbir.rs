@@ -1997,6 +1997,14 @@ end impl ProbeTest"#,
     .unwrap();
     let merged = merge::merge_for_sim(vec![tb, test], None).expect("merge");
     let err = lower::lower_program_diagnostic(&merged).expect_err("probe type must be rejected");
+    assert!(matches!(
+        err.error(),
+        lower::LowerError::NotImplemented {
+            v1: lower::V1Status::Rejects,
+            ..
+        }
+    ));
+    cpp_tb::emit(&merged).expect_err("v1 rejects the same non-scalar probe type");
     let source = merged
         .source_for_id(err.source_id())
         .expect("diagnostic source remains available");
@@ -2548,6 +2556,37 @@ fn watchdog_quiesce_emitted_cpp_snapshot() {
         "watchdog_quiesce_emitted_cpp",
         emit_fixture_cpp("watchdog_quiesce_test.harc")
     );
+}
+
+#[test]
+fn data_scoreboard_watchdog_routes_through_component_ir() {
+    let src = r#"scoreboard Watched
+    hits : uint<32> default 0
+    watchdog
+        period 2 cycles
+        max_idle 10 cycles
+        log(info, "scoreboard watchdog")
+    end watchdog
+end scoreboard Watched
+testbench Tb
+    dut : Top
+    watched : Watched
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#;
+    let prog = lower_src(src).expect("watchdog scoreboard lowers as a component");
+    verify::verify_program(&prog).expect("watchdog scoreboard verifies");
+    assert!(prog.scoreboards.is_empty());
+    let watched = prog
+        .components
+        .iter()
+        .find(|component| component.name == "Watched")
+        .expect("watchdog scoreboard component schema");
+    assert!(watched.watchdog.is_some());
+    assert!(emit_cpp_src(src).contains("Watched_watchdog"));
 }
 
 /// `env_quiesced_phase_test` exercises three TB-IR constructs together:
@@ -27198,6 +27237,79 @@ end impl T
     assert!(lower_src(&mk("0")).is_err(), "tags 0 must be rejected");
     assert!(lower_src(&mk("65")).is_err(), "tags 65 must be rejected");
     assert!(lower_src(&mk("2")).is_ok(), "tags 2 must lower");
+    for source in [
+        mk("1 < 2"),
+        mk("true | false"),
+        mk("TAGS").replacen(
+            "bus MemBus",
+            "const TAGS : bool = true\n\nbus MemBus",
+            1,
+        ),
+    ] {
+        let err = lower_src(&source).expect_err("boolean tag counts must be rejected");
+        assert!(
+            err.to_string()
+                .contains("compile-time integer, not a boolean expression"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn tlm_target_ooo_responder_folds_constant_tag_count() {
+    let src = r#"const TAGS : int = 1 + 1
+
+bus MemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: out_of_order tags TAGS;
+end bus MemBus
+transactor MemTarget bound to MemBus
+    thread bus.read(addr: uint<8>)
+        return addr
+    end thread
+end transactor MemTarget
+testbench Tb
+    dut : Dummy
+end testbench Tb
+impl T for Tb
+    let mem : MemBus = bind dut
+    let target : MemTarget passive = bind mem
+    run
+        wait 1 cycle
+    end run
+end impl T"#;
+    let prog = lower_src(src).expect("constant OOO tag count lowers");
+    verify::verify_program(&prog).expect("constant OOO tag count verifies");
+    assert!(matches!(
+        prog.testbenches[0].bus_bindings[0].methods[0].mode,
+        ir::TlmMethodMode::OutOfOrder { tags: 2 }
+    ));
+    assert_eq!(prog.transactors[0].target_methods[0].ooo_tags, Some(2));
+    assert!(emit_cpp_src(src).contains("std::array<std::atomic<bool>, 2>"));
+}
+
+#[test]
+fn responderless_bound_component_is_inert_in_target_ir() {
+    let src = r#"bus MemBus
+    tlm_method read(addr: uint<8>) -> uint<32>: blocking;
+end bus MemBus
+transactor EmptyTarget bound to MemBus
+    count : uint<32> default 0
+end transactor EmptyTarget
+testbench Tb
+    dut : Dummy
+end testbench Tb
+impl T for Tb
+    let mem : MemBus = bind dut
+    let target : EmptyTarget passive = bind mem
+    run
+        assert target.count == 0
+        wait 1 cycle
+    end run
+end impl T"#;
+    let prog = lower_src(src).expect("responderless bound state holder lowers");
+    verify::verify_program(&prog).expect("responderless bound state holder verifies");
+    assert!(prog.transactors[0].target_methods.is_empty());
+    emit_cpp_src(src);
 }
 
 /// Responder `TbFunction`s are shared per transactor TYPE. Each target actor
@@ -41512,11 +41624,24 @@ end impl MTest"#;
     }
 
     // A parser-valid TSeq container element that the value-sequence model
-    // cannot represent is still a backend subset boundary, not malformed
-    // source. Record-leaf fixed vectors are supported separately below.
-    let queue_elem = SRC.replace(DECL, "tseq Gen(n: int) -> TSeq<queue<uint<8>>>");
-    let msg = assert_unsupported(&lower_src(&queue_elem).unwrap_err());
+    // cannot represent is not a usable v1 escape hatch: v1 erases the
+    // stream element spelling to its scalar sequence carrier. Record-leaf
+    // fixed vectors are supported separately below. Keep the yielded value
+    // scalar so the probe isolates declaration-type erasure rather than a
+    // later push_back mismatch.
+    let stream_elem = SRC
+        .replace(DECL, "tseq Gen(n: int) -> TSeq<stream<uint<8>>>")
+        .replace(
+            "        let t : Req\n        t.a = i\n        yield t\n",
+            "        yield i\n",
+        );
+    let msg = assert_not_implemented(
+        &lower_src(&stream_elem).unwrap_err(),
+        lower::V1Status::SilentlyMisLowers,
+    );
     assert!(msg.contains("element type"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(&stream_elem)).expect("v1 emits the erased TSeq element");
+    assert!(v1.contains("TODO: type Stream") && v1.contains("uint64_t"), "{v1}");
 
     let value_elem = SRC.replace(DECL, "tseq Gen(n: int) -> TSeq<1 + 2>");
     let msg = assert_invalid(&lower_src(&value_elem).unwrap_err());
@@ -54175,6 +54300,158 @@ end impl T
     let err = lower_src(target).expect_err("a non-scalar signature must fail closed");
     let message = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
     assert!(message.contains("non-scalar type"), "{message}");
+}
+
+#[test]
+fn declaration_type_erasure_gates_do_not_advertise_v1() {
+    let cases = [
+        (
+            "component scalar field",
+            r#"agent A
+    payload : stream<uint<8>>
+end agent A
+testbench Tb
+    dut : Top
+    a : A
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#,
+        ),
+        (
+            "component vector element",
+            r#"agent A
+    payloads : Vec<stream<uint<8>>, 2>
+end agent A
+testbench Tb
+    dut : Top
+    a : A
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#,
+        ),
+        (
+            "testbench field",
+            r#"testbench Tb
+    dut : Top
+    payload : stream<uint<8>>
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#,
+        ),
+    ];
+    for (case, source) in cases {
+        let err = lower_src(source).unwrap_err();
+        let msg = assert_not_implemented(&err, lower::V1Status::SilentlyMisLowers);
+        assert!(msg.contains("field"), "{case}: {msg}");
+        let v1 = cpp_tb::emit(&merged_src(source)).expect("v1 emits erased field type");
+        assert!(v1.contains("uint64_t"), "{case}: {v1}");
+    }
+}
+
+#[test]
+fn unselected_testbench_declaration_is_inert() {
+    let src = r#"
+testbench UnusedTb
+    dut : Top
+end testbench UnusedTb
+
+test Selected
+    let dut : Top
+    run
+        wait 1 cycle
+    end run
+end test Selected
+"#;
+    let prog = lower_src(src).expect("an unselected testbench declaration is inert");
+    assert_eq!(prog.tests.len(), 1);
+    assert_eq!(prog.tests[0].name, "Selected");
+}
+
+#[test]
+fn transactor_instance_initializer_does_not_advertise_v1() {
+    let source = r#"transactor Driver
+    dut : Top
+    when active
+        hookable drive()
+            wait 1 cycle
+        end drive
+    end when
+end transactor Driver
+test T
+    let dut : Top
+    let driver : Driver active = 0
+    run
+        wait 1 cycle
+    end run
+end test T"#;
+    let err = lower_src(source).expect_err("transactor initializer is not representable");
+    let msg = assert_not_implemented(&err, lower::V1Status::Rejects);
+    assert!(msg.contains("initializer"), "{msg}");
+    let v1 = cpp_tb::emit(&merged_src(source)).expect_err("v1 rejects an initializer too");
+    assert!(v1.to_string().contains("has no value form"), "{v1}");
+}
+
+#[test]
+fn structural_binding_diagnostics_do_not_advertise_broken_v1() {
+    let unbound_handshake = r#"agent Monitor
+    seen : uint<32> default 0
+    on bus.req.handshake(value)
+        seen = seen + 1
+    end on
+end agent Monitor
+testbench Tb
+    dut : Top
+    monitor : Monitor
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#;
+    let err = lower_src(unbound_handshake).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(
+        msg.contains("no bound bus") || msg.contains("non-bound component"),
+        "{msg}"
+    );
+
+    let bad_connect_root = r#"transactor Source
+    observed : out event<uint<8>>
+    hookable publish(value: uint<8>)
+        emit observed(value)
+    end publish
+end transactor Source
+scoreboard Sink
+    seen : uint<32> default 0
+    hookable take(value: uint<8>)
+        seen = seen + 1
+    end take
+end scoreboard Sink
+testbench Tb
+    dut : Top
+    source : Source passive
+    sink : Sink
+    connect
+        missing.observed -> sink.take
+    end connect
+end testbench Tb
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T"#;
+    let err = lower_src(bad_connect_root).unwrap_err();
+    let msg = assert_not_implemented(&err, lower::V1Status::EmitsUncompilable);
+    assert!(msg.contains("root `missing`"), "{msg}");
 }
 
 #[test]

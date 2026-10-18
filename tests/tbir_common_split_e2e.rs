@@ -1504,6 +1504,7 @@ const SEQUENTIAL_REGISTRY: &str = r#"#include "sequence__suite_api.hpp"
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <sys/stat.h>
 #ifdef HARC_TEST_VALIDATE_FST
 #include "gtkwave/fstapi.h"
 #endif
@@ -1637,13 +1638,28 @@ static int invoke_body(
 }
 
 static bool artifact_is_closed(const std::filesystem::path& expected) {
+    struct stat expected_stat;
+    if (::stat(expected.c_str(), &expected_stat) != 0) return false;
+    std::filesystem::path fd_root = "/proc/self/fd";
+    if (!std::filesystem::exists(fd_root)) fd_root = "/dev/fd";
     std::error_code error;
-    for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd", error)) {
-        auto target = std::filesystem::read_symlink(entry.path(), error);
-        if (!error && target == expected) return false;
-        error.clear();
+    std::filesystem::directory_iterator entry(fd_root, error);
+    std::filesystem::directory_iterator end;
+    if (error) return false;
+    while (entry != end) {
+        std::string name = entry->path().filename().string();
+        char* tail = nullptr;
+        long descriptor = std::strtol(name.c_str(), &tail, 10);
+        if (tail != name.c_str() && *tail == '\0' && descriptor >= 0) {
+            struct stat descriptor_stat;
+            if (::fstat(static_cast<int>(descriptor), &descriptor_stat) == 0
+                && descriptor_stat.st_dev == expected_stat.st_dev
+                && descriptor_stat.st_ino == expected_stat.st_ino) return false;
+        }
+        entry.increment(error);
+        if (error) return false;
     }
-    return !error;
+    return true;
 }
 
 static bool finalized_artifacts(
@@ -1672,6 +1688,16 @@ static bool finalized_artifacts(
 int main(int argc, char** argv) {
     if (argc != 2) return 90;
     std::string directory = argv[1];
+
+    auto open_path = std::filesystem::path(directory) / "open_artifact_control.tmp";
+    std::ofstream open_artifact(open_path);
+    if (!open_artifact) return 24;
+    open_artifact << "open";
+    open_artifact.flush();
+    if (artifact_is_closed(open_path)) return 25;
+    open_artifact.close();
+    if (!artifact_is_closed(open_path)) return 26;
+    std::filesystem::remove(open_path);
 
     if (invoke(harc_test_Common17, directory, "same_a") != 0) return 1;
     if (invoke(harc_test_Common17, directory, "same_b") != 0) return 2;

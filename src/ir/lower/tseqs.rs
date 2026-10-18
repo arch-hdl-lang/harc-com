@@ -50,8 +50,8 @@ use crate::ir::{
 
 use super::helpers::{ir_type_of, HelperRegistry};
 use super::{
-    not_implemented, unsupported, FuncBuilder, LowerCtx, LowerDiagnosticRecorder, LowerError,
-    SideTables, V1Status,
+    not_implemented, FuncBuilder, LowerCtx, LowerDiagnosticRecorder, LowerError, SideTables,
+    V1Status,
 };
 
 /// The element name of a `tseq`'s `-> TSeq<T>` return type when `T` is a
@@ -236,10 +236,12 @@ pub(crate) fn collect_tseq_records(
                     decl.name.name
                 )));
             }
-            return Err(unsupported(
+            return Err(super::not_implemented(
                 &format!("`tseq {}` element type", decl.name.name),
                 "a `-> TSeq<T>` must name a declared `transaction`/`struct` record, a \
-                 primitive scalar (`uint<N>`/`sint<N>`/`bool`), or scalar-leaf fixed vector",
+                 primitive scalar (`uint<N>`/`sint<N>`/`bool`), or scalar-leaf fixed vector; \
+                 v1 erases other element spellings to a scalar carrier",
+                super::V1Status::SilentlyMisLowers,
             ));
         };
         let param_names: Vec<String> = decl.params.iter().map(|p| p.name.name.clone()).collect();

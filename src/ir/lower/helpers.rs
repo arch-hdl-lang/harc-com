@@ -32,7 +32,7 @@
 //! scanner might miss inside unrecognized constructs).
 
 use super::{
-    exprs::width_cast_kind, not_implemented, unsupported, FuncBuilder, InlineFrame, LowerCtx,
+    exprs::width_cast_kind, not_implemented, FuncBuilder, InlineFrame, LowerCtx,
     LowerDiagnosticRecorder, LowerError, SideTables, V1Status,
 };
 use crate::ast::{
@@ -1185,9 +1185,10 @@ pub(crate) fn callable_tseq_ir_type(
             if let Some(detail) = malformed {
                 return Err(LowerError::Invalid(format!("{}: {detail}", construct())));
             }
-            Err(unsupported(
+            Err(not_implemented(
                 &construct(),
-                "callable TSeq values support records, scalars, and fixed vectors with scalar or declared-record leaves",
+                "callable TSeq values support records, scalars, and fixed vectors with scalar or declared-record leaves; v1 erases other element spellings to a scalar carrier",
+                V1Status::SilentlyMisLowers,
             ))
         }
         other => Ok(other),

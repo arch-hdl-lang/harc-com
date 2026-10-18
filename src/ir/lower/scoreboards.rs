@@ -310,11 +310,24 @@ pub(crate) fn lower_scoreboard(
                 ));
             }
             ComponentItem::Lifecycle(..) => {}
-            _ => {
-                return Err(unsupported(
-                    &format!("an unsupported item in scoreboard `{sb}`"),
-                    "only scalar, record, list, and queue fields are lowered",
+            ComponentItem::TargetTlmThread(_) => {
+                return Err(super::not_implemented(
+                    &format!("a target thread in scoreboard `{sb}`"),
+                    "target-serving threads belong on a bus-bound transactor; v1 emits no serving actor for a scoreboard thread",
+                    super::V1Status::SilentlyMisLowers,
                 ));
+            }
+            ComponentItem::Apply(_) => {
+                return Err(super::not_implemented(
+                    &format!("an `apply` item in scoreboard `{sb}`"),
+                    "v1 drops scoreboard-scope aspect activation without resolving its name",
+                    super::V1Status::SilentlyMisLowers,
+                ));
+            }
+            ComponentItem::Watchdog(_) => {
+                return Err(LowerError::Invalid(format!(
+                    "internal: watchdog-bearing scoreboard `{sb}` reached the data-only lowering path"
+                )));
             }
         }
     }

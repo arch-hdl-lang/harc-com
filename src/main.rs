@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, NamedSource, Report, Result};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -2044,6 +2045,86 @@ fn push_build_input_path(
     Ok(())
 }
 
+fn native_reference_source_identity(ref_src: &[PathBuf]) -> Result<String> {
+    let mut identity = String::new();
+    for (index, path) in ref_src.iter().enumerate() {
+        let canonical = fs::canonicalize(path).into_diagnostic()?;
+        let contents = fs::read(&canonical).into_diagnostic()?;
+        identity.push_str(&format!(
+            "ref_src:{index:08}:{}:{}\n",
+            canonical.display(),
+            harc::codegen::common_artifacts::stable_hash_hex(&contents)
+        ));
+    }
+    Ok(harc::codegen::common_artifacts::stable_hash_hex(
+        identity.as_bytes(),
+    ))
+}
+
+fn native_reference_object_stems(ref_src: &[PathBuf]) -> Result<Vec<String>> {
+    let mut owners = HashMap::<String, (String, PathBuf)>::new();
+    let mut stems = Vec::with_capacity(ref_src.len());
+    for source in ref_src {
+        let stem = source
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| {
+                miette::miette!(
+                    "reference source `{}` must have a UTF-8 file stem",
+                    source.display()
+                )
+            })?
+            .to_owned();
+        let object_key = stem.to_ascii_lowercase();
+        if let Some((previous_stem, previous)) =
+            owners.insert(object_key, (stem.clone(), source.clone()))
+        {
+            return Err(miette::miette!(
+                "reference sources `{}` and `{}` have colliding object basenames `{previous_stem}` and `{stem}`; --ref-src paths must have unique UTF-8 basenames, ignoring ASCII case",
+                previous.display(),
+                source.display()
+            ));
+        }
+        stems.push(stem);
+    }
+    Ok(stems)
+}
+
+/// Make reference-source rebuilds independent of filesystem timestamp
+/// resolution. Verilator delegates these sources to Make; on filesystems
+/// where a rapid source/object/binary update receives one timestamp, Make can
+/// recompile the object but skip the final link. Keep this identity separate
+/// from the common artifact/build profile: a reference-model edit invalidates
+/// only its native objects and executable, not generated common C++.
+fn invalidate_changed_native_reference_sources(
+    mdir: &Path,
+    top: &str,
+    ref_src: &[PathBuf],
+) -> Result<Option<(PathBuf, String)>> {
+    if ref_src.is_empty() {
+        return Ok(None);
+    }
+    let object_stems = native_reference_object_stems(ref_src)?;
+    let marker = mdir.join(".harc_reference_source_identity");
+    let identity = native_reference_source_identity(ref_src)?;
+    let expected = format!("{identity}\n");
+    if !fs::read_to_string(&marker).is_ok_and(|value| value == expected) {
+        for stem in object_stems {
+            for extension in ["o", "d"] {
+                let artifact = mdir.join(format!("{stem}.{extension}"));
+                if artifact.exists() {
+                    fs::remove_file(&artifact).into_diagnostic()?;
+                }
+            }
+        }
+        let binary = mdir.join(format!("V{top}"));
+        if binary.exists() {
+            fs::remove_file(binary).into_diagnostic()?;
+        }
+    }
+    Ok(Some((marker, expected)))
+}
+
 fn embedded_runtime_abi_fingerprint(include_cosim: bool) -> String {
     let mut canonical = String::new();
     for (name, contents) in [
@@ -2216,6 +2297,8 @@ fn run_verilator(
     // verilator flags changed in a way the emitted .cpp doesn't
     // capture.
     prepare_native_build_directory(&mdir, rebuild, build_identity)?;
+    let reference_source_identity =
+        invalidate_changed_native_reference_sources(&mdir, top, ref_src)?;
 
     let mut args: Vec<String> = if cosim {
         // `--cosim dpi`: the simulator owns time. `--binary` =
@@ -2435,6 +2518,10 @@ fn run_verilator(
             "verilator build failed (status {})",
             output.status
         ));
+    }
+    if let Some((marker, expected)) = reference_source_identity {
+        harc::codegen::common_artifacts::atomic_write_if_changed(&marker, expected.as_bytes())
+            .map_err(|error| miette::miette!(error.to_string()))?;
     }
 
     let bin = mdir.join(format!("V{top}"));
@@ -3956,6 +4043,118 @@ mod tests {
         assert_eq!(
             first, second,
             "Verilator tracks source contents; an RTL edit must not evict reusable native objects"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn native_reference_source_content_forces_object_and_binary_rebuild() {
+        let base = temp_dir("native-reference-source-content");
+        let obj_dir = base.join("obj_dir");
+        fs::create_dir_all(&obj_dir).unwrap();
+        let source = base.join("reference.cpp");
+        fs::write(&source, "extern \"C\" int value() { return 1; }\n").unwrap();
+
+        let (marker, expected) = invalidate_changed_native_reference_sources(
+            &obj_dir,
+            "Top",
+            std::slice::from_ref(&source),
+        )
+        .unwrap()
+        .expect("reference-source identity");
+        fs::write(&marker, expected).unwrap();
+        let object = obj_dir.join("reference.o");
+        let dependency = obj_dir.join("reference.d");
+        let binary = obj_dir.join("VTop");
+        for artifact in [&object, &dependency, &binary] {
+            fs::write(artifact, "native artifact").unwrap();
+        }
+
+        invalidate_changed_native_reference_sources(
+            &obj_dir,
+            "Top",
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        assert!(object.exists() && dependency.exists() && binary.exists());
+
+        fs::write(&source, "extern \"C\" int value() { return 2; }\n").unwrap();
+        invalidate_changed_native_reference_sources(
+            &obj_dir,
+            "Top",
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        assert!(!object.exists());
+        assert!(!dependency.exists());
+        assert!(!binary.exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn native_reference_sources_reject_duplicate_object_basenames() {
+        let base = temp_dir("native-reference-duplicate-basename");
+        let first = base.join("first").join("reference.cpp");
+        let second = base.join("second").join("reference.cpp");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&first, "extern \"C\" int first() { return 1; }\n").unwrap();
+        fs::write(&second, "extern \"C\" int second() { return 2; }\n").unwrap();
+
+        let error = invalidate_changed_native_reference_sources(
+            &base.join("obj_dir"),
+            "Top",
+            &[first, second],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unique UTF-8 basenames"),
+            "unexpected diagnostic: {error}"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn native_reference_sources_reject_case_only_object_basename_collisions() {
+        let base = temp_dir("native-reference-case-only-basename");
+        let first = base.join("first").join("Reference.cpp");
+        let second = base.join("second").join("reference.cpp");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&first, "extern \"C\" int first() { return 1; }\n").unwrap();
+        fs::write(&second, "extern \"C\" int second() { return 2; }\n").unwrap();
+
+        let error = invalidate_changed_native_reference_sources(
+            &base.join("obj_dir"),
+            "Top",
+            &[first, second],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("ignoring ASCII case"),
+            "unexpected diagnostic: {error}"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_reference_sources_reject_non_utf8_object_basename() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let base = temp_dir("native-reference-non-utf8-basename");
+        let source = base.join(OsString::from_vec(b"reference-\xff.cpp".to_vec()));
+
+        let error = invalidate_changed_native_reference_sources(
+            &base.join("obj_dir"),
+            "Top",
+            std::slice::from_ref(&source),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("UTF-8 file stem"),
+            "unexpected diagnostic: {error}"
         );
         let _ = fs::remove_dir_all(base);
     }
