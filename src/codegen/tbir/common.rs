@@ -7404,6 +7404,8 @@ fn render_common_capsule_template(
                     },
                     runtime_cells: runtime_cell_binding,
                     common_contextual_tseqs: Some(&plan.contextual_tseqs),
+                    randomize_snippets: plan.randomize_snippets(),
+                    outofline_lifecycle: Some(&outofline_lifecycle),
                     durable_capture: true,
                     async_scheduler: "ctx.scheduler",
                     async_slots: "ctx.actor_slots",

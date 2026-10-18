@@ -1410,39 +1410,6 @@ pub fn validate_component_binding_modes(
     Ok(())
 }
 
-/// Return the first constructor-time facility that prevents a component tree
-/// from being represented as a function-local value. ComponentInit installs
-/// event/connect, DUT, lifecycle, and covergroup registrations at the source
-/// declaration point. A bound bus still needs a separately planned adapter.
-pub(crate) fn component_local_runtime_requirement(
-    components: &[ComponentSchema],
-    component: ComponentId,
-) -> Option<String> {
-    fn visit(
-        components: &[ComponentSchema],
-        component: ComponentId,
-        visiting: &mut std::collections::HashSet<ComponentId>,
-    ) -> Option<String> {
-        if !visiting.insert(component) {
-            return None;
-        }
-        let schema = components.get(component.index())?;
-        let reason = if schema.bound_bus.is_some() {
-            Some(format!("bound-bus setup on `{}`", schema.name))
-        } else {
-            schema.fields.iter().find_map(|field| match field.kind {
-                ComponentFieldKind::Sub {
-                    component: child, ..
-                } => visit(components, child, visiting),
-                _ => None,
-            })
-        };
-        visiting.remove(&component);
-        reason
-    }
-    visit(components, component, &mut std::collections::HashSet::new())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentKindTag {
     Env,

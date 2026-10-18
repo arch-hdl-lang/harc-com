@@ -6123,16 +6123,6 @@ impl Checker<'_> {
                                 ),
                             });
                         }
-                        if let Some(detail) =
-                            component_local_runtime_requirement(&self.prog.components, *component)
-                        {
-                            self.errs.push(VerifyError::BadProgramRef {
-                                what: format!(
-                                    "fn{} b{} ComponentInit requires unsupported {detail}",
-                                    self.fid.0, self.bid.0
-                                ),
-                            });
-                        }
                     }
                     if let Err(detail) = self.component_local_initializer(*local) {
                         self.errs.push(VerifyError::BadProgramRef {

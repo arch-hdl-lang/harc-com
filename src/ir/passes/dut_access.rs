@@ -31,6 +31,70 @@ fn collect_component_covergroups(
     Ok(())
 }
 
+fn record_covergroup_reads_at(
+    prog: &TbProgram,
+    interface: &DutInterfaceCatalog,
+    entries: &mut BTreeMap<DutAccessIdentity, DutAccessEntry>,
+    site: DutAccessSite,
+    function: &crate::ir::TbFunction,
+    covgroup: CovgroupId,
+) -> Result<(), DutAccessPlanError> {
+    let schema = prog.covgroups.get(covgroup.index()).ok_or_else(|| {
+        DutAccessPlanError(format!(
+            "component covergroup registration references missing cg{}",
+            covgroup.0
+        ))
+    })?;
+    for point in &schema.points {
+        record_expr_reads_at(
+            prog,
+            interface,
+            entries,
+            site,
+            function.id,
+            &function.name,
+            0,
+            &point.target,
+        )?;
+        for bin in &point.bins {
+            for value in &bin.values {
+                match value {
+                    crate::ir::CovBinValue::Eq(crate::ir::CovBinBound::Runtime(expr)) => {
+                        record_expr_reads_at(
+                            prog,
+                            interface,
+                            entries,
+                            site,
+                            function.id,
+                            &function.name,
+                            0,
+                            expr,
+                        )?;
+                    }
+                    crate::ir::CovBinValue::Range { lo, hi } => {
+                        for bound in [lo, hi].into_iter().flatten() {
+                            if let crate::ir::CovBinBound::Runtime(expr) = bound {
+                                record_expr_reads_at(
+                                    prog,
+                                    interface,
+                                    entries,
+                                    site,
+                                    function.id,
+                                    &function.name,
+                                    0,
+                                    expr,
+                                )?;
+                            }
+                        }
+                    }
+                    crate::ir::CovBinValue::Eq(crate::ir::CovBinBound::Const(_)) => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DutAccessIdentity {
     Port { path: Vec<String>, aggregate: bool },
@@ -980,59 +1044,14 @@ fn analyze_impl(
             )?;
         }
         for covgroup in component_covgroups {
-            let schema = prog.covgroups.get(covgroup.index()).ok_or_else(|| {
-                DutAccessPlanError(format!(
-                    "component covergroup registration references missing cg{}",
-                    covgroup.0
-                ))
-            })?;
-            for point in &schema.points {
-                record_expr_reads_at(
-                    prog,
-                    interface,
-                    &mut entries,
-                    DutAccessSite::Function(run.id),
-                    run.id,
-                    &run.name,
-                    0,
-                    &point.target,
-                )?;
-                for bin in &point.bins {
-                    for value in &bin.values {
-                        match value {
-                            crate::ir::CovBinValue::Eq(crate::ir::CovBinBound::Runtime(expr)) => {
-                                record_expr_reads_at(
-                                    prog,
-                                    interface,
-                                    &mut entries,
-                                    DutAccessSite::Function(run.id),
-                                    run.id,
-                                    &run.name,
-                                    0,
-                                    expr,
-                                )?;
-                            }
-                            crate::ir::CovBinValue::Range { lo, hi } => {
-                                for bound in [lo, hi].into_iter().flatten() {
-                                    if let crate::ir::CovBinBound::Runtime(expr) = bound {
-                                        record_expr_reads_at(
-                                            prog,
-                                            interface,
-                                            &mut entries,
-                                            DutAccessSite::Function(run.id),
-                                            run.id,
-                                            &run.name,
-                                            0,
-                                            expr,
-                                        )?;
-                                    }
-                                }
-                            }
-                            crate::ir::CovBinValue::Eq(crate::ir::CovBinBound::Const(_)) => {}
-                        }
-                    }
-                }
-            }
+            record_covergroup_reads_at(
+                prog,
+                interface,
+                &mut entries,
+                DutAccessSite::Function(run.id),
+                run,
+                covgroup,
+            )?;
         }
     }
 
@@ -1097,6 +1116,27 @@ fn analyze_impl(
 
     let mut inferred_local_types = BTreeMap::<(FunctionId, LocalId), IrType>::new();
     for function in &prog.functions {
+        // Function-local components install their covergroup samplers at the
+        // ComponentInit statement rather than through a SamplerAuto function.
+        // Keep those DUT reads on the containing function site so common-layout
+        // capsules receive every accessor used by the local runtime graph.
+        let mut local_component_covgroups = BTreeSet::new();
+        for stmt in function.blocks.iter().flat_map(|block| &block.stmts) {
+            if let Stmt::ComponentInit { component, .. } = stmt {
+                collect_component_covergroups(prog, *component, &mut local_component_covgroups)?;
+            }
+        }
+        for covgroup in local_component_covgroups {
+            record_covergroup_reads_at(
+                prog,
+                interface,
+                &mut entries,
+                DutAccessSite::Function(function.id),
+                function,
+                covgroup,
+            )?;
+        }
+
         for (block_index, block) in function.blocks.iter().enumerate() {
             for stmt in &block.stmts {
                 match stmt {

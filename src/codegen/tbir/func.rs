@@ -156,6 +156,8 @@ pub(super) struct TestHookRenderBindings<'a> {
     pub flow: FlowRenderBindings<'a>,
     pub runtime_cells: Option<RuntimeCellRenderBinding<'a>>,
     pub common_contextual_tseqs: Option<&'a BTreeSet<FunctionId>>,
+    pub randomize_snippets: &'a [String],
+    pub outofline_lifecycle: Option<&'a HashMap<FunctionId, LifecycleEmit>>,
     pub durable_capture: bool,
     /// Scheduler and owning slot vector used by suspending statement-cycle
     /// hooks. Other hook kinds remain synchronous.
@@ -8553,6 +8555,10 @@ pub(super) fn emit_test_hook(
     let pad1 = INDENT.repeat(depth + 1);
     let pad2 = INDENT.repeat(depth + 2);
     let pad3 = INDENT.repeat(depth + 3);
+    let empty_lifecycle = HashMap::new();
+    let outofline_lifecycle = render
+        .outofline_lifecycle
+        .unwrap_or(&empty_lifecycle);
 
     // Hooks are void in this subset; a value-returning hook is never
     // produced by lowering (the firing site discards any result).
@@ -8782,6 +8788,119 @@ pub(super) fn emit_test_hook(
                     writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
                 }
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
+            Terminator::Randomize {
+                target,
+                constraints,
+                succ,
+            } => {
+                let run_context = cx.bindings.run_context.unwrap_or("ctx");
+                let state_receiver = randomize_state_receiver(
+                    func,
+                    *constraints,
+                    render
+                        .runtime_cells
+                        .filter(|_| cx.bindings.run_context.is_some()),
+                    run_context,
+                )?;
+                let snippet = randomize_snippet_for(
+                    prog,
+                    func,
+                    &names,
+                    *target,
+                    *constraints,
+                    render.randomize_snippets,
+                    run_context,
+                    &state_receiver,
+                    cx.bindings.self_receiver,
+                )?
+                .ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: Randomize in hook {} references missing constraint snippet c{}",
+                        func.name, constraints.0
+                    ))
+                })?;
+                out.push_str(&snippet);
+                writeln!(out, "{pad3}__bb = {};", succ.0).ok();
+            }
+            Terminator::TbLifecycleCall { function, succ } => {
+                let callee = prog.function(*function);
+                let testbench_receiver = cx.bindings.testbench_receiver.ok_or_else(|| {
+                    EmitError(format!(
+                        "tbir: lifecycle call in hook {} has no testbench receiver",
+                        func.name
+                    ))
+                })?;
+                match outofline_lifecycle.get(function).copied() {
+                    Some(LifecycleEmit::Plain) => {
+                        writeln!(
+                            out,
+                            "{pad3}{}(ctx, {testbench_receiver});",
+                            lifecycle_cpp_name(&callee.name)
+                        )
+                        .ok();
+                    }
+                    Some(LifecycleEmit::Coro) => {
+                        writeln!(
+                            out,
+                            "{pad3}{{ auto _lc_sub = {}(ctx, {testbench_receiver}, _slot); _lc_sub.resume();",
+                            lifecycle_cpp_name(&callee.name)
+                        )
+                        .ok();
+                        writeln!(
+                            out,
+                            "{pad3}{INDENT}while (!_lc_sub.done()) {{ co_await harc_rt::harc_lifecycle_yield(); _lc_sub.resume(); }}"
+                        )
+                        .ok();
+                        writeln!(out, "{pad3}{INDENT}_lc_sub.destroy(); }}").ok();
+                    }
+                    None => {
+                        if let Some(contextual_tseqs) = render.common_contextual_tseqs {
+                            emit_common_function(
+                                out,
+                                prog,
+                                callee,
+                                &prog.records,
+                                &owner_testbench.bus_bindings,
+                                cx.lanes,
+                                render.randomize_snippets,
+                                dut_type,
+                                &HashSet::new(),
+                                depth + 3,
+                                contextual_tseqs,
+                                render.runtime_cells,
+                                render.flow,
+                                outofline_lifecycle,
+                            )?;
+                        } else {
+                            emit_function(
+                                out,
+                                prog,
+                                callee,
+                                &prog.records,
+                                &owner_testbench.bus_bindings,
+                                cx.lanes,
+                                render.randomize_snippets,
+                                dut_type,
+                                &HashSet::new(),
+                                depth + 3,
+                                render.runtime_cells,
+                                render.flow,
+                                outofline_lifecycle,
+                            )?;
+                        }
+                    }
+                }
+                writeln!(out, "{pad3}__bb = {};", succ.0).ok();
+            }
+            Terminator::Fatal(args) => {
+                emit_log_call(out, &cx, "FATAL", None, args, depth + 3)?;
+                writeln!(out, "{pad3}errors++; _fatal = true;").ok();
+                if async_cycle {
+                    writeln!(out, "{pad3}co_return;").ok();
+                } else {
+                    writeln!(out, "{pad3}return;").ok();
+                }
             }
             Terminator::Return => {
                 if async_cycle {

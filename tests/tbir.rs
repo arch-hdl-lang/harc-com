@@ -34038,7 +34038,7 @@ end test T"#;
 }
 
 #[test]
-fn a_suspending_statement_handler_rejects_unemittable_terminators_during_lowering() {
+fn a_suspending_statement_handler_emits_randomization_in_its_coroutine() {
     let source = r#"transaction Item
     value : uint<8>
 end transaction Item
@@ -34057,12 +34057,11 @@ impl T for Tb
         wait 2 cycles
     end run
 end impl T"#;
-    let error = lower_src(source).expect_err("mixed suspending handler must fail in lowering");
-    let message = assert_invalid(&error);
+    assert_async_handler_supported(source, "mixed wait/randomize handler");
+    let cpp = emit_cpp_src(source);
     assert!(
-        message.contains("suspending statement-position `on` handler")
-            && message.contains("randomize"),
-        "the diagnostic must identify the unsupported mixed handler shape: {message}"
+        cpp.contains("_harc_randomize_c") && cpp.contains("co_await harc_rt::wait_cycles"),
+        "the scheduler-owned hook must contain both suspension and randomization: {cpp}"
     );
 }
 

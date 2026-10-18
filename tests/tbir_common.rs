@@ -4973,6 +4973,46 @@ end impl CommonNestedCov"#,
 }
 
 #[test]
+fn common_local_component_covergroups_plan_their_dut_reads() {
+    let source = parse_source(
+        r#"covergroup LocalCov @(posedge dut.clk)
+    cp : cover dut.q
+        bins
+            zero = {0}
+        end bins
+end covergroup LocalCov
+
+env LocalEnv
+    cov : LocalCov
+end env LocalEnv
+
+testbench LocalCovTb
+    dut : CommonReg
+end testbench LocalCovTb
+
+impl CommonLocalCov for LocalCovTb
+    clock clk = 10ns
+    run
+        let local_env : LocalEnv
+        wait 1 cycle
+    end run
+end impl CommonLocalCov"#,
+    )
+    .expect("local common covergroup source parses");
+    let program = lower::lower_program(&source).expect("local common covergroup lowers");
+    verify::verify_program(&program).expect("local common covergroup verifies");
+    let mut opts = cpp_tb::EmitOpts::default();
+    set_common_reg_interface(&mut opts);
+    let plan = tbir::common::plan_common_tests(&program, &opts, "local_cov__")
+        .expect("local common covergroup plans");
+    let capsule = tbir::common::emit_common_capsule(&plan, 0).expect("capsule emits");
+    assert!(
+        capsule.contains("local_env.cov.cp.zero++"),
+        "function-local covergroup registration must retain its DUT access:\n{capsule}"
+    );
+}
+
+#[test]
 fn common_testbench_method_uses_explicit_component_receiver() {
     let source = parse_source(
         r#"agent Counter

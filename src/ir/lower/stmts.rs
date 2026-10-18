@@ -1295,19 +1295,12 @@ impl FuncBuilder<'_> {
                     // Install that destination graph before applying the
                     // source snapshot whenever this component's local
                     // runtime surface is supported.
-                    if crate::ir::component_local_runtime_requirement(
-                        &self.ctx.components,
+                    self.component_local_modes.insert(id, None);
+                    self.push(Stmt::ComponentInit {
+                        local: id,
                         component,
-                    )
-                    .is_none()
-                    {
-                        self.component_local_modes.insert(id, None);
-                        self.push(Stmt::ComponentInit {
-                            local: id,
-                            component,
-                            mode: None,
-                        });
-                    }
+                        mode: None,
+                    });
                     self.push(Stmt::Assign(id, Expr::ComponentValue { base }));
                     return Ok(());
                 }
@@ -1329,16 +1322,6 @@ impl FuncBuilder<'_> {
                         l.name.name
                     ))
                 })?;
-                if let Some(detail) =
-                    crate::ir::component_local_runtime_requirement(&self.ctx.components, component)
-                {
-                    return Err(LowerError::Invalid(format!(
-                        "default-constructed component local `{}` of type `{}` requires \
-                         {detail}; declare a concrete `= bind <bus>` instance at testbench \
-                         scope so the bus adapter and lifetime are explicit",
-                        l.name.name, self.ctx.components[component.index()].name
-                    )));
-                }
                 let id = self.declare(&l.name.name);
                 self.set_local_type(id, IrType::Component(component));
                 self.component_local_modes.insert(id, instance_mode);
@@ -5913,30 +5896,6 @@ impl FuncBuilder<'_> {
             },
             self.ctx.owner,
         )?;
-
-        let suspends = f.blocks.iter().any(|block| {
-            matches!(
-                block.terminator,
-                Terminator::WaitCycles(..)
-                    | Terminator::WaitCyclesSync(..)
-                    | Terminator::WaitUntil { .. }
-                    | Terminator::WaitUntilTimeout { .. }
-                    | Terminator::WaitTimePs(..)
-            )
-        });
-        if suspends {
-            let unsupported = f.blocks.iter().find_map(|block| match &block.terminator {
-                Terminator::Randomize { .. } => Some("randomize"),
-                Terminator::TbLifecycleCall { .. } => Some("a testbench lifecycle call"),
-                Terminator::Fatal(_) => Some("fatal termination"),
-                _ => None,
-            });
-            if let Some(operation) = unsupported {
-                return Err(LowerError::Invalid(format!(
-                    "a suspending statement-position `on` handler cannot contain {operation}"
-                )));
-            }
-        }
 
         self.commit_pending_function(pending_id, f);
         let id = {

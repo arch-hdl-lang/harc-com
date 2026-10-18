@@ -3666,6 +3666,8 @@ fn emit_test(
                     },
                     runtime_cells: runtime_cell_binding,
                     common_contextual_tseqs: None,
+                    randomize_snippets,
+                    outofline_lifecycle: Some(outofline_lifecycle),
                     durable_capture: false,
                     async_scheduler: "sched",
                     async_slots: "_harc_callback_slots",
