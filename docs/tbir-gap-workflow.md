@@ -642,6 +642,10 @@ not applicable before requesting review:
    `HarcWide` method ABI. Direct emission probes pin the reachable erasure
    outcomes, leaving 64 textual matches (63 executable constructors plus the
    helper definition).
+   Target responders now use that same exact-width scalar ABI for request and
+   response wires, including blocking and tagged 2048-bit paths. This removes
+   the stale target-TLM 1024-bit ceiling and leaves 63 textual matches (62
+   executable constructors plus the helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

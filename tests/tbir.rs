@@ -54178,6 +54178,69 @@ end impl T
 }
 
 #[test]
+fn overwide_target_tlm_scalars_use_exact_wide_carriers() {
+    let source = r#"bus B
+    tlm_method echo(value: uint<2048>) -> uint<2048>: blocking;
+    tlm_method echo_ooo(value: uint<2048>) -> uint<2048>: out_of_order tags 2;
+end bus B
+transactor WideTarget bound to B
+    thread bus.echo(value: uint<2048>)
+        return value
+    end thread
+    thread bus.echo_ooo(value: uint<2048>)
+        return value
+    end thread
+end transactor WideTarget
+testbench Tb
+    dut : Top
+end testbench Tb
+impl T for Tb
+    let bus : B = bind dut
+    let target : WideTarget passive = bind bus
+    run
+        wait 1 cycle
+    end run
+end impl T
+"#;
+
+    let prog = lower_src(source).expect("2048-bit target TLM scalars lower");
+    verify::verify_program(&prog).expect("2048-bit target TLM scalars verify");
+    let methods = &prog.transactors[0].target_methods;
+    assert_eq!(methods.len(), 2);
+    for method in methods {
+        assert_eq!(method.param_tys, vec![ir::IrType::UInt(Some(2048))]);
+        assert_eq!(method.ret_ty, Some(ir::IrType::UInt(Some(2048))));
+    }
+    assert_eq!(methods[0].ooo_tags, None);
+    assert_eq!(methods[1].ooo_tags, Some(2));
+
+    let cpp = emit_cpp_src(source);
+    assert!(
+        cpp.contains("harc_rt::HarcWide<64>"),
+        "2048-bit responder values must retain all 64 words:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("harc_rt::harc_wide_trunc<64>(harc_rt::harc_read(dut->bus_echo_value), 2048)"),
+        "blocking request capture must use the exact-width carrier:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("std::array<harc_rt::HarcWide<64>, 2> _target_echo_ooo_target_ooo_arg_value"),
+        "tagged responder request lanes must use the exact-width carrier:\n{cpp}"
+    );
+    assert!(
+        cpp.contains(
+            "std::array<harc_rt::HarcWide<64>, 2> _target_echo_ooo_target_ooo_lane_rsp_data"
+        ),
+        "tagged responder response lanes must use the exact-width carrier:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("harc_rt::harc_assign(dut->bus_echo_rsp_data")
+            && cpp.contains("harc_rt::harc_assign(dut->bus_echo_ooo_rsp_data"),
+        "both responder modes must drive wide response wires through `harc_assign`:\n{cpp}"
+    );
+}
+
+#[test]
 fn verifier_rejects_recursive_string_container_mutations() {
     let source = r#"function identity(value: String) -> String
     return value
