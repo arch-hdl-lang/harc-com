@@ -1,6 +1,6 @@
 # TB-IR migration manifest
 
-Snapshot: 2026-10-17, `origin/main` at `7f8217e5` plus this batch.
+Snapshot: 2026-10-18, `origin/main` at `52be19ca` plus this batch.
 
 This is the retirement queue, not a count of every defensive diagnostic.
 The source inventory is regenerated with:
@@ -12,8 +12,8 @@ awk '/^fn [A-Za-z0-9_]+\(/ { fn=$2; sub(/\(.*/, "", fn) }
   sort -u
 ```
 
-The snapshot has 63 textual `unsupported(` matches under `src/ir/lower`:
-62 executable constructor sites and the constructor definition. That is down
+The snapshot has 43 textual `unsupported(` matches under `src/ir/lower`:
+42 executable constructor sites and the constructor definition. That is down
 from 174 constructor sites at the `e17b938d` baseline. The count is only an
 inventory: one constructor can fence many source shapes, and adding a precise
 fail-closed neighbor can increase it while the supported surface grows.
@@ -59,6 +59,18 @@ unreachable when exact-width `HarcWide` method values were implemented. Direct
 v1 emission probes pin the erasure outcomes; the affected reachable sites now
 report `NotImplemented { SilentlyMisLowers }` rather than offering v1 as an
 escape hatch.
+
+This twenty-site batch adds three TB-IR paths and removes stale fallback
+claims around them: target-responder out-of-order tag counts now fold named
+constants, responderless bound target components are valid inert state
+holders, and data-scoreboard watchdogs route through the component path that
+already implements them. The remaining sites in the batch classify measured
+v1 rejection, uncompilable emission, or type erasure across declaration,
+binding, probe, TSeq, and component-state boundaries. Defensive pipeline
+invariants now report `Invalid` instead of advertising a backend escape hatch.
+Focused tests cover the three new paths and representative classifications; the raw
+inventory is now 43 textual matches (42 executable constructors plus the
+helper definition).
 
 No other state/helper `Unsupported` assertion currently has both a positive v1
 runtime control and an unambiguous intended value semantics.

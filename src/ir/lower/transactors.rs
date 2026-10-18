@@ -733,15 +733,10 @@ fn lower_bound_target_transactor(
             }
             ComponentItem::TargetTlmThread(th) => threads_ast.push((th, activation)),
             ComponentItem::Hookable(h) => {
-                return Err(unsupported(
-                    &format!(
-                        "bound-to transactor `{tname}` `hookable {}` (initiator-side method)",
-                        h.name.name
-                    ),
-                    "the bus-bound BFM (initiator) form — driving handshake channels from \
-                     hookable bodies — is a follow-up slice; only target-side `thread \
-                     bus.<m>(...)` responders are lowered",
-                ));
+                return Err(LowerError::Invalid(format!(
+                    "internal: bound-to transactor `{tname}` hookable `{}` reached the target-responder lowering path",
+                    h.name.name
+                )));
             }
             ComponentItem::OnHandler(h) if !h.periodic => {
                 // The component IR view lowers and schedules non-periodic
@@ -881,15 +876,6 @@ fn lower_bound_target_transactor(
             }
         }
     }
-    if threads_ast.is_empty() {
-        return Err(unsupported(
-            &format!(
-                "bound-to transactor `{tname}` without any `thread bus.<method>(...)` responder"
-            ),
-            "a target-side TLM transactor must serve at least one bus method",
-        ));
-    }
-
     let mut schema = TransactorSchema {
         name: tname.clone(),
         emission_name: None,
@@ -1024,16 +1010,31 @@ fn lower_bound_target_transactor(
                          method has no `tags N` count"
                     )));
                 };
-                let Some(n) = super::exprs::parse_int_literal_expr(tags_expr) else {
-                    return Err(unsupported(
-                        &format!(
+                let folded = super::fold_const(tags_expr, &record_ctx.consts, "").map_err(
+                    |error| {
+                        let detail = match error {
+                            super::ConstFoldErr::Unsupported(detail)
+                            | super::ConstFoldErr::Invalid(detail) => detail,
+                        };
+                        LowerError::Invalid(format!(
                             "transactor `{tname}` target thread `bus.{mname}`: \
-                             `out_of_order tags <N>` requires a literal tag count for \
-                             responder-lane lowering"
-                        ),
-                        "use an integer literal (`out_of_order tags 2`)",
-                    ));
-                };
+                             `out_of_order tags <N>` must be a compile-time integer: {detail}"
+                        ))
+                    },
+                )?;
+                if folded.is_boolean_kind() {
+                    return Err(LowerError::Invalid(format!(
+                        "transactor `{tname}` target thread `bus.{mname}`: \
+                         `out_of_order tags <N>` must be a compile-time integer, not a boolean expression"
+                    )));
+                }
+                if folded.is_negative() {
+                    return Err(LowerError::Invalid(format!(
+                        "transactor `{tname}` target thread `bus.{mname}`: supports \
+                         1..64 out_of_order target tags, got a negative value"
+                    )));
+                }
+                let n = folded.bits;
                 if n == 0 || n > 64 {
                     return Err(LowerError::Invalid(format!(
                         "transactor `{tname}` target thread `bus.{mname}`: supports \
@@ -1043,11 +1044,12 @@ fn lower_bound_target_transactor(
                 Some(n)
             }
             other => {
-                return Err(unsupported(
+                return Err(not_implemented(
                     &format!(
                         "transactor `{tname}` target thread `bus.{mname}` serving a `{other}` method"
                     ),
                     "target-side TLM responders support `blocking` and `out_of_order tags N`",
+                    V1Status::Rejects,
                 ));
             }
         };
@@ -1494,10 +1496,9 @@ fn lower_bound_initiator_transactor(
         }
     }
     if methods_ast.is_empty() {
-        return Err(unsupported(
-            &format!("initiator-side bound-to transactor `{tname}` without any `hookable` method"),
-            "",
-        ));
+        return Err(LowerError::Invalid(format!(
+            "internal: initiator-side bound-to transactor `{tname}` reached method lowering without a hookable method"
+        )));
     }
 
     let mut schema = TransactorSchema {

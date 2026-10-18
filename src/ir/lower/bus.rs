@@ -51,6 +51,7 @@ pub(super) fn lower_bus_binding(
     decl: &BusDecl,
     id: ir::BusBindingId,
     record_ids: &std::collections::HashMap<String, ir::RecordId>,
+    consts: &std::collections::HashMap<String, super::ConstVal>,
 ) -> Result<(ir::BusBindingSchema, BusDecl), LowerError> {
     let bind = &l.name.name;
     if !l.probes.is_empty() {
@@ -151,22 +152,35 @@ pub(super) fn lower_bus_binding(
             let mode = match m.mode.name.as_str() {
                 "blocking" => ir::TlmMethodMode::Blocking,
                 "out_of_order" => {
-                    let tags = m
-                        .out_of_order_tags
-                        .as_ref()
-                        .and_then(super::exprs::parse_int_literal_expr)
-                        .ok_or_else(|| {
-                            LowerError::Invalid(format!(
-                                "bus `{}` tlm_method `{}` requires a literal positive `tags` count",
-                                decl.name.name, m.name.name
-                            ))
-                        })?;
-                    if tags == 0 {
+                    let tags_expr = m.out_of_order_tags.as_ref().ok_or_else(|| {
+                        LowerError::Invalid(format!(
+                            "bus `{}` tlm_method `{}` requires a positive `tags` count",
+                            decl.name.name, m.name.name
+                        ))
+                    })?;
+                    let folded = super::fold_const(tags_expr, consts, "").map_err(|error| {
+                        let detail = match error {
+                            super::ConstFoldErr::Unsupported(detail)
+                            | super::ConstFoldErr::Invalid(detail) => detail,
+                        };
+                        LowerError::Invalid(format!(
+                            "bus `{}` tlm_method `{}` tags must be a compile-time integer: {detail}",
+                            decl.name.name, m.name.name
+                        ))
+                    })?;
+                    if folded.is_boolean_kind() {
+                        return Err(LowerError::Invalid(format!(
+                            "bus `{}` tlm_method `{}` tags must be a compile-time integer, not a boolean expression",
+                            decl.name.name, m.name.name
+                        )));
+                    }
+                    if folded.is_negative() || folded.bits == 0 {
                         return Err(LowerError::Invalid(format!(
                             "bus `{}` tlm_method `{}` requires a positive `tags` count",
                             decl.name.name, m.name.name
                         )));
                     }
+                    let tags = folded.bits;
                     ir::TlmMethodMode::OutOfOrder { tags }
                 }
                 other => {

@@ -330,6 +330,7 @@ impl SideTables {
 pub(crate) enum ConstProvenance {
     Typed(IrType),
     Untyped,
+    UntypedBool,
     EnumVariant,
 }
 
@@ -369,10 +370,27 @@ impl ConstVal {
         }
     }
 
+    fn boolean(value: bool) -> Self {
+        Self {
+            bits: value as u64,
+            signed: true,
+            provenance: ConstProvenance::UntypedBool,
+        }
+    }
+
+    pub(crate) fn is_boolean_kind(&self) -> bool {
+        matches!(
+            self.provenance,
+            ConstProvenance::Typed(IrType::Bool) | ConstProvenance::UntypedBool
+        )
+    }
+
     pub(crate) fn value_type(&self) -> IrType {
         match &self.provenance {
             ConstProvenance::Typed(ty) => ty.clone(),
-            ConstProvenance::Untyped | ConstProvenance::EnumVariant => {
+            ConstProvenance::Untyped
+            | ConstProvenance::UntypedBool
+            | ConstProvenance::EnumVariant => {
                 if self.signed {
                     IrType::SInt(None)
                 } else {
@@ -575,10 +593,10 @@ fn fold_const_inner(
     call_stack: &mut Vec<String>,
 ) -> Result<ConstVal, ConstFoldErr> {
     use crate::ast::{BinaryOp, TypeExpr, UnaryOp};
-    let boolean = |x: bool| {
-        // Comparison / logical results promote like C++ `bool` → `int`.
-        Ok(ConstVal::untyped(x as u64, true))
-    };
+    // Preserve the source-level boolean result kind even though v1 stores
+    // untyped constants in an integer carrier. Metadata such as an OOO tag
+    // count must distinguish an integer expression from a boolean one.
+    let boolean = |x: bool| Ok(ConstVal::boolean(x));
     match &*e.kind {
         ExprKind::Paren(inner) => fold_const_inner(inner, consts, self_name, helpers, call_stack),
         ExprKind::Int(s) => match exprs::parse_int_literal(s) {
@@ -647,6 +665,11 @@ fn fold_const_inner(
                     v.signed,
                 )),
                 UnaryOp::Not | UnaryOp::NotKw => boolean(v.bits == 0),
+                UnaryOp::BitNot if v.is_boolean_kind() => Ok(ConstVal {
+                    bits: !v.bits,
+                    signed: v.signed,
+                    provenance: ConstProvenance::UntypedBool,
+                }),
                 UnaryOp::BitNot => Ok(ConstVal::untyped(!v.bits, v.signed)),
             }
         }
@@ -776,6 +799,16 @@ fn fold_const_inner(
                         a.bits >> n
                     };
                     Ok(ConstVal::untyped(bits, a.signed))
+                }
+                BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor
+                    if a.is_boolean_kind() && b.is_boolean_kind() =>
+                {
+                    let bits = match op {
+                        BinaryOp::BitAnd => a.bits & b.bits,
+                        BinaryOp::BitOr => a.bits | b.bits,
+                        _ => a.bits ^ b.bits,
+                    };
+                    Ok(ConstVal::boolean(bits != 0))
                 }
                 BinaryOp::BitAnd => arith(a.bits & b.bits),
                 BinaryOp::BitOr => arith(a.bits | b.bits),
@@ -962,6 +995,9 @@ pub(crate) fn check_const_decl_type(
     use crate::ast::{BuiltinTy, TypeArg, TypeExpr};
     let Some(TypeExpr::Builtin { name, args, .. }) = ty else {
         // Untyped `const NAME = expr` — v1 stores it as `int64_t`.
+        if ty.is_none() && v.is_boolean_kind() {
+            return Ok(v);
+        }
         return Ok(ConstVal::untyped(v.bits, ty.is_none() || v.signed));
     };
     let width: Option<u32> = args.first().and_then(|a| match a {
@@ -1337,7 +1373,14 @@ fn lower_program_impl(
         crate::codegen::sv_stub::collect_suite_probes(&file).map_err(|error| {
             diagnostics.record(error.source_id(), error.span());
             if error.is_unsupported_type() {
-                unsupported("a DUT probe declaration", error.to_string())
+                not_implemented(
+                    "a DUT probe declaration with a non-scalar type",
+                    format!(
+                        "{}; v1 rejects the same unsupported probe spelling before emission",
+                        error
+                    ),
+                    V1Status::Rejects,
+                )
             } else {
                 LowerError::Invalid(error.to_string())
             }
@@ -2405,16 +2448,19 @@ fn lower_program_impl(
                     // path below — inert at this gate (its items are
                     // validated by the component schema builder).
                 } else {
-                    return Err(unsupported(
-                        &format!("env/component `{}`", c.name.name),
-                        "only testbench components bound via `impl ... for` are lowered",
-                    ));
+                    // An unreferenced testbench declaration is inert. v1 emits
+                    // only the selected test/impl, and no call site can observe
+                    // this declaration, so it need not poison the suite.
                 }
             }
-            other => {
-                return Err(unsupported(
-                    &format!("the `{}` construct", item_label(other)),
-                    "",
+            // Declarations are inert until referenced. Their executable
+            // reference sites retain the precise diagnostic.
+            Item::Pseq(_) | Item::CoverSequence(_) | Item::ExternalModule(_) => {}
+            Item::Apply(_) => {
+                return Err(not_implemented(
+                    "a file-scope `apply` item",
+                    "v1 drops the aspect activation without resolving its name",
+                    V1Status::SilentlyMisLowers,
                 ));
             }
         }
@@ -3762,15 +3808,12 @@ fn validate_testbench_component(
                     if component_type_names.contains(simple) {
                         if component_transactor_names.contains(simple) {
                             if matches!(mode, Some(TransactorMode::Active)) {
-                                return Err(unsupported(
-                                    &format!(
-                                        "an `active` mode on composite-component \
-                                         testbench field `{}.{} : {simple}`",
-                                        c.name.name, f.name.name
-                                    ),
-                                    "only the passive ownership annotation is accepted for an \
-                                     analysis-source component field",
-                                ));
+                                return Err(LowerError::Invalid(format!(
+                                    "an `active` mode on composite-component testbench field \
+                                     `{}.{} : {simple}` is invalid; only the passive ownership \
+                                     annotation is accepted for an analysis-source component field",
+                                    c.name.name, f.name.name
+                                )));
                             }
                             continue;
                         }
@@ -3838,13 +3881,11 @@ fn validate_testbench_component(
                     // entry in `components` here is a `sequencer`, which is
                     // out of the lowered subset entirely.
                     if components.contains_key(simple) {
-                        return Err(unsupported(
-                            &format!(
-                                "testbench field `{}` of component type `{}`",
-                                f.name.name, simple
-                            ),
-                            "the `sequencer` construct is not in this subset",
-                        ));
+                        return Err(LowerError::Invalid(format!(
+                            "internal: component type `{simple}` for testbench field `{}` was \
+                             catalogued but not assigned a component schema",
+                            f.name.name
+                        )));
                     }
                 } else if let TypeExpr::Builtin {
                     name: BuiltinTy::Queue,
@@ -3890,12 +3931,13 @@ fn validate_testbench_component(
                         ));
                     }
                 } else if tb_scalar_field_ir_type(&f.ty).is_none() {
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         &format!(
                             "testbench field `{}` with a non-scalar, non-named type",
                             f.name.name
                         ),
-                        "only nonzero-width uint/sint/bits/bool fields up to 1024 bits are lowered",
+                        "only nonzero-width uint/sint/bits/bool fields up to 1024 bits are lowered; v1 erases other builtin spellings to a scalar carrier",
+                        V1Status::SilentlyMisLowers,
                     ));
                 }
             }
@@ -3983,38 +4025,6 @@ fn validate_testbench_component(
         }
     }
     Ok(())
-}
-
-fn item_label(it: &Item) -> &'static str {
-    match it {
-        Item::Use(_) => "use",
-        Item::Package(_) => "package",
-        Item::Const(_) => "const",
-        Item::Domain(_) => "domain",
-        Item::Struct(_) => "struct",
-        Item::Enum(_) => "enum",
-        Item::Transaction(_) => "transaction",
-        Item::Relation(_) => "relation",
-        Item::Tseq(_) => "tseq",
-        Item::Agent(_) => "agent",
-        Item::Env(_) => "env",
-        Item::Scoreboard(_) => "scoreboard",
-        Item::Sequencer(_) => "sequencer",
-        Item::Test(_) => "test",
-        Item::Extend(_) => "extend",
-        Item::Covergroup(_) => "covergroup",
-        Item::Property(_) => "property",
-        Item::Pseq(_) => "pseq",
-        Item::CoverSequence(_) => "cover sequence",
-        Item::ExternalModule(_) => "external module",
-        Item::Function(_) => "function",
-        Item::ExternFn(_) => "extern fn",
-        Item::Apply(_) => "apply",
-        Item::Bus(_) => "bus",
-        Item::Transactor(_) => "transactor",
-        Item::Regblock(_) => "regblock",
-        Item::Addrmap(_) => "addrmap",
-    }
 }
 
 /// Human-readable kind for a `ComponentItem`, for testbench-scope
@@ -4341,7 +4351,8 @@ fn lower_test(
                 let bus_name = type_simple_name(l.ty.as_ref()).unwrap();
                 let decl = buses[bus_name];
                 let binding_id = ir::BusBindingId(bus_bindings.len() as u32);
-                let (schema, owned) = bus::lower_bus_binding(l, decl, binding_id, record_ids)?;
+                let (schema, owned) =
+                    bus::lower_bus_binding(l, decl, binding_id, record_ids, consts)?;
                 if bus_binding_decls.contains_key(&l.name.name) {
                     // Two bindings with one name would resolve
                     // ambiguously (v1's map silently keeps the last;
@@ -4798,13 +4809,15 @@ fn lower_test(
                     ));
                 }
                 if l.value.is_some() {
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         &format!(
                             "transactor instance `let {}` with an initializer",
                             l.name.name
                         ),
                         "transactor instances default-construct; bind the DUT with \
-                         `{}.dut = dut` in the body",
+                         `{}.dut = dut` in the body; v1 rejects a transactor initializer \
+                         because the type has no value form",
+                        V1Status::Rejects,
                     ));
                 }
                 let simple = type_simple_name(l.ty.as_ref()).unwrap();
@@ -4867,9 +4880,17 @@ fn lower_test(
                             }
                         }
                     }
-                    return Err(unsupported(
-                        &format!("test-scope `let {}` with probes or a bind", l.name.name),
-                        "only plain `let <name> [: <Ty>] = <expr>` test-scope lets are lowered",
+                    if !l.probes.is_empty() {
+                        return Err(not_implemented(
+                            &format!("probe declarations on test-scope `let {}`", l.name.name),
+                            "v1 only materializes probes declared on `let dut`; probes on any other local are silently inert",
+                            V1Status::SilentlyMisLowers,
+                        ));
+                    }
+                    return Err(not_implemented(
+                        &format!("unresolved test-scope bind `let {}`", l.name.name),
+                        "all supported bus, transactor, component, regblock, and addrmap binds are resolved before this gate; v1 cannot materialize the remaining unknown binding",
+                        V1Status::Rejects,
                     ));
                 }
                 test_let_names.insert(l.name.name.clone());

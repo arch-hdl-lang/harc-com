@@ -12,9 +12,9 @@ such sites in `src/codegen/tbir`. That raw count is an inventory, not a work
 queue: some sites cover several source shapes, and some diagnostics were
 incorrectly classified as gaps even though v1 rejects the same source.
 
-The refreshed 2026-10-17 inventory is recorded in
+The refreshed 2026-10-18 inventory is recorded in
 [`tbir-migration-manifest.md`](tbir-migration-manifest.md). After the current
-batch there are 63 executable constructors (64 textual matches including the
+batch there are 42 executable constructors (43 textual matches including the
 helper definition); the manifest separates positive runtime controls from
 diagnostic and deliberately deferred shapes.
 
@@ -646,6 +646,14 @@ not applicable before requesting review:
    response wires, including blocking and tagged 2048-bit paths. This removes
    the stale target-TLM 1024-bit ceiling and leaves 63 textual matches (62
    executable constructors plus the helper definition).
+   The following twenty-site batch implements constant-folded target-responder
+   tag counts, responderless bound target components, and data-scoreboard
+   watchdog routing. It also replaces stale fallback claims at declaration,
+   binding, probe, TSeq, and component-state boundaries with measured v1
+   rejection, uncompilable-emission, or silent-type-erasure diagnostics, and
+   turns unreachable pipeline states into `Invalid` invariants. The raw
+   inventory is now 43 textual matches (42 executable constructors plus the
+   helper definition).
 9. Before a PR, obtain the independent findings-first review required by
    `AGENTS.md`, address its findings, mark the reviewed HEAD, and run
    `scripts/pre_pr_review.sh check`.

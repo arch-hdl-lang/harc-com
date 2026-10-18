@@ -39,7 +39,7 @@ use std::collections::HashMap;
 pub(crate) fn scoreboard_is_component(c: &ComponentDecl) -> bool {
     if c.items
         .iter()
-        .any(|it| matches!(it, ComponentItem::Hookable(_)))
+        .any(|it| matches!(it, ComponentItem::Hookable(_) | ComponentItem::Watchdog(_)))
     {
         return true;
     }
@@ -1659,16 +1659,18 @@ fn lower_field(
             let elem = match decoded {
                 Some(e) => e,
                 None => {
-                    return Err(unsupported(
+                    return Err(not_implemented(
                         &format!(
                             "fixed-vector field `{comp}.{fname}` with an unsupported element type"
                         ),
                         format!(
                             "a fixed-vector element is a nonzero-width uint/sint/bits/bool/bit \
                          scalar ({}), a declared record, or another `Vec<..>` of those (nested); \
-                         dynamic-list elements are not yet lowered",
+                         dynamic-list elements are not yet lowered, and v1 erases unsupported \
+                         element spellings to its scalar carrier",
                             scalar_width_detail()
                         ),
+                        V1Status::SilentlyMisLowers,
                     ));
                 }
             };
@@ -1737,10 +1739,11 @@ fn lower_field(
             }
             let what = format!("scalar field `{comp}.{fname}` of an unsupported type");
             let ty = scalar_field_ir_type(&f.ty).ok_or_else(|| {
-                unsupported(
+                not_implemented(
                     &what,
                     "only nonzero-width uint/sint/bits/bool fields up to 1024 bits \
-                     are lowered",
+                     are lowered; v1 erases other builtin field spellings to a scalar carrier",
+                    V1Status::SilentlyMisLowers,
                 )
             })?;
             let default = scalar_default(&f.default, comp, fname, &f.ty, consts)?;
@@ -2279,9 +2282,10 @@ fn lower_monitor_handshake_body(
         .bus_bindings
         .get(super::transactors::INITIATOR_BUS_PLACEHOLDER)
         .ok_or_else(|| {
-            unsupported(
+            not_implemented(
                 "an `on bus.<ch>.handshake(...)` handler with no bound bus in scope",
-                "",
+                "v1 emits bus-signal accesses without a bound bus instance, so the generated C++ does not compile",
+                V1Status::EmitsUncompilable,
             )
         })?;
     let hs = bus
@@ -3182,9 +3186,10 @@ fn resolve_testbench_path(
         ));
     };
     let cid = roots.get(root).copied().ok_or_else(|| {
-        unsupported(
+        not_implemented(
             &format!("a testbench `connect` root `{root}` that is not a component field"),
-            "connect endpoints must be rooted at a testbench-owned component field",
+            "connect endpoints must be rooted at a testbench-owned component field; v1 emits an unresolved member access",
+            V1Status::EmitsUncompilable,
         )
     })?;
     if tail.is_empty() {
