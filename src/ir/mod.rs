@@ -3120,7 +3120,7 @@ pub enum FileLogLevel {
 }
 
 /// A pre-parsed interpolated format string: `fmt` is the printf-style
-/// format (produced by `cpp_tb::process_interp`), `args` are the lowered
+/// format (produced by `source_transform::process_interp`), `args` are the lowered
 /// `${...}` capture expressions in order.
 #[derive(Debug, Clone)]
 pub struct FmtArgs {

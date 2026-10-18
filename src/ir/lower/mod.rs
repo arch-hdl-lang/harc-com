@@ -1590,10 +1590,10 @@ fn lower_program_impl(
     // testbench `TestbenchLifecycle` lowering below. Empty when the switch
     // is off (historical inlining folds the bodies into each test instead).
     let (file, shared_lifecycle_bodies) = if native_lifecycle_enabled() {
-        crate::codegen::source_transform::desugar_impl_for_test_sharing_lifecycle(file)
+        crate::codegen::lifecycle_transform::desugar_impl_for_test_sharing_lifecycle(file)
     } else {
         (
-            crate::codegen::source_transform::desugar_impl_for_test_in_file(file),
+            crate::codegen::lifecycle_transform::desugar_impl_for_test_in_file(file),
             crate::codegen::source_transform::SharedLifecycleBodies::new(),
         )
     };
@@ -5487,7 +5487,7 @@ fn lower_test(
                         let mut hm = h.clone();
                         let params: HashSet<String> =
                             h.params.iter().map(|p| p.name.name.clone()).collect();
-                        crate::codegen::source_transform::rewrite_testbench_scope_body(
+                        crate::codegen::lifecycle_transform::rewrite_testbench_scope_body(
                             &mut hm.body,
                             c,
                             &params,
@@ -5537,7 +5537,7 @@ fn lower_test(
                             } else {
                                 HashSet::new()
                             };
-                        crate::codegen::source_transform::rewrite_testbench_scope_body(
+                        crate::codegen::lifecycle_transform::rewrite_testbench_scope_body(
                             &mut handler.body,
                             c,
                             &payload_names,
@@ -9004,7 +9004,11 @@ fn lower_tb_periodic_service_body<'a>(
     member: ir::TestHookMember,
 ) -> Result<TbFunction, LowerError> {
     let mut body = h.body.clone();
-    crate::codegen::source_transform::rewrite_testbench_scope_body(&mut body, tb, &HashSet::new());
+    crate::codegen::lifecycle_transform::rewrite_testbench_scope_body(
+        &mut body,
+        tb,
+        &HashSet::new(),
+    );
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     b.lower_block_stmts(&body)?;
     if !b.is_terminated() {
@@ -9049,7 +9053,11 @@ fn lower_tb_cycle_service_body<'a>(
         h.event.span,
         ctx.source_id,
     );
-    crate::codegen::source_transform::rewrite_testbench_scope_body(&mut trigger_wrapper, tb, &HashSet::new());
+    crate::codegen::lifecycle_transform::rewrite_testbench_scope_body(
+        &mut trigger_wrapper,
+        tb,
+        &HashSet::new(),
+    );
     trigger_wrapper.stmt_sources.remove(0);
     let StmtKind::Expr(rewritten) = trigger_wrapper.stmts.remove(0).kind else {
         unreachable!("trigger wrapper holds exactly the Expr statement we inserted");
@@ -9057,7 +9065,11 @@ fn lower_tb_cycle_service_body<'a>(
     trigger_expr = rewritten;
 
     let mut body = h.body.clone();
-    crate::codegen::source_transform::rewrite_testbench_scope_body(&mut body, tb, &HashSet::new());
+    crate::codegen::lifecycle_transform::rewrite_testbench_scope_body(
+        &mut body,
+        tb,
+        &HashSet::new(),
+    );
     let mut b = FuncBuilder::new(ctx, helpers, side_tables);
     let trigger = b.lower_expr(&trigger_expr)?;
     b.validate_truth_expr(&trigger, "testbench cycle-handler trigger")?;

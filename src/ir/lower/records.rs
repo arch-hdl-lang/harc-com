@@ -51,7 +51,7 @@ use std::collections::HashMap;
 ///
 /// Every row is decided by the member type `txn_field_c_type` picks and
 /// the draw `emit_field_random` writes, so this asks THOSE —
-/// `cpp_tb::record_leaf_fate` sits next to both and recurses through
+/// `source_transform::record_leaf_fate` is shared by both and recurses through
 /// the same `list_elem_type` / `fixed_vec_type_args` helpers. Three
 /// versions of this arm got it wrong by restating the rules instead:
 /// one `queue` probe generalised to everything denied `list` its
