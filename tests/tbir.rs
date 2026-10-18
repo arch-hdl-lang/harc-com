@@ -21508,8 +21508,9 @@ end impl CovTest
 }
 
 /// Covergroup width-method targets use the same basic guardrails as the
-/// ordinary TBIR expression path: no zero widths, no >64-bit widths, and
-/// no wrong-direction casts when the source width is known.
+/// ordinary TBIR expression path: no zero widths and no wrong-direction
+/// casts when the source width is known. Wide destinations use the same
+/// exact-width scalar ABI as other cover expressions.
 #[test]
 fn covergroup_width_methods_reject_bad_widths() {
     let src_zero = r#"
@@ -21544,8 +21545,12 @@ test BadWidthWide
     end run
 end test
 "#;
-    let err = lower_src(src_wide).unwrap_err();
-    assert_unsupported(&err);
+    let wide = lower_src(src_wide).expect("wide covergroup width cast lowers");
+    verify::verify_program(&wide).expect("wide covergroup width cast verifies");
+    assert!(matches!(
+        wide.covgroups[0].points[0].target,
+        ir::Expr::WidthCast { width: 65, .. }
+    ));
 
     let src_wrong_direction = r#"
 covergroup Cov @(posedge dut.clk)
@@ -26028,7 +26033,10 @@ fn transactor_method_sync_only_waits() {
         "wait 1 cycle\n            dut.en = 0",
         "wait 1 cycle on clk\n            dut.en = 0",
     );
-    let msg = assert_unsupported(&lower_src(&clocked).unwrap_err());
+    let msg = assert_not_implemented(
+        &lower_src(&clocked).unwrap_err(),
+        lower::V1Status::EmitsUncompilable,
+    );
     assert!(
         msg.contains("`wait N cycles on <clock>` inside a transactor method"),
         "{msg}"
@@ -49514,7 +49522,7 @@ end test BadNestedTseq
     }
     for source in sources("18446744073709551616") {
         let overflow = lower_src(&source).unwrap_err();
-        let message = assert_unsupported(&overflow);
+        let message = assert_not_implemented(&overflow, lower::V1Status::EmitsUncompilable);
         assert!(message.contains("64-bit constant-evaluation domain"), "{message}");
     }
 }
@@ -52210,6 +52218,192 @@ end impl T"#;
     let prog = lower_src(src).expect("test-scope no-arg subscription lowers");
     verify::verify_program(&prog).expect("verifies");
     tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default()).expect("emits");
+}
+
+#[test]
+fn testbench_declaration_event_subscription_registers_in_run_flow() {
+    let src = r#"transactor Source
+    observed : out event<uint<8>>
+    hookable publish(v: uint<8>)
+        emit observed(v)
+    end publish
+end transactor Source
+
+testbench Tb
+    dut : Top
+    src : Source passive
+    seen : uint<32> default 0
+    v : uint<8> default 99
+    on src.observed(v)
+        seen = seen + v
+    end on
+end testbench Tb
+
+impl T for Tb
+    run
+        src.publish(3)
+        assert seen == 3 else fail("testbench handler did not fire")
+    end run
+end impl T"#;
+    let program = lower_src(src).expect("testbench event subscription lowers");
+    verify::verify_program(&program).expect("testbench event subscription verifies");
+    let handler = program
+        .functions
+        .iter()
+        .find(|function| matches!(function.kind, ir::FunctionKind::TestHook { .. }))
+        .expect("event subscriber body");
+    assert!(
+        handler.blocks.iter().any(|block| {
+            block.stmts.iter().any(|stmt| {
+                matches!(
+                    stmt,
+                    ir::Stmt::TbFieldWrite {
+                        field,
+                        value: ir::Expr::Binary(_, _, rhs),
+                    } if field == "seen" && matches!(&**rhs, ir::Expr::Local(local) if local.0 == 0)
+                )
+            })
+        }),
+        "event payload must shadow the same-named testbench field: {handler:#?}"
+    );
+    let cpp = emit_cpp_src(src);
+    assert!(cpp.contains("observed.push_back"), "{cpp}");
+    assert!(cpp.contains("seen ="), "{cpp}");
+}
+
+#[test]
+fn const_ternary_folds_only_the_selected_arm() {
+    let src = r#"const Lazy : uint<8> = true ? 7 : (1 / 0)
+const Selected : uint<8> = true ? (7 as sint<8>) : (1 as uint<8>)
+
+test T
+    let dut : Top
+    run
+        assert Lazy == 7 else fail("lazy ternary const")
+        assert Selected == 7 else fail("mixed-signedness ternary const")
+        wait 1 cycle
+    end run
+end test T"#;
+    let program = lower_src(src).expect("constant ternary lowers");
+    verify::verify_program(&program).expect("constant ternary verifies");
+    tbir::emit(&program, &merged_src(src), &cpp_tb::EmitOpts::default())
+        .expect("constant ternary emits");
+
+    let narrow = src.replace("(7 as sint<8>)", "(-1 as sint<8>)");
+    let err = lower_src(&narrow).expect_err("64-bit unsigned result does not fit uint<8>");
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_))
+            && err.to_string().contains("max 255"),
+        "mixed signedness must use the unsigned 64-bit carrier before width validation: {err}"
+    );
+
+    let unresolved = src.replace("(1 as uint<8>)", "(MISSING as uint<8>)");
+    let err = lower_src(&unresolved).expect_err("unselected casts are still type-checked");
+    assert!(
+        matches!(err, lower::LowerError::Invalid(_)) && err.to_string().contains("MISSING"),
+        "{err}"
+    );
+
+    let helper_prefix = r#"function Pick(first: uint<8>, second: uint<8>) -> uint<8>
+    return first
+end function Pick
+
+"#;
+    for (bad_call, expected) in [
+        ("Pick()", "takes 2 argument"),
+        ("Pick(no_such = 1, second = 2)", "no parameter"),
+        ("Pick(second = 1, first = 2)", "written in position"),
+    ] {
+        let bad = format!(
+            "{helper_prefix}const Bad : uint<8> = true ? 7 : {bad_call}\ntest T{}",
+            src.split_once("test T").expect("test suffix").1
+        );
+        let err = lower_src(&bad).expect_err("unselected helper calls are contract-checked");
+        assert!(err.to_string().contains(expected), "{bad_call}: {err}");
+    }
+}
+
+#[test]
+fn target_responder_wall_clock_wait_uses_the_test_scheduler() {
+    let src = fixture("tlm_target_thread_test.harc").replace("wait 1 cycle", "wait 1ns");
+    let program = lower_src(&src).expect("target responder wall-clock wait lowers");
+    verify::verify_program(&program).expect("target responder wall-clock wait verifies");
+    let cpp = tbir::emit(&program, &merged_src(&src), &cpp_tb::EmitOpts::default())
+        .expect("target responder wall-clock wait emits");
+    assert!(cpp.contains("eval_clocks_until(now_ps + 1000);"), "{cpp}");
+}
+
+#[test]
+fn tseq_wall_clock_wait_uses_the_test_scheduler() {
+    let src = r#"tseq Delayed() -> TSeq<uint<8>>
+    wait 1ns
+    yield 7
+end tseq Delayed
+
+test T
+    let dut : Top
+    clock clk = 10ns
+    run
+        let values = Delayed()
+        wait 1 cycle
+    end run
+end test T"#;
+    let program = lower_src(src).expect("tseq wall-clock wait lowers");
+    verify::verify_program(&program).expect("tseq wall-clock wait verifies");
+    let cpp = tbir::emit(&program, &merged_src(src), &cpp_tb::EmitOpts::default())
+        .expect("tseq wall-clock wait emits");
+    assert!(cpp.contains("eval_clocks_until(now_ps + 1000);"), "{cpp}");
+}
+
+#[test]
+fn handleless_state_transactor_uses_component_storage() {
+    let src = r#"transactor HostState
+    count : uint<32> default 1
+end transactor HostState
+
+testbench Tb
+    dut : Top
+    state : HostState passive
+end testbench Tb
+
+impl T for Tb
+    run
+        state.count = state.count + 1
+        assert state.count == 2 else fail("state")
+    end run
+end impl T"#;
+    let program = lower_src(src).expect("handle-less state transactor lowers as a component");
+    verify::verify_program(&program).expect("handle-less state transactor verifies");
+    assert!(
+        program.components.iter().any(|component| component.name == "HostState"),
+        "state-only transactor must be represented by component IR"
+    );
+}
+
+#[test]
+fn untyped_promoted_composed_runtime_initializer_uses_host_scalar_storage() {
+    let src = r#"testbench Tb
+    dut : Top
+end testbench Tb
+
+impl T for Tb
+    let shared = dut.value + 1
+    run
+        wait 1 cycle
+    end run
+    check
+        assert shared >= 0 else fail("shared")
+    end check
+end impl T"#;
+    let program = lower_src(src).expect("composed promoted initializer lowers");
+    verify::verify_program(&program).expect("composed promoted initializer verifies");
+    assert!(
+        program.testbenches[0]
+            .state_fields
+            .iter()
+            .any(|field| matches!(field, ir::TbStateFieldSchema::Scalar(field) if field.name == "shared" && field.ty == ir::IrType::UInt(None))),
+        "untyped promoted runtime storage must use the widthless host scalar ABI"
+    );
 }
 
 /// A bare read or write of a `queue` state field in a bound-to target

@@ -3106,7 +3106,8 @@ fn validate_shared_callable(
             Terminator::WaitTimePs(_, _)
                 if matches!(
                     surface,
-                    SharedCallableSurface::TestbenchMethod
+                    SharedCallableSurface::Tseq
+                        | SharedCallableSurface::TestbenchMethod
                         | SharedCallableSurface::ComponentMethod
                         | SharedCallableSurface::TransactorMethod
                 ) => {}

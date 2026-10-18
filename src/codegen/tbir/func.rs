@@ -1845,6 +1845,30 @@ fn emit_tseq_impl(
                 writeln!(out, "{pad3}while (!({cond})) tick();").ok();
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
+            Terminator::WaitTimePs(ps, b) => {
+                match emission {
+                    TseqEmission::LocalLambda => {
+                        writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
+                    }
+                    TseqEmission::Common { needs_context: true, .. } => {
+                        writeln!(
+                            out,
+                            "{pad3}harc_eval_clocks_until(ctx, ctx.now_ps + {ps});"
+                        )
+                        .ok();
+                    }
+                    TseqEmission::Common {
+                        needs_context: false,
+                        ..
+                    } => {
+                        return Err(EmitError(format!(
+                            "tbir: tseq `{}` has a wall-clock wait without runtime context",
+                            func.name
+                        )));
+                    }
+                }
+                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+            }
             Terminator::Randomize {
                 target,
                 constraints,
@@ -1885,7 +1909,6 @@ fn emit_tseq_impl(
             },
             other @ (Terminator::WaitCycles(_, Some(_), _)
             | Terminator::WaitCyclesSync(_, _)
-            | Terminator::WaitTimePs(_, _)
             | Terminator::WaitUntilTimeout { .. }
             | Terminator::TbLifecycleCall { .. }
             | Terminator::Fatal(_)) => {
@@ -7711,6 +7734,18 @@ fn emit_responder_loop_switch(
                 )
                 .ok();
                 writeln!(out, "{pad_body}__bb = {};", succ.0).ok();
+            }
+            Terminator::WaitTimePs(ps, b) => {
+                if let Some(context) = cx.bindings.run_context {
+                    writeln!(
+                        out,
+                        "{pad_body}harc_eval_clocks_until({context}, {context}.now_ps + {ps});"
+                    )
+                    .ok();
+                } else {
+                    writeln!(out, "{pad_body}eval_clocks_until(now_ps + {ps});").ok();
+                }
+                writeln!(out, "{pad_body}__bb = {};", b.0).ok();
             }
             Terminator::Return => {
                 writeln!(out, "{pad_body}__done = true;").ok();

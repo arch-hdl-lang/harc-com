@@ -43,7 +43,7 @@
 
 use std::collections::HashMap;
 
-use super::{not_implemented, unsupported, LowerError, V1Status};
+use super::{not_implemented, LowerError, V1Status};
 use crate::ast::{CallArg, ExprKind, RegAccess as AstRegAccess, RegblockDecl};
 use crate::ir::{
     self, BinOp, Expr, FmtArg, FmtArgs, IrType, RecordFieldSchema, RecordId, RecordSchema,
@@ -1128,11 +1128,9 @@ impl super::FuncBuilder<'_> {
         addr: &crate::ast::Expr,
     ) -> Result<RegRegisterSchema, LowerError> {
         let Some(addr_val) = self.const_eval_index(addr) else {
-            return Err(unsupported(
-                &format!("`{binding}.{api}(...)` with a non-constant address"),
-                "the passive record API decodes the address at compile time; \
-                 pass a literal or const offset",
-            ));
+            return Err(LowerError::Invalid(format!(
+                "internal error: `{binding}.{api}(...)` reached constant record-API resolution with a runtime address"
+            )));
         };
         let bctx = &self.ctx.regblock_bindings[binding];
         bctx.registers
