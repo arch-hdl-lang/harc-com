@@ -51,9 +51,9 @@ use crate::codegen::dut_interface::{
     scan_sv_module_ports,
 };
 pub use crate::codegen::emission::{EmitError, EmitOpts, GeneratedCppFile, SplitCppOutput};
+pub use crate::codegen::randomize::uses_constraint_solver;
 use crate::codegen::randomize::{
-    PerRunCell, TbirRandomizeEmissionPlan, TbirRandomizeSiteState,
-    TBIR_RANDOMIZE_CONTEXT_SENTINEL,
+    PerRunCell, TbirRandomizeEmissionPlan, TbirRandomizeSiteState, TBIR_RANDOMIZE_CONTEXT_SENTINEL,
     TBIR_RANDOMIZE_SEQUENCER_SCOPE_SENTINEL, TBIR_RANDOMIZE_STATE_SENTINEL,
     TBIR_RANDOMIZE_TARGET_SENTINEL, TBIR_RANDOMIZE_TSEQ_SCOPE_SENTINEL,
 };
@@ -22783,130 +22783,6 @@ impl Emitter {
     }
 }
 
-/// True if any code path will emit the Z3 solver block. Drives the
-/// `harc_z3_rt.h` include + Z3 link flags. The check needs to mirror the
-/// codegen's actual decision:
-///   * `randomize(t) with <body>` — always solver (user wrote constraints)
-///   * bare `randomize(t)` where `t`'s transaction has `keep` items,
-///     `[unique]` fields, or auto coverage goals — also solver (keeps and
-///     policy preferences are call-site constraints)
-pub fn uses_constraint_solver(file: &SourceFile) -> bool {
-    let enum_names: std::collections::HashSet<&str> = file
-        .items
-        .iter()
-        .filter_map(|it| match it {
-            Item::Enum(e) => Some(e.name.name.as_str()),
-            _ => None,
-        })
-        .collect();
-    // First pass: collect names of transactions whose bare `randomize(t)`
-    // needs the solver path. False positives are cheap (an unused include);
-    // false negatives are compile failures.
-    let solver_bearing: std::collections::HashSet<&str> = file
-        .items
-        .iter()
-        .filter_map(|it| match it {
-            Item::Transaction(t) => {
-                if txn_body_has_keep(&t.body) || txn_body_has_solver_policy(&t.body, &enum_names) {
-                    Some(t.name.name.as_str())
-                } else {
-                    None
-                }
-            }
-            Item::Struct(s) => {
-                if txn_body_has_keep(&s.body) || fields_have_solver_policy(&s.fields, &enum_names) {
-                    Some(s.name.name.as_str())
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        })
-        .collect();
-
-    fn block(b: &Block, solver_bearing: &std::collections::HashSet<&str>) -> bool {
-        b.stmts.iter().any(|s| stmt(s, solver_bearing))
-    }
-    fn component_item(
-        item: &ComponentItem,
-        solver_bearing: &std::collections::HashSet<&str>,
-    ) -> bool {
-        match item {
-            ComponentItem::OnHandler(h) => block(&h.body, solver_bearing),
-            ComponentItem::Hookable(h) => block(&h.body, solver_bearing),
-            ComponentItem::Watchdog(w) => block(&w.body, solver_bearing),
-            _ => false,
-        }
-    }
-    fn component_items(
-        items: &[ComponentItem],
-        solver_bearing: &std::collections::HashSet<&str>,
-    ) -> bool {
-        items
-            .iter()
-            .any(|item| component_item(item, solver_bearing))
-    }
-    fn stmt(s: &Stmt, solver_bearing: &std::collections::HashSet<&str>) -> bool {
-        match &s.kind {
-            StmtKind::Randomize { with_body, .. } => {
-                !with_body.is_empty() || !solver_bearing.is_empty()
-            }
-            StmtKind::For(f) => block(&f.body, solver_bearing),
-            StmtKind::Repeat(r) => block(&r.body, solver_bearing),
-            StmtKind::Loop(b) => block(b, solver_bearing),
-            StmtKind::While { body, .. } => block(body, solver_bearing),
-            StmtKind::If(i) => {
-                block(&i.then_block, solver_bearing)
-                    || i.else_block
-                        .as_ref()
-                        .map_or(false, |b| block(b, solver_bearing))
-                    || i.elsifs.iter().any(|(_, b)| block(b, solver_bearing))
-            }
-            StmtKind::Fork(f) => f.branches.iter().any(|b| block(b, solver_bearing)),
-            StmtKind::Parallel(bs) | StmtKind::Schedule(bs) => {
-                bs.iter().any(|b| block(b, solver_bearing))
-            }
-            StmtKind::Select(arms) => arms.iter().any(|a| block(&a.action, solver_bearing)),
-            StmtKind::On(h) => block(&h.body, solver_bearing),
-            StmtKind::After { body, .. } => block(body, solver_bearing),
-            _ => false,
-        }
-    }
-    file.items.iter().any(|it| match it {
-        Item::Function(f) => block(&f.body, &solver_bearing),
-        Item::Tseq(t) => block(&t.body, &solver_bearing),
-        Item::Agent(c) | Item::Env(c) | Item::Scoreboard(c) | Item::Sequencer(c) => {
-            component_items(&c.items, &solver_bearing)
-        }
-        Item::Transactor(t) => {
-            component_items(&t.items, &solver_bearing)
-                || t.when_active
-                    .as_ref()
-                    .map_or(false, |items| component_items(items, &solver_bearing))
-        }
-        Item::Test(t) => t.items.iter().any(|ti| match ti {
-            TestItem::Stmt(s) => stmt(s, &solver_bearing),
-            TestItem::Phase(_, body) => block(body, &solver_bearing),
-            TestItem::Scope(sc) => {
-                sc.setup
-                    .as_ref()
-                    .map_or(false, |b| block(b, &solver_bearing))
-                    || sc.run.as_ref().map_or(false, |b| block(b, &solver_bearing))
-                    || sc
-                        .check
-                        .as_ref()
-                        .map_or(false, |b| block(b, &solver_bearing))
-                    || sc
-                        .teardown
-                        .as_ref()
-                        .map_or(false, |b| block(b, &solver_bearing))
-            }
-            _ => false,
-        }),
-        _ => false,
-    })
-}
-
 fn list_max_len(t: &TypeExpr) -> Option<usize> {
     let args = list_type_args(t)?;
     for arg in args {
@@ -24044,57 +23920,6 @@ fn escape_c(s: &str) -> String {
         }
     }
     out
-}
-
-fn txn_body_has_keep(items: &[TxnBodyItem]) -> bool {
-    items.iter().any(|item| match item {
-        TxnBodyItem::Keep(_) => true,
-        TxnBodyItem::When(w) => txn_body_has_keep(&w.items),
-        TxnBodyItem::Field(_) => false,
-    })
-}
-
-fn txn_body_has_solver_policy(
-    items: &[TxnBodyItem],
-    enum_names: &std::collections::HashSet<&str>,
-) -> bool {
-    items.iter().any(|item| match item {
-        TxnBodyItem::Field(f) => txn_field_has_solver_policy(f, enum_names),
-        TxnBodyItem::When(w) => txn_body_has_solver_policy(&w.items, enum_names),
-        TxnBodyItem::Keep(_) => false,
-    })
-}
-
-fn fields_have_solver_policy(
-    fields: &[Field],
-    enum_names: &std::collections::HashSet<&str>,
-) -> bool {
-    fields
-        .iter()
-        .any(|field| txn_field_has_solver_policy(field, enum_names))
-}
-
-fn txn_field_has_solver_policy(f: &Field, enum_names: &std::collections::HashSet<&str>) -> bool {
-    if f.attrs
-        .iter()
-        .any(|a| a.name.name == "unique" || a.name.name == "range")
-    {
-        return true;
-    }
-    match &f.ty {
-        TypeExpr::Builtin { name, args, .. } => match name {
-            BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => true,
-            BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => {
-                type_arg_width(args).is_some_and(|w| w <= 1024)
-            }
-            BuiltinTy::SInt | BuiltinTy::SIntCap => type_arg_width(args).is_some_and(|w| w <= 1024),
-            _ => false,
-        },
-        TypeExpr::Named { name, .. } => name
-            .segments
-            .last()
-            .is_some_and(|segment| enum_names.contains(segment.name.as_str())),
-    }
 }
 
 fn guarded_constraint_guard(expr: &Expr) -> Option<&Expr> {
