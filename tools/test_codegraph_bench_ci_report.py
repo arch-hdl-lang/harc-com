@@ -55,8 +55,8 @@ class ReportTests(unittest.TestCase):
     def test_cli_writes_diagnostic_artifacts_for_missing_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            summary = root / "summary.md"
-            metrics = root / "metrics.jsonl"
+            summary = root / "not-created" / "summary.md"
+            metrics = root / "not-created" / "metrics.jsonl"
             result = subprocess.run(
                 ["python3", str(Path(__file__).with_name("codegraph_bench_ci_report.py")),
                  str(root / "missing.jsonl"), "--summary", str(summary), "--metrics", str(metrics)],
