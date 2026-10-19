@@ -58,6 +58,7 @@ jobs:
           python3 tools/codegraph_ci_retrieval.py --harc ./target/debug/harc
 
       - name: Run frozen paired simulation benchmark
+        id: benchmark
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
@@ -68,7 +69,7 @@ jobs:
           python3 tools/codegraph_bench_sim.py --output "$RUNNER_TEMP/codegraph-benchmark"
 
       - name: Report regression
-        if: success()
+        if: always() && steps.benchmark.outcome != 'skipped'
         run: |
           status=0
           python3 tools/codegraph_bench_ci_report.py "$RUNNER_TEMP/codegraph-benchmark/records.jsonl" --summary "$RUNNER_TEMP/codegraph-benchmark/summary.md" --metrics "$RUNNER_TEMP/codegraph-benchmark/metrics.jsonl" || status=$?

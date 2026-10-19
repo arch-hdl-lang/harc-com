@@ -1,4 +1,7 @@
 import unittest
+import tempfile
+import subprocess
+from pathlib import Path
 
 from codegraph_bench_ci_report import public_metrics, report
 
@@ -48,6 +51,20 @@ class ReportTests(unittest.TestCase):
         output = public_metrics([baseline])
         self.assertNotIn("secret", output)
         self.assertIn('"input_tokens": 100', output)
+
+    def test_cli_writes_diagnostic_artifacts_for_missing_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summary = root / "summary.md"
+            metrics = root / "metrics.jsonl"
+            result = subprocess.run(
+                ["python3", str(Path(__file__).with_name("codegraph_bench_ci_report.py")),
+                 str(root / "missing.jsonl"), "--summary", str(summary), "--metrics", str(metrics)],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Benchmark integrity failed", summary.read_text())
+            self.assertEqual(metrics.read_text(), "")
         graph = row("graph")
         graph["repo_sha"] = "other"
         with self.assertRaises(ValueError):

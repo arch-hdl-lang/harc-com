@@ -84,8 +84,15 @@ def main() -> None:
     parser.add_argument("--summary", type=Path)
     parser.add_argument("--metrics", type=Path, help="Write allowlisted, artifact-safe metrics")
     args = parser.parse_args()
-    records = [json.loads(line) for line in args.records.read_text().splitlines() if line.strip()]
-    summary, passed = report(records, json.loads(args.tasks.read_text()))
+    records = []
+    try:
+        records = [json.loads(line) for line in args.records.read_text().splitlines() if line.strip()]
+        summary, passed = report(records, json.loads(args.tasks.read_text()))
+    except (OSError, ValueError) as error:
+        summary = ("# HARC graph CI benchmark\n\n"
+                   f"Benchmark integrity failed ({type(error).__name__}). "
+                   "No token-saving conclusion is available.\n")
+        passed = False
     print(summary)
     if args.summary:
         args.summary.write_text(summary)
