@@ -13,6 +13,7 @@ pub(crate) mod native;
 pub mod probe_catalog;
 pub mod randomize;
 pub(crate) mod render_support;
+pub(crate) mod lifecycle_transform;
 pub(crate) mod source_transform;
 pub mod runtime_support;
 pub mod sv_stub;
