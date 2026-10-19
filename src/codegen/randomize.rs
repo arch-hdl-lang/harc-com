@@ -1,7 +1,13 @@
 //! Shared TBIR randomization emission contracts.
 
 use crate::ast::*;
+use crate::codegen::emission::{EmitError, EmitOpts};
+use crate::codegen::lifecycle_transform::{
+    desugar_impl_for_test_in_file, desugar_impl_for_test_sharing_lifecycle,
+};
+use crate::codegen::native::NativeRandomizeEmitter;
 use crate::codegen::render_support::int_width_from_args;
+use crate::codegen::source_transform::normalize_vec_record_elem_fields;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PerRunCell {
@@ -29,9 +35,168 @@ pub(crate) struct TbirRandomizeSiteState {
     pub cells: Vec<PerRunCell>,
 }
 
-pub(crate) use crate::codegen::native::{
-    emit_record_randomize_helpers, plan_tbir_randomize_emission,
-};
+/// Emit the legacy solver snippet for each lowered TBIR constraint site.
+/// Kept public through `cpp_tb` as a compatibility surface for tests and
+/// downstream callers while the native backend is retired.
+pub fn emit_randomize_snippets(
+    file: &SourceFile,
+    opts: &EmitOpts,
+    sites: &[crate::ir::ConstraintSite],
+    depth: usize,
+) -> Result<Vec<String>, EmitError> {
+    if sites.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut emitter = NativeRandomizeEmitter::new(file, opts);
+    sites
+        .iter()
+        .map(|site| {
+            emitter
+                .emit_site(site, depth, false)
+                .map(|(snippet, _)| snippet)
+        })
+        .collect()
+}
+
+pub(crate) fn plan_tbir_randomize_emission(
+    file: &SourceFile,
+    opts: &EmitOpts,
+    sites: &[crate::ir::ConstraintSite],
+    depth: usize,
+) -> Result<TbirRandomizeEmissionPlan, EmitError> {
+    let typed_table = crate::solver::problem_table::build_typed_solver_problem_table(file);
+    let mut runtime_table =
+        crate::solver::runtime::RuntimeProblemTable::from_typed_solver_table(&typed_table);
+    if sites.is_empty() {
+        return Ok(TbirRandomizeEmissionPlan {
+            runtime_table,
+            snippets: Vec::new(),
+            site_states: Vec::new(),
+        });
+    }
+
+    let required_problem_ids = sites
+        .iter()
+        .filter_map(|site| site.problem_id)
+        .collect::<std::collections::HashSet<_>>();
+    let runtime_has_all_sites = |table: &crate::solver::runtime::RuntimeProblemTable| {
+        required_problem_ids
+            .iter()
+            .all(|id| table.problems.iter().any(|problem| problem.id == *id))
+    };
+    let mut transformed_source = None;
+    if !runtime_has_all_sites(&runtime_table) {
+        let (shared, _) = desugar_impl_for_test_sharing_lifecycle(file);
+        let shared_typed = crate::solver::problem_table::build_typed_solver_problem_table(&shared);
+        let shared_runtime =
+            crate::solver::runtime::RuntimeProblemTable::from_typed_solver_table(&shared_typed);
+        if runtime_has_all_sites(&shared_runtime) {
+            transformed_source = Some(shared);
+            runtime_table = shared_runtime;
+        } else {
+            let inlined = desugar_impl_for_test_in_file(file);
+            let inlined_typed =
+                crate::solver::problem_table::build_typed_solver_problem_table(&inlined);
+            let inlined_runtime =
+                crate::solver::runtime::RuntimeProblemTable::from_typed_solver_table(
+                    &inlined_typed,
+                );
+            if runtime_has_all_sites(&inlined_runtime) {
+                transformed_source = Some(inlined);
+                runtime_table = inlined_runtime;
+            }
+        }
+    }
+    let emission_source = transformed_source.as_deref().unwrap_or(file);
+
+    let mut emitter = NativeRandomizeEmitter::new(emission_source, opts);
+    emitter.configure_tbir_capsule();
+    let mut snippets = Vec::with_capacity(sites.len());
+    let mut site_states = Vec::with_capacity(sites.len());
+    for (index, site) in sites.iter().enumerate() {
+        if let Some(problem_id) = site.problem_id {
+            if !runtime_table
+                .problems
+                .iter()
+                .any(|problem| problem.id == problem_id)
+            {
+                return Err(EmitError(format!(
+                    "TB-IR randomize site c{index} references missing runtime problem {problem_id}"
+                )));
+            }
+        }
+        let (snippet, cells) = emitter.emit_site(site, depth, true)?;
+        snippets.push(snippet);
+        site_states.push(TbirRandomizeSiteState {
+            problem_id: site.problem_id,
+            cells,
+        });
+    }
+
+    let mut all_cells = emitter.all_cells().to_vec();
+    all_cells.sort_by(|lhs, rhs| lhs.tag.cmp(&rhs.tag));
+    all_cells
+        .dedup_by(|lhs, rhs| lhs.tag == rhs.tag && lhs.ctype == rhs.ctype && lhs.init == rhs.init);
+    for pair in all_cells.windows(2) {
+        if pair[0].tag == pair[1].tag {
+            return Err(EmitError(format!(
+                "TB-IR common randomize cell `{}` has conflicting declarations",
+                pair[0].tag
+            )));
+        }
+    }
+
+    Ok(TbirRandomizeEmissionPlan {
+        runtime_table,
+        snippets,
+        site_states,
+    })
+}
+
+/// Emit unconstrained-randomize helpers in dependency-safe record order.
+pub fn emit_record_randomize_helpers(
+    file: &SourceFile,
+    opts: &EmitOpts,
+    records: &[crate::ir::RecordSchema],
+    record_order: &[usize],
+) -> Result<String, EmitError> {
+    if record_order.is_empty() {
+        return Ok(String::new());
+    }
+    let source_prog = crate::ir::lower::lower_program(file).map_err(|error| {
+        EmitError(format!(
+            "tbir record randomize helper source check: {error}"
+        ))
+    })?;
+    if source_prog.records != records {
+        return Err(EmitError(
+            "tbir record randomize helper source/schema mismatch".to_string(),
+        ));
+    }
+    let normalized = normalize_vec_record_elem_fields(file);
+    let normalized = desugar_impl_for_test_in_file(&normalized);
+    let mut emitter = NativeRandomizeEmitter::new(&normalized, opts);
+    emitter.begin_record_helpers();
+    for &record_index in record_order {
+        let Some(record) = records.get(record_index) else {
+            return Err(EmitError(format!(
+                "tbir randomize helper record index {record_index} does not resolve"
+            )));
+        };
+        let name = &record.name;
+        let Some(item) = normalized.items.iter().find(|item| match item {
+            Item::Struct(record) => record.name.name == *name,
+            Item::Transaction(record) => record.name.name == *name,
+            _ => false,
+        }) else {
+            return Err(EmitError(format!(
+                "tbir randomize helper record `{name}` does not resolve"
+            )));
+        };
+        emitter.emit_record_helper(item)?;
+    }
+    Ok(emitter.finish_record_helpers())
+}
 
 /// True if any code path will emit the Z3 solver block. Drives the
 /// `harc_z3_rt.h` include + Z3 link flags. The check needs to mirror the
