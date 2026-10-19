@@ -95,8 +95,10 @@ def main() -> None:
         passed = False
     print(summary)
     if args.summary:
+        args.summary.parent.mkdir(parents=True, exist_ok=True)
         args.summary.write_text(summary)
     if args.metrics:
+        args.metrics.parent.mkdir(parents=True, exist_ok=True)
         args.metrics.write_text(public_metrics(records))
     if not passed:
         raise SystemExit(1)
