@@ -7,6 +7,32 @@
 
 use super::*;
 
+/// The per-element random draw `emit_field_random` writes inside a
+/// `list<T>` loop, or `None` when this backend has none for `T` and
+/// writes a bare `t->f[_i] = 0;` instead.
+///
+/// A `None` here is not merely a weak draw. The member is
+/// `std::vector<T'>` for whatever `T'` `txn_field_c_type` picked, and
+/// `= 0` only compiles when `T'` is a scalar — for
+/// `list<Vec<uint<8>, 2>>` it is `std::array<uint64_t, 2>` and g++
+/// rejects the assignment, for EVERY program that declares the record.
+/// `record_leaf_fate` asks this rather than restating the arm.
+fn list_elem_random_expr(elem: &TypeExpr) -> Option<String> {
+    let TypeExpr::Builtin { args, .. } = elem else {
+        return None;
+    };
+    match list_elem_random_kind(elem)? {
+        ScalarLeafKind::Unsigned => Some(emit_random_unsigned_expr(
+            type_arg_width(args).unwrap_or(32),
+        )),
+        ScalarLeafKind::Signed => {
+            let w = type_arg_width(args).unwrap_or(32);
+            Some(emit_random_signed_expr(w))
+        }
+        ScalarLeafKind::Bool => Some("harc_rt::random::harc_rng_range(harc_rng_next, 0, 1)".into()),
+    }
+}
+
 fn build_randomize_emitter(file: &SourceFile, opts: &EmitOpts) -> Emitter {
     let file = &normalize_vec_record_elem_fields(file);
     // The tbir backend already desugars impl-for before lowering, so the
@@ -528,6 +554,193 @@ impl Emitter {
         writeln!(self.out, "trace.randomize(cycle_count, _trace_fields);").ok();
         self.pad(depth);
         writeln!(self.out, "}}").ok();
+    }
+
+    /// Emit one random-field assignment honouring `[range(...)]` and
+    /// `[dist {...}]` attributes. Falls back to a uniform sample over the
+    /// declared type's value range.
+    fn emit_field_random(&mut self, f: &Field) {
+        if let Some(info) = list_field_info(&f.ty) {
+            let max_len = info.declared_max_len.unwrap_or(0);
+            writeln!(
+                self.out,
+                "{INDENT}t->{}.resize((size_t)harc_rt::random::harc_rng_range(harc_rng_next, 0, {}));",
+                f.name.name, max_len
+            )
+            .ok();
+            writeln!(
+                self.out,
+                "{INDENT}for (size_t _i = 0; _i < t->{}.size(); ++_i) {{",
+                f.name.name
+            )
+            .ok();
+            let draw = list_elem_type(&f.ty)
+                .and_then(list_elem_random_expr)
+                .unwrap_or_else(|| "0".to_string());
+            writeln!(self.out, "{INDENT}{INDENT}t->{}[_i] = {draw};", f.name.name).ok();
+            writeln!(self.out, "{INDENT}}}").ok();
+            return;
+        }
+
+        // Look for a `[range(lo, hi)]` or `[dist {...}]` attribute.
+        let mut handled = false;
+        for a in &f.attrs {
+            match a.name.name.as_str() {
+                "range" => {
+                    if a.args.len() >= 2 {
+                        if let (AttrArg::Expr(lo), AttrArg::Expr(hi)) = (&a.args[0], &a.args[1]) {
+                            write!(
+                                self.out,
+                                "{INDENT}t->{} = harc_rt::random::harc_rng_range(harc_rng_next, ",
+                                f.name.name
+                            )
+                            .ok();
+                            self.emit_expr(lo);
+                            write!(self.out, ", ").ok();
+                            self.emit_expr(hi);
+                            writeln!(self.out, ");").ok();
+                            handled = true;
+                        }
+                    }
+                }
+                "dist" => {
+                    let dist_args: Option<&Vec<DistEntry>> = a.args.iter().find_map(|x| match x {
+                        AttrArg::Dist(d) => Some(d),
+                        _ => None,
+                    });
+                    if let Some(entries) = dist_args {
+                        write!(
+                            self.out,
+                            "{INDENT}t->{} = harc_rt::random::harc_rng_dist(harc_rng_next, {{",
+                            f.name.name
+                        )
+                        .ok();
+                        self.emit_rng_dist_entries(entries);
+                        writeln!(self.out, "}});").ok();
+                        handled = true;
+                    }
+                }
+                _ => {}
+            }
+            if handled {
+                break;
+            }
+        }
+        if handled {
+            return;
+        }
+
+        // Fallback: type-driven uniform sampling.
+        match &f.ty {
+            TypeExpr::Builtin { name, args, .. } => {
+                let width = type_arg_width(args);
+                match name {
+                    BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits => {
+                        let w = width.unwrap_or(32);
+                        writeln!(
+                            self.out,
+                            "{INDENT}t->{} = {};",
+                            f.name.name,
+                            emit_random_unsigned_expr(w)
+                        )
+                        .ok();
+                    }
+                    BuiltinTy::SInt | BuiltinTy::SIntCap => {
+                        let w = width.unwrap_or(32);
+                        writeln!(
+                            self.out,
+                            "{INDENT}t->{} = {};",
+                            f.name.name,
+                            emit_random_signed_expr(w)
+                        )
+                        .ok();
+                    }
+                    BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => {
+                        writeln!(
+                            self.out,
+                            "{INDENT}t->{} = harc_rt::random::harc_rng_range(harc_rng_next, 0, 1);",
+                            f.name.name
+                        )
+                        .ok();
+                    }
+                    BuiltinTy::Int => {
+                        writeln!(
+                            self.out,
+                            "{INDENT}t->{} = harc_rt::random::harc_rng_range(harc_rng_next, 0, 0x7FFFFFFF);",
+                            f.name.name
+                        )
+                        .ok();
+                    }
+                    _ => {
+                        writeln!(
+                            self.out,
+                            "{INDENT}// {} : <unsupported type for v0 randomize>",
+                            f.name.name
+                        )
+                        .ok();
+                    }
+                }
+            }
+            TypeExpr::Named { name, .. } => {
+                let last = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+                if let Some(&n) = self.enums.get(last) {
+                    let hi = if n == 0 { 0 } else { (n - 1) as i64 };
+                    writeln!(
+                        self.out,
+                        "{INDENT}t->{} = harc_rt::random::harc_rng_range(harc_rng_next, 0, {});",
+                        f.name.name, hi
+                    )
+                    .ok();
+                } else if self.is_record_type(last) {
+                    writeln!(
+                        self.out,
+                        "{INDENT}randomize_{last}(&t->{}, harc_rng);",
+                        f.name.name
+                    )
+                    .ok();
+                } else {
+                    writeln!(
+                        self.out,
+                        "{INDENT}// {} : {} (named, not yet supported)",
+                        f.name.name, last
+                    )
+                    .ok();
+                }
+            }
+        }
+    }
+
+    pub(super) fn emit_rng_dist_entries(&mut self, entries: &[DistEntry]) {
+        for (i, e) in entries.iter().enumerate() {
+            if i > 0 {
+                write!(self.out, ", ").ok();
+            }
+            // Each dist entry: (lo, hi, weight). The `value` expression is
+            // either a RangeLit (use lo/hi) or a scalar (use as both lo/hi).
+            match &*e.value.kind {
+                ExprKind::RangeLit {
+                    lo: Some(lo),
+                    hi: Some(hi),
+                } => {
+                    write!(self.out, "{{(int64_t)(").ok();
+                    self.emit_expr(lo);
+                    write!(self.out, "), (int64_t)(").ok();
+                    self.emit_expr(hi);
+                    write!(self.out, "), (int64_t)(").ok();
+                    self.emit_expr(&e.weight);
+                    write!(self.out, ")}}").ok();
+                }
+                _ => {
+                    write!(self.out, "{{(int64_t)(").ok();
+                    self.emit_expr(&e.value);
+                    write!(self.out, "), (int64_t)(").ok();
+                    self.emit_expr(&e.value);
+                    write!(self.out, "), (int64_t)(").ok();
+                    self.emit_expr(&e.weight);
+                    write!(self.out, ")}}").ok();
+                }
+            }
+        }
     }
 
     pub(super) fn emit_record_randomize_fn(&mut self, name: &str, fields: &[Field]) {
