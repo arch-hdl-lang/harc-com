@@ -8,6 +8,17 @@ import json
 from pathlib import Path
 
 
+METRIC_FIELDS = ("task_id", "repeat", "condition", "model", "effort", "repo_sha",
+                 "repo_diff_sha256", "tasks_sha256", "input_tokens", "cached_input_tokens",
+                 "output_tokens", "success", "protocol_ok", "exit_code", "index_seconds",
+                 "latency_s")
+
+
+def public_metrics(records: list[dict]) -> str:
+    return "".join(json.dumps({key: row[key] for key in METRIC_FIELDS if key in row},
+                              sort_keys=True) + "\n" for row in records)
+
+
 def report(records: list[dict], tasks: dict, max_token_regression: float = 0.20) -> tuple[str, bool]:
     expected = {(task["id"], repeat, condition)
                 for task in tasks["tasks"]
@@ -71,12 +82,15 @@ def main() -> None:
     parser.add_argument("records", type=Path)
     parser.add_argument("--tasks", type=Path, default=Path(__file__).resolve().parents[1] / "docs/codegraph_user_sim_tasks.json")
     parser.add_argument("--summary", type=Path)
+    parser.add_argument("--metrics", type=Path, help="Write allowlisted, artifact-safe metrics")
     args = parser.parse_args()
     records = [json.loads(line) for line in args.records.read_text().splitlines() if line.strip()]
     summary, passed = report(records, json.loads(args.tasks.read_text()))
     print(summary)
     if args.summary:
         args.summary.write_text(summary)
+    if args.metrics:
+        args.metrics.write_text(public_metrics(records))
     if not passed:
         raise SystemExit(1)
 

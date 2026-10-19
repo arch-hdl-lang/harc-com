@@ -45,6 +45,25 @@ class SimGradeTests(unittest.TestCase):
                 self.assertFalse(details["simulation_passed"])
                 self.assertEqual(len(details["missing_added"]), 1)
 
+    def test_accepts_two_single_cycle_assertions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sim.FROZEN = root / "frozen"
+            work = root / "work"
+            sim.FROZEN.mkdir()
+            work.mkdir()
+            original = "test Counter\n"
+            added = "for _ in 0 .. 1 {\n  wait 1 cycle\n  assert dut.count_out == 0\n}\n"
+            (sim.FROZEN / "case.harc").write_text(original)
+            (work / "case.harc").write_text(original + added)
+            task = {"id": "sim04_counter_post_reset_hold", "expected_files": ["case.harc"],
+                    "must_add": {"case.harc": ["wait 2 cycles", "assert dut.count_out == 0"]}}
+            rubric = {"checks": [{"passed": True, "output": "ALL TESTS PASSED"}]}
+            with patch.object(sim.common, "grade", return_value=(True, rubric)):
+                passed, details = sim.grade(task, "", work, {"case.harc": original}, root / "harc", root)
+                self.assertTrue(passed)
+                self.assertEqual(details["missing_added"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

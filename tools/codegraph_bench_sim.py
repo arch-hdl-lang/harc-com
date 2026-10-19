@@ -25,7 +25,15 @@ def grade(task: dict, answer: str, work: Path, before: dict[str, str | None], ha
         old = (before[relative] or "").splitlines()
         new = (work / relative).read_text().splitlines()
         added = "\n".join(line[1:] for line in difflib.ndiff(old, new) if line.startswith("+ "))
-        missing_added.extend(f"{relative}: {marker}" for marker in markers if marker not in added)
+        for marker in markers:
+            if marker in added:
+                continue
+            equivalent_hold = (task.get("id") == "sim04_counter_post_reset_hold"
+                               and marker == "wait 2 cycles"
+                               and all(part in added for part in
+                                       ("for _ in 0 .. 1", "wait 1 cycle", "assert dut.count_out == 0")))
+            if not equivalent_hold:
+                missing_added.append(f"{relative}: {marker}")
 
     baseline_sources = {
         path.relative_to(FROZEN): hashlib.sha256(path.read_bytes()).digest()
@@ -70,7 +78,7 @@ def main() -> None:
     if not harc.exists():
         shutil.copy2(repo / "target/debug/harc", harc)
     global FROZEN
-    FROZEN, metadata = common.freeze(repo, tasks_path, output, harc)
+    FROZEN, metadata = common.freeze(repo, tasks_path, output, harc, hide_benchmark_material=True)
     records_path = output / "records.jsonl"
     done = {(row["task_id"], row["repeat"], row["condition"]) for row in
             (json.loads(line) for line in records_path.read_text().splitlines())} if records_path.exists() else set()

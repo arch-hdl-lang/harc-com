@@ -26,8 +26,8 @@ jobs:
         id: cache-verilator
         uses: actions/cache@v6
         with:
-          path: /opt/verilator
-          key: verilator-v5.034-ubuntu-${{ runner.os }}
+          path: ${{ runner.temp }}/verilator
+          key: verilator-v5.034-ubuntu-${{ runner.os }}-user
 
       - name: Build Verilator on cache miss
         if: steps.cache-verilator.outputs.cache-hit != 'true'
@@ -35,12 +35,12 @@ jobs:
           git clone --branch v5.034 --depth 1 https://github.com/verilator/verilator.git /tmp/verilator-src
           cd /tmp/verilator-src
           autoconf
-          ./configure --prefix=/opt/verilator
+          ./configure --prefix="$RUNNER_TEMP/verilator"
           make -j"$(nproc)"
-          sudo make install
+          make install
 
       - name: Add Verilator to PATH
-        run: echo "/opt/verilator/bin" >> "$GITHUB_PATH"
+        run: echo "$RUNNER_TEMP/verilator/bin" >> "$GITHUB_PATH"
 
       - uses: actions/setup-node@v4
         with:
@@ -71,7 +71,7 @@ jobs:
         if: success()
         run: |
           status=0
-          python3 tools/codegraph_bench_ci_report.py "$RUNNER_TEMP/codegraph-benchmark/records.jsonl" --summary "$RUNNER_TEMP/codegraph-benchmark/summary.md" || status=$?
+          python3 tools/codegraph_bench_ci_report.py "$RUNNER_TEMP/codegraph-benchmark/records.jsonl" --summary "$RUNNER_TEMP/codegraph-benchmark/summary.md" --metrics "$RUNNER_TEMP/codegraph-benchmark/metrics.jsonl" || status=$?
           cat "$RUNNER_TEMP/codegraph-benchmark/summary.md" >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
 
@@ -81,7 +81,7 @@ jobs:
         with:
           name: codegraph-benchmark
           path: |
-            ${{ runner.temp }}/codegraph-benchmark/records.jsonl
+            ${{ runner.temp }}/codegraph-benchmark/metrics.jsonl
             ${{ runner.temp }}/codegraph-benchmark/freeze.json
             ${{ runner.temp }}/codegraph-benchmark/summary.md
           if-no-files-found: ignore
