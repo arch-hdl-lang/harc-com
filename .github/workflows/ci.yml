@@ -97,6 +97,9 @@ jobs:
           ./target/release/harc graph dev-index --out .harcdevgraph
           ./target/release/harc graph dev-query 'transactor lowering' --index .harcdevgraph | grep -q lower_transactor
 
+      - name: Graph benchmark retrieval regression
+        run: python3 tools/codegraph_ci_retrieval.py --harc ./target/release/harc
+
       - name: harc check every fixture
         run: |
           set -euo pipefail
