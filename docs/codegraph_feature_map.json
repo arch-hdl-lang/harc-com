@@ -24,7 +24,7 @@
         {"role": "parser", "path": "src/parser.rs", "symbol": "parse_transaction"},
         {"role": "lowerer", "path": "src/ir/lower/records.rs", "symbol": "lower_transaction"},
         {"role": "ir", "path": "src/ir/mod.rs", "symbol": "RecordSchema"},
-        {"role": "backend", "path": "src/codegen/cpp_tb.rs", "symbol": "emit_transaction"},
+        {"role": "backend", "path": "src/codegen/native/record_renderer.rs", "symbol": "emit_transaction"},
         {"role": "fixture", "path": "tests/fixtures/transaction_basic_test.harc"}
       ]
     },
@@ -36,7 +36,7 @@
         {"role": "lowerer", "path": "src/ir/lower/transactors.rs", "symbol": "lower_transactor"},
         {"role": "semantic_check", "path": "src/ir/verify.rs", "symbol": "check_transactor_call"},
         {"role": "ir", "path": "src/ir/mod.rs", "symbol": "TransactorSchema"},
-        {"role": "backend", "path": "src/codegen/cpp_tb.rs", "symbol": "synth_component_from_transactor"},
+        {"role": "backend", "path": "src/codegen/native.rs", "symbol": "synth_component_from_transactor"},
         {"role": "fixture", "path": "tests/fixtures/transactor_active_test.harc"}
       ]
     },
@@ -59,7 +59,7 @@
         {"role": "lowerer", "path": "src/ir/lower/covergroups.rs", "symbol": "lower_covergroup"},
         {"role": "semantic_check", "path": "src/ir/verify.rs", "symbol": "check_cover_schema"},
         {"role": "ir", "path": "src/ir/mod.rs", "symbol": "CovgroupSchema"},
-        {"role": "backend", "path": "src/codegen/cpp_tb.rs", "symbol": "emit_covergroup_struct"},
+        {"role": "backend", "path": "src/codegen/native.rs", "symbol": "emit_covergroup_struct"},
         {"role": "fixture", "path": "tests/fixtures/covergroup_hook_trigger_test.harc"}
       ]
     },
@@ -88,7 +88,7 @@
       "name": "randomize",
       "links": [
         {"role": "lowerer", "path": "src/ir/lower/stmts.rs", "symbol": "lower_randomize"},
-        {"role": "backend", "path": "src/codegen/cpp_tb.rs", "symbol": "emit_randomize_for_site"},
+        {"role": "backend", "path": "src/codegen/native/randomize_renderer.rs", "symbol": "emit_randomize_for_site"},
         {"role": "fixture", "path": "tests/fixtures/transaction_basic_test.harc"}
       ]
     },

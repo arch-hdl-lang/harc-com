@@ -30,7 +30,6 @@ fn main() -> std::io::Result<()> {
     );
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=Cargo.lock");
-    println!("cargo:rerun-if-changed=build.rs");
     let mut paths = Vec::new();
     source_paths(Path::new("src"), &mut paths)?;
     paths.sort();
