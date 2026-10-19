@@ -1,0 +1,87 @@
+name: HARC graph simulation benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      RUSTFLAGS: -D warnings
+      HARC_CXX: clang++
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install simulation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libz3-dev clang ccache git make autoconf flex bison g++ help2man perl python3 numactl perl-doc libfl2 libfl-dev zlib1g zlib1g-dev
+
+      - name: Cache Verilator
+        id: cache-verilator
+        uses: actions/cache@v6
+        with:
+          path: /opt/verilator
+          key: verilator-v5.034-ubuntu-${{ runner.os }}
+
+      - name: Build Verilator on cache miss
+        if: steps.cache-verilator.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch v5.034 --depth 1 https://github.com/verilator/verilator.git /tmp/verilator-src
+          cd /tmp/verilator-src
+          autoconf
+          ./configure --prefix=/opt/verilator
+          make -j"$(nproc)"
+          sudo make install
+
+      - name: Add Verilator to PATH
+        run: echo "/opt/verilator/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install pinned Codex CLI
+        run: npm install -g @openai/codex@0.159.2
+
+      - name: Build HARC
+        run: cargo build --bin harc
+
+      - name: Check harness and graph retrieval
+        run: |
+          python3 -m unittest discover -s tools -p 'test_codegraph_bench*.py'
+          python3 tools/codegraph_ci_retrieval.py --harc ./target/debug/harc
+
+      - name: Run frozen paired simulation benchmark
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo '::error::Add a dedicated OPENAI_API_KEY repository secret to run the benchmark.'
+            exit 1
+          fi
+          python3 tools/codegraph_bench_sim.py --output "$RUNNER_TEMP/codegraph-benchmark"
+
+      - name: Report regression
+        if: success()
+        run: |
+          status=0
+          python3 tools/codegraph_bench_ci_report.py "$RUNNER_TEMP/codegraph-benchmark/records.jsonl" --summary "$RUNNER_TEMP/codegraph-benchmark/summary.md" || status=$?
+          cat "$RUNNER_TEMP/codegraph-benchmark/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Preserve benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codegraph-benchmark
+          path: |
+            ${{ runner.temp }}/codegraph-benchmark/records.jsonl
+            ${{ runner.temp }}/codegraph-benchmark/freeze.json
+            ${{ runner.temp }}/codegraph-benchmark/summary.md
+          if-no-files-found: ignore
