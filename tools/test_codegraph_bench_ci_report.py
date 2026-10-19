@@ -1,6 +1,6 @@
 import unittest
 
-from codegraph_bench_ci_report import report
+from codegraph_bench_ci_report import public_metrics, report
 
 
 TASKS = {"repeats": 1, "tasks": [{"id": "one"}]}
@@ -40,6 +40,14 @@ class ReportTests(unittest.TestCase):
         summary, passed = report([row("baseline"), graph], TASKS)
         self.assertFalse(passed)
         self.assertIn("0/1", summary)
+
+    def test_public_metrics_drops_agent_text(self):
+        baseline = row("baseline")
+        baseline["answer"] = "OPENAI_API_KEY=secret"
+        baseline["rubric"] = {"patch": "secret"}
+        output = public_metrics([baseline])
+        self.assertNotIn("secret", output)
+        self.assertIn('"input_tokens": 100', output)
         graph = row("graph")
         graph["repo_sha"] = "other"
         with self.assertRaises(ValueError):

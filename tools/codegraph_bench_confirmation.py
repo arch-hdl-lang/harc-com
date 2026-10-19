@@ -29,11 +29,14 @@ def snapshot_hash(root: Path) -> str:
     return digest.hexdigest()
 
 
-def freeze(repo: Path, tasks_path: Path, output: Path, harc: Path) -> tuple[Path, dict]:
+def freeze(repo: Path, tasks_path: Path, output: Path, harc: Path,
+           hide_benchmark_material: bool = False) -> tuple[Path, dict]:
     frozen = output / "frozen_source"
     metadata_path = output / "freeze.json"
     if metadata_path.exists():
         metadata = json.loads(metadata_path.read_text())
+        if metadata.get("hidden_benchmark_material", False) != hide_benchmark_material:
+            raise ValueError("benchmark source visibility changed after freeze")
         if metadata["tasks_sha256"] != hashlib.sha256(tasks_path.read_bytes()).hexdigest():
             raise ValueError("task manifest changed after freeze")
         if metadata["source_sha256"] != snapshot_hash(frozen):
@@ -42,12 +45,19 @@ def freeze(repo: Path, tasks_path: Path, output: Path, harc: Path) -> tuple[Path
     if frozen.exists():
         raise ValueError("frozen source exists without freeze metadata")
     shutil.copytree(repo, frozen, ignore=shutil.ignore_patterns(*EXCLUDES))
+    if hide_benchmark_material:
+        for directory in (frozen / "docs", frozen / "tools"):
+            for pattern in ("codegraph_*", "test_codegraph_*"):
+                for path in directory.glob(pattern):
+                    if path.is_file():
+                        path.unlink()
     metadata = {
         "repo_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
         "source_sha256": snapshot_hash(frozen),
         "tasks_sha256": hashlib.sha256(tasks_path.read_bytes()).hexdigest(),
         "codex_version": subprocess.check_output(["codex", "--version"], text=True).strip(),
         "harc_version": subprocess.check_output([str(harc), "--version"], text=True).strip(),
+        "hidden_benchmark_material": hide_benchmark_material,
     }
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
     return frozen, metadata
