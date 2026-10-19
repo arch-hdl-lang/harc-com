@@ -45,7 +45,6 @@ pub use crate::codegen::dut_interface::{
     CosimOpts, CosimPort, CosimProbe,
 };
 pub use crate::codegen::probe_catalog::dut_probes;
-use crate::codegen::dut_interface::eval_const_i64;
 #[cfg(test)]
 use crate::codegen::dut_interface::{
     collect_port_overrides_from_src, collect_port_widths_from_src, scan_sv_module_lane_widths,
@@ -61,13 +60,18 @@ use crate::codegen::randomize::{
 use crate::codegen::lifecycle_transform::{
     desugar_impl_for_test_in_file, desugar_impl_for_test_sharing_lifecycle,
 };
+use crate::codegen::render_support::{
+    bus_param_env, bus_param_env_with_port_override, c_ident, c_type_for,
+    collision_free_generated_ident, component_unique_registry_name, cpp_param_names,
+    cpp_sint_for_width, cpp_uint_for_width, emit_extern_fn_decls, gate_passes,
+    int_width_from_args, tseq_inner_type, txn_field_c_type,
+};
 use crate::codegen::source_transform::{
     and_join, collect_record_keeps, collect_temporal_occurrences, const_usize_expr,
     expr_source_str, fixed_vec_type_args, is_concurrent_assertion, is_list_type,
-    list_elem_random_kind, list_elem_type, list_type_args, native_container_kind,
-    prefix_record_keep_expr, process_interp, property_label, record_type_name, scalar_leaf_kind,
-    string_value_literal_cpp, txn_direct_fields, type_arg_const_usize, verilated_handle_name,
-    InterpCap, NativeContainerKind, ScalarLeafKind,
+    list_elem_random_kind, list_elem_type, list_type_args, prefix_record_keep_expr, process_interp,
+    property_label, record_type_name, string_value_literal_cpp, txn_direct_fields,
+    type_arg_const_usize, InterpCap, ScalarLeafKind,
 };
 pub use crate::codegen::runtime_support::{
     common_runtime_abi_fingerprint, COSIM_RT_HEADER, LOG_RT_HEADER, QUEUE_RT_HEADER,
@@ -1753,32 +1757,6 @@ fn global_enum_variant_cpp_name(name: &str) -> String {
     )
 }
 
-pub(crate) fn component_unique_registry_name<'a>(
-    field_names: impl IntoIterator<Item = &'a str>,
-) -> String {
-    let occupied = field_names
-        .into_iter()
-        .map(c_ident)
-        .collect::<std::collections::HashSet<_>>();
-    collision_free_generated_ident("_harc_unique", &occupied)
-}
-
-fn collision_free_generated_ident(
-    preferred: &str,
-    occupied: &std::collections::HashSet<String>,
-) -> String {
-    if !occupied.contains(preferred) {
-        return preferred.to_string();
-    }
-    for suffix in 1u32.. {
-        let candidate = format!("{preferred}_{suffix}");
-        if !occupied.contains(&candidate) {
-            return candidate;
-        }
-    }
-    unreachable!("generated identifier suffix space exhausted")
-}
-
 #[derive(Debug, Clone, Copy)]
 struct StableSourceIdentity {
     tag: u64,
@@ -3190,102 +3168,6 @@ fn type_simple_name(t: Option<&TypeExpr>) -> Option<&str> {
     }
 }
 
-/// Compute a bus's effective const-param environment at a bind site.
-///
-/// Starts from the bus declaration's param defaults (`BusDecl::params`) and
-/// applies any named generic overrides from the bind-site type expression
-/// (`BusAxi4#(READ=0, WRITE=1)` → {READ:0, WRITE:1}). This is the env the
-/// `generate_if` gate is evaluated against, so HARC's notion of which gated
-/// signals are present matches `arch build`'s flatten exactly.
-///
-/// Only const-foldable params land in the env (literals / arithmetic over
-/// other params). A param whose value can't be folded is omitted; a gate
-/// referencing it then fails to evaluate and the signal is conservatively
-/// treated as PRESENT (see `gate_passes`) — never silently dropped.
-fn bus_param_env(
-    bus: &BusDecl,
-    bind_ty: Option<&TypeExpr>,
-) -> std::collections::HashMap<String, i64> {
-    let mut env: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    // Defaults first, in declaration order (later params may reference earlier
-    // ones, e.g. `STRB_W = DATA_W/8`).
-    for p in &bus.params {
-        if let Some(d) = &p.default {
-            if let Some(v) = eval_const_i64(d, &env) {
-                env.insert(p.name.name.clone(), v);
-            }
-        }
-    }
-    // Bind-site named overrides win over defaults.
-    if let Some(TypeExpr::Named { generics, .. }) = bind_ty {
-        for g in generics {
-            if let TypeArg::Named { name, value } = g {
-                if let Some(v) = eval_const_i64(value, &env) {
-                    env.insert(name.name.clone(), v);
-                }
-            }
-        }
-    }
-    env
-}
-
-/// Like `bus_param_env`, but additionally layers a DUT-port-level override
-/// (`port s: target BusRw<WRITE=0>` in the DUT's `.arch`/`.archi`) onto the env.
-///
-/// Precedence, lowest to highest:
-///   1. bus param defaults,
-///   2. HARC-TB bind-site generic (`let s : BusRw<...> = bind dut`, the `...`),
-///   3. DUT-port override (the port's own `<...>`).
-///
-/// The DUT port's override is authoritative because it reflects which
-/// `generate_if`-gated channels `arch build` *actually* flattened into the SV
-/// port set for that port. In the realistic case the DUT carries the override
-/// and the harc TB does not restate it, so (2) is empty and (3) is the only
-/// non-default layer; when both name the same param, (3) wins so harc agrees
-/// with `arch build` rather than with a stale TB restatement. Overrides that
-/// can't be folded are simply not inserted, leaving the gate conservatively
-/// PRESENT (same fallback as `gate_passes`).
-pub(crate) fn bus_param_env_with_port_override(
-    bus: &BusDecl,
-    bind_ty: Option<&TypeExpr>,
-    port_override: Option<&std::collections::HashMap<String, i64>>,
-) -> std::collections::HashMap<String, i64> {
-    let mut env = bus_param_env(bus, bind_ty);
-    if let Some(ov) = port_override {
-        for (k, v) in ov {
-            env.insert(k.clone(), *v);
-        }
-    }
-    env
-}
-
-/// Decide whether a gated bus signal is present under an effective param env.
-///
-/// `None` gate ⇒ ungated ⇒ always present. `Some(cond)` ⇒ present iff `cond`
-/// folds to a non-zero value. If the condition can't be folded (references a
-/// param not in the env, or uses an operator the mini-evaluator doesn't
-/// handle), we return `true` (present) — the same conservative default the
-/// pre-fix behavior had, so we never regress a working corpus design into a
-/// missing-port error. The common ARCH forms (`generate_if READ`,
-/// `generate_if WRITE`, `generate_if READ > 0`) all fold.
-pub(crate) fn gate_passes(
-    gate: Option<&Expr>,
-    env: &std::collections::HashMap<String, i64>,
-) -> bool {
-    match gate {
-        None => true,
-        Some(cond) => match eval_const_i64(cond, env) {
-            Some(v) => v != 0,
-            None => true,
-        },
-    }
-}
-
-/// Minimal const-expression evaluator over an i64 param env. Handles the
-/// literal/identifier/paren/unary/binary forms that appear in bus param
-/// defaults and `generate_if` conditions. Returns `None` for anything it
-/// can't fold (unknown ident, unsupported op, division by zero) so callers
-/// fall back to their conservative default.
 /// Collect every method-name string that appears as the callee of
 /// a `Call { callee: Field { name, .. }, .. }` expression anywhere
 /// inside the given block (recursively). Used by
@@ -4798,18 +4680,6 @@ fn c_solver_int_literal(s: &str) -> String {
     } else {
         format!("(int64_t)({})", c_int_literal(s))
     }
-}
-
-fn c_ident(s: &str) -> String {
-    s.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn randomize_target_field_name(
@@ -23078,55 +22948,6 @@ fn list_field_info(t: &TypeExpr) -> Option<ListFieldInfo> {
     })
 }
 
-/// Pick a C++ representation for a transaction field's HARC type. Conservative
-/// — small ints get widened to `uint64_t`/`int64_t`; bool stays bool; named
-/// types get the bare name (likely an enum which is `int64_t` in v0).
-fn txn_field_c_type(t: &TypeExpr) -> String {
-    match native_container_kind(t) {
-        Some(NativeContainerKind::List(elem)) => {
-            let inner = elem
-                .map(txn_field_c_type)
-                .unwrap_or_else(|| "uint64_t".into());
-            return format!("std::vector<{inner}>");
-        }
-        Some(NativeContainerKind::FixedVec { elem, len }) => {
-            let inner = txn_field_c_type(elem);
-            return format!("std::array<{inner}, {len}>");
-        }
-        None => {}
-    }
-    match t {
-        TypeExpr::Builtin { name, args, .. } => {
-            scalar_leaf_c_type(name, args).unwrap_or_else(|| "uint64_t".into())
-        }
-        // Enums (and other named user types) lower to int64_t. Real type
-        // emission lands when we have a proper type system.
-        TypeExpr::Named { .. } => "int64_t".into(),
-    }
-}
-
-/// The builtin leaves this backend gives a real, width-correct C++ value
-/// type. `txn_field_c_type` is the only caller that turns it into a
-/// member, and everything NOT matched there falls through its `_ =>`
-/// arms to a
-/// bare `uint64_t` / `int64_t` — a member that does not mean what was
-/// written. Splitting the decision out is what lets `record_leaf_fate`
-/// ask the question instead of restating it.
-///
-/// NOT the last word on a member type: `Emitter::record_field_c_type`
-/// wraps `txn_field_c_type` with one more layer (a named type that is a
-/// declared record gets the record's own name), and that is the
-/// function scoreboard and record members actually go through.
-fn scalar_leaf_c_type(name: &BuiltinTy, args: &[TypeArg]) -> Option<String> {
-    match scalar_leaf_kind(name)? {
-        ScalarLeafKind::Unsigned => {
-            Some(cpp_uint_for_width(int_width_from_args(args)))
-        }
-        ScalarLeafKind::Signed => Some(cpp_sint_for_width(int_width_from_args(args))),
-        ScalarLeafKind::Bool => Some("bool".into()),
-    }
-}
-
 /// The per-element random draw `emit_field_random` writes inside a
 /// `list<T>` loop, or `None` when this backend has none for `T` and
 /// writes a bare `t->f[_i] = 0;` instead.
@@ -23325,47 +23146,6 @@ fn rhs_wants_auto(e: &Expr, _tseq_names: &std::collections::HashSet<String>) -> 
     }
 }
 
-/// Extract `T` from `TSeq<T>`. Returns the C++ rendering of the inner
-/// type. The TSeq builtin always carries exactly one type-arg in
-/// well-formed source; if missing or malformed, returns `None` so the
-/// caller can fall back to a sentinel type (the user already wrote
-/// something well-formed in practice — this guards against synth from
-/// degenerate ASTs).
-fn tseq_inner_type(t: &TypeExpr) -> Option<String> {
-    if let TypeExpr::Builtin {
-        name: BuiltinTy::TSeq,
-        args,
-        ..
-    } = t
-    {
-        if let Some(TypeArg::Type(inner)) = args.first() {
-            return Some(c_type_for(inner));
-        }
-        if let Some(TypeArg::Expr(e)) = args.first() {
-            // `TSeq<MyTxn>` parses as Expr(Ident) at the type level — if
-            // the path is a single identifier, treat it as a Named type.
-            if let ExprKind::Ident(id) = &*e.kind {
-                return Some(id.name.clone());
-            }
-        }
-    }
-    None
-}
-
-/// Pull the bit-width literal out of a builtin integer's args list
-/// (`uint<N>`, `bits<N>`, etc.). Returns `None` if the args don't have
-/// a recognizable integer literal — caller falls back to a default
-/// (typically 64).
-fn int_width_from_args(args: &[TypeArg]) -> Option<u32> {
-    args.first().and_then(|a| match a {
-        TypeArg::Expr(e) => match &*e.kind {
-            ExprKind::Int(s) => s.replace('_', "").parse().ok(),
-            _ => None,
-        },
-        _ => None,
-    })
-}
-
 /// Evaluate a HARC expression as a compile-time integer width. Used by
 /// the width-method intrinsics (`.trunc<N>()` / `.zext<N>()` /
 /// `.sext<N>()` / `.resize<N>()`) to extract `N`. Today recognizes only
@@ -23392,195 +23172,6 @@ fn eval_const_width(e: &Expr) -> Option<u32> {
         }
         _ => None,
     }
-}
-
-/// Pick the C++ value-type for a HARC unsigned integer of the given
-/// bit-width:
-///   1..64    → uint64_t       (every narrow case widens; native ops)
-///   65..128  → _harc_u128     (typedef of __uint128_t; mirrors arch-com)
-///   >128     → HarcWide<N>     (one 32-bit word per storage lane)
-fn cpp_uint_for_width(w: Option<u32>) -> String {
-    value_abi_class_cpp(
-        crate::ir::value_abi_class(&crate::ir::IrType::UInt(w))
-            .expect("uint always has a native ABI class"),
-    )
-}
-
-/// Render the neutral value ABI class used by collection compatibility. Scalar
-/// classes use their shared C++ storage spelling; record classes use an opaque
-/// identity token because their generated names require the record table.
-pub(crate) fn ir_vec_elem_class(t: &crate::ir::IrType) -> Option<String> {
-    use crate::ir::IrType;
-    match t {
-        IrType::UInt(w) => Some(cpp_uint_for_width(*w)),
-        IrType::SInt(w) => Some(cpp_sint_for_width(*w)),
-        IrType::Bool => Some("bool".into()),
-        IrType::Record(rid) => Some(format!("record#{}", rid.index())),
-        IrType::FixedVec { elem, len } => {
-            Some(format!("std::array<{}, {len}>", ir_vec_elem_class(elem)?))
-        }
-        _ => None,
-    }
-}
-
-fn cpp_sint_for_width(w: Option<u32>) -> String {
-    value_abi_class_cpp(
-        crate::ir::value_abi_class(&crate::ir::IrType::SInt(w))
-            .expect("sint always has a native ABI class"),
-    )
-}
-
-pub(crate) fn value_abi_class_cpp(class: crate::ir::ValueAbiClass) -> String {
-    match class {
-        crate::ir::ValueAbiClass::Bool => "bool".into(),
-        crate::ir::ValueAbiClass::Unsigned64 => "uint64_t".into(),
-        crate::ir::ValueAbiClass::Signed64 => "int64_t".into(),
-        crate::ir::ValueAbiClass::Wide128 => "_harc_u128".into(),
-        crate::ir::ValueAbiClass::WideWords(words) => {
-            format!("harc_rt::HarcWide<{words}>")
-        }
-        crate::ir::ValueAbiClass::Record(record) => format!("record#{}", record.index()),
-    }
-}
-
-/// Emit the file-scope `extern "C" { … }` forward-declaration block for
-/// every `extern function name(params) -> ret` (spec §9) in `file`, so a
-/// user-supplied `--ref-src <file>.cpp` resolves at link time. Shared by
-/// the v1 (`cpp_tb`) and TB-IR codegens so both produce byte-identical
-/// declarations. Writes nothing when the program declares no extern fns.
-pub(crate) fn emit_extern_fn_decls(out: &mut String, file: &SourceFile) {
-    let extern_fns: Vec<&ExternFnDecl> = file
-        .items
-        .iter()
-        .filter_map(|it| match it {
-            Item::ExternFn(f) => Some(f),
-            _ => None,
-        })
-        .collect();
-    if extern_fns.is_empty() {
-        return;
-    }
-    writeln!(
-        out,
-        "// extern reference functions (spec §9) — implementations"
-    )
-    .ok();
-    writeln!(
-        out,
-        "// supplied via `harc sim --ref-src <file>` and linked into the"
-    )
-    .ok();
-    writeln!(out, "// verilator-built binary.").ok();
-    writeln!(out, "extern \"C\" {{").ok();
-    for f in &extern_fns {
-        let param_names = cpp_param_names(&f.params);
-        let ret = f
-            .return_ty
-            .as_ref()
-            .map(c_type_for)
-            .unwrap_or_else(|| "void".to_string());
-        write!(out, "{INDENT}{ret} {}(", f.name.name).ok();
-        for (i, p) in f.params.iter().enumerate() {
-            if i > 0 {
-                write!(out, ", ").ok();
-            }
-            let pty =
-                p.ty.as_ref()
-                    .map(c_type_for)
-                    .unwrap_or_else(|| "int64_t".to_string());
-            write!(out, "{pty} {}", param_names[i]).ok();
-        }
-        writeln!(out, ");").ok();
-    }
-    writeln!(out, "}}").ok();
-    writeln!(out, "").ok();
-}
-
-fn c_type_for(t: &TypeExpr) -> String {
-    if is_list_type(t) || fixed_vec_type_args(t).is_some() {
-        return txn_field_c_type(t);
-    }
-    match t {
-        TypeExpr::Builtin { name, args, .. } => match name {
-            BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
-                cpp_uint_for_width(int_width_from_args(args))
-            }
-            BuiltinTy::SInt | BuiltinTy::SIntCap => cpp_sint_for_width(int_width_from_args(args)),
-            BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => {
-                ir_vec_elem_class(&crate::ir::IrType::Bool)
-                    .expect("bool always has a native ABI class")
-            }
-            BuiltinTy::String => "const char*".into(),
-            BuiltinTy::Time => "uint64_t".into(),
-            BuiltinTy::TSeq => {
-                // `TSeq<T>` → `const std::vector<T>&` for params (pass-
-                // by-reference avoids copying every transaction across
-                // method calls). Matches the tseq lowering — a tseq
-                // emits a `std::vector<T>` accumulator filled by
-                // `yield`. Outside param context this is also a sane
-                // local-variable type.
-                let inner = tseq_inner_type(t).unwrap_or_else(|| "uint64_t".into());
-                format!("const std::vector<{inner}>&")
-            }
-            BuiltinTy::Queue => {
-                // `queue<T>` as a function param — pass by reference to
-                // avoid copying the runtime queue. Mirrors the field-type
-                // lowering.
-                let inner = args
-                    .first()
-                    .map(|a| match a {
-                        TypeArg::Type(ty) => txn_field_c_type(ty),
-                        TypeArg::Expr(e) => match &*e.kind {
-                            ExprKind::Ident(id) => id.name.clone(),
-                            _ => "uint64_t".into(),
-                        },
-                        _ => "uint64_t".into(),
-                    })
-                    .unwrap_or_else(|| "uint64_t".into());
-                format!("harc_rt::HarcQueue<{inner}>&")
-            }
-            // Aggregates / verification-only types fall back to the spelling
-            // — caller will get a compile error pointing at the gap.
-            _ => format!("/* TODO: type {:?} */ uint64_t", name),
-        },
-        TypeExpr::Named { .. } => {
-            // User-defined module types lower to Verilator pointers (`VFoo*`).
-            // Matches the `let dut : AxiLiteRegs` → `VAxiLiteRegs* dut` rule
-            // already used for the test-level DUT decl.
-            //
-            // Routed THROUGH `verilated_handle_name` rather than repeating
-            // its body: TB-IR lowering refuses an `extern function` whose
-            // signature renders this way, and a second copy of the rule is
-            // exactly how the `list`/`Vec` guard above came to be missed
-            // once already. One of these two callers being wrong is now
-            // impossible rather than merely unlikely.
-            //
-            // Inlining the callee here is an EQUIVALENT mutant — same
-            // behaviour, so no test can see it — and that is the point.
-            // What this line buys is not a behaviour but the absence of
-            // a place for the two to disagree later; a mutation score
-            // cannot measure that, and citing one here would be citing
-            // the wrong evidence.
-            let last = verilated_handle_name(t).unwrap_or("");
-            format!("V{last}*")
-        }
-    }
-}
-
-fn cpp_param_names(params: &[Param]) -> Vec<String> {
-    let mut discard_idx = 0usize;
-    params
-        .iter()
-        .map(|p| {
-            if p.name.name == "_" {
-                let name = format!("_discard{discard_idx}");
-                discard_idx += 1;
-                name
-            } else {
-                p.name.name.clone()
-            }
-        })
-        .collect()
 }
 
 /// Whether an expression reads a name that more than one `let` declares.
