@@ -5,7 +5,7 @@ use crate::codegen::emission::{EmitError, EmitOpts};
 use crate::codegen::lifecycle_transform::{
     desugar_impl_for_test_in_file, desugar_impl_for_test_sharing_lifecycle,
 };
-use crate::codegen::native::NativeRandomizeEmitter;
+use crate::codegen::native::randomize_renderer::NativeRandomizeEmitter;
 use crate::codegen::render_support::int_width_from_args;
 use crate::codegen::source_transform::normalize_vec_record_elem_fields;
 
