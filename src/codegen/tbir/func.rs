@@ -838,7 +838,7 @@ pub(super) fn lifecycle_shareable_kind(func: &TbFunction) -> Option<LifecycleEmi
             // `Randomize` draws from the file-scope `harc_rng` global — an
             // out-of-line body COULD emit it — but sharing a randomize-bearing
             // lifecycle would only be RNG-order-correct because `ShareScan`
-            // (`src/codegen/cpp_tb::desugar_impl_for_test_sharing_lifecycle`)
+            // (`src/codegen/lifecycle_transform::desugar_impl_for_test_sharing_lifecycle`)
             // rejects randomize-bearing testbenches upstream, so no
             // `TestbenchLifecycle` is ever minted for one. That invariant is
             // not enforced HERE, so return `None` defensively: if a future

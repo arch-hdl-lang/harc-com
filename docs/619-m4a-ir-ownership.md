@@ -14,13 +14,13 @@ here (that is M4b). The gate is the existing v1↔tbir equivalence harness.
 1. `lower_program` (`src/ir/lower/mod.rs:930`) captures `tb_of_test` (which
    testbench each impl-for test binds) **before** desugaring clears
    `for_testbench` (`:933`).
-2. It then calls v1's desugaring:
-   `let file = crate::codegen::cpp_tb::desugar_impl_for_test_in_file(file)`
+2. It then calls the shared lifecycle desugaring:
+   `let file = crate::codegen::lifecycle_transform::desugar_impl_for_test_in_file(file)`
    (`:945`). For every `impl … for Tb` test, `desugar_impl_for_test_in_file`
-   (`src/codegen/cpp_tb.rs:23811`) **copies** the bound testbench's
+   (`src/codegen/lifecycle_transform.rs`) **copies** the bound testbench's
    `setup`/`check`/`teardown` lifecycle bodies into a synthetic `sim` ScopeDecl
    on that test, and rewrites bare field refs to `_tb.<field>`
-   (`cpp_tb.rs:23934`+). After this pass, a testbench's lifecycle body exists as
+   (`lifecycle_transform.rs`). After this pass, a testbench's lifecycle body exists as
    N independent copies — one per bound test — and the copies are
    indistinguishable from test-owned statements.
 3. Downstream lowering builds `FunctionKind::Run`/`Check` per test from the
