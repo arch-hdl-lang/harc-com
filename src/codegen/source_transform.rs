@@ -119,6 +119,133 @@ pub(crate) fn txn_direct_fields(items: &[TxnBodyItem]) -> Vec<Field> {
         .collect()
 }
 
+pub(crate) fn txn_all_fields(items: &[TxnBodyItem]) -> Vec<Field> {
+    fn collect(items: &[TxnBodyItem], out: &mut Vec<Field>) {
+        for item in items {
+            match item {
+                TxnBodyItem::Field(field) => out.push(field.clone()),
+                TxnBodyItem::When(when) => collect(&when.items, out),
+                TxnBodyItem::Keep(_) => {}
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    collect(items, &mut out);
+    out
+}
+
+/// Normalize `Vec<Record, N>` element type arguments on record field
+/// declarations. The parser represents a bare named element as an expression,
+/// while downstream record-layout and randomization code expects a type.
+pub(crate) fn normalize_vec_record_elem_fields(
+    file: &SourceFile,
+) -> std::borrow::Cow<'_, SourceFile> {
+    let record_names: std::collections::HashSet<&str> = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Struct(record) => Some(record.name.name.as_str()),
+            Item::Transaction(record) => Some(record.name.name.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    fn vec_record_elem(ty: &TypeExpr, record_names: &std::collections::HashSet<&str>) -> bool {
+        let TypeExpr::Builtin {
+            name: BuiltinTy::Vec,
+            args,
+            ..
+        } = ty
+        else {
+            return false;
+        };
+        let Some(TypeArg::Expr(expr)) = args.first() else {
+            return false;
+        };
+        let ExprKind::Ident(ident) = &*expr.kind else {
+            return false;
+        };
+        record_names.contains(ident.name.as_str())
+    }
+
+    fn normalize_ty(ty: &mut TypeExpr, record_names: &std::collections::HashSet<&str>) {
+        if !vec_record_elem(ty, record_names) {
+            return;
+        }
+        let TypeExpr::Builtin {
+            name: BuiltinTy::Vec,
+            args,
+            ..
+        } = ty
+        else {
+            return;
+        };
+        let Some(first) = args.first_mut() else {
+            return;
+        };
+        let TypeArg::Expr(expr) = first else { return };
+        let ExprKind::Ident(ident) = &*expr.kind else {
+            return;
+        };
+        *first = TypeArg::Type(TypeExpr::Named {
+            name: Path {
+                segments: vec![ident.clone()],
+                span: expr.span,
+            },
+            generics: Vec::new(),
+            mode: None,
+            span: expr.span,
+        });
+    }
+
+    let needs_rewrite = file.items.iter().any(|item| match item {
+        Item::Struct(record) => {
+            record
+                .fields
+                .iter()
+                .any(|field| vec_record_elem(&field.ty, &record_names))
+                || record.body.iter().any(|body_item| match body_item {
+                    TxnBodyItem::Field(field) => vec_record_elem(&field.ty, &record_names),
+                    _ => false,
+                })
+        }
+        Item::Transaction(record) => record.body.iter().any(|body_item| match body_item {
+            TxnBodyItem::Field(field) => vec_record_elem(&field.ty, &record_names),
+            _ => false,
+        }),
+        _ => false,
+    });
+    if !needs_rewrite {
+        return std::borrow::Cow::Borrowed(file);
+    }
+
+    let mut normalized = file.clone();
+    for item in &mut normalized.items {
+        match item {
+            Item::Struct(record) => {
+                for field in &mut record.fields {
+                    normalize_ty(&mut field.ty, &record_names);
+                }
+                for body_item in &mut record.body {
+                    if let TxnBodyItem::Field(field) = body_item {
+                        normalize_ty(&mut field.ty, &record_names);
+                    }
+                }
+            }
+            Item::Transaction(record) => {
+                for body_item in &mut record.body {
+                    if let TxnBodyItem::Field(field) = body_item {
+                        normalize_ty(&mut field.ty, &record_names);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    std::borrow::Cow::Owned(normalized)
+}
+
 fn collect_txn_keeps(items: &[TxnBodyItem]) -> Vec<Expr> {
     let mut out = Vec::new();
     collect_txn_keeps_with_guard(items, None, &mut out);

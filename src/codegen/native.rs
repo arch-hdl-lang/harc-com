@@ -39,45 +39,48 @@
 use crate::ast::*;
 use crate::codegen::common_artifacts::{self, CommonArtifactPlan};
 pub use crate::codegen::dut_interface::{
-    add_arch_scalar_bit_lanes, cosim_ports_from_sv, dut_interface_catalog,
-    dut_bus_port_overrides_from_files, dut_interface_catalog_with_parameter_overrides,
+    add_arch_scalar_bit_lanes, cosim_ports_from_sv, dut_bus_port_overrides_from_files,
+    dut_interface_catalog, dut_interface_catalog_with_parameter_overrides,
     dut_port_widths_from_files, dut_port_widths_from_sv, dut_type_name, vec_lane_widths_from_sv,
     CosimOpts, CosimPort, CosimProbe,
 };
-pub use crate::codegen::probe_catalog::dut_probes;
 #[cfg(test)]
 use crate::codegen::dut_interface::{
     collect_port_overrides_from_src, collect_port_widths_from_src, scan_sv_module_lane_widths,
     scan_sv_module_ports,
 };
 pub use crate::codegen::emission::{EmitError, EmitOpts, GeneratedCppFile, SplitCppOutput};
-pub use crate::codegen::randomize::uses_constraint_solver;
-use crate::codegen::randomize::{
-    PerRunCell, TbirRandomizeEmissionPlan, TbirRandomizeSiteState, TBIR_RANDOMIZE_CONTEXT_SENTINEL,
-    TBIR_RANDOMIZE_SEQUENCER_SCOPE_SENTINEL, TBIR_RANDOMIZE_STATE_SENTINEL,
-    TBIR_RANDOMIZE_TARGET_SENTINEL, TBIR_RANDOMIZE_TSEQ_SCOPE_SENTINEL,
+use crate::codegen::lifecycle_transform::desugar_impl_for_test_in_file;
+#[cfg(test)]
+use crate::codegen::lifecycle_transform::desugar_impl_for_test_sharing_lifecycle;
+pub use crate::codegen::probe_catalog::dut_probes;
+pub use crate::codegen::randomize::{
+    emit_randomize_snippets, emit_record_randomize_helpers, uses_constraint_solver,
 };
-use crate::codegen::lifecycle_transform::{
-    desugar_impl_for_test_in_file, desugar_impl_for_test_sharing_lifecycle,
+use crate::codegen::randomize::{
+    PerRunCell, TBIR_RANDOMIZE_CONTEXT_SENTINEL, TBIR_RANDOMIZE_SEQUENCER_SCOPE_SENTINEL,
+    TBIR_RANDOMIZE_STATE_SENTINEL, TBIR_RANDOMIZE_TARGET_SENTINEL,
+    TBIR_RANDOMIZE_TSEQ_SCOPE_SENTINEL,
 };
 use crate::codegen::render_support::{
     bus_param_env, bus_param_env_with_port_override, c_ident, c_type_for,
     collision_free_generated_ident, component_unique_registry_name, cpp_param_names,
-    cpp_sint_for_width, cpp_uint_for_width, emit_extern_fn_decls, gate_passes,
-    int_width_from_args, tseq_inner_type, txn_field_c_type,
+    cpp_sint_for_width, cpp_uint_for_width, emit_extern_fn_decls, gate_passes, int_width_from_args,
+    tseq_inner_type, txn_field_c_type,
 };
-use crate::codegen::source_transform::{
-    and_join, collect_record_keeps, collect_temporal_occurrences, const_usize_expr,
-    expr_source_str, fixed_vec_type_args, is_concurrent_assertion, is_list_type,
-    list_elem_random_kind, list_elem_type, list_type_args, prefix_record_keep_expr, process_interp,
-    property_label, record_type_name, string_value_literal_cpp, txn_direct_fields,
-    type_arg_const_usize, InterpCap, ScalarLeafKind,
-};
+use crate::codegen::runtime_support::complete_common_abi_inputs;
 pub use crate::codegen::runtime_support::{
     common_runtime_abi_fingerprint, COSIM_RT_HEADER, LOG_RT_HEADER, QUEUE_RT_HEADER,
     RANDOM_RT_HEADER, RUNTIME_HEADERS, THREAD_RT_HEADER, TRACE_RT_HEADER, Z3_RT_HEADER,
 };
-use crate::codegen::runtime_support::complete_common_abi_inputs;
+use crate::codegen::source_transform::{
+    and_join, collect_record_keeps, collect_temporal_occurrences, const_usize_expr,
+    expr_source_str, fixed_vec_type_args, is_concurrent_assertion, is_list_type,
+    list_elem_random_kind, list_elem_type, list_type_args, normalize_vec_record_elem_fields,
+    prefix_record_keep_expr, process_interp, property_label, record_type_name,
+    string_value_literal_cpp, txn_all_fields, txn_direct_fields, type_arg_const_usize, InterpCap,
+    ScalarLeafKind,
+};
 use crate::lexer::Span;
 use std::fmt::Write;
 
@@ -92,7 +95,6 @@ use std::fmt::Write;
 use crate::ast::{expr_node_count, RELATION_EXPANSION_BUDGET, RELATION_EXPANSION_MAX_DEPTH};
 
 const INDENT: &str = "    ";
-
 
 /// Which artifact an [`Emitter`] is currently producing. The legacy
 /// self-contained layout keeps byte-identical output; the common-object
@@ -1586,137 +1588,6 @@ fn validate_split_tests_share_dut(
 /// touches no other Emitter state. (Listing every field explicitly is
 /// deliberate: a future field addition fails to compile here, forcing a
 /// reviewer to decide whether the randomize path needs it.)
-/// Normalize `Vec<Entry, N>` element type-args on struct/transaction
-/// FIELD declarations (harc#522). The parser's type-arg heuristic parses
-/// a bare NAMED element as `TypeArg::Expr(Ident)` (only builtin heads
-/// parse as `TypeArg::Type`), a shape `fixed_vec_type_args` — and with it
-/// the member-type, default, packed-width, and pack-helper walks — cannot
-/// see: the field silently fell through to the scalar `uint64_t` mapping
-/// and every real use miscompiled in clang. Rewriting the element to
-/// `TypeArg::Type(TypeExpr::Named)` when the ident names a
-/// struct/transaction in the file routes a record-element `Vec` field
-/// through the SAME emission path as a scalar-element one
-/// (`std::array<Entry, N>` member, `{}` default, per-element
-/// `harc_pack_Entry` packing). Scoped to record field declarations —
-/// every other type position keeps the parser's shape.
-/// Returns the file unchanged (borrowed) when no `Vec<Record, N>` field
-/// needs rewriting, which is the common case.
-///
-/// This used to clone the whole `SourceFile` unconditionally and then
-/// mutate a handful of declarations. On a large suite that is a couple of
-/// GB of AST copied for, usually, no edit at all — and it sits on the
-/// randomize-emitter path, so it ran for every suite with a `randomize`
-/// site.
-fn normalize_vec_record_elem_fields(file: &SourceFile) -> std::borrow::Cow<'_, SourceFile> {
-    let record_names: std::collections::HashSet<&str> = file
-        .items
-        .iter()
-        .filter_map(|it| match it {
-            Item::Struct(s) => Some(s.name.name.as_str()),
-            Item::Transaction(t) => Some(t.name.name.as_str()),
-            _ => None,
-        })
-        .collect();
-    // Single source of truth for "does this type need rewriting". The
-    // pre-pass below and the mutator both go through it, so the borrow
-    // decision cannot drift away from the edit it guards — getting those
-    // two out of step would silently skip the transform rather than fail
-    // a test.
-    fn vec_record_elem(ty: &TypeExpr, record_names: &std::collections::HashSet<&str>) -> bool {
-        let TypeExpr::Builtin {
-            name: BuiltinTy::Vec,
-            args,
-            ..
-        } = ty
-        else {
-            return false;
-        };
-        let Some(TypeArg::Expr(e)) = args.first() else {
-            return false;
-        };
-        let ExprKind::Ident(id) = &*e.kind else {
-            return false;
-        };
-        record_names.contains(id.name.as_str())
-    }
-    fn normalize_ty(ty: &mut TypeExpr, record_names: &std::collections::HashSet<&str>) {
-        if !vec_record_elem(ty, record_names) {
-            return;
-        }
-        let TypeExpr::Builtin {
-            name: BuiltinTy::Vec,
-            args,
-            ..
-        } = ty
-        else {
-            return;
-        };
-        let Some(first) = args.first_mut() else {
-            return;
-        };
-        let TypeArg::Expr(e) = first else { return };
-        let ExprKind::Ident(id) = &*e.kind else {
-            return;
-        };
-        *first = TypeArg::Type(TypeExpr::Named {
-            name: Path {
-                segments: vec![id.clone()],
-                span: e.span,
-            },
-            generics: Vec::new(),
-            mode: None,
-            span: e.span,
-        });
-    }
-    // Read-only pre-pass: does anything actually need rewriting? This
-    // walks record/struct field types only — never statement bodies — so
-    // it is orders of magnitude cheaper than the clone it avoids.
-    let needs_rewrite = file.items.iter().any(|it| match it {
-        Item::Struct(s) => {
-            s.fields
-                .iter()
-                .any(|f| vec_record_elem(&f.ty, &record_names))
-                || s.body.iter().any(|b| match b {
-                    TxnBodyItem::Field(f) => vec_record_elem(&f.ty, &record_names),
-                    _ => false,
-                })
-        }
-        Item::Transaction(t) => t.body.iter().any(|b| match b {
-            TxnBodyItem::Field(f) => vec_record_elem(&f.ty, &record_names),
-            _ => false,
-        }),
-        _ => false,
-    });
-    if !needs_rewrite {
-        return std::borrow::Cow::Borrowed(file);
-    }
-
-    let mut out = file.clone();
-    for it in &mut out.items {
-        match it {
-            Item::Struct(s) => {
-                for f in &mut s.fields {
-                    normalize_ty(&mut f.ty, &record_names);
-                }
-                for b in &mut s.body {
-                    if let TxnBodyItem::Field(f) = b {
-                        normalize_ty(&mut f.ty, &record_names);
-                    }
-                }
-            }
-            Item::Transaction(t) => {
-                for b in &mut t.body {
-                    if let TxnBodyItem::Field(f) = b {
-                        normalize_ty(&mut f.ty, &record_names);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    std::borrow::Cow::Owned(out)
-}
-
 fn stable_identity_hash(domain: &str, parts: &[&[u8]]) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     let mut feed = |bytes: &[u8]| {
@@ -1988,209 +1859,85 @@ fn build_randomize_emitter(file: &SourceFile, opts: &EmitOpts) -> Emitter {
     }
 }
 
-/// Emit the v1 Z3-solve C++ snippet for each TB-IR `ConstraintSite`, in
-/// table order. The returned `Vec` is indexed by `ConstraintRef.0`, so a
-/// `Terminator::Randomize { constraints: ConstraintRef(i), .. }` splices
-/// in `snippets[i]`. Each snippet is emitted at `depth` indentation
-/// levels and is byte-identical to what v1 emits at the same site (the
-/// constraints arrive pre-merged from lowering — transaction keeps ahead
-/// of the `with {...}` body — so this path runs v1's dispatch without
-/// re-doing the merge). `Err` if any site reports an emission error.
-pub fn emit_randomize_snippets(
-    file: &SourceFile,
-    opts: &EmitOpts,
-    sites: &[crate::ir::ConstraintSite],
-    depth: usize,
-) -> Result<Vec<String>, EmitError> {
-    if sites.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut e = build_randomize_emitter(file, opts);
-    let mut out = Vec::with_capacity(sites.len());
-    for site in sites {
-        e.out.clear();
-        e.errors.clear();
-        e.current_source_id = site.source_id;
-        e.emit_randomize_for_site(site, depth);
-        if let Some(err) = e.errors.first() {
-            return Err(EmitError(format!("tbir randomize({}): {err}", site.record)));
-        }
-        out.push(std::mem::take(&mut e.out));
-    }
-    Ok(out)
+/// Narrow bridge to the retiring native emitter for randomization C++ text.
+/// Backend-neutral planning and validation live in `codegen::randomize`; this
+/// type exposes only the legacy rendering operations that have not yet been
+/// rewritten as a dedicated emitter.
+pub(crate) struct NativeRandomizeEmitter {
+    emitter: Emitter,
 }
 
-pub(crate) fn plan_tbir_randomize_emission(
-    file: &SourceFile,
-    opts: &EmitOpts,
-    sites: &[crate::ir::ConstraintSite],
-    depth: usize,
-) -> Result<TbirRandomizeEmissionPlan, EmitError> {
-    let typed_table = crate::solver::problem_table::build_typed_solver_problem_table(file);
-    let mut runtime_table =
-        crate::solver::runtime::RuntimeProblemTable::from_typed_solver_table(&typed_table);
-    if sites.is_empty() {
-        return Ok(TbirRandomizeEmissionPlan {
-            runtime_table,
-            snippets: Vec::new(),
-            site_states: Vec::new(),
-        });
-    }
-
-    // `lower_program` lowers an impl-for source after lifecycle desugaring.
-    // A randomize site copied out of a lifecycle body therefore carries the
-    // transformed source identity/problem id, while public emitters receive
-    // the original merged source. Select the same transformed source whenever
-    // the original solver table cannot account for every lowered site.
-    let required_problem_ids = sites
-        .iter()
-        .filter_map(|site| site.problem_id)
-        .collect::<std::collections::HashSet<_>>();
-    let runtime_has_all_sites = |table: &crate::solver::runtime::RuntimeProblemTable| {
-        required_problem_ids
-            .iter()
-            .all(|id| table.problems.iter().any(|problem| problem.id == *id))
-    };
-    let mut transformed_source = None;
-    if !runtime_has_all_sites(&runtime_table) {
-        let (shared, _) = desugar_impl_for_test_sharing_lifecycle(file);
-        let shared_typed = crate::solver::problem_table::build_typed_solver_problem_table(&shared);
-        let shared_runtime =
-            crate::solver::runtime::RuntimeProblemTable::from_typed_solver_table(&shared_typed);
-        if runtime_has_all_sites(&shared_runtime) {
-            transformed_source = Some(shared);
-            runtime_table = shared_runtime;
-        } else {
-            let inlined = desugar_impl_for_test_in_file(file);
-            let inlined_typed =
-                crate::solver::problem_table::build_typed_solver_problem_table(&inlined);
-            let inlined_runtime =
-                crate::solver::runtime::RuntimeProblemTable::from_typed_solver_table(
-                    &inlined_typed,
-                );
-            if runtime_has_all_sites(&inlined_runtime) {
-                transformed_source = Some(inlined);
-                runtime_table = inlined_runtime;
-            }
+impl NativeRandomizeEmitter {
+    pub(crate) fn new(file: &SourceFile, opts: &EmitOpts) -> Self {
+        Self {
+            emitter: build_randomize_emitter(file, opts),
         }
     }
-    let emission_source = transformed_source.as_deref().unwrap_or(file);
 
-    let mut emitter = build_randomize_emitter(emission_source, opts);
-    emitter.flavor = Flavor::Capsule;
-    emitter.randomize_target_sentinel = Some(TBIR_RANDOMIZE_TARGET_SENTINEL);
-    emitter.randomize_context_sentinel = Some(TBIR_RANDOMIZE_CONTEXT_SENTINEL);
-    emitter.randomize_state_sentinel = Some(TBIR_RANDOMIZE_STATE_SENTINEL);
-    let mut snippets = Vec::with_capacity(sites.len());
-    let mut site_states = Vec::with_capacity(sites.len());
-    for (index, site) in sites.iter().enumerate() {
-        if let Some(problem_id) = site.problem_id {
-            if !runtime_table
-                .problems
-                .iter()
-                .any(|problem| problem.id == problem_id)
-            {
-                return Err(EmitError(format!(
-                    "TB-IR randomize site c{index} references missing runtime problem {problem_id}"
-                )));
-            }
-        }
-        emitter.out.clear();
-        emitter.errors.clear();
-        emitter.current_source_id = site.source_id;
-        let cell_start = emitter.per_run_cells.len();
-        emitter.emit_randomize_for_site(site, depth);
-        if let Some(error) = emitter.errors.first() {
+    pub(crate) fn configure_tbir_capsule(&mut self) {
+        self.emitter.flavor = Flavor::Capsule;
+        self.emitter.randomize_target_sentinel = Some(TBIR_RANDOMIZE_TARGET_SENTINEL);
+        self.emitter.randomize_context_sentinel = Some(TBIR_RANDOMIZE_CONTEXT_SENTINEL);
+        self.emitter.randomize_state_sentinel = Some(TBIR_RANDOMIZE_STATE_SENTINEL);
+    }
+
+    pub(crate) fn emit_site(
+        &mut self,
+        site: &crate::ir::ConstraintSite,
+        depth: usize,
+        rewrite_rng_for_tbir: bool,
+    ) -> Result<(String, Vec<PerRunCell>), EmitError> {
+        self.emitter.out.clear();
+        self.emitter.errors.clear();
+        self.emitter.current_source_id = site.source_id;
+        let cell_start = self.emitter.per_run_cells.len();
+        self.emitter.emit_randomize_for_site(site, depth);
+        if let Some(error) = self.emitter.errors.first() {
             return Err(EmitError(format!(
                 "tbir randomize({}): {error}",
                 site.record
             )));
         }
-        let snippet = std::mem::take(&mut emitter.out).replace(
-            "harc_rng_next()",
-            &format!("{}.rng.next()", TBIR_RANDOMIZE_CONTEXT_SENTINEL),
-        );
-        snippets.push(snippet);
-        site_states.push(TbirRandomizeSiteState {
-            problem_id: site.problem_id,
-            cells: emitter.per_run_cells[cell_start..].to_vec(),
-        });
-    }
-    emitter
-        .per_run_cells
-        .sort_by(|lhs, rhs| lhs.tag.cmp(&rhs.tag));
-    emitter
-        .per_run_cells
-        .dedup_by(|lhs, rhs| lhs.tag == rhs.tag && lhs.ctype == rhs.ctype && lhs.init == rhs.init);
-    for pair in emitter.per_run_cells.windows(2) {
-        if pair[0].tag == pair[1].tag {
-            return Err(EmitError(format!(
-                "TB-IR common randomize cell `{}` has conflicting declarations",
-                pair[0].tag
-            )));
+        let mut snippet = std::mem::take(&mut self.emitter.out);
+        if rewrite_rng_for_tbir {
+            snippet = snippet.replace(
+                "harc_rng_next()",
+                &format!("{}.rng.next()", TBIR_RANDOMIZE_CONTEXT_SENTINEL),
+            );
         }
+        Ok((snippet, self.emitter.per_run_cells[cell_start..].to_vec()))
     }
 
-    Ok(TbirRandomizeEmissionPlan {
-        runtime_table,
-        snippets,
-        site_states,
-    })
-}
+    pub(crate) fn all_cells(&self) -> &[PerRunCell] {
+        &self.emitter.per_run_cells
+    }
 
-/// Emit only the legacy per-record unconstrained-randomize helpers, in the
-/// caller's dependency-safe record order. TBIR uses these for dynamic-list
-/// records when a site has no typed solver problem.
-pub fn emit_record_randomize_helpers(
-    file: &SourceFile,
-    opts: &EmitOpts,
-    records: &[crate::ir::RecordSchema],
-    record_order: &[usize],
-) -> Result<String, EmitError> {
-    if record_order.is_empty() {
-        return Ok(String::new());
+    pub(crate) fn begin_record_helpers(&mut self) {
+        self.emitter.out.clear();
+        self.emitter.errors.clear();
     }
-    let source_prog = crate::ir::lower::lower_program(file)
-        .map_err(|err| EmitError(format!("tbir record randomize helper source check: {err}")))?;
-    if source_prog.records != records {
-        return Err(EmitError(
-            "tbir record randomize helper source/schema mismatch".to_string(),
-        ));
-    }
-    let normalized = normalize_vec_record_elem_fields(file);
-    let normalized = desugar_impl_for_test_in_file(&normalized);
-    let mut e = build_randomize_emitter(&normalized, opts);
-    e.out.clear();
-    e.errors.clear();
-    for &record_index in record_order {
-        let Some(record) = records.get(record_index) else {
-            return Err(EmitError(format!(
-                "tbir randomize helper record index {record_index} does not resolve"
-            )));
-        };
-        let name = &record.name;
-        let Some(item) = normalized.items.iter().find(|item| match item {
-            Item::Struct(s) => s.name.name == *name,
-            Item::Transaction(t) => t.name.name == *name,
-            _ => false,
-        }) else {
-            return Err(EmitError(format!(
-                "tbir randomize helper record `{name}` does not resolve"
-            )));
-        };
+
+    pub(crate) fn emit_record_helper(&mut self, item: &Item) -> Result<(), EmitError> {
         match item {
-            Item::Struct(s) => e.emit_record_randomize_fn(&s.name.name, &s.fields),
-            Item::Transaction(t) => {
-                let fields = txn_all_fields(&t.body);
-                e.emit_record_randomize_fn(&t.name.name, &fields);
+            Item::Struct(record) => self
+                .emitter
+                .emit_record_randomize_fn(&record.name.name, &record.fields),
+            Item::Transaction(record) => {
+                let fields = txn_all_fields(&record.body);
+                self.emitter
+                    .emit_record_randomize_fn(&record.name.name, &fields);
             }
-            _ => unreachable!("record item filtered above"),
+            _ => unreachable!("record helper item must be a struct or transaction"),
         }
+        if let Some(error) = self.emitter.errors.first() {
+            return Err(EmitError(format!("tbir record randomize helper: {error}")));
+        }
+        Ok(())
     }
-    if let Some(err) = e.errors.first() {
-        return Err(EmitError(format!("tbir record randomize helper: {err}")));
+
+    pub(crate) fn finish_record_helpers(self) -> String {
+        self.emitter.out
     }
-    Ok(e.out)
 }
 
 /// Everything `emit_with_opts` derives from the merged source before any
@@ -3751,22 +3498,6 @@ fn txn_field_info_from_field_path(
         non_random: f.non_random,
         attrs: f.attrs.clone(),
         when_guard,
-    }
-}
-
-fn txn_all_fields(items: &[TxnBodyItem]) -> Vec<Field> {
-    let mut out = Vec::new();
-    collect_txn_all_fields(items, &mut out);
-    out
-}
-
-fn collect_txn_all_fields(items: &[TxnBodyItem], out: &mut Vec<Field>) {
-    for item in items {
-        match item {
-            TxnBodyItem::Field(f) => out.push(f.clone()),
-            TxnBodyItem::When(w) => collect_txn_all_fields(&w.items, out),
-            TxnBodyItem::Keep(_) => {}
-        }
     }
 }
 
