@@ -2310,10 +2310,7 @@ fn relabel_point_as_bin(e: LowerError, bin: &str) -> LowerError {
     let from = format!("point `{bin}`");
     let to = format!("bin `{bin}`");
     match e {
-        LowerError::Unsupported { construct, detail } => LowerError::Unsupported {
-            construct: construct.replace(&from, &to),
-            detail,
-        },
+        unsupported @ LowerError::Unsupported { .. } => unsupported,
         LowerError::NotImplemented {
             construct,
             detail,

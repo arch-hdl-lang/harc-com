@@ -133,7 +133,9 @@ HARC compiles the test to C++, links Verilator's compiled DUT, runs the binary, 
 
 ## Compile flow
 
-Solid = ships in v0. Dashed = spec §10 roadmap (same compiler IR, alternate emit target).
+Solid = ships today; TB-IR is the product path and v1 is temporary
+compatibility. Dashed = spec §10 roadmap (same compiler IR, alternate emit
+target).
 
 ```mermaid
 graph LR
@@ -141,7 +143,9 @@ graph LR
     H --> Parse["parse +<br/>extend merge"]
     Parse --> Codegen["codegen<br/>(per-emit target)"]
 
-    Codegen -->|"v0: tbir<br/>(--codegen v1: cpp_tb)"| TB["testbench.cpp"]
+    Codegen -->|"v0 product path: TB-IR"| TB["testbench.cpp"]
+    Codegen -->|"temporary compatibility:<br/>--codegen v1"| V1["legacy cpp_tb emitter"]
+    V1 --> TB
     Codegen -.->|"§10.2 sv-uvm"| SVUVM["SV+UVM TB<br/>(class hierarchy +<br/>uvm_sequence_item + SVA)"]
     Codegen -.->|"§10.3 btor2 / smt2"| Formal["BTOR2 / SMT-LIB2"]
     Codegen -.->|"§10.4 emul"| Emul["synthesizable<br/>RTL checkers"]
@@ -293,7 +297,9 @@ src/
   diagnostics.rs          miette-based error reporting
   learn/                  Local learning store (`harc advise`)
   codegen/
-    cpp_tb.rs             C++ TB emitter (single file; drives both --sv and --dut paths)
+    tbir/                 Product C++ testbench backend (drives both --sv and --dut paths)
+    randomize_renderer.rs TB-IR randomization/constraint renderer
+    cpp_tb.rs             Temporary compatibility facade for the retiring v1 backend
     merge.rs              Multi-file `extend test T` merging
   main.rs                 CLI
 
