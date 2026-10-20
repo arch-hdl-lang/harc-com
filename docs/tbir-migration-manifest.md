@@ -1,6 +1,6 @@
 # TB-IR migration manifest
 
-Snapshot: 2026-10-18, `origin/main` at `d2671320` plus this batch.
+Snapshot: 2026-10-20, `origin/main` at `8e6806ec` plus this batch.
 
 This is the retirement queue, not a count of every defensive diagnostic.
 The source inventory is regenerated with:
@@ -17,6 +17,14 @@ The snapshot has **zero** textual `unsupported(` matches under
 baseline. The compatibility `LowerError::Unsupported` variant remains for
 serialized/differential consumers, but production lowering no longer creates
 it or recommends rerunning the retired v1 backend.
+
+TB-IR randomization is also independent of the legacy native emitter. Phase 6
+is therefore in progress rather than blocked on feature coverage. The
+user-facing v1 route, its parity-test infrastructure, and `codegen/cpp_tb.rs`
+plus `codegen/native/` remain temporarily by explicit retirement choice. CI
+keeps the zero-constructor and zero-retirement-gate invariants across all
+lowering source, including in-source tests, while those compatibility pieces
+are retained.
 
 ## State/helper audit queue
 

@@ -42,6 +42,9 @@ jobs:
       - name: cargo build
         run: cargo build --release --all-targets
 
+      - name: Enforce TB-IR retirement invariants
+        run: cargo test --release --test tbir_retirement_inventory
+
       - name: cargo test
         # HARC_REQUIRE_VERILATOR turns a Verilator-less skip into a hard
         # failure. The prebuilt CI image is what makes these tests
@@ -112,9 +115,10 @@ jobs:
           done
           exit $fail
 
-      - name: v1 vs TB-IR emitted parity
-        # Acceptance + solver-constraint-text parity between the two
-        # emitters, across the whole fixture corpus. Complements
+      - name: "Legacy-v1 compatibility: emitted parity"
+        # Temporary retirement gate while the v1 route and parity tests remain.
+        # Acceptance + solver-constraint-text parity between the two emitters,
+        # across the whole fixture corpus. Complements
         # run_tbir_equiv.sh, which trace-diffs: that needs Verilator, needs
         # both backends to build AND run, and is therefore blind to a
         # one-sided rejection — the shape harc#559 shipped with every job
@@ -230,7 +234,8 @@ jobs:
           HARC_CXX: clang++
         run: ./tests/run_vcd_dump_smoke.sh
 
-      - name: v1-vs-tbir codegen equivalence harness
+      - name: "Legacy-v1 compatibility: semantic equivalence"
+        # Temporary retirement gate while the v1 route and parity tests remain.
         # Every registered fixture (tests/tbir_equiv_fixtures.txt) must
         # produce identical semantic traces under both C++ emitters
         # (`--codegen v1` and `--codegen tbir`). Lives in this job to

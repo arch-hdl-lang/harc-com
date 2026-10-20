@@ -12,11 +12,13 @@ such sites in `src/codegen/tbir`. That raw count is an inventory, not a work
 queue: some sites cover several source shapes, and some diagnostics were
 incorrectly classified as gaps even though v1 rejects the same source.
 
-The refreshed 2026-10-18 inventory is recorded in
-[`tbir-migration-manifest.md`](tbir-migration-manifest.md). After the current
-batch there are 13 executable constructors (14 textual matches including the
-helper definition); the manifest separates positive runtime controls from
-diagnostic and deliberately deferred shapes.
+The completed 2026-10-20 inventory is recorded in
+[`tbir-migration-manifest.md`](tbir-migration-manifest.md). Production lowering
+now contains zero `unsupported(...)` constructors and zero
+`WorksButRetired`/`Unreliable` gates. CI enforces both invariants across the
+entire lowering source tree, including in-source tests. Remaining
+phase-6 work is deletion of the temporarily retained v1 CLI route, parity
+infrastructure, and implementation—not TB-IR gap repair.
 
 ## Source of truth and ordering
 
