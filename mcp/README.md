@@ -75,10 +75,16 @@ allowed so bundled docs and fixtures remain available.
 
 The focused context and developer query tools automatically build missing indexes and
 refresh stale ones. User graph context defaults to the shipped fixtures and DUTs
-when querying this repository; pass `source_paths` for an external workspace.
+when querying this repository; use a workspace-specific `index` together with
+`source_paths` for an external workspace. Do not reuse the repository's default
+index for unrelated sources. `harc_graph_tests_for_dut` requires an existing
+fresh index.
 Developer queries default to this repository's curated feature map. Skip graph
 retrieval when the task already identifies the exact files and no relationship
 discovery is needed.
+For unknown ownership or cross-file relationships, graph-first discovery is the
+recommended default before broad source search; inspect the returned files and
+fall back to ordinary search when results are incomplete.
 Graph indexing and querying honor `HARC_MCP_WORKSPACE_ROOTS` for imported bus
 sources too. Add a sibling ARCH checkout to that variable when its bus
 declarations should appear in MCP graph results.
