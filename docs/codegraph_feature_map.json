@@ -59,7 +59,7 @@
         {"role": "lowerer", "path": "src/ir/lower/covergroups.rs", "symbol": "lower_covergroup"},
         {"role": "semantic_check", "path": "src/ir/verify.rs", "symbol": "check_cover_schema"},
         {"role": "ir", "path": "src/ir/mod.rs", "symbol": "CovgroupSchema"},
-        {"role": "backend", "path": "src/codegen/native.rs", "symbol": "emit_covergroup_struct"},
+        {"role": "backend", "path": "src/codegen/native/covergroup_renderer.rs", "symbol": "emit_covergroup_struct"},
         {"role": "fixture", "path": "tests/fixtures/covergroup_hook_trigger_test.harc"}
       ]
     },
