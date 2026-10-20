@@ -81,14 +81,14 @@ use crate::codegen::lifecycle_transform::desugar_impl_for_test_in_file;
 #[cfg(test)]
 use crate::codegen::lifecycle_transform::desugar_impl_for_test_sharing_lifecycle;
 pub use crate::codegen::probe_catalog::dut_probes;
-pub use crate::codegen::randomize::{
-    emit_randomize_snippets, emit_record_randomize_helpers, uses_constraint_solver,
-};
+pub use crate::codegen::randomize::{emit_record_randomize_helpers, uses_constraint_solver};
+pub use randomize_renderer::emit_randomize_snippets;
 use crate::codegen::randomize::{
     PerRunCell, TBIR_RANDOMIZE_CONTEXT_SENTINEL, TBIR_RANDOMIZE_SEQUENCER_SCOPE_SENTINEL,
-    TBIR_RANDOMIZE_STATE_SENTINEL, TBIR_RANDOMIZE_TARGET_SENTINEL,
     TBIR_RANDOMIZE_TSEQ_SCOPE_SENTINEL,
 };
+#[cfg(test)]
+use crate::codegen::randomize::{TBIR_RANDOMIZE_STATE_SENTINEL, TBIR_RANDOMIZE_TARGET_SENTINEL};
 use crate::codegen::render_support::{
     bus_param_env, bus_param_env_with_port_override, c_ident, c_type_for,
     collision_free_generated_ident, component_unique_registry_name, cpp_param_names,

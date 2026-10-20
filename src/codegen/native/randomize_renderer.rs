@@ -7,6 +7,27 @@
 
 use super::*;
 
+/// Emit legacy solver snippets for the v1 compatibility API.
+pub fn emit_randomize_snippets(
+    file: &SourceFile,
+    opts: &EmitOpts,
+    sites: &[crate::ir::ConstraintSite],
+    depth: usize,
+) -> Result<Vec<String>, EmitError> {
+    if sites.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut emitter = NativeRandomizeEmitter::new(file, opts);
+    sites
+        .iter()
+        .map(|site| {
+            emitter
+                .emit_site(site, depth, false)
+                .map(|(snippet, _)| snippet)
+        })
+        .collect()
+}
+
 /// The per-element random draw `emit_field_random` writes inside a
 /// `list<T>` loop, or `None` when this backend has none for `T` and
 /// writes a bare `t->f[_i] = 0;` instead.
@@ -233,6 +254,7 @@ impl NativeRandomizeEmitter {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn configure_tbir_capsule(&mut self) {
         self.emitter.flavor = Flavor::Capsule;
         self.emitter.randomize_target_sentinel = Some(TBIR_RANDOMIZE_TARGET_SENTINEL);
@@ -267,15 +289,13 @@ impl NativeRandomizeEmitter {
         Ok((snippet, self.emitter.per_run_cells[cell_start..].to_vec()))
     }
 
-    pub(crate) fn all_cells(&self) -> &[PerRunCell] {
-        &self.emitter.per_run_cells
-    }
-
+    #[cfg(test)]
     pub(crate) fn begin_record_helpers(&mut self) {
         self.emitter.out.clear();
         self.emitter.errors.clear();
     }
 
+    #[cfg(test)]
     pub(crate) fn emit_record_helper(&mut self, item: &Item) -> Result<(), EmitError> {
         match item {
             Item::Struct(record) => self
@@ -294,6 +314,7 @@ impl NativeRandomizeEmitter {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn finish_record_helpers(self) -> String {
         self.emitter.out
     }

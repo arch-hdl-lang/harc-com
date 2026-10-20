@@ -930,9 +930,11 @@ constraint-IR seam: `Terminator::Randomize { target, constraints:
 ConstraintRef, succ }` + a `TbProgram::constraint_sites` table the
 `ConstraintRef` indexes. Lowering merges transaction `keep`s ahead of
 the call-site `with {...}` body (spec §4) and records the
-`ConstraintProblemId` handle per site. The tbir backend reuses v1's
-Z3-solve emission verbatim (`cpp_tb::emit_randomize_snippets`) — see
-docs/tbir-mvp.md divergence 14.
+`ConstraintProblemId` handle per site. TBIR now owns the focused
+randomization renderer in `codegen::randomize_renderer`; v1 keeps a
+compatibility-only renderer until that backend is deleted. An exact-output
+parity test pins solver snippets, runtime cells, and record helpers during
+the retirement window — see docs/tbir-mvp.md divergence 14.
 
 Two fixtures registered (both trace-clean v1↔tbir at seed 1):
 
