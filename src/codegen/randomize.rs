@@ -5,11 +5,11 @@ use crate::codegen::emission::{EmitError, EmitOpts};
 use crate::codegen::lifecycle_transform::{
     desugar_impl_for_test_in_file, desugar_impl_for_test_sharing_lifecycle,
 };
-use crate::codegen::native::randomize_renderer::NativeRandomizeEmitter;
+use crate::codegen::randomize_renderer::TbirRandomizeEmitter;
 use crate::codegen::render_support::int_width_from_args;
 use crate::codegen::source_transform::normalize_vec_record_elem_fields;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PerRunCell {
     pub tag: String,
     pub ctype: String,
@@ -33,29 +33,6 @@ pub(crate) struct TbirRandomizeEmissionPlan {
 pub(crate) struct TbirRandomizeSiteState {
     pub problem_id: Option<u64>,
     pub cells: Vec<PerRunCell>,
-}
-
-/// Emit the legacy solver snippet for each lowered TBIR constraint site.
-/// Kept public through `cpp_tb` as a compatibility surface for tests and
-/// downstream callers while the native backend is retired.
-pub fn emit_randomize_snippets(
-    file: &SourceFile,
-    opts: &EmitOpts,
-    sites: &[crate::ir::ConstraintSite],
-    depth: usize,
-) -> Result<Vec<String>, EmitError> {
-    if sites.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut emitter = NativeRandomizeEmitter::new(file, opts);
-    sites
-        .iter()
-        .map(|site| {
-            emitter
-                .emit_site(site, depth, false)
-                .map(|(snippet, _)| snippet)
-        })
-        .collect()
 }
 
 pub(crate) fn plan_tbir_randomize_emission(
@@ -109,8 +86,7 @@ pub(crate) fn plan_tbir_randomize_emission(
     }
     let emission_source = transformed_source.as_deref().unwrap_or(file);
 
-    let mut emitter = NativeRandomizeEmitter::new(emission_source, opts);
-    emitter.configure_tbir_capsule();
+    let mut emitter = TbirRandomizeEmitter::new(emission_source, opts);
     let mut snippets = Vec::with_capacity(sites.len());
     let mut site_states = Vec::with_capacity(sites.len());
     for (index, site) in sites.iter().enumerate() {
@@ -125,7 +101,7 @@ pub(crate) fn plan_tbir_randomize_emission(
                 )));
             }
         }
-        let (snippet, cells) = emitter.emit_site(site, depth, true)?;
+        let (snippet, cells) = emitter.emit_site(site, depth)?;
         snippets.push(snippet);
         site_states.push(TbirRandomizeSiteState {
             problem_id: site.problem_id,
@@ -175,7 +151,7 @@ pub fn emit_record_randomize_helpers(
     }
     let normalized = normalize_vec_record_elem_fields(file);
     let normalized = desugar_impl_for_test_in_file(&normalized);
-    let mut emitter = NativeRandomizeEmitter::new(&normalized, opts);
+    let mut emitter = TbirRandomizeEmitter::new(&normalized, opts);
     emitter.begin_record_helpers();
     for &record_index in record_order {
         let Some(record) = records.get(record_index) else {
@@ -379,7 +355,9 @@ fn txn_field_has_solver_policy(f: &Field, enum_names: &std::collections::HashSet
 
 #[cfg(test)]
 mod tests {
-    use super::uses_constraint_solver;
+    use super::{
+        emit_record_randomize_helpers, plan_tbir_randomize_emission, uses_constraint_solver,
+    };
 
     fn parse(source: &str) -> crate::ast::SourceFile {
         crate::parser::parse_source_named("solver_usage_test.harc", source).unwrap()
@@ -426,5 +404,76 @@ end transactor X
         );
 
         assert!(uses_constraint_solver(&file));
+    }
+
+    #[test]
+    fn tbir_randomize_renderer_matches_the_retiring_native_renderer() {
+        let file = parse(
+            r#"transaction Packet
+    opcode : uint<3> with [range(1, 6)]
+    data : uint<16> with [unique within test]
+    keep data > opcode
+end transaction Packet
+
+test T
+    let dut : Top
+    run
+        let packet : Packet
+        randomize(packet) with packet.data < 100 end randomize
+    end run
+end test T
+"#,
+        );
+        let program = crate::ir::lower::lower_program(&file).expect("lower");
+        let opts = crate::codegen::emission::EmitOpts::default();
+        let plan = plan_tbir_randomize_emission(&file, &opts, &program.constraint_sites, 3)
+            .expect("standalone TBIR renderer");
+
+        let mut legacy =
+            crate::codegen::native::randomize_renderer::NativeRandomizeEmitter::new(&file, &opts);
+        legacy.configure_tbir_capsule();
+        let mut legacy_snippets = Vec::new();
+        let mut legacy_cells = Vec::new();
+        for site in &program.constraint_sites {
+            let (snippet, cells) = legacy.emit_site(site, 3, true).expect("native renderer");
+            legacy_snippets.push(snippet);
+            legacy_cells.push(cells);
+        }
+        assert_eq!(plan.snippets, legacy_snippets);
+        assert_eq!(
+            plan.site_states
+                .iter()
+                .map(|state| state.cells.clone())
+                .collect::<Vec<_>>(),
+            legacy_cells
+        );
+
+        let lowered_records = program.records.clone();
+        let order = (0..lowered_records.len()).collect::<Vec<_>>();
+        let standalone = emit_record_randomize_helpers(&file, &opts, &lowered_records, &order)
+            .expect("standalone record helpers");
+        let normalized = crate::codegen::source_transform::normalize_vec_record_elem_fields(&file);
+        let normalized =
+            crate::codegen::lifecycle_transform::desugar_impl_for_test_in_file(&normalized);
+        let mut legacy = crate::codegen::native::randomize_renderer::NativeRandomizeEmitter::new(
+            &normalized,
+            &opts,
+        );
+        legacy.begin_record_helpers();
+        for record in &lowered_records {
+            let item = normalized
+                .items
+                .iter()
+                .find(|item| match item {
+                    crate::ast::Item::Struct(decl) => decl.name.name == record.name,
+                    crate::ast::Item::Transaction(decl) => decl.name.name == record.name,
+                    _ => false,
+                })
+                .expect("record item");
+            legacy
+                .emit_record_helper(item)
+                .expect("native record helper");
+        }
+        assert_eq!(standalone, legacy.finish_record_helpers());
     }
 }

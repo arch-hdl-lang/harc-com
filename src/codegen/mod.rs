@@ -12,10 +12,11 @@ pub mod merge;
 pub(crate) mod native;
 pub mod probe_catalog;
 pub mod randomize;
+pub(crate) mod randomize_renderer;
 pub(crate) mod render_support;
 pub(crate) mod lifecycle_transform;
-pub(crate) mod source_transform;
 pub mod runtime_support;
+pub(crate) mod source_transform;
 pub mod sv_stub;
 pub mod tbir;
 
