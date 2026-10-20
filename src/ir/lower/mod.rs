@@ -5258,6 +5258,12 @@ fn lower_test(
                 )));
             }
         };
+        if period_ps <= 0 || period_ps % 2 != 0 {
+            return Err(LowerError::Invalid(format!(
+                "clock {} resolves to an invalid period of {period_ps} ps; clock periods must be positive and even so both half-cycles advance simulated time",
+                c.name.name
+            )));
+        }
         clock_specs.push(ClockSpec {
             name: c.name.name.clone(),
             period_ps,

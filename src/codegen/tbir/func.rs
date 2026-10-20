@@ -548,7 +548,7 @@ fn emit_function_with_tseq_calls(
                     .run_context
                     .map(|context| format!("harc_tseq_tick({context})"))
                     .unwrap_or_else(|| "tick()".to_string());
-                writeln!(out, "{pad3}for (int _w = 0; _w < {n}; _w++) {tick};").ok();
+                writeln!(out, "{pad3}for (int64_t _w = 0; _w < {n}; _w++) {tick};").ok();
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::WaitTimePs(ps, b) => {
@@ -2486,17 +2486,20 @@ fn scalar_sink_expr_cpp(
 fn emit_local_qualified_clock_wait(out: &mut String, pad: &str, clock_index: usize, cycles: &str) {
     writeln!(
         out,
-        "{pad}{{ if (_harc_actor_tick_due) {{ _harc_advance_actors(); _harc_actor_tick_due = false; }} long long _target = clocks_[{clock_index}].rising_count + (long long)({cycles}); while (clocks_[{clock_index}].rising_count < _target && !_fatal) {{"
+        "{pad}{{ if (_harc_actor_tick_due) {{ _harc_advance_actors(); _harc_actor_tick_due = false; }} uint64_t _remaining = (uint64_t)({cycles}); while (_remaining > 0 && !_fatal) {{"
     )
     .ok();
-    writeln!(out, "{pad}{INDENT}int _before_cycle = cycle_count;").ok();
+    writeln!(out, "{pad}{INDENT}uint64_t _before_rising = clocks_[{clock_index}].rising_count;").ok();
+    writeln!(out, "{pad}{INDENT}uint64_t _before_cycle = cycle_count;").ok();
     writeln!(
         out,
-        "{pad}{INDENT}long long _next = clocks_[0].next_edge_ps;"
+        "{pad}{INDENT}unsigned __int128 _next = clocks_[0].next_edge_ps;"
     )
     .ok();
     writeln!(out, "{pad}{INDENT}for (auto& _ck : clocks_) if (_ck.next_edge_ps < _next) _next = _ck.next_edge_ps;").ok();
     writeln!(out, "{pad}{INDENT}eval_clocks_until(_next);").ok();
+    writeln!(out, "{pad}{INDENT}uint64_t _advanced = clocks_[{clock_index}].rising_count - _before_rising;").ok();
+    writeln!(out, "{pad}{INDENT}if (_advanced > 0) _remaining = _advanced >= _remaining ? 0 : _remaining - _advanced;").ok();
     writeln!(
         out,
         "{pad}{INDENT}if (cycle_count != _before_cycle) _harc_advance_actors();"
@@ -2814,10 +2817,10 @@ fn emit_cycle_handler(
             writeln!(out, "{pad1}int64_t {tag}_period = (int64_t)({period});").ok();
             writeln!(
                 out,
-                "{pad1}if ({tag}_period > 0 && (int64_t)cycle_count - {last} >= {tag}_period) {{"
+                "{pad1}if ({tag}_period > 0 && cycle_count - {last} >= (uint64_t){tag}_period) {{"
             )
             .ok();
-            writeln!(out, "{pad2}{last} = (int64_t)cycle_count;").ok();
+            writeln!(out, "{pad2}{last} = cycle_count;").ok();
             writeln!(out, "{pad2}{lambda}();").ok();
             writeln!(out, "{pad1}}}").ok();
         }
@@ -5926,11 +5929,11 @@ pub(super) fn emit_method(
                 // only the diagnostic text.
                 let cond = preds_cpp(&cx, preds, *mode)?;
                 let n = bounded_count_expr_cpp(&cx, cycles, i64::MAX as u64)?;
-                writeln!(out, "{pad3}int64_t _wu_budget = (int64_t)({n});").ok();
-                writeln!(out, "{pad3}int64_t _wu_start = (int64_t)cycle_count;").ok();
+                writeln!(out, "{pad3}uint64_t _wu_budget = (uint64_t)({n});").ok();
+                writeln!(out, "{pad3}uint64_t _wu_start = cycle_count;").ok();
                 writeln!(
                     out,
-                    "{pad3}while (!({cond}) && ((int64_t)cycle_count - _wu_start) < _wu_budget) \
+                    "{pad3}while (!({cond}) && (cycle_count - _wu_start) < _wu_budget) \
                      tick();"
                 )
                 .ok();
@@ -7472,11 +7475,11 @@ fn emit_component_fn_lambda(
             } => {
                 let cond = preds_cpp(&cx, preds, *mode)?;
                 let n = bounded_count_expr_cpp(&cx, cycles, i64::MAX as u64)?;
-                writeln!(out, "{pad3}int64_t _wu_budget = (int64_t)({n});").ok();
-                writeln!(out, "{pad3}int64_t _wu_start = (int64_t)cycle_count;").ok();
+                writeln!(out, "{pad3}uint64_t _wu_budget = (uint64_t)({n});").ok();
+                writeln!(out, "{pad3}uint64_t _wu_start = cycle_count;").ok();
                 writeln!(
                     out,
-                    "{pad3}while (!({cond}) && ((int64_t)cycle_count - _wu_start) < _wu_budget) \
+                    "{pad3}while (!({cond}) && (cycle_count - _wu_start) < _wu_budget) \
                      {tick_call};"
                 )
                 .ok();
@@ -8052,8 +8055,8 @@ pub(super) fn emit_active_bound_driver_actor(
 ///
 /// In cooperative mode every coroutine pushes onto the shared `sched`;
 /// under `--mt` each (dispatcher, per-lane, arbiter) slot gets its own
-/// dedicated `ThreadScheduler` + OS worker thread, mirroring v1's
-/// multi-lane split (`cpp_tb.rs:6837-7129`). Trace payloads (incl. the
+/// dedicated `ThreadScheduler`; one actor-phase worker ticks those schedulers
+/// in registration order. Trace payloads (incl. the
 /// routed tag) match v1 byte-for-byte so `harc trace-diff` stays clean.
 #[allow(clippy::too_many_arguments)]
 fn emit_tagged_target_actors(
@@ -8688,7 +8691,12 @@ pub(super) fn emit_test_hook(
                 .ok();
             }
             Terminator::WaitCycles(n, None, b) | Terminator::WaitCyclesSync(n, b) => {
-                let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
+                let limit = if async_cycle {
+                    u32::MAX as u64
+                } else {
+                    i64::MAX as u64
+                };
+                let n = bounded_count_expr_cpp(&cx, n, limit)?;
                 if async_cycle {
                     writeln!(out, "{pad3}co_await harc_rt::wait_cycles(_slot, (uint32_t)({n}));").ok();
                 } else {
@@ -8713,8 +8721,9 @@ pub(super) fn emit_test_hook(
                         .run_context
                         .map(|context| format!("{context}.clocks"))
                         .unwrap_or_else(|| "clocks_".to_string());
-                    writeln!(out, "{pad3}auto _harc_target_edges = {clocks}[{}].rising_count + (uint64_t)({n});", clock.index).ok();
-                    writeln!(out, "{pad3}co_await harc_rt::wait_until(_slot, [&] {{ return {clocks}[{}].rising_count >= _harc_target_edges; }});", clock.index).ok();
+                    writeln!(out, "{pad3}uint64_t _harc_start_edges = (uint64_t){clocks}[{}].rising_count;", clock.index).ok();
+                    writeln!(out, "{pad3}uint64_t _harc_wait_edges = (uint64_t)({n});").ok();
+                    writeln!(out, "{pad3}co_await harc_rt::wait_until(_slot, [&] {{ return (uint64_t){clocks}[{}].rising_count - _harc_start_edges >= _harc_wait_edges; }});", clock.index).ok();
                 } else if render.flow.run_context.is_some() {
                     let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
                     writeln!(

@@ -5710,10 +5710,10 @@ fn render_common_interface_template(plan: &CommonCppPlan) -> Result<String, Emit
     }
     writeln!(out, "struct HarcClockState {{").ok();
     writeln!(out, "{INDENT}const char* name;").ok();
-    writeln!(out, "{INDENT}long long half_period_ps;").ok();
-    writeln!(out, "{INDENT}long long next_edge_ps;").ok();
+    writeln!(out, "{INDENT}unsigned __int128 half_period_ps;").ok();
+    writeln!(out, "{INDENT}unsigned __int128 next_edge_ps;").ok();
     writeln!(out, "{INDENT}int level;").ok();
-    writeln!(out, "{INDENT}long long rising_count;").ok();
+    writeln!(out, "{INDENT}uint64_t rising_count;").ok();
     writeln!(out, "{INDENT}std::function<void(int)> drive;").ok();
     writeln!(out, "}};").ok();
     writeln!(out).ok();
@@ -5724,12 +5724,12 @@ fn render_common_interface_template(plan: &CommonCppPlan) -> Result<String, Emit
     writeln!(out, "{INDENT}HarcTraceC* tfp = nullptr;").ok();
     writeln!(out, "{INDENT}std::string wave_path;").ok();
     writeln!(out, "#endif").ok();
-    writeln!(out, "{INDENT}uint64_t trace_time = 0;").ok();
+    writeln!(out, "{INDENT}unsigned __int128 trace_time = 0;").ok();
     writeln!(out, "{INDENT}int errors = 0;").ok();
     writeln!(out, "{INDENT}bool fatal = false;").ok();
     writeln!(out, "{INDENT}bool run_complete = false;").ok();
-    writeln!(out, "{INDENT}int cycle_count = 0;").ok();
-    writeln!(out, "{INDENT}long long now_ps = 0;").ok();
+    writeln!(out, "{INDENT}uint64_t cycle_count = 0;").ok();
+    writeln!(out, "{INDENT}unsigned __int128 now_ps = 0;").ok();
     writeln!(out, "{INDENT}std::vector<HarcClockState> clocks;").ok();
     writeln!(out, "{INDENT}harc_rt::trace::HarcTraceWriter trace;").ok();
     writeln!(out, "{INDENT}harc_rt::log::HarcLogContext log_ctx;").ok();
@@ -5867,7 +5867,7 @@ fn render_common_interface_template(plan: &CommonCppPlan) -> Result<String, Emit
     }
     writeln!(
         out,
-        "void harc_eval_clocks_until(HarcTestContext& ctx, long long target_ps);"
+        "void harc_eval_clocks_until(HarcTestContext& ctx, unsigned __int128 target_ps);"
     )
     .ok();
     writeln!(
@@ -6328,52 +6328,42 @@ fn render_common_runtime_template(plan: &CommonCppPlan) -> Result<String, EmitEr
     .ok();
     if plan.mt {
         writeln!(out, "{INDENT}std::atomic<bool> worker_shutdown{{false}};").ok();
-        writeln!(out, "{INDENT}std::atomic<size_t> worker_turn{{0}};").ok();
         writeln!(
             out,
             "{INDENT}std::unique_ptr<harc_rt::Barrier> worker_start;"
         )
         .ok();
         writeln!(out, "{INDENT}std::unique_ptr<harc_rt::Barrier> worker_end;").ok();
-        writeln!(out, "{INDENT}std::vector<std::thread> workers;").ok();
+        writeln!(out, "{INDENT}std::thread actor_worker;").ok();
         writeln!(out, "{INDENT}if (!ctx.actor_schedulers.empty()) {{").ok();
-        writeln!(out, "{INDENT}{INDENT}worker_start = std::make_unique<harc_rt::Barrier>((uint32_t)ctx.actor_schedulers.size() + 1);").ok();
-        writeln!(out, "{INDENT}{INDENT}worker_end = std::make_unique<harc_rt::Barrier>((uint32_t)ctx.actor_schedulers.size() + 1);").ok();
-        writeln!(out, "{INDENT}{INDENT}for (size_t worker_index = 0; worker_index < ctx.actor_schedulers.size(); ++worker_index) {{").ok();
         writeln!(
             out,
-            "{INDENT}{INDENT}{INDENT}auto* scheduler = ctx.actor_schedulers[worker_index].get();"
+            "{INDENT}{INDENT}worker_start = std::make_unique<harc_rt::Barrier>(2);"
         )
         .ok();
         writeln!(
             out,
-            "{INDENT}{INDENT}{INDENT}workers.emplace_back([&, scheduler, worker_index]() {{"
+            "{INDENT}{INDENT}worker_end = std::make_unique<harc_rt::Barrier>(2);"
         )
         .ok();
-        writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}while (true) {{").ok();
+        writeln!(out, "{INDENT}{INDENT}actor_worker = std::thread([&]() {{").ok();
+        writeln!(out, "{INDENT}{INDENT}{INDENT}while (true) {{").ok();
+        writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}worker_start->wait();").ok();
         writeln!(
             out,
-            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}worker_start->wait();"
+            "{INDENT}{INDENT}{INDENT}{INDENT}if (worker_shutdown.load(std::memory_order_acquire)) break;"
         )
         .ok();
-        writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}if (worker_shutdown.load(std::memory_order_acquire)) break;").ok();
-        writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}while (worker_turn.load(std::memory_order_acquire) != worker_index) std::this_thread::yield();").ok();
         writeln!(
             out,
-            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}scheduler->tick();"
+            "{INDENT}{INDENT}{INDENT}{INDENT}for (auto& scheduler : ctx.actor_schedulers) scheduler->tick();"
         )
         .ok();
-        writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}worker_turn.fetch_add(1, std::memory_order_release);").ok();
-        writeln!(
-            out,
-            "{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}worker_end->wait();"
-        )
-        .ok();
-        writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}}}").ok();
-        writeln!(out, "{INDENT}{INDENT}{INDENT}}});").ok();
-        writeln!(out, "{INDENT}{INDENT}}}").ok();
+        writeln!(out, "{INDENT}{INDENT}{INDENT}{INDENT}worker_end->wait();").ok();
+        writeln!(out, "{INDENT}{INDENT}{INDENT}}}").ok();
+        writeln!(out, "{INDENT}{INDENT}}});").ok();
         writeln!(out, "{INDENT}}}").ok();
-        writeln!(out, "{INDENT}if (worker_start) ctx.advance_actor_schedulers = [&]() {{ worker_turn.store(0, std::memory_order_release); worker_start->wait(); worker_end->wait(); }};").ok();
+        writeln!(out, "{INDENT}if (worker_start) ctx.advance_actor_schedulers = [&]() {{ worker_start->wait(); worker_end->wait(); }};").ok();
     }
     writeln!(out, "{INDENT}if (ctx.clocks.empty()) {{").ok();
     writeln!(out, "{INDENT}{INDENT}harc_eval_clockless_edge(ctx, 0);").ok();
@@ -6382,12 +6372,12 @@ fn render_common_runtime_template(plan: &CommonCppPlan) -> Result<String, EmitEr
     writeln!(out, "{INDENT}{INDENT}ctx.dut->eval();").ok();
     writeln!(
         out,
-        "{INDENT}{INDENT}ctx.trace.set_timing((uint64_t)ctx.now_ps, \"\", 0);"
+        "{INDENT}{INDENT}ctx.trace.set_timing(ctx.now_ps, \"\", 0);"
     )
     .ok();
     writeln!(
         out,
-        "{INDENT}{INDENT}HARC_RT_DUMP_WAVE_TRACE(ctx.tfp, (uint64_t)ctx.now_ps);"
+        "{INDENT}{INDENT}HARC_RT_DUMP_WAVE_TRACE(ctx.tfp, harc_rt::trace::harc_wave_time(ctx.now_ps));"
     )
     .ok();
     writeln!(out, "{INDENT}}}").ok();
@@ -6412,7 +6402,7 @@ fn render_common_runtime_template(plan: &CommonCppPlan) -> Result<String, EmitEr
     writeln!(out, "{INDENT}{INDENT}{INDENT}if (!ctx._post_eval_services.empty()) harc_trace_clockless_edge(ctx, (uint64_t)ctx.cycle_count);").ok();
     writeln!(out, "{INDENT}{INDENT}{INDENT}ctx.scheduler.tick();").ok();
     if plan.mt {
-        writeln!(out, "{INDENT}{INDENT}{INDENT}if (worker_start && !ctx.run_complete && !ctx.fatal) {{ worker_turn.store(0, std::memory_order_release); worker_start->wait(); worker_end->wait(); }}").ok();
+        writeln!(out, "{INDENT}{INDENT}{INDENT}if (worker_start && !ctx.run_complete && !ctx.fatal) {{ worker_start->wait(); worker_end->wait(); }}").ok();
     }
     writeln!(
         out,
@@ -6428,7 +6418,7 @@ fn render_common_runtime_template(plan: &CommonCppPlan) -> Result<String, EmitEr
     writeln!(out, "{INDENT}{INDENT}}} else {{").ok();
     writeln!(
         out,
-        "{INDENT}{INDENT}{INDENT}long long target = ctx.now_ps + ctx.clocks[0].half_period_ps * 2;"
+        "{INDENT}{INDENT}{INDENT}unsigned __int128 target = ctx.now_ps + ctx.clocks[0].half_period_ps * 2;"
     )
     .ok();
     writeln!(
@@ -6455,11 +6445,7 @@ fn render_common_runtime_template(plan: &CommonCppPlan) -> Result<String, EmitEr
         )
         .ok();
         writeln!(out, "{INDENT}{INDENT}worker_start->wait();").ok();
-        writeln!(
-            out,
-            "{INDENT}{INDENT}for (auto& worker : workers) worker.join();"
-        )
-        .ok();
+        writeln!(out, "{INDENT}{INDENT}actor_worker.join();").ok();
         writeln!(out, "{INDENT}}}").ok();
     }
     super::runtime::automatic_coverage_reports(&mut out, 1, "ctx._auto_cov_reports");
@@ -6524,36 +6510,36 @@ fn emit_common_tseq_tick(out: &mut String, plan: &CommonCppPlan) {
         "static void harc_trace_clockless_edge(HarcTestContext& ctx, uint64_t clock_cycle) {{"
     )
     .ok();
-    writeln!(out, "{INDENT}uint64_t time = ctx.trace_time++;").ok();
+    writeln!(out, "{INDENT}unsigned __int128 time = ctx.trace_time++;").ok();
     writeln!(
         out,
         "{INDENT}ctx.trace.set_timing(time, \"clk\", clock_cycle);"
     )
     .ok();
-    writeln!(out, "{INDENT}ctx.now_ps = (long long)ctx.trace_time;").ok();
-    writeln!(out, "{INDENT}HARC_RT_DUMP_WAVE_TRACE(ctx.tfp, time);").ok();
+    writeln!(out, "{INDENT}ctx.now_ps = (unsigned __int128)ctx.trace_time;").ok();
+    writeln!(out, "{INDENT}HARC_RT_DUMP_WAVE_TRACE(ctx.tfp, harc_rt::trace::harc_wave_time(time));").ok();
     writeln!(out, "}}").ok();
     writeln!(out).ok();
     writeln!(
         out,
-        "void harc_eval_clocks_until(HarcTestContext& ctx, long long target_ps) {{"
+        "void harc_eval_clocks_until(HarcTestContext& ctx, unsigned __int128 target_ps) {{"
     )
     .ok();
     writeln!(out, "{INDENT}if (ctx.clocks.empty()) {{").ok();
     writeln!(out, "{INDENT}{INDENT}if (target_ps <= ctx.now_ps) return;").ok();
     writeln!(out, "{INDENT}{INDENT}ctx.now_ps = target_ps;").ok();
     writeln!(out, "{INDENT}{INDENT}ctx.dut->eval();").ok();
-    writeln!(out, "{INDENT}{INDENT}ctx.trace.set_timing((uint64_t)ctx.now_ps, \"\", (uint64_t)ctx.cycle_count);").ok();
+    writeln!(out, "{INDENT}{INDENT}ctx.trace.set_timing(ctx.now_ps, \"\", (uint64_t)ctx.cycle_count);").ok();
     writeln!(
         out,
-        "{INDENT}{INDENT}HARC_RT_DUMP_WAVE_TRACE(ctx.tfp, (uint64_t)ctx.now_ps);"
+        "{INDENT}{INDENT}HARC_RT_DUMP_WAVE_TRACE(ctx.tfp, harc_rt::trace::harc_wave_time(ctx.now_ps));"
     )
     .ok();
-    writeln!(out, "{INDENT}{INDENT}if (ctx.trace_time <= (uint64_t)ctx.now_ps) ctx.trace_time = (uint64_t)ctx.now_ps + 1;").ok();
+    writeln!(out, "{INDENT}{INDENT}if (ctx.trace_time <= ctx.now_ps) ctx.trace_time = ctx.now_ps + 1;").ok();
     writeln!(out, "{INDENT}{INDENT}return;").ok();
     writeln!(out, "{INDENT}}}").ok();
     writeln!(out, "{INDENT}while (ctx.now_ps < target_ps) {{").ok();
-    writeln!(out, "{INDENT}{INDENT}long long next = target_ps;").ok();
+    writeln!(out, "{INDENT}{INDENT}unsigned __int128 next = target_ps;").ok();
     writeln!(out, "{INDENT}{INDENT}for (auto& clock : ctx.clocks) if (clock.next_edge_ps < next) next = clock.next_edge_ps;").ok();
     writeln!(out, "{INDENT}{INDENT}ctx.now_ps = next;").ok();
     writeln!(out, "{INDENT}{INDENT}bool primary_rising = false;").ok();
@@ -6593,7 +6579,7 @@ fn emit_common_tseq_tick(out: &mut String, plan: &CommonCppPlan) {
     writeln!(out, "{INDENT}{INDENT}ctx.dut->eval();").ok();
     writeln!(
         out,
-        "{INDENT}{INDENT}ctx.trace.set_timing((uint64_t)ctx.now_ps, last_edge_clock, last_edge_cycle);"
+        "{INDENT}{INDENT}ctx.trace.set_timing(ctx.now_ps, last_edge_clock, last_edge_cycle);"
     )
     .ok();
     writeln!(out, "{INDENT}{INDENT}if (primary_rising) {{").ok();
@@ -6601,7 +6587,7 @@ fn emit_common_tseq_tick(out: &mut String, plan: &CommonCppPlan) {
     writeln!(out, "{INDENT}{INDENT}}}").ok();
     writeln!(
         out,
-        "{INDENT}{INDENT}HARC_RT_DUMP_WAVE_TRACE(ctx.tfp, (uint64_t)ctx.now_ps);"
+        "{INDENT}{INDENT}HARC_RT_DUMP_WAVE_TRACE(ctx.tfp, harc_rt::trace::harc_wave_time(ctx.now_ps));"
     )
     .ok();
     writeln!(out, "{INDENT}}}").ok();
@@ -6620,25 +6606,24 @@ fn emit_common_tseq_tick(out: &mut String, plan: &CommonCppPlan) {
         "{INDENT}if (index == ctx.clocks.size()) {{ ctx.errors++; ctx.fatal = true; return; }}"
     )
     .ok();
-    writeln!(
-        out,
-        "{INDENT}long long target = ctx.clocks[index].rising_count + cycles;"
-    )
-    .ok();
+    writeln!(out, "{INDENT}uint64_t remaining = (uint64_t)cycles;").ok();
     writeln!(out, "{INDENT}if (ctx.actor_tick_due) {{ ctx.advance_actor_schedulers(); ctx.actor_tick_due = false; }}").ok();
     writeln!(
         out,
-        "{INDENT}while (ctx.clocks[index].rising_count < target && !ctx.fatal) {{"
+        "{INDENT}while (remaining > 0 && !ctx.fatal) {{"
     )
     .ok();
-    writeln!(out, "{INDENT}{INDENT}int before_cycle = ctx.cycle_count;").ok();
+    writeln!(out, "{INDENT}{INDENT}uint64_t before_rising = ctx.clocks[index].rising_count;").ok();
+    writeln!(out, "{INDENT}{INDENT}uint64_t before_cycle = ctx.cycle_count;").ok();
     writeln!(
         out,
-        "{INDENT}{INDENT}long long next = ctx.clocks[0].next_edge_ps;"
+        "{INDENT}{INDENT}unsigned __int128 next = ctx.clocks[0].next_edge_ps;"
     )
     .ok();
     writeln!(out, "{INDENT}{INDENT}for (auto& clock : ctx.clocks) if (clock.next_edge_ps < next) next = clock.next_edge_ps;").ok();
     writeln!(out, "{INDENT}{INDENT}harc_eval_clocks_until(ctx, next);").ok();
+    writeln!(out, "{INDENT}{INDENT}uint64_t advanced = ctx.clocks[index].rising_count - before_rising;").ok();
+    writeln!(out, "{INDENT}{INDENT}if (advanced > 0) remaining = advanced >= remaining ? 0 : remaining - advanced;").ok();
     writeln!(
         out,
         "{INDENT}{INDENT}if (ctx.cycle_count != before_cycle) ctx.advance_actor_schedulers();"

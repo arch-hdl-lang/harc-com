@@ -2477,6 +2477,78 @@ fn tbir_common_cli_emits_vcd_fst_and_semantic_trace() {
 }
 
 #[test]
+fn named_clock_wait_preserves_semantic_time_above_u64_in_every_layout() {
+    if !verilator_present() {
+        eprintln!(
+            "SKIP named_clock_wait_preserves_semantic_time_above_u64_in_every_layout: \
+             `verilator` not found"
+        );
+        return;
+    }
+
+    let inputs = fresh_dir("wide_clock_time_inputs");
+    let sv = inputs.join("WideClockTimeTop.sv");
+    let tb = inputs.join("wide_clock_time.harc");
+    std::fs::write(&sv, "module WideClockTimeTop(input logic clk);\nendmodule\n")
+        .expect("write wide-clock DUT");
+    std::fs::write(
+        &tb,
+        r#"test WideClockTime
+    let dut : WideClockTimeTop
+    clock clk = 9223372036854775806ps
+    run
+        wait 3 cycles on clk
+        log(info, "WIDE_CLOCK_TIME")
+    end run
+end test WideClockTime
+"#,
+    )
+    .expect("write wide-clock test");
+
+    for layout in ["self", "common"] {
+        let outdir = fresh_dir(&format!("wide_clock_time_{layout}"));
+        let trace = outdir.join("semantic.jsonl");
+        let mut command = Command::new(harc_bin());
+        command
+            .arg("sim")
+            .arg("--sv")
+            .arg(&sv)
+            .arg(&tb)
+            .args(["--top", "WideClockTimeTop", "--codegen", "tbir"]);
+        if layout == "common" {
+            command.args(["--cpp-split", "tests", "--cpp-split-layout", "common"]);
+        }
+        let output = command
+            .args(["--record-trace", trace.to_str().expect("UTF-8 trace path")])
+            .arg("--outdir")
+            .arg(&outdir)
+            .env("HARC_SEED", "1")
+            .output()
+            .expect("run wide-clock simulation");
+        assert!(
+            output.status.success(),
+            "{layout} wide-clock simulation failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let semantic = std::fs::read_to_string(&trace).expect("read wide-clock trace");
+        let log_line = semantic
+            .lines()
+            .find(|line| line.contains("WIDE_CLOCK_TIME"))
+            .expect("wide-clock log event");
+        let time = log_line
+            .split("\"vcd_time\":")
+            .nth(1)
+            .and_then(|tail| tail.split(',').next())
+            .and_then(|value| value.parse::<u128>().ok())
+            .expect("u128 semantic timestamp");
+        assert!(time > u64::MAX as u128, "{layout} trace wrapped: {log_line}");
+        let _ = std::fs::remove_dir_all(outdir);
+    }
+    let _ = std::fs::remove_dir_all(inputs);
+}
+
+#[test]
 fn randomize_target_names_compile_and_run_in_every_layout() {
     if !verilator_present() {
         eprintln!(
@@ -6668,12 +6740,23 @@ fn tbir_common_mt_target_workers_are_selected_run_owned_and_torn_down() {
     );
     let runtime = std::fs::read_to_string(common_out.join("tlm_target_thread_test__runtime.cpp"))
         .expect("read MT common runtime");
+    let interface =
+        std::fs::read_to_string(common_out.join("tlm_target_thread_test__suite_api.hpp"))
+            .expect("read MT common interface");
     let capsule = std::fs::read_to_string(
         common_out.join("tlm_target_thread_test__test_TlmTargetThreadTest.cpp"),
     )
     .expect("read MT target capsule");
     assert!(runtime.contains("worker_shutdown"), "{runtime}");
-    assert!(runtime.contains("worker.join()"), "{runtime}");
+    assert!(runtime.contains("actor_worker.join()"), "{runtime}");
+    assert!(!runtime.contains("worker_turn"), "{runtime}");
+    assert_eq!(runtime.matches("std::thread actor_worker").count(), 1, "{runtime}");
+    assert!(runtime.contains("uint64_t remaining = (uint64_t)cycles;"), "{runtime}");
+    assert!(interface.contains("uint64_t cycle_count = 0;"), "{interface}");
+    assert!(interface.contains("uint64_t rising_count;"), "{interface}");
+    assert!(interface.contains("unsigned __int128 now_ps = 0;"), "{interface}");
+    assert!(interface.contains("unsigned __int128 next_edge_ps;"), "{interface}");
+    assert!(!runtime.contains("rising_count + cycles"), "{runtime}");
     assert!(
         capsule.contains("ctx.actor_schedulers.emplace_back"),
         "{capsule}"

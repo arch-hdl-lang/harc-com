@@ -420,22 +420,22 @@ struct HarcLogContext {
 inline int harc_finish_sim_run(
     HarcLogContext& log,
     harc_rt::trace::HarcTraceWriter& trace,
-    int cycle,
+    uint64_t cycle,
     int errors) {
     log.close_all();
     harc_rt::trace::harc_finish_trace(trace, cycle, errors);
     return harc_report_test_result(errors);
 }
 
-inline void harc_log_stdout_line(int cycle, const char* sev, const char* msg) {
-    std::printf("[cycle:%d %s] ", cycle, sev ? sev : "");
+inline void harc_log_stdout_line(uint64_t cycle, const char* sev, const char* msg) {
+    std::printf("[cycle:%llu %s] ", static_cast<unsigned long long>(cycle), sev ? sev : "");
     std::printf("%s", msg ? msg : "");
     std::printf("\n");
 }
 
-inline void harc_log_file_line(FILE* f, int cycle, const char* sev, const char* msg) {
+inline void harc_log_file_line(FILE* f, uint64_t cycle, const char* sev, const char* msg) {
     if (!f) return;
-    std::fprintf(f, "[cycle:%d %s] ", cycle, sev ? sev : "");
+    std::fprintf(f, "[cycle:%llu %s] ", static_cast<unsigned long long>(cycle), sev ? sev : "");
     std::fprintf(f, "%s", msg ? msg : "");
     std::fprintf(f, "\n");
     std::fflush(f);
@@ -444,7 +444,7 @@ inline void harc_log_file_line(FILE* f, int cycle, const char* sev, const char* 
 inline void harc_log_line(
     FILE* sim_log,
     harc_rt::trace::HarcTraceWriter* trace,
-    int cycle,
+    uint64_t cycle,
     const char* sev,
     const char* msg) {
     harc_log_stdout_line(cycle, sev, msg);
@@ -455,7 +455,7 @@ inline void harc_log_line(
 inline void harc_log_vline(
     FILE* sim_log,
     harc_rt::trace::HarcTraceWriter* trace,
-    int cycle,
+    uint64_t cycle,
     const char* sev,
     const char* fmt,
     va_list ap) {
@@ -467,18 +467,18 @@ inline void harc_log_vline(
     harc_log_line(sim_log, trace, cycle, sev, msg);
 }
 
-inline void harc_log_file_only_line(FILE* f, int cycle, const char* sev, const char* msg) {
+inline void harc_log_file_only_line(FILE* f, uint64_t cycle, const char* sev, const char* msg) {
     harc_log_stdout_line(cycle, sev, msg);
     harc_log_file_line(f, cycle, sev, msg);
 }
 
 inline void harc_log_file_only_vline(
     FILE* f,
-    int cycle,
+    uint64_t cycle,
     const char* sev,
     const char* fmt,
     va_list ap) {
-    std::printf("[cycle:%d %s] ", cycle, sev ? sev : "");
+    std::printf("[cycle:%llu %s] ", static_cast<unsigned long long>(cycle), sev ? sev : "");
     va_list stdout_ap;
     va_copy(stdout_ap, ap);
     std::vprintf(fmt ? fmt : "", stdout_ap);
@@ -486,7 +486,7 @@ inline void harc_log_file_only_vline(
     std::printf("\n");
 
     if (!f) return;
-    std::fprintf(f, "[cycle:%d %s] ", cycle, sev ? sev : "");
+    std::fprintf(f, "[cycle:%llu %s] ", static_cast<unsigned long long>(cycle), sev ? sev : "");
     va_list file_ap;
     va_copy(file_ap, ap);
     std::vfprintf(f, fmt ? fmt : "", file_ap);

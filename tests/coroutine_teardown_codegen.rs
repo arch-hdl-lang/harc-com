@@ -31,7 +31,10 @@ fn verilator_present() -> bool {
 }
 
 fn assert_cleanup_order(cpp: &str, backend: &str) {
-    let joined = cpp.find("for (auto& _w : _workers) _w.join();").unwrap();
+    let joined = cpp
+        .find("_actor_worker.join();")
+        .or_else(|| cpp.find("for (auto& _w : _workers) _w.join();"))
+        .unwrap();
     let reports = cpp
         .find("for (auto& _r : _auto_cov_reports) _r();")
         .unwrap();

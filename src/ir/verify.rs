@@ -1243,6 +1243,16 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
                 });
             }
         }
+        for clock in &t.clocks {
+            if clock.period_ps <= 0 || clock.period_ps % 2 != 0 {
+                errs.push(VerifyError::BadProgramRef {
+                    what: format!(
+                        "test {} clock `{}` has invalid period {} ps; clock periods must be positive and even",
+                        t.name, clock.name, clock.period_ps
+                    ),
+                });
+            }
+        }
         // Cross-IR: every clock-qualified WaitCycles in the test's
         // functions must name a clock the test actually declares
         // (index in range AND name agreement — lowering resolves both

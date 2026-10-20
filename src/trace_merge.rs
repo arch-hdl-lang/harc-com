@@ -8,7 +8,7 @@ struct SemanticEvent {
     typ: String,
     seq: u64,
     cycle: u64,
-    vcd_time: u64,
+    vcd_time: u128,
     clock: String,
     clock_cycle: u64,
     component: String,
@@ -119,7 +119,7 @@ fn parse_trace_events(trace_text: &str) -> Result<Vec<SemanticEvent>> {
         if typ.is_empty() || typ == "meta" {
             continue;
         }
-        let Some(vcd_time) = u64_field(&fields, "vcd_time") else {
+        let Some(vcd_time) = u128_field(&fields, "vcd_time") else {
             continue;
         };
         let cycle = u64_field(&fields, "cycle").unwrap_or(0);
@@ -178,7 +178,7 @@ fn merge_trace_into_vcd(
     };
     let existing_ids = collect_vcd_ids(&lines[..=enddefs_idx]);
     let mut id_gen = VcdIdGen::new(existing_ids);
-    let mut by_time: BTreeMap<u64, Vec<SemanticEvent>> = BTreeMap::new();
+    let mut by_time: BTreeMap<u128, Vec<SemanticEvent>> = BTreeMap::new();
     for event in events {
         by_time
             .entry(event.vcd_time)
@@ -219,7 +219,7 @@ fn merge_trace_into_vcd(
     out.push('\n');
 
     let mut active = false;
-    let pending_times: Vec<u64> = by_time.keys().copied().collect();
+    let pending_times: Vec<u128> = by_time.keys().copied().collect();
     let mut pending_idx = 0;
     for line in &lines[enddefs_idx + 1..] {
         if let Some(time) = parse_vcd_time_line(line.trim()) {
@@ -296,7 +296,7 @@ fn emit_semantic_header(out: &mut String, signal_ids: &[SignalIds], maps: &Strin
             ids.seq
         ));
         out.push_str(&format!(
-            "$var integer 32 {} event{lane}_cycle $end\n",
+            "$var integer 64 {} event{lane}_cycle $end\n",
             ids.cycle
         ));
         out.push_str(&format!(
@@ -360,7 +360,7 @@ fn emit_events_at_time(
             32,
         );
         emit_int(out, &ids.seq, event.seq, 64);
-        emit_int(out, &ids.cycle, event.cycle, 32);
+        emit_int(out, &ids.cycle, event.cycle, 64);
         emit_int(out, &ids.clock_id, maps.clock.id(&event.clock) as u64, 32);
         emit_int(out, &ids.clock_cycle, event.clock_cycle, 64);
         emit_int(
@@ -502,7 +502,7 @@ impl VcdIdGen {
     }
 }
 
-fn parse_vcd_time_line(line: &str) -> Option<u64> {
+fn parse_vcd_time_line(line: &str) -> Option<u128> {
     let rest = line.strip_prefix('#')?;
     rest.parse().ok()
 }
@@ -552,21 +552,29 @@ fn event_label(
 #[derive(Debug, Clone)]
 enum JsonValue {
     String(String),
-    Number(i128),
+    Number(String),
     Raw,
 }
 
 fn string_field(fields: &HashMap<String, JsonValue>, key: &str) -> Option<String> {
     match fields.get(key)? {
         JsonValue::String(s) => Some(s.clone()),
-        JsonValue::Number(n) => Some(n.to_string()),
+        JsonValue::Number(n) => Some(n.clone()),
         JsonValue::Raw => None,
     }
 }
 
 fn u64_field(fields: &HashMap<String, JsonValue>, key: &str) -> Option<u64> {
     match fields.get(key)? {
-        JsonValue::Number(n) => (*n).try_into().ok(),
+        JsonValue::Number(n) => n.parse().ok(),
+        JsonValue::String(s) => s.parse().ok(),
+        JsonValue::Raw => None,
+    }
+}
+
+fn u128_field(fields: &HashMap<String, JsonValue>, key: &str) -> Option<u128> {
+    match fields.get(key)? {
+        JsonValue::Number(n) => n.parse().ok(),
         JsonValue::String(s) => s.parse().ok(),
         JsonValue::Raw => None,
     }
@@ -635,8 +643,10 @@ fn parse_json_number(
         return Ok((JsonValue::Raw, i));
     }
     let s = std::str::from_utf8(&bytes[start..i]).map_err(|e| e.to_string())?;
-    let n = s.parse::<i128>().map_err(|e| e.to_string())?;
-    Ok((JsonValue::Number(n), i))
+    if s == "-" {
+        return Err("expected digits after `-`".into());
+    }
+    Ok((JsonValue::Number(s.to_string()), i))
 }
 
 fn parse_json_string(bytes: &[u8], mut i: usize) -> std::result::Result<(String, usize), String> {
@@ -751,6 +761,52 @@ mod tests {
         assert_eq!(events[0].typ, "tlm_call");
         assert_eq!(events[0].tag, Some(1));
         assert_eq!(events[1].typ, "randomize");
+    }
+
+    #[test]
+    fn merged_cycle_lane_preserves_values_above_u32() {
+        let vcd = "$enddefinitions $end\n#0\n";
+        let events = parse_trace_events(
+            r#"{"type":"log","cycle":4294967296,"seq":1,"vcd_time":0,"severity":"INFO","message":"wide"}"#,
+        )
+        .unwrap();
+        let (merged, _) = merge_trace_into_vcd(vcd, &events).unwrap();
+        assert!(merged.contains("$var integer 64 HARC3 event0_cycle $end"));
+        assert!(
+            merged.contains(
+                "b0000000000000000000000000000000100000000000000000000000000000000 HARC3"
+            ),
+            "{merged}"
+        );
+    }
+
+    #[test]
+    fn merged_timestamps_preserve_values_above_u64() {
+        let vcd = "$enddefinitions $end\n#18446744073709551615\n";
+        let events = parse_trace_events(
+            r#"{"type":"log","cycle":1,"seq":1,"vcd_time":18446744073709551616,"severity":"INFO","message":"wide time"}"#,
+        )
+        .unwrap();
+        assert_eq!(events[0].vcd_time, u64::MAX as u128 + 1);
+        let (merged, _) = merge_trace_into_vcd(vcd, &events).unwrap();
+        assert!(
+            merged.contains("#18446744073709551616\n"),
+            "{merged}"
+        );
+        assert!(
+            merged.contains("#18446744073709551617\n"),
+            "{merged}"
+        );
+    }
+
+
+    #[test]
+    fn trace_parser_accepts_the_full_unsigned_timestamp_range() {
+        let events = parse_trace_events(
+            r#"{"type":"log","cycle":1,"seq":1,"vcd_time":340282366920938463463374607431768211455,"severity":"INFO","message":"max time"}"#,
+        )
+        .unwrap();
+        assert_eq!(events[0].vcd_time, u128::MAX);
     }
 
     #[test]
