@@ -10,10 +10,11 @@ Use this skill to produce HARC verification code and iterate it through the curr
 ## Workflow
 
 1. If HARC MCP tools are available, use them before hand-writing unfamiliar syntax:
-   - Skip graph retrieval when exact target files are already known and no cross-file relationship needs discovery.
-   - For unknown DUT/test relationships, use `harc_graph_tests_for_dut()` or token-bounded `harc_graph_context()` before broad source reads. Filter `node_kinds` and `edge_kinds` when the question is narrow.
-   - For unknown compiler ownership, use `harc_dev_graph_query()` with relevant `roles` to locate AST, parser, lowerer, IR, backend, and fixtures.
-   - Focused MCP queries refresh missing or stale indexes. Fall back to ordinary search when graph results are incomplete or ambiguous.
+   - Default to graph-first discovery when the target file, DUT/test relationship, or compiler owner is unknown; make one focused query before broad search.
+   - For user-code discovery, start with token-bounded `harc_graph_context()`, which builds or refreshes its index. Use `harc_graph_tests_for_dut()` for a named DUT after an index exists. Filter `node_kinds` and `edge_kinds` when the question is narrow.
+   - For compiler ownership, use `harc_dev_graph_query()` with relevant `roles` to locate AST, parser, lowerer, IR, backend, and fixtures.
+   - Skip the graph when exact target files are already known and no cross-file relationship needs discovery.
+   - For an external workspace, pass its own `index` and `source_paths` to `harc_graph_context()` rather than reusing the HARC repository index. Fall back to ordinary search when results are incomplete or ambiguous.
    - Call `harc_feature_status()` before relying on advanced or pre-1.0 features.
    - Call `harc_examples()` to retrieve shipped fixture examples for the requested pattern.
    - Call `get_harc_syntax()` for targeted syntax snippets.
@@ -21,6 +22,7 @@ Use this skill to produce HARC verification code and iterate it through the curr
    - Use `harc_sim_emit_only()` for backend/codegen validation without full simulation.
    - On compiler errors, call `harc_advise()` with the error keywords before attempting a fix.
 2. If `tool_search` is available but HARC MCP tools are not loaded, search for `harc`. If MCP tools are still unavailable, use the CLI workflow below.
+   For unknown ownership, use `harc graph context` or `harc graph dev-query` after building the corresponding missing or stale index; keep output bounded. Run developer graph commands from the HARC compiler checkout or pass `--root <harc-com>` and an explicit `--index`.
 3. Read `references/README.md` first for current status, examples, CLI commands, and shipped features.
 4. Read `references/spec.md` for language syntax and intended semantics. Verify roadmap-looking features through README status, fixtures, parser behavior, or compiler checks.
 5. For simulator options, backend selection, waveforms, semantic traces, coverage, split compilation, or Z3 configuration, read `references/harc-sim-cli.md`.

@@ -3,6 +3,21 @@
 This file provides guidance to Codex and other coding agents when working in
 this repository.
 
+## Graph-First Discovery
+
+When a HARC task requires finding an unknown test, DUT, verification component,
+or compiler owner, start with a focused, token-bounded code-graph query before
+broad repository search. Start user-code discovery with `harc_graph_context`,
+which builds or refreshes its index; use `harc_graph_tests_for_dut` for a
+named DUT after an index exists. Use `harc_dev_graph_query` for compiler
+ownership. The equivalent `harc graph` CLI commands work without MCP after
+building an index. Inspect the identified source files, and use `rg` when
+graph results are empty or ambiguous.
+
+When the task already names the exact files and no relationship discovery is
+needed, read those files directly. Graph use is a discovery default, not a
+prerequisite for `harc check`, `harc sim`, or validation.
+
 ## PR Review Gate
 
 Before creating a pull request, request an independent code-review pass against

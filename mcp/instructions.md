@@ -18,7 +18,9 @@ PREFER FIXTURES OVER PROSE:
 - When a user asks for a pattern, retrieve one or two matching fixtures and adapt the smallest relevant shape.
 
 GRAPH RETRIEVAL:
-- If the task already names the exact file(s) and their ownership is clear, inspect those files directly; a graph call adds overhead. Use graph when ownership is unknown or a cross-file relationship must be discovered.
-- For unknown DUT/test and verification-component relationships, use `harc_graph_tests_for_dut()` or `harc_graph_context()` before broad file reads. For focused context, set `node_kinds`, `edge_kinds`, and a small `token_budget`; pass `source_paths` for an external workspace.
-- For unknown compiler ownership, ask `harc_dev_graph_query()` for the feature path before opening large Rust files. Set `roles` to the needed layers, such as `parser` or `lowerer`.
-- Focused MCP queries build missing indexes and refresh stale ones. If a query is empty or uncertain, fall back to fixture search and source inspection. A curated feature link identifies likely ownership, not a proven runtime call edge.
+- Default to graph-first discovery when the target file or owner is unknown or a cross-file relationship must be found. Make one focused graph call before broad file reads or repository search.
+- For unknown DUT/test and verification-component relationships, start with `harc_graph_context()`, which can build or refresh the index. Use `harc_graph_tests_for_dut()` for a named DUT after an index exists. Keep context bounded with a small `token_budget` and relevant `node_kinds` or `edge_kinds`.
+- For an external workspace, use its own `index` path and `source_paths` in `harc_graph_context()`; do not reuse the HARC repository's default index for different sources.
+- For unknown compiler ownership, use `harc_dev_graph_query()` before opening large Rust files. Set `roles` to the needed layers, such as `parser` or `lowerer`.
+- If the task names the exact file(s) and ownership is clear, inspect those files directly; do not make a graph call merely to satisfy this default.
+- `harc_graph_context()` and `harc_dev_graph_query()` build missing indexes and refresh stale ones; `harc_graph_tests_for_dut()` requires an existing fresh index. If a query is empty or uncertain, fall back to fixture search and source inspection. A curated feature link identifies likely ownership, not a proven runtime call edge.
