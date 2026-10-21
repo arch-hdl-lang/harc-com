@@ -208,13 +208,12 @@ enum Cmd {
         /// `cargo run --bin arch --manifest-path ../arch-com/Cargo.toml`).
         #[arg(long)]
         arch_bin: Option<PathBuf>,
-        /// Run bound-driver/bound-monitor coroutine actors on dedicated
-        /// OS threads with dual-barrier sync (Phase 3a). Default is the
-        /// cooperative single-OS-thread model — typically faster on
-        /// real fixtures because per-cycle barrier overhead exceeds
-        /// per-cycle actor work. Use `--mt` for correctness validation
-        /// of the multi-actor model, or for fixtures with substantial
-        /// per-cycle compute that genuinely benefit from parallelism.
+        /// Run coroutine actors on a dedicated actor-phase OS worker with
+        /// dual-barrier synchronization. Actor schedulers retain deterministic
+        /// registration order because they share queues, trace state, and DUT
+        /// pins; this option validates threaded ownership and teardown rather
+        /// than executing actor bodies concurrently. The cooperative default
+        /// is typically faster because it avoids the per-cycle barriers.
         #[arg(long)]
         mt: bool,
         /// Enable DUT coverage collection. Works on both DUT paths:

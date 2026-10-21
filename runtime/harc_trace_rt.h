@@ -11,6 +11,25 @@
 namespace harc_rt {
 namespace trace {
 
+inline std::string harc_trace_u128(unsigned __int128 value) {
+    char digits[40];
+    char* end = digits + sizeof(digits);
+    char* p = end;
+    do {
+        *--p = static_cast<char>('0' + value % 10);
+        value /= 10;
+    } while (value != 0);
+    return std::string(p, end);
+}
+
+inline uint64_t harc_wave_time(unsigned __int128 value) {
+    // Verilator's waveform ABI is 64-bit. Saturate at its ceiling so a
+    // long-running simulation never sends time backwards; semantic traces
+    // retain the exact 128-bit decimal timestamp for merge and analysis.
+    constexpr unsigned __int128 max = static_cast<unsigned __int128>(UINT64_MAX);
+    return value > max ? UINT64_MAX : static_cast<uint64_t>(value);
+}
+
 inline std::string harc_trace_escape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 8);
@@ -37,7 +56,7 @@ inline std::string harc_trace_escape(const std::string& s) {
 struct HarcTraceWriter {
     FILE* out = nullptr;
     uint64_t seq = 0;
-    uint64_t vcd_time = 0;
+    unsigned __int128 vcd_time = 0;
     uint64_t clock_cycle = 0;
     std::string clock;
     bool enabled = false;
@@ -61,7 +80,7 @@ struct HarcTraceWriter {
 
     uint64_t next_seq() { return seq++; }
 
-    void set_timing(uint64_t new_vcd_time, const char* new_clock, uint64_t new_clock_cycle) {
+    void set_timing(unsigned __int128 new_vcd_time, const char* new_clock, uint64_t new_clock_cycle) {
         vcd_time = new_vcd_time;
         clock = new_clock ? new_clock : "";
         clock_cycle = new_clock_cycle;
@@ -83,15 +102,16 @@ struct HarcTraceWriter {
         meta(seed, std::getenv("HARC_DUT_BACKEND"), top, test);
     }
 
-    void raw(const char* type, int cycle, const std::string& payload) {
+    void raw(const char* type, uint64_t cycle, const std::string& payload) {
         if (!enabled) return;
+        const std::string vcd_time_decimal = harc_trace_u128(vcd_time);
         std::fprintf(
             out,
-            "{\"type\":\"%s\",\"cycle\":%d,\"seq\":%llu,\"vcd_time\":%llu,\"clock\":\"%s\",\"clock_cycle\":%llu%s%s}\n",
+            "{\"type\":\"%s\",\"cycle\":%llu,\"seq\":%llu,\"vcd_time\":%s,\"clock\":\"%s\",\"clock_cycle\":%llu%s%s}\n",
             type,
-            cycle,
+            static_cast<unsigned long long>(cycle),
             static_cast<unsigned long long>(next_seq()),
-            static_cast<unsigned long long>(vcd_time),
+            vcd_time_decimal.c_str(),
             harc_trace_escape(clock).c_str(),
             static_cast<unsigned long long>(clock_cycle),
             payload.empty() ? "" : ",",
@@ -99,20 +119,20 @@ struct HarcTraceWriter {
         std::fflush(out);
     }
 
-    void sim_start(int cycle) {
+    void sim_start(uint64_t cycle) {
         raw("sim_start", cycle, "");
     }
 
-    void sim_end(int cycle, int errors) {
+    void sim_end(uint64_t cycle, int errors) {
         raw("sim_end", cycle, "\"errors\":" + std::to_string(errors));
     }
 
-    void randomize(int cycle, const std::string& fields_payload) {
+    void randomize(uint64_t cycle, const std::string& fields_payload) {
         raw("randomize", cycle, fields_payload);
     }
 
     void tlm_call(
-        int cycle,
+        uint64_t cycle,
         const char* component,
         const char* bus,
         const char* method,
@@ -131,7 +151,7 @@ struct HarcTraceWriter {
         raw("tlm_call", cycle, payload);
     }
 
-    void log(int cycle, const char* sev, const std::string& msg) {
+    void log(uint64_t cycle, const char* sev, const std::string& msg) {
         std::string payload =
             "\"severity\":\"" + harc_trace_escape(sev ? sev : "") +
             "\",\"message\":\"" + harc_trace_escape(msg) + "\"";
@@ -149,13 +169,13 @@ inline void harc_start_trace(
     uint64_t seed,
     const char* top,
     const char* test,
-    int cycle) {
+    uint64_t cycle) {
     trace.open_env();
     trace.meta_env(seed, top, test);
     trace.sim_start(cycle);
 }
 
-inline void harc_finish_trace(HarcTraceWriter& trace, int cycle, int errors) {
+inline void harc_finish_trace(HarcTraceWriter& trace, uint64_t cycle, int errors) {
     trace.sim_end(cycle, errors);
     trace.close();
 }

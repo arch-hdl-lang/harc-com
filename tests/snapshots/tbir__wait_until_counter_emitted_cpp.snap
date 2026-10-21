@@ -68,10 +68,10 @@ struct HarcTestContext {
     HarcTraceC* tfp = nullptr;
     std::string _wave_path;
 #endif
-    uint64_t _trace_time = 0;
+    unsigned __int128 _trace_time = 0;
     int errors = 0;
     bool _fatal = false;
-    int cycle_count = 0;
+    uint64_t cycle_count = 0;
     harc_rt::trace::HarcTraceWriter trace;
     harc_rt::log::HarcLogContext log_ctx;
     harc_rt::random::HarcRng rng;
@@ -109,27 +109,27 @@ int run_WaitUntilCounterTest(int argc, char** argv) {
     harc_rng.seed_from_env();
     harc_rt::trace::harc_start_trace(trace, harc_rng.state, "Top", "WaitUntilCounterTest", cycle_count);
     auto _harc_trace_dump_next = [&](const char* clock, uint64_t clock_cycle) {
-        uint64_t t = _trace_time++;
+        unsigned __int128 t = _trace_time++;
         trace.set_timing(t, clock, clock_cycle);
-        HARC_RT_DUMP_WAVE_TRACE(tfp, t);
+        HARC_RT_DUMP_WAVE_TRACE(tfp, harc_rt::trace::harc_wave_time(t));
     };
-    auto _harc_trace_dump_at = [&](uint64_t t, const char* clock, uint64_t clock_cycle) {
+    auto _harc_trace_dump_at = [&](unsigned __int128 t, const char* clock, uint64_t clock_cycle) {
         trace.set_timing(t, clock, clock_cycle);
-        HARC_RT_DUMP_WAVE_TRACE(tfp, t);
+        HARC_RT_DUMP_WAVE_TRACE(tfp, harc_rt::trace::harc_wave_time(t));
     };
 
     HARC_RT_LOG_WAVE_FILE(log_ctx.sim_log, _wave_path);
 
 
-    long long now_ps = 0;
-    struct ClockState { const char* name; long long half_period_ps; long long next_edge_ps; int level; long long rising_count; };
+    unsigned __int128 now_ps = 0;
+    struct ClockState { const char* name; unsigned __int128 half_period_ps; unsigned __int128 next_edge_ps; int level; uint64_t rising_count; };
     std::vector<ClockState> clocks_;
     clocks_.push_back(ClockState{"clk", 5000, 5000, 0, 0});
     dut->clk = 0;
 
-    auto eval_clocks_until = [&](long long t_ps) {
+    auto eval_clocks_until = [&](unsigned __int128 t_ps) {
         while (now_ps < t_ps) {
-            long long next = t_ps;
+            unsigned __int128 next = t_ps;
             for (auto& c : clocks_) if (c.next_edge_ps < next) next = c.next_edge_ps;
             now_ps = next;
             bool _primary_rising = false;
@@ -154,14 +154,14 @@ int run_WaitUntilCounterTest(int argc, char** argv) {
             // services (and the follow-up eval) have settled DUT-visible
             // state. VCD cannot represent two dumps at the same physical
             // timestamp, so we dump exactly once per `now_ps` (issue #477).
-            trace.set_timing((uint64_t)now_ps, _last_edge_clock, _last_edge_cycle);
+            trace.set_timing(now_ps, _last_edge_clock, _last_edge_cycle);
             if (_primary_rising) { for (auto& _svc : _post_eval_services) _svc(); if (!_post_eval_services.empty()) dut->eval(); }
-            _harc_trace_dump_at((uint64_t)now_ps, _last_edge_clock, _last_edge_cycle);
+            _harc_trace_dump_at(now_ps, _last_edge_clock, _last_edge_cycle);
         }
     };
 
     auto tick = [&]() {
-        long long target = now_ps + clocks_[0].half_period_ps * 2;
+        unsigned __int128 target = now_ps + clocks_[0].half_period_ps * 2;
         eval_clocks_until(target);
         for (auto& _c : _checkers) _c();
     };
@@ -217,7 +217,7 @@ int run_WaitUntilCounterTest(int argc, char** argv) {
                     harc_rt::harc_assign(dut->en, 1);
                     sim_log_line("INFO", "released reset, counting toward 8");
                     __t0 = 100;
-                    int64_t _wu_budget = (int64_t)(__t0);
+                    int64_t _wu_budget = (int64_t)(harc_rt::harc_u64_shift_count((uint64_t)(__t0), 4294967295ULL));
                     bool _wu_satisfied = co_await harc_rt::wait_until_timeout(_slot, [&]{ return (harc_rt::harc_read(dut->count_out) == 8); }, (uint32_t)_wu_budget);
                     if (_wu_satisfied) { __bb = 2; } else { ctx.errors++; __bb = 3; }
                     break;
@@ -229,7 +229,7 @@ int run_WaitUntilCounterTest(int argc, char** argv) {
                     }
                     sim_log_line("INFO", "PASS: count reached 8 (count_out=%lld)", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->count_out)));
                     __t1 = 100;
-                    int64_t _wu_budget = (int64_t)(__t1);
+                    int64_t _wu_budget = (int64_t)(harc_rt::harc_u64_shift_count((uint64_t)(__t1), 4294967295ULL));
                     bool _wu_satisfied = co_await harc_rt::wait_until_timeout(_slot, [&]{ return ((harc_rt::harc_read(dut->count_out) >= 12)) && ((harc_rt::harc_read(dut->en) == 1)); }, (uint32_t)_wu_budget);
                     if (_wu_satisfied) { __bb = 4; } else { ctx.errors++; __bb = 5; }
                     break;
@@ -293,9 +293,9 @@ int run_WaitUntilCounterTest(int argc, char** argv) {
     // settle in Verilog. Each `wait 1 cycle` then maps to exactly
     // one posedge that observes the just-set values.
     dut->eval();
-    _harc_trace_dump_at((uint64_t)now_ps, "", 0);
+    _harc_trace_dump_at(now_ps, "", 0);
     while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {
-        long long _target = now_ps + clocks_[0].half_period_ps * 2;
+        unsigned __int128 _target = now_ps + clocks_[0].half_period_ps * 2;
         eval_clocks_until(_target);
         sched.tick();
         for (auto& _c : _checkers) _c();

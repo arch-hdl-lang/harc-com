@@ -954,8 +954,8 @@ impl FuncBuilder<'_> {
         if matches!(n, Expr::Literal { value: 0, .. }) {
             return Ok(());
         }
-        // A wide cycle count lowers: the emitter narrows it to the
-        // `uint32_t` the terminator takes.
+        // A wide cycle count lowers: the emitter saturates it to the
+        // `uint32_t` limit the terminator takes.
         //
         // This USED to be refused, on the grounds that a wide operand
         // reaches the count through `HarcWide`'s two implicit
@@ -964,10 +964,8 @@ impl FuncBuilder<'_> {
         // and harc#647's `wait sb.wide cycles` runs. Refusing it made
         // TB-IR lower LESS than v1, the wrong direction (harc#662).
         //
-        // The count IS narrowed, so a value past 2^32 cycles does not
-        // mean what it says. That is worth a diagnostic one day, but a
-        // `not_implemented` refusal is not it: `wait 2 cycles` and
-        // `wait n cycles` must not differ in whether they compile.
+        // Counts past the runtime carrier are saturated rather than
+        // modulo-cast: a 2^32-cycle wait must not silently become zero.
         let next = self.new_block();
         // Plain waits inside an inlined helper / testbench-method body
         // take v1's synchronous lambda path (no coroutine yield) — see

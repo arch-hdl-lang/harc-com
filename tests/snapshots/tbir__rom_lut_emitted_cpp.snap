@@ -112,10 +112,10 @@ struct HarcTestContext {
     HarcTraceC* tfp = nullptr;
     std::string _wave_path;
 #endif
-    uint64_t _trace_time = 0;
+    unsigned __int128 _trace_time = 0;
     int errors = 0;
     bool _fatal = false;
-    int cycle_count = 0;
+    uint64_t cycle_count = 0;
     harc_rt::trace::HarcTraceWriter trace;
     harc_rt::log::HarcLogContext log_ctx;
     harc_rt::random::HarcRng rng;
@@ -153,38 +153,38 @@ int run_RomLutTest(int argc, char** argv) {
     harc_rng.seed_from_env();
     harc_rt::trace::harc_start_trace(trace, harc_rng.state, "RomLut", "RomLutTest", cycle_count);
     auto _harc_trace_dump_next = [&](const char* clock, uint64_t clock_cycle) {
-        uint64_t t = _trace_time++;
+        unsigned __int128 t = _trace_time++;
         trace.set_timing(t, clock, clock_cycle);
-        HARC_RT_DUMP_WAVE_TRACE(tfp, t);
+        HARC_RT_DUMP_WAVE_TRACE(tfp, harc_rt::trace::harc_wave_time(t));
     };
-    auto _harc_trace_dump_at = [&](uint64_t t, const char* clock, uint64_t clock_cycle) {
+    auto _harc_trace_dump_at = [&](unsigned __int128 t, const char* clock, uint64_t clock_cycle) {
         trace.set_timing(t, clock, clock_cycle);
-        HARC_RT_DUMP_WAVE_TRACE(tfp, t);
+        HARC_RT_DUMP_WAVE_TRACE(tfp, harc_rt::trace::harc_wave_time(t));
     };
 
     HARC_RT_LOG_WAVE_FILE(log_ctx.sim_log, _wave_path);
 
 
-    long long now_ps = 0;
-    auto eval_clocks_until = [&](long long t_ps) {
+    unsigned __int128 now_ps = 0;
+    auto eval_clocks_until = [&](unsigned __int128 t_ps) {
         if (t_ps <= now_ps) return;
         now_ps = t_ps;
         dut->eval();
-        _harc_trace_dump_at((uint64_t)now_ps, "", (uint64_t)cycle_count);
-        if (_trace_time <= (uint64_t)now_ps) _trace_time = (uint64_t)now_ps + 1;
+        _harc_trace_dump_at(now_ps, "", (uint64_t)cycle_count);
+        if (_trace_time <= now_ps) _trace_time = now_ps + 1;
     };
 
     auto tick = [&]() {
         _harc_eval_negedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)cycle_count);
-        now_ps = (long long)_trace_time;
+        now_ps = (unsigned __int128)_trace_time;
         _harc_eval_posedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)(cycle_count + 1));
-        now_ps = (long long)_trace_time;
+        now_ps = (unsigned __int128)_trace_time;
         cycle_count++;
         for (auto& _svc : _post_eval_services) _svc();
         if (!_post_eval_services.empty()) dut->eval();
-        if (!_post_eval_services.empty()) { _harc_trace_dump_next("clk", (uint64_t)cycle_count); now_ps = (long long)_trace_time; }
+        if (!_post_eval_services.empty()) { _harc_trace_dump_next("clk", (uint64_t)cycle_count); now_ps = (unsigned __int128)_trace_time; }
         for (auto& _c : _checkers) _c();
     };
 
@@ -262,7 +262,7 @@ int run_RomLutTest(int argc, char** argv) {
                     addr = 0;
                     harc_rt::harc_assign(dut->rd_addr, addr);
                     harc_rt::harc_assign(dut->rd_en, 1);
-                    for (int _w = 0; _w < 1; _w++) tick();
+                    for (int64_t _w = 0; _w < 1; _w++) tick();
                     __bb = 3;
                     break;
                 }
@@ -275,7 +275,7 @@ int run_RomLutTest(int argc, char** argv) {
                     addr_2 = 1;
                     harc_rt::harc_assign(dut->rd_addr, addr_2);
                     harc_rt::harc_assign(dut->rd_en, 1);
-                    for (int _w = 0; _w < 1; _w++) tick();
+                    for (int64_t _w = 0; _w < 1; _w++) tick();
                     __bb = 5;
                     break;
                 }
@@ -293,7 +293,7 @@ int run_RomLutTest(int argc, char** argv) {
                     addr_3 = 2;
                     harc_rt::harc_assign(dut->rd_addr, addr_3);
                     harc_rt::harc_assign(dut->rd_en, 1);
-                    for (int _w = 0; _w < 1; _w++) tick();
+                    for (int64_t _w = 0; _w < 1; _w++) tick();
                     __bb = 7;
                     break;
                 }
@@ -311,7 +311,7 @@ int run_RomLutTest(int argc, char** argv) {
                     addr_4 = 3;
                     harc_rt::harc_assign(dut->rd_addr, addr_4);
                     harc_rt::harc_assign(dut->rd_en, 1);
-                    for (int _w = 0; _w < 1; _w++) tick();
+                    for (int64_t _w = 0; _w < 1; _w++) tick();
                     __bb = 9;
                     break;
                 }
@@ -329,7 +329,7 @@ int run_RomLutTest(int argc, char** argv) {
                     addr_5 = 4;
                     harc_rt::harc_assign(dut->rd_addr, addr_5);
                     harc_rt::harc_assign(dut->rd_en, 1);
-                    for (int _w = 0; _w < 1; _w++) tick();
+                    for (int64_t _w = 0; _w < 1; _w++) tick();
                     __bb = 11;
                     break;
                 }
@@ -347,7 +347,7 @@ int run_RomLutTest(int argc, char** argv) {
                     addr_6 = 5;
                     harc_rt::harc_assign(dut->rd_addr, addr_6);
                     harc_rt::harc_assign(dut->rd_en, 1);
-                    for (int _w = 0; _w < 1; _w++) tick();
+                    for (int64_t _w = 0; _w < 1; _w++) tick();
                     __bb = 13;
                     break;
                 }
@@ -365,7 +365,7 @@ int run_RomLutTest(int argc, char** argv) {
                     addr_7 = 6;
                     harc_rt::harc_assign(dut->rd_addr, addr_7);
                     harc_rt::harc_assign(dut->rd_en, 1);
-                    for (int _w = 0; _w < 1; _w++) tick();
+                    for (int64_t _w = 0; _w < 1; _w++) tick();
                     __bb = 15;
                     break;
                 }
@@ -383,7 +383,7 @@ int run_RomLutTest(int argc, char** argv) {
                     addr_8 = 7;
                     harc_rt::harc_assign(dut->rd_addr, addr_8);
                     harc_rt::harc_assign(dut->rd_en, 1);
-                    for (int _w = 0; _w < 1; _w++) tick();
+                    for (int64_t _w = 0; _w < 1; _w++) tick();
                     __bb = 17;
                     break;
                 }
@@ -460,19 +460,19 @@ int run_RomLutTest(int argc, char** argv) {
     // one posedge that observes the just-set values.
     _harc_eval_negedge(dut);
     _harc_trace_dump_next("clk", (uint64_t)cycle_count);
-    now_ps = (long long)_trace_time;
+    now_ps = (unsigned __int128)_trace_time;
     while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {
         _harc_eval_posedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)(cycle_count + 1));
-        now_ps = (long long)_trace_time;
+        now_ps = (unsigned __int128)_trace_time;
         cycle_count++;
         for (auto& _svc : _post_eval_services) _svc();
         if (!_post_eval_services.empty()) dut->eval();
-        if (!_post_eval_services.empty()) { _harc_trace_dump_next("clk", (uint64_t)cycle_count); now_ps = (long long)_trace_time; }
+        if (!_post_eval_services.empty()) { _harc_trace_dump_next("clk", (uint64_t)cycle_count); now_ps = (unsigned __int128)_trace_time; }
         sched.tick();
         _harc_eval_negedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)cycle_count);
-        now_ps = (long long)_trace_time;
+        now_ps = (unsigned __int128)_trace_time;
         for (auto& _c : _checkers) _c();
     }
 

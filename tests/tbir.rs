@@ -124,6 +124,41 @@ fn assert_cpp_typechecks(name: &str, cpp: &str) {
     );
 }
 
+fn assert_cpp_runs(name: &str, cpp: &str) {
+    let dir = std::env::temp_dir().join(format!("harc_tbir_{name}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create C++ run directory");
+    let source = dir.join("probe.cpp");
+    let binary = dir.join("probe");
+    std::fs::write(&source, cpp).expect("write C++ probe");
+    let compile = std::process::Command::new("c++")
+        .args(["-std=gnu++20"])
+        .arg("-I")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime"))
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("spawn C++ compiler");
+    assert!(
+        compile.status.success(),
+        "C++ probe must compile\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let run = std::process::Command::new(&binary)
+        .output()
+        .expect("run C++ probe");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        run.status.success(),
+        "C++ probe must pass (status {})\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
 fn v1_user_symbol(cpp: &str, kind: &str, source_name: &str) -> String {
     let prefix = format!("harc_user_{kind}_{source_name}_");
     cpp.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
@@ -20927,7 +20962,7 @@ fn tbir_emit_helper_mix() {
         "static uint64_t harc_helper_double_it(uint64_t x);",
         "static uint64_t harc_helper_double_it(uint64_t x) {",
         "harc_helper_double_it(__t",
-        "for (int _w = 0; _w < 1; _w++) tick();",
+        "for (int64_t _w = 0; _w < 1; _w++) tick();",
     ] {
         assert!(cpp.contains(marker), "missing marker `{marker}` in:\n{cpp}");
     }
@@ -21059,12 +21094,14 @@ fn tbir_emit_wait_on_clock_inline_loop() {
     let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
     for marker in [
         "{ if (_harc_actor_tick_due) { _harc_advance_actors(); \
-         _harc_actor_tick_due = false; } long long _target = \
-         clocks_[1].rising_count + (long long)(2); while \
-         (clocks_[1].rising_count < _target && !_fatal) {",
-        "long long _next = clocks_[0].next_edge_ps;",
+         _harc_actor_tick_due = false; } uint64_t _remaining = \
+         (uint64_t)(2); while (_remaining > 0 && !_fatal) {",
+        "uint64_t _before_rising = clocks_[1].rising_count;",
+        "unsigned __int128 _next = clocks_[0].next_edge_ps;",
         "for (auto& _ck : clocks_) if (_ck.next_edge_ps < _next) _next = _ck.next_edge_ps;",
         "eval_clocks_until(_next);",
+        "uint64_t _advanced = clocks_[1].rising_count - _before_rising;",
+        "if (_advanced > 0) _remaining = _advanced >= _remaining ? 0 : _remaining - _advanced;",
         "if (cycle_count != _before_cycle) _harc_advance_actors();",
         "} for (auto& _c : _checkers) _c(); }",
     ] {
@@ -21246,6 +21283,222 @@ fn tbir_emit_scaffolding_contract() {
     ] {
         assert!(cpp.contains(marker), "missing scaffolding marker `{marker}`");
     }
+}
+
+#[test]
+fn clock_periods_must_have_two_positive_half_cycles() {
+    let source = |mhz| {
+        format!(
+            "domain D\n  freq_mhz: {mhz}\nend domain D\n\n\
+             test T\n    let dut : Top\n    clock clk = D\n    run\n\
+             \x20       wait 1 cycle\n    end run\nend test T\n"
+        )
+    };
+
+    for (mhz, period) in [(2_000_000, 0), (333, 3003)] {
+        let msg = assert_invalid(&lower_src(&source(mhz)).unwrap_err());
+        assert!(msg.contains(&format!("invalid period of {period} ps")), "{msg}");
+        assert!(msg.contains("positive and even"), "{msg}");
+    }
+
+    let mut corrupted = lower_src(&source(100)).expect("valid 10 ns clock lowers");
+    corrupted.tests[0].clocks[0].period_ps = 0;
+    let errors = verify::verify_program(&corrupted).unwrap_err();
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            verify::VerifyError::BadProgramRef { what }
+                if what.contains("invalid period 0 ps")
+        )),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn cycle_counts_saturate_instead_of_wrapping_at_host_api_widths() {
+    let cpp = emit_cpp_src(
+        r#"
+test CountSaturation
+    let dut : Top
+    run
+        let dynamic : uint<64> = 4294967296
+        wait 4294967296 cycles
+        wait dynamic cycles
+    end run
+end test CountSaturation
+"#,
+    );
+
+    assert!(
+        cpp.contains("co_await harc_rt::wait_cycles(_slot, (uint32_t)(4294967295ULL));"),
+        "{cpp}"
+    );
+    assert!(
+        cpp.contains("harc_rt::harc_u64_shift_count((uint64_t)(dynamic), 4294967295ULL)"),
+        "{cpp}"
+    );
+    assert!(!cpp.contains("(uint32_t)(4294967296)"), "{cpp}");
+    assert!(cpp.contains("uint64_t cycle_count = 0;"), "{cpp}");
+}
+
+#[test]
+fn runtime_logging_and_trace_preserve_cycles_above_signed_int_range() {
+    assert_cpp_runs(
+        "runtime_cycle_width",
+        r#"
+#include "harc_log_rt.h"
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+
+int main() {
+    constexpr uint64_t cycle = 4294967296ULL;
+    char line[512] = {};
+
+    FILE* log = std::tmpfile();
+    if (!log) return 1;
+    harc_rt::log::harc_log_file_line(log, cycle, "INFO", "boundary");
+    std::rewind(log);
+    if (!std::fgets(line, sizeof(line), log)) return 2;
+    if (!std::strstr(line, "[cycle:4294967296 INFO] boundary")) return 3;
+    std::fclose(log);
+
+    harc_rt::trace::HarcTraceWriter trace;
+    trace.out = std::tmpfile();
+    if (!trace.out) return 4;
+    trace.enabled = true;
+    const unsigned __int128 wide_time = static_cast<unsigned __int128>(UINT64_MAX) + 1;
+    trace.set_timing(wide_time, "clk", cycle);
+    trace.raw("boundary", cycle, "");
+    trace.set_timing(~static_cast<unsigned __int128>(0), "clk", cycle);
+    trace.raw("max_time", cycle, "");
+    std::rewind(trace.out);
+    std::memset(line, 0, sizeof(line));
+    if (!std::fgets(line, sizeof(line), trace.out)) return 5;
+    if (!std::strstr(line, "\"cycle\":4294967296")) return 6;
+    if (!std::strstr(line, "\"vcd_time\":18446744073709551616")) return 7;
+    if (harc_rt::trace::harc_wave_time(wide_time) != UINT64_MAX) return 8;
+    if (!std::fgets(line, sizeof(line), trace.out)) return 9;
+    if (!std::strstr(line, "\"vcd_time\":340282366920938463463374607431768211455")) return 10;
+    trace.close();
+    return 0;
+}
+"#,
+    );
+}
+
+#[test]
+fn signed_and_secondary_cycle_count_lanes_do_not_wrap_or_turn_negative_huge() {
+    let signed = emit_cpp_src(
+        r#"
+test SignedCount
+    let dut : Top
+    run
+        let negative : sint<64> = -1
+        wait negative cycles
+        wait -9223372036854775808 cycles
+    end run
+end test SignedCount
+"#,
+    );
+    assert!(
+        signed.contains("int64_t _harc_count = (int64_t)(negative)"),
+        "{signed}"
+    );
+    assert!(
+        signed.contains("_harc_count <= 0 ? 0ULL"),
+        "{signed}"
+    );
+    assert!(!signed.contains("(uint64_t)(-(9223372036854775808))"), "{signed}");
+    assert_cpp_typechecks("signed_count_clamp", &signed);
+
+    let handler = emit_cpp_src(
+        r#"
+test HandlerCount
+    let dut : Top
+    run
+        on true
+            wait 4294967296 cycles
+        end on
+        wait 1 cycle
+    end run
+end test HandlerCount
+"#,
+    );
+    assert!(
+        handler.contains("co_await harc_rt::wait_cycles(_slot, (uint32_t)(4294967295ULL));"),
+        "{handler}"
+    );
+    assert!(!handler.contains("(uint32_t)(4294967296)"), "{handler}");
+
+    let helper = emit_cpp_src(
+        r#"
+function delay_count(n: uint<64>)
+    wait n cycles
+end function delay_count
+
+test HelperCount
+    let dut : Top
+    run
+        delay_count(4294967296)
+    end run
+end test HelperCount
+"#,
+    );
+    assert!(
+        helper.contains("for (int64_t _w = 0; _w <"),
+        "{helper}"
+    );
+    assert!(!helper.contains("for (int _w = 0; _w <"), "{helper}");
+}
+
+#[test]
+fn named_clock_waits_count_remaining_edges_without_target_overflow() {
+    let cpp = emit_cpp_src(
+        r#"
+domain D
+    freq_mhz: 100
+end domain D
+
+test NamedClockCount
+    let dut : Top
+    clock clk = D
+    run
+        let count : uint<64> = 18446744073709551615
+        wait count cycles on clk
+    end run
+end test NamedClockCount
+"#,
+    );
+
+    assert!(cpp.contains("uint64_t _remaining = (uint64_t)("), "{cpp}");
+    assert!(cpp.contains("uint64_t rising_count;"), "{cpp}");
+    assert!(cpp.contains("unsigned __int128 now_ps = 0;"), "{cpp}");
+    assert!(cpp.contains("unsigned __int128 next_edge_ps;"), "{cpp}");
+    assert!(cpp.contains("if (_advanced > 0) _remaining ="), "{cpp}");
+    assert!(!cpp.contains("rising_count + (long long)"), "{cpp}");
+
+    let handler = emit_cpp_src(
+        r#"
+domain D
+    freq_mhz: 100
+end domain D
+
+test NamedClockHandlerCount
+    let dut : Top
+    clock clk = D
+    run
+        on true
+            wait 18446744073709551615 cycles on clk
+        end on
+        wait 1 cycle
+    end run
+end test NamedClockHandlerCount
+"#,
+    );
+    assert!(handler.contains("uint64_t _harc_start_edges = (uint64_t)clocks_[0].rising_count;"), "{handler}");
+    assert!(handler.contains("(uint64_t)clocks_[0].rising_count - _harc_start_edges >= _harc_wait_edges"), "{handler}");
+    assert!(!handler.contains("_harc_target_edges"), "{handler}");
 }
 
 /// The harness's divergence detector (`harc trace-diff` wraps this):
@@ -22223,7 +22476,7 @@ fn tbir_emit_declared_cross_contract() {
     );
 }
 
-/// `--mt` is now accepted by the tbir emitter (multi-thread actor model,
+/// `--mt` is now accepted by the tbir emitter (actor-phase worker model,
 /// issue #425). For a program with no bound monitors / target actors the
 /// `--mt` output is byte-identical to the cooperative default — `--mt`
 /// only changes emission for programs that actually carry actors, so an
@@ -22242,6 +22495,25 @@ fn tbir_accepts_mt() {
         cpp_mt, cpp_default,
         "an actor-free program must emit identical C++ with and without --mt"
     );
+}
+
+#[test]
+fn tbir_mt_uses_one_deterministic_actor_phase_worker() {
+    let merged = merged_src(&fixture("tlm_target_thread_test.harc"));
+    let prog = lower::lower_program(&merged).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let opts = cpp_tb::EmitOpts {
+        mt: true,
+        ..Default::default()
+    };
+    let cpp = tbir::emit(&prog, &merged, &opts).expect("emits under --mt");
+
+    assert_eq!(cpp.matches("std::thread _actor_worker").count(), 1, "{cpp}");
+    assert!(cpp.contains("harc_rt::Barrier _start_barrier(2);"), "{cpp}");
+    assert!(cpp.contains("harc_rt::Barrier _end_barrier(2);"), "{cpp}");
+    assert!(cpp.contains("_actor_worker.join();"), "{cpp}");
+    assert!(!cpp.contains("worker_turn"), "{cpp}");
+    assert!(!cpp.contains("std::vector<std::thread> _workers"), "{cpp}");
 }
 
 // ── placement pass snapshots — tier/timing annotation per block plus
@@ -24038,11 +24310,11 @@ end test ClocklessMethodWaitTest
 "#;
     let cpp = emit_cpp_src(src);
     assert!(
-        cpp.contains("long long now_ps = 0;"),
+        cpp.contains("unsigned __int128 now_ps = 0;"),
         "clockless tests with wall waits should emit absolute time state:\n{cpp}"
     );
     assert!(
-        cpp.contains("auto eval_clocks_until = [&](long long t_ps)"),
+        cpp.contains("auto eval_clocks_until = [&](unsigned __int128 t_ps)"),
         "clockless tests with wall waits should emit a time-advance helper:\n{cpp}"
     );
     assert!(
@@ -24076,11 +24348,11 @@ end impl ClocklessTransactorMethodEmitTest
 "#;
     let cpp = emit_cpp_src(src);
     assert!(
-        cpp.contains("long long now_ps = 0;"),
+        cpp.contains("unsigned __int128 now_ps = 0;"),
         "clockless transactor method waits should emit absolute time state:\n{cpp}"
     );
     assert!(
-        cpp.contains("auto eval_clocks_until = [&](long long t_ps)"),
+        cpp.contains("auto eval_clocks_until = [&](unsigned __int128 t_ps)"),
         "clockless transactor method waits should emit a time-advance helper:\n{cpp}"
     );
     assert!(
@@ -24118,11 +24390,11 @@ end impl ClocklessTestHookEmitTest
 "#;
     let cpp = emit_cpp_src(src);
     assert!(
-        cpp.contains("long long now_ps = 0;"),
+        cpp.contains("unsigned __int128 now_ps = 0;"),
         "clockless hook waits should emit absolute time state:\n{cpp}"
     );
     assert!(
-        cpp.contains("auto eval_clocks_until = [&](long long t_ps)"),
+        cpp.contains("auto eval_clocks_until = [&](unsigned __int128 t_ps)"),
         "clockless hook waits should emit a time-advance helper:\n{cpp}"
     );
     assert!(
@@ -26058,8 +26330,8 @@ fn transactor_method_timed_wait_lowers_to_the_sync_poll_loop() {
 
     let cpp = emit_cpp_src(&timed);
     for needle in [
-        "int64_t _wu_budget = (int64_t)(",
-        "int64_t _wu_start = (int64_t)cycle_count;",
+        "uint64_t _wu_budget = (uint64_t)(",
+        "uint64_t _wu_start = cycle_count;",
         ") < _wu_budget) tick();",
         "ctx.errors++;",
     ] {
@@ -32887,9 +33159,9 @@ end test T"#;
         "bool cycle_run_hs0_previous = false;",
         "if (!_harc_runtime_cells.cycle_run_hs0_previous && _onh_0_curr) {",
         "_harc_runtime_cells.cycle_run_hs0_previous = _onh_0_curr;",
-        "int64_t cycle_run_hs1_last = 0;",
+        "uint64_t cycle_run_hs1_last = 0;",
         "int64_t _onh_1_period = (int64_t)(3);",
-        "if (_onh_1_period > 0 && (int64_t)cycle_count - _harc_runtime_cells.cycle_run_hs1_last >= _onh_1_period) {",
+        "if (_onh_1_period > 0 && cycle_count - _harc_runtime_cells.cycle_run_hs1_last >= (uint64_t)_onh_1_period) {",
     ] {
         assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
     }
@@ -35210,7 +35482,7 @@ fn sync_timed_wait_reserves_its_state_and_covers_both_body_emitters() {
     );
     let cpp = emit_cpp_src(&shadowing);
     assert!(
-        cpp.contains("int64_t _wu_start = (int64_t)cycle_count;"),
+        cpp.contains("uint64_t _wu_start = cycle_count;"),
         "the snapshot must keep its own name; got:\n{cpp}"
     );
     assert!(
@@ -35241,7 +35513,7 @@ impl T for Tb
 end impl T"#,
     );
     assert!(
-        cpp.contains("int64_t _wu_start = (int64_t)cycle_count;")
+        cpp.contains("uint64_t _wu_start = cycle_count;")
             && cpp.contains(") < _wu_budget) tick();"),
         "a component method must render the same sync poll loop; got:\n{cpp}"
     );

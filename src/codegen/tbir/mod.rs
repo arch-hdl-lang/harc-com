@@ -2729,12 +2729,12 @@ pub(in crate::codegen::tbir) fn emit_lifecycle_checkers(
         .ok();
         writeln!(
             out,
-            "{pad1}if ({tag}_period > 0 && (int64_t)cycle_count - {last} >= {tag}_period) {{"
+            "{pad1}if ({tag}_period > 0 && cycle_count - {last} >= (uint64_t){tag}_period) {{"
         )
         .ok();
         writeln!(
             out,
-            "{pad2}{last} = (int64_t)cycle_count;"
+            "{pad2}{last} = cycle_count;"
         )
         .ok();
         let call = component_callable_call(
@@ -2934,12 +2934,12 @@ pub(in crate::codegen::tbir) fn emit_lifecycle_checkers(
             .ok();
             writeln!(
             out,
-            "{pad1}if ({tag}_period > 0 && (int64_t)cycle_count - {last} >= {tag}_period) {{"
+            "{pad1}if ({tag}_period > 0 && cycle_count - {last} >= (uint64_t){tag}_period) {{"
         )
         .ok();
             writeln!(
                 out,
-                "{pad2}{last} = (int64_t)cycle_count;"
+                "{pad2}{last} = cycle_count;"
             )
             .ok();
             // 1. User body (typically a heartbeat log).
@@ -2965,8 +2965,8 @@ pub(in crate::codegen::tbir) fn emit_lifecycle_checkers(
             writeln!(
             out,
             "{pad2}if ({tag}_max_idle > 0 \
-             && (int64_t)((uint64_t)cycle_count - {inst_path}.{input_heartbeat}) >= {tag}_max_idle \
-             && (int64_t)((uint64_t)cycle_count - {inst_path}.{output_heartbeat}) >= {tag}_max_idle) {{"
+             && cycle_count - {inst_path}.{input_heartbeat} >= (uint64_t){tag}_max_idle \
+             && cycle_count - {inst_path}.{output_heartbeat} >= (uint64_t){tag}_max_idle) {{"
         )
         .ok();
             writeln!(
@@ -3033,12 +3033,12 @@ fn emit_tb_periodic_services(
         emit_persistent_setup_bindings(out, 2, run_context);
         writeln!(
             out,
-            "{INDENT}{INDENT}if ((int64_t)cycle_count - {last} >= {period}) {{"
+            "{INDENT}{INDENT}if (cycle_count - {last} >= (uint64_t){period}) {{"
         )
         .ok();
         writeln!(
             out,
-            "{INDENT}{INDENT}{INDENT}{last} = (int64_t)cycle_count;"
+            "{INDENT}{INDENT}{INDENT}{last} = cycle_count;"
         )
         .ok();
         writeln!(out, "{INDENT}{INDENT}{INDENT}{lambda}();").ok();

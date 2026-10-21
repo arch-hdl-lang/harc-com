@@ -2211,14 +2211,59 @@ pub(super) fn bounded_count_expr_cpp(
     limit: u64,
 ) -> Result<String, EmitError> {
     let rendered = expr_cpp(cx, expr)?;
-    Ok(match expr_static_width(cx, expr) {
-        Some(width) if width > 128 => {
+    if let Expr::Literal { value, ty } = expr {
+        let negative = match ty {
+            crate::ir::IrType::SInt(Some(width @ 1..=64)) => {
+                (*value & (1u64 << (width - 1))) != 0
+            }
+            crate::ir::IrType::SInt(None) => (*value as i64) < 0,
+            _ => false,
+        };
+        if negative {
+            return Ok("0ULL".to_string());
+        }
+        return Ok(if *value <= limit {
+            rendered
+        } else {
+            format!("{limit}ULL")
+        });
+    }
+    let width_fits = |width: u32| match width {
+        0 => true,
+        1..=63 => (1u64 << width) - 1 <= limit,
+        64 => limit == u64::MAX,
+        _ => false,
+    };
+    let width = expr_static_width(cx, expr);
+    // A source-level unary minus denotes a signed count even when its
+    // magnitude literal is 2^63 and therefore does not itself fit i64.
+    // Count conversion clamps that negative boundary to zero instead of
+    // reinterpreting it as a huge unsigned wait.
+    let signed = expr_is_signed(cx, expr) || matches!(expr, Expr::Unary(UnOp::Neg, _));
+    Ok(match (width, signed) {
+        (Some(width), true) if width > 128 => {
+            format!(
+                "([&] {{ auto _harc_count = ({rendered}); return harc_rt::harc_wide_get_bit(_harc_count, {}) ? 0ULL : harc_rt::harc_wide_shift_count(_harc_count, {limit}ULL); }}())",
+                width - 1
+            )
+        }
+        (Some(width), false) if width > 128 => {
             format!("harc_rt::harc_wide_shift_count({rendered}, {limit}ULL)")
         }
-        Some(width) if width > 64 => {
+        (Some(width), true) if width > 64 => {
+            format!(
+                "([&] {{ _harc_u128 _harc_count = (_harc_u128)({rendered}); return ((_harc_count >> {}) & 1) != 0 ? 0ULL : harc_rt::harc_u128_shift_count(_harc_count, {limit}ULL); }}())",
+                width - 1
+            )
+        }
+        (Some(width), false) if width > 64 => {
             format!("harc_rt::harc_u128_shift_count((_harc_u128)({rendered}), {limit}ULL)")
         }
-        _ => rendered,
+        (Some(width), false) if width_fits(width) => rendered,
+        (_, true) => {
+            format!("([&] {{ int64_t _harc_count = (int64_t)({rendered}); return _harc_count <= 0 ? 0ULL : harc_rt::harc_u64_shift_count((uint64_t)_harc_count, {limit}ULL); }}())")
+        }
+        _ => format!("harc_rt::harc_u64_shift_count((uint64_t)({rendered}), {limit}ULL)"),
     })
 }
 
