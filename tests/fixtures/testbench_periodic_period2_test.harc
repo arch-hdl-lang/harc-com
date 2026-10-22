@@ -4,10 +4,9 @@
 // gating (`cycle_count - last >= period`) is trivially "every cycle" and
 // the `phase` choice is moot. This fixture pins the non-trivial cadence:
 // two handlers with DIFFERENT periods (2 and 3) and DIFFERENT phases
-// (default Checker vs `post_eval`) must fire the SAME number of times
-// under `--codegen v1` and `--codegen tbir` — the v1↔tbir trace-diff
-// equivalence gate (tests/tbir_equiv_fixtures.txt) enforces that, and the
-// asserts below pin the absolute cadence both backends agree on.
+// (default Checker vs `post_eval`) must fire the expected number of times.
+// The TB-IR regression sweep runs this fixture, and the assertions below
+// pin the absolute cadence.
 
 scoreboard Cadence
     fast : uint<32> default 0   // fired by the period-2 handler
@@ -49,7 +48,7 @@ impl TbPeriodGt1Run for TbPeriodGt1
         // gate is sampled, so the cadences are not simply `floor(10/period)`
         // and the period-2 (Checker) count (4) differs from a period-2
         // post_eval count (5). Both backends must agree on these exact
-        // counts; the v1↔tbir trace-diff gate cross-checks the same run.
+        // counts; the TB-IR regression sweep executes this same run.
         assert cad.fast == 4
             else fail("period-2 handler fired ${cad.fast} times, expected 4")
         assert cad.slow == 3

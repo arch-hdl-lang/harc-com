@@ -93,12 +93,8 @@ fn runtime_outdir(codegen: &str) -> PathBuf {
 }
 
 #[test]
-fn v1_and_tbir_default_construct_typed_component_locals() {
+fn tbir_default_constructs_typed_component_locals() {
     let merged = merged_source(SOURCE);
-    let v1 = cpp_tb::emit(&merged).expect("v1 supports default-constructed component locals");
-    assert_eq!(v1.matches("LocalModel model;").count(), 2, "{v1}");
-    assert!(v1.contains("ActiveModel active_model;"), "{v1}");
-
     let prog = lower::lower_program(&merged).expect("TB-IR lowers component locals");
     verify::verify_program(&prog).expect("component locals verify");
     let run = prog.function(prog.tests[0].run);
@@ -187,7 +183,6 @@ test LocalListenerTest
     end run
 end test LocalListenerTest
 "#;
-    cpp_tb::emit(&merged_source(source)).expect("v1 installs local component handlers");
     let merged = merged_source(source);
     let program = lower::lower_program(&merged).expect("TB-IR lowers the local handler component");
     verify::verify_program(&program).expect("local handler component verifies");
@@ -278,7 +273,7 @@ end test LocalConnectTest
         return;
     }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for codegen in ["v1", "tbir"] {
+    for codegen in ["tbir"] {
         let outdir = runtime_outdir(&format!("{codegen}_connect"));
         let _ = std::fs::remove_dir_all(&outdir);
         std::fs::create_dir_all(&outdir).expect("create local-connect runtime directory");
@@ -436,7 +431,10 @@ end test LocalListenerCopyTest
         .iter()
         .position(|stmt| matches!(stmt, ir::Stmt::Assign(local, ir::Expr::ComponentValue { .. }) if *local == copy))
         .expect("the source user state is copied");
-    assert!(init < assign, "runtime graph installation must precede the state copy");
+    assert!(
+        init < assign,
+        "runtime graph installation must precede the state copy"
+    );
 
     if !verilator_present() {
         eprintln!("skipping component-copy runtime test: verilator not found");
@@ -511,7 +509,6 @@ test RepeatedLocalListenerTest
 end test RepeatedLocalListenerTest
 "#;
     let merged = merged_source(source);
-    cpp_tb::emit(&merged).expect("v1 supports repeated local component initialization");
     let program = lower::lower_program(&merged).expect("TB-IR lowers repeated ComponentInit");
     verify::verify_program(&program).expect("repeated ComponentInit verifies");
     let cpp = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default())
@@ -538,7 +535,7 @@ end test RepeatedLocalListenerTest
         return;
     }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for codegen in ["v1", "tbir"] {
+    for codegen in ["tbir"] {
         let outdir = runtime_outdir(&format!("{codegen}_repeated"));
         let _ = std::fs::remove_dir_all(&outdir);
         std::fs::create_dir_all(&outdir).expect("create repeated-init runtime directory");
@@ -660,14 +657,14 @@ fn verifier_rejects_corrupt_component_local_initialization() {
 }
 
 #[test]
-fn component_locals_default_construct_at_runtime_in_v1_and_tbir() {
+fn component_locals_default_construct_at_runtime_in_tbir() {
     if !verilator_present() {
         eprintln!("skipping component-local initialization runtime test: verilator not found");
         return;
     }
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for codegen in ["v1", "tbir"] {
+    for codegen in ["tbir"] {
         let outdir = runtime_outdir(codegen);
         let _ = std::fs::remove_dir_all(&outdir);
         std::fs::create_dir_all(&outdir).expect("create component-init runtime directory");

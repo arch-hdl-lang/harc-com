@@ -362,15 +362,14 @@ not applicable before requesting review:
    precise `Invalid`/`NotImplemented` diagnostics for malformed neighbors.
 4. Emit from TB-IR without replaying AST lowering in the backend.
 5. Convert the former rejection test into a lowering + verifier test.
-6. Add a self-checking fixture to `tests/tbir_equiv_fixtures.txt`; runtime
+6. Add a self-checking fixture to `tests/tbir_regression_fixtures.txt`; runtime
    effects must be observable in assertions or semantic traces.
 7. Run, in increasing cost order:
 
    - targeted Rust tests;
-   - `harc check` and both emitters' `sim --emit-only` paths;
-   - both simulations plus `harc trace-diff` for changed fixtures;
-   - `tests/run_emit_parity.sh`;
-   - `tests/run_tbir_equiv.sh`;
+   - `harc check` and TB-IR's `sim --emit-only` path;
+   - the changed fixture under TB-IR with its expected verdict;
+   - `tests/run_tbir_regression.sh`;
    - the complete Rust test suite.
 
 8. Recount `unsupported(...)` sites and record which family disappeared.

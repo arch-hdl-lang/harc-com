@@ -11,8 +11,8 @@
 //! test, falls back to the historical per-test inlining (byte-identical to
 //! switch-OFF).
 //!
-//! End-to-end trace equality (v1 == tbir) is the primary gate in
-//! `tests/run_tbir_equiv.sh`; this file pins the IR/emit shape and the
+//! The TB-IR semantic regression sweep is the primary end-to-end gate in
+//! `tests/run_tbir_regression.sh`; this file pins the IR/emit shape and the
 //! share/fallback decision deterministically in-process.
 //!
 //! The switch is read from the environment. Integration-test functions run

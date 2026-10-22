@@ -115,20 +115,6 @@ jobs:
           done
           exit $fail
 
-      - name: "Legacy-v1 compatibility: emitted parity"
-        # Temporary retirement gate while the v1 route and parity tests remain.
-        # Acceptance + solver-constraint-text parity between the two emitters,
-        # across the whole fixture corpus. Complements
-        # run_tbir_equiv.sh, which trace-diffs: that needs Verilator, needs
-        # both backends to build AND run, and is therefore blind to a
-        # one-sided rejection — the shape harc#559 shipped with every job
-        # green. This one only needs --emit-only, so it lives in the fast
-        # job and does not need a fixture to be runnable to compare it.
-        # Scope is the shared table (tests/fixtures.tbl). See harc#551.
-        run: ./tests/run_emit_parity.sh
-        env:
-          HARC: ./target/release/harc
-
       - name: harc fmt round-trip
         # Pretty-print → reparse → pretty-print again must be a fixed point.
         run: |
@@ -234,17 +220,15 @@ jobs:
           HARC_CXX: clang++
         run: ./tests/run_vcd_dump_smoke.sh
 
-      - name: "Legacy-v1 compatibility: semantic equivalence"
-        # Temporary retirement gate while the v1 route and parity tests remain.
-        # Every registered fixture (tests/tbir_equiv_fixtures.txt) must
-        # produce identical semantic traces under both C++ emitters
-        # (`--codegen v1` and `--codegen tbir`). Lives in this job to
-        # reuse the image toolchain and harc build above.
+      - name: "TB-IR semantic regression"
+        # Every registered fixture (tests/tbir_regression_fixtures.txt) must
+        # reach its expected verdict under TB-IR. Lives in this job to reuse
+        # the image toolchain and harc build above.
         # ARCH_BIN is intentionally NOT set here (no arch checkout in
         # this job), so the optional --dut sweep self-skips.
         env:
           HARC_CXX: clang++
-        run: ./tests/run_tbir_equiv.sh
+        run: ./tests/run_tbir_regression.sh
 
       - name: ccache stats
         if: always()

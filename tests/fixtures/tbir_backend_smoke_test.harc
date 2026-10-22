@@ -1,32 +1,19 @@
-// Backend-parity fixture for the shapes harc#551 catalogued as having
+// TB-IR backend smoke fixture for the shapes harc#551 catalogued as having
 // ZERO fixture coverage — every one of them was a real defect at some
 // point, and every one was invisible to CI because nothing exercised it.
 //
-// This fixture only carries shapes BOTH emitters accept, so it can be
-// registered in tests/tbir_equiv_fixtures.txt and trace-diffed. The
-// shapes only one backend accepts are pinned as unit tests instead
-// (tests/codegen.rs, the `*_escape_hatch_phrase*` tests), because a fixture one
-// backend refuses to emit cannot be trace-diffed at all — which is
-// exactly why those gaps went unnoticed.
-//
-// Deliberately NOT covered here, and why:
-//   - ARCH sized literals (`8'hFF`) and `as` casts above 128 bits are
-//     declared TB-IR subset gaps (the diagnostic names `--codegen v1`).
-//     tests/run_emit_parity.sh classifies those automatically.
-//   - `let s : sint<8> = a +% b` is now rejected by BOTH backends with a
-//     real diagnostic, so it belongs in a negative test, not here.
-//     (harc#551 describes it as an internal error under TB-IR; that was
-//     true when the issue was filed and is no longer.)
+// This fixture keeps those formerly parity-only shapes in the TB-IR runtime
+// regression corpus after the legacy comparison harness was retired.
 
 domain SysDomain
   freq_mhz: 100
 end domain SysDomain
 
-testbench BackendParityTb
+testbench TbirBackendSmokeTb
     dut : Top
-end testbench BackendParityTb
+end testbench TbirBackendSmokeTb
 
-impl BackendParityTest for BackendParityTb
+impl TbirBackendSmokeTest for TbirBackendSmokeTb
     clock clk = SysDomain
 
     run
@@ -76,6 +63,6 @@ impl BackendParityTest for BackendParityTb
         assert widened == 260
             else fail("`+` must not wrap: got ${widened}, want 260")
 
-        log(info, "PASS: backend-parity shapes agree")
+        log(info, "PASS: TB-IR backend smoke shapes")
     end run
-end impl BackendParityTest
+end impl TbirBackendSmokeTest

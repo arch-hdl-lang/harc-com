@@ -4,10 +4,9 @@
 //
 // Ranges got runtime bounds first (`[dut.en .. 7]`); exact values were
 // left folding-only, so `{dut.en}` was rejected while `[dut.en .. 7]`
-// worked in the same bins block. v1 never had that split — it renders
-// both with the same `emit_expr`, emitting `_v == harc_rt::harc_read(
-// dut->en)` per sample — so this file now passes under BOTH backends
-// and the equivalence harness trace-diffs the two.
+// worked in the same bins block. TB-IR now emits `_v ==
+// harc_rt::harc_read(dut->en)` per sample, and the regression sweep runs
+// the self-checking fixture.
 //
 // `cp_count` mixes the shapes an exact value can take:
 //   - eq_en    = {dut.en}          — bare DUT port

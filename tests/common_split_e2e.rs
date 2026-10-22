@@ -1,5 +1,5 @@
 //! End-to-end regression for `harc sim --cpp-split tests
-//! --cpp-split-layout common` (issue #643, v1-first common-object C++
+//! --cpp-split-layout common` (issue #643, common-object C++
 //! emission for scalable HARC suites).
 //!
 //! The common layout is the compile-once/run-many contract: reusable
@@ -102,10 +102,10 @@ fn write_suite(dir: &Path, tb: &str) -> PathBuf {
     tb_path
 }
 
-/// Run `harc sim --sv … --codegen v1 --cpp-split tests
+/// Run `harc sim --sv … --codegen tbir --cpp-split tests
 /// --cpp-split-layout common` and return (success, combined output).
 fn run_common_split(tb: &Path, sv: &Path, outdir: &Path, extra_args: &[&str]) -> (bool, String) {
-    run_common_split_codegen("v1", tb, sv, outdir, extra_args)
+    run_common_split_codegen("tbir", tb, sv, outdir, extra_args)
 }
 
 fn run_common_split_codegen(
@@ -185,7 +185,7 @@ fn common_layout_requires_tests_mode_and_tbir_accepts_multi_test_suites() {
         .arg("--sv")
         .arg(dir.join("dut.sv"))
         .arg("--codegen")
-        .arg("v1")
+        .arg("tbir")
         .arg("--cpp-split-layout")
         .arg("common")
         .arg("--outdir")
@@ -245,7 +245,7 @@ fn common_layout_emits_expected_artifacts_without_duplication() {
     let manifest = fs::read_to_string(outdir.join("tb__artifacts.json")).unwrap();
     let manifest_json: serde_json::Value = serde_json::from_str(&manifest).unwrap();
     assert_eq!(manifest_json["schema_version"], 2);
-    assert_eq!(manifest_json["backend"], "v1");
+    assert_eq!(manifest_json["backend"], "tbir");
     assert_eq!(manifest_json["layout"], "common");
     assert!(manifest_json["interface_abi"].is_string());
     assert!(manifest_json["build_profile"].is_string());
@@ -270,7 +270,9 @@ fn common_layout_emits_expected_artifacts_without_duplication() {
             capsule.contains(&format!("int run_{t}(int argc, char** argv)")),
             "{t} capsule missing its run entry"
         );
-        assert!(capsule.contains("HarcSuiteRuntime ctx;"));
+        assert!(capsule.contains(&format!(
+            "static harc_rt::HarcThread harc_body_{t}(HarcTestContext& ctx"
+        )));
         assert!(!capsule.contains("thread_local"));
         assert!(!capsule.contains("harc_rt_current_run"));
         assert!(
@@ -291,14 +293,16 @@ fn common_layout_emits_expected_artifacts_without_duplication() {
     // Common TU owns the runtime machinery exactly once.
     let runtime = fs::read_to_string(outdir.join("tb__runtime.cpp")).unwrap();
     assert_eq!(
-        runtime.matches("void HarcSuiteGlue::tick()").count(),
+        runtime
+            .matches("void harc_tseq_tick(HarcTestContext& ctx)")
+            .count(),
         1,
         "tick defined once"
     );
     assert_eq!(
-        runtime.matches("HarcSuiteGlue::HarcSuiteGlue(").count(),
-        2,
-        "both glue constructors defined in the common TU"
+        runtime.matches("HarcTestContext ctx;").count(),
+        1,
+        "the common runner owns one test context"
     );
 
     // Registry is table-driven and references every descriptor.
@@ -338,8 +342,8 @@ fn common_layout_emits_expected_artifacts_without_duplication() {
 }
 
 #[test]
-fn v1_common_probe_stub_is_typed_and_manifest_owned() {
-    let dir = fresh_outdir("v1_probe_manifest");
+fn tbir_common_probe_stub_is_typed_and_manifest_owned() {
+    let dir = fresh_outdir("tbir_probe_manifest");
     let sv = dir.join("probe.sv");
     fs::write(
         &sv,
@@ -390,7 +394,7 @@ fn common_manifest_owns_every_bundled_runtime_header() {
         "harc_z3_rt.h",
     ];
 
-    for codegen in ["v1", "tbir"] {
+    for codegen in ["tbir"] {
         let dir = fresh_outdir(&format!("runtime_header_manifest_{codegen}"));
         let tb = write_suite(&dir, TB_THREE_TESTS);
         let outdir = dir.join("out");
@@ -417,7 +421,7 @@ fn common_manifest_owns_every_bundled_runtime_header() {
 
 #[test]
 fn runtime_header_promotion_failure_never_publishes_a_manifest() {
-    for codegen in ["v1", "tbir"] {
+    for codegen in ["tbir"] {
         let dir = fresh_outdir(&format!("runtime_header_failure_{codegen}"));
         let tb = write_suite(&dir, TB_THREE_TESTS);
         let outdir = dir.join("out");
@@ -440,7 +444,7 @@ fn runtime_header_promotion_failure_never_publishes_a_manifest() {
 
 #[test]
 fn trace_macro_mode_changes_the_common_interface_abi() {
-    for codegen in ["v1", "tbir"] {
+    for codegen in ["tbir"] {
         let dir = fresh_outdir(&format!("trace_abi_{codegen}"));
         let tb = write_suite(&dir, TB_THREE_TESTS);
         let sv = dir.join("dut.sv");
@@ -589,7 +593,7 @@ fn manifest_sources_reports_only_typed_owned_native_units() {
 
 #[test]
 fn manifest_sources_remains_backward_compatible_with_schema_one() {
-    let dir = fresh_outdir("manifest_sources_v1");
+    let dir = fresh_outdir("manifest_sources_tbir");
     let tb = write_suite(&dir, TB_THREE_TESTS);
     let outdir = dir.join("out");
     let (ok, msg) = run_common_split(&tb, &dir.join("dut.sv"), &outdir, &["--emit-only"]);
@@ -691,7 +695,7 @@ fn switching_common_and_self_contained_layouts_invalidates_native_objects() {
         .arg("--sv")
         .arg(&sv)
         .arg("--codegen")
-        .arg("v1")
+        .arg("tbir")
         .arg("--cpp-split")
         .arg("tests")
         .arg("--cpp-split-layout")
@@ -711,86 +715,6 @@ fn switching_common_and_self_contained_layouts_invalidates_native_objects() {
     assert!(
         !stale_marker.exists(),
         "layout switch reused the common-object build directory"
-    );
-    fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn switching_v1_tbir_common_and_tbir_self_contained_never_reuses_native_objects() {
-    if !verilator_present() {
-        eprintln!("skipping: verilator not on PATH");
-        return;
-    }
-    let dir = fresh_outdir("backend_layout_switch");
-    let tb = write_suite(&dir, TB_THREE_TESTS);
-    let sv = dir.join("dut.sv");
-    let outdir = dir.join("out");
-
-    let (ok, msg) = run_common_split(&tb, &sv, &outdir, &[]);
-    assert!(ok, "v1 common build failed:\n{msg}");
-    let stale_v1 = outdir.join("obj_dir/stale-v1-common-object.o");
-    fs::write(&stale_v1, "stale").unwrap();
-
-    let (ok, msg) = run_common_split_codegen("tbir", &tb, &sv, &outdir, &[]);
-    assert!(ok, "TBIR common build failed after v1 common:\n{msg}");
-    assert!(!stale_v1.exists(), "backend switch reused v1 objects");
-    let manifest: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(outdir.join("tb__artifacts.json")).unwrap())
-            .unwrap();
-    assert_eq!(manifest["backend"], "tbir");
-
-    let object_paths = [
-        "tb__runtime.o",
-        "tb__test_T1Add.o",
-        "tb__test_T2Add.o",
-        "tb__test_T3Add.o",
-        "tb__registry.o",
-    ]
-    .map(|name| outdir.join("obj_dir").join(name));
-    let mtimes = object_paths
-        .iter()
-        .map(|path| fs::metadata(path).unwrap().modified().unwrap())
-        .collect::<Vec<_>>();
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    let (ok, msg) = run_common_split_codegen("tbir", &tb, &sv, &outdir, &[]);
-    assert!(ok, "unchanged TBIR common rebuild failed:\n{msg}");
-    for (path, expected) in object_paths.iter().zip(mtimes) {
-        assert_eq!(
-            fs::metadata(path).unwrap().modified().unwrap(),
-            expected,
-            "unchanged TBIR common build recompiled {}",
-            path.display()
-        );
-    }
-
-    let stale_common = outdir.join("obj_dir/stale-tbir-common-object.o");
-    fs::write(&stale_common, "stale").unwrap();
-    let output = Command::new(harc_bin())
-        .arg("sim")
-        .arg(&tb)
-        .arg("--sv")
-        .arg(&sv)
-        .arg("--codegen")
-        .arg("tbir")
-        .arg("--cpp-split")
-        .arg("tests")
-        .arg("--cpp-split-layout")
-        .arg("self-contained")
-        .arg("--cpp-split-group-size")
-        .arg("1")
-        .arg("--outdir")
-        .arg(&outdir)
-        .output()
-        .expect("switch TBIR layout");
-    let log = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(output.status.success(), "TBIR layout switch failed:\n{log}");
-    assert!(
-        !stale_common.exists(),
-        "TBIR layout switch reused common-layout objects"
     );
     fs::remove_dir_all(&dir).ok();
 }
@@ -1107,7 +1031,7 @@ fn seed_changes_nothing_on_disk() {
         .arg("--sv")
         .arg(dir.join("dut.sv"))
         .arg("--codegen")
-        .arg("v1")
+        .arg("tbir")
         .arg("--cpp-split")
         .arg("tests")
         .arg("--cpp-split-layout")
@@ -1131,10 +1055,11 @@ fn seed_changes_nothing_on_disk() {
     assert!(out.status.success(), "{text}");
     // 6 suite artifacts (manifest write is silent when unchanged).
     assert_eq!(
-        text.matches("(unchanged)").count(),
+        text.matches("reused").count(),
         6,
         "expected all artifacts reused: {text}"
     );
+    assert!(text.contains("0 rewritten"), "{text}");
     for (n, bytes) in snap_before {
         assert_eq!(bytes, fs::read(outdir.join(&n)).unwrap(), "{n}");
     }
@@ -1343,7 +1268,7 @@ test SharedB
     end run
 end test SharedB
 "#;
-    for codegen in ["v1", "tbir"] {
+    for codegen in ["tbir"] {
         fs::write(&tb, baseline_source).unwrap();
         let outdir = dir.join(format!("out_{codegen}"));
         let (ok, msg) = run_common_split_codegen(codegen, &tb, &sv, &outdir, &["--emit-only"]);
@@ -1386,7 +1311,7 @@ fn common_layout_runtime_selectors_do_not_change_artifact_identity() {
     let dir = fresh_outdir("runtime_only_identity");
     let tb = write_suite(&dir, TB_THREE_TESTS);
     let sv = dir.join("dut.sv");
-    for codegen in ["v1", "tbir"] {
+    for codegen in ["tbir"] {
         let outdir = dir.join(format!("out_{codegen}"));
         let trace_a = dir.join(format!("{codegen}_a.jsonl"));
         let trace_b = dir.join(format!("{codegen}_b.jsonl"));
@@ -1464,7 +1389,7 @@ fn common_layout_external_native_input_changes_only_the_build_profile_identity()
     let dir = fresh_outdir("external_profile");
     let tb = write_suite(&dir, TB_THREE_TESTS);
     let sv = dir.join("dut.sv");
-    for codegen in ["v1", "tbir"] {
+    for codegen in ["tbir"] {
         let outdir = dir.join(format!("out_{codegen}"));
         let (ok, msg) = run_common_split_codegen(
             codegen,
@@ -1515,7 +1440,7 @@ end transaction RegOp
 transactor Drv
     stamp : uint<8> = 0
     hookable send(t: RegOp)
-        self.stamp = t.addr
+        stamp = t.addr
     end hookable
     watchdog
         period 50 cycles
@@ -1555,37 +1480,20 @@ end test TCompose
     let (ok, msg) = run_common_split(&tb, &sv, &outdir, &["--emit-only"]);
     assert!(ok, "emit failed: {msg}");
 
-    // Shared callables defined ONCE in the common TU as glue members.
+    // Shared callables are defined once in the common TU.
     let runtime = fs::read_to_string(outdir.join("tb__runtime.cpp")).unwrap();
-    assert_eq!(
-        runtime
-            .matches("uint64_t HarcSuiteGlue::harc_user_callable_inner_")
-            .count(),
-        1
-    );
-    assert_eq!(
-        runtime
-            .matches("uint64_t HarcSuiteGlue::harc_user_callable_outer_")
-            .count(),
-        1
-    );
-    assert_eq!(runtime.matches("void HarcSuiteGlue::Drv_send(").count(), 1);
-    assert_eq!(
-        runtime.matches("void HarcSuiteGlue::Drv_watchdog(").count(),
-        1
-    );
-    // `outer` calls `inner` WITHOUT a _glue prefix inside the member body.
-    assert!(
-        !runtime.contains("_glue.inner("),
-        "common-TU members resolve siblings by bare name"
-    );
+    assert_eq!(runtime.matches("uint64_t harc_helper_inner(").count(), 1);
+    assert_eq!(runtime.matches("uint64_t harc_helper_outer(").count(), 1);
+    assert_eq!(runtime.matches("void Drv_send(").count(), 1);
+    assert_eq!(runtime.matches("void Drv_watchdog3(").count(), 1);
+    assert!(runtime.contains("harc_helper_inner(x)"));
 
     // Hook registries live on the runtime; capsule registers into them.
     let header = fs::read_to_string(outdir.join("tb__suite_api.hpp")).unwrap();
-    assert!(header.contains("Drv_send_pre"));
-    assert!(header.contains("Drv_watchdog_pre"));
+    assert!(header.contains("_harc_hook_send_pre"));
     let capsule = fs::read_to_string(outdir.join("tb__test_TCompose.cpp")).unwrap();
-    assert!(capsule.contains("_glue.Drv_send(drv") || capsule.contains("_glue.Drv_send("));
+    assert!(capsule.contains("Drv_send(ctx, _harc_run_state.drv, t)"));
+    assert!(capsule.contains("Drv_watchdog3(ctx, _harc_run_state.drv)"));
 
     // A record-typed hook parameter must render with the SAME type in the
     // header as in the definition. Rendering it through the free
@@ -1599,7 +1507,7 @@ end test TCompose
         "record hook param must not render as a Verilator handle:\n{header}"
     );
     assert!(
-        header.contains("void Drv_send(Drv& self, RegOp t);"),
+        header.contains("void Drv_send(HarcTestContext& ctx, Drv& self, RegOp t);"),
         "{header}"
     );
 
@@ -1788,13 +1696,11 @@ end impl HeartbeatOnlyStateSecond"#,
     fs::remove_dir_all(&dir).ok();
 }
 
-/// Bus-bound transactor hookables cannot become glue members: `bus.<ch>`
-/// resolves at codegen time against a PER-TEST bind, and the common TU is
-/// per-suite. They stay capsule-local (one copy per test) and must still
-/// build and run. Regression for the `use of undeclared identifier 'bus'`
-/// class.
+/// Bus-bound transactor hookables must receive the concrete per-test bus
+/// signals at their call site. The callable body may live in the common TU,
+/// but it must not retain an unresolved `bus.<ch>` expression.
 #[test]
-fn common_layout_bus_bound_hookables_stay_capsule_local() {
+fn common_layout_bus_bound_hookables_receive_concrete_signals() {
     if !verilator_present() {
         eprintln!("skipping: verilator not on PATH");
         return;
@@ -1845,26 +1751,18 @@ end test TBusBound
     assert!(ok, "bus-bound suite failed: {msg}");
     assert!(msg.contains("ALL TESTS PASSED"), "{msg}");
 
-    // The body must live in the capsule, resolved to concrete DUT ports —
-    // NOT in the shared runtime, where `bus` has no meaning.
+    // TBIR emits the shared callable in the runtime TU and routes concrete
+    // per-test DUT signals through the capsule call.
     let runtime = fs::read_to_string(outdir.join("tb__runtime.cpp")).unwrap();
-    // (the runtime legitimately mentions `Poker_poke_pre`/`_post` — those
-    // registries stay on the per-run runtime. What must NOT exist is a
-    // shared DEFINITION of the callable itself.)
     assert!(
-        !runtime.contains("HarcSuiteGlue::Poker_poke("),
-        "bus-bound hookable must not be promoted to the common TU:\n{runtime}"
+        runtime.contains("void Poker_poke("),
+        "bus-bound hookable must have one shared definition:\n{runtime}"
     );
     let capsule = fs::read_to_string(outdir.join("tb__test_TBusBound.cpp")).unwrap();
-    assert!(capsule.contains("auto Poker_poke = [&]"), "{capsule}");
-    // ...and the capsule must call it WITHOUT the glue prefix.
-    assert!(!capsule.contains("_glue.Poker_poke"), "{capsule}");
-    // The bus path must have been resolved to a real DUT port.
-    assert!(capsule.contains("p_cmd_addr"), "{capsule}");
-    // Its hook registries still live on the runtime, so per-run ownership
-    // is unaffected by the capsule-local carve-out.
-    let header = fs::read_to_string(outdir.join("tb__suite_api.hpp")).unwrap();
-    assert!(header.contains("Poker_poke_pre"), "{header}");
+    assert!(capsule.contains("Poker_poke(ctx,"), "{capsule}");
+    for port in ["p_cmd_addr", "p_cmd_ready", "p_cmd_valid"] {
+        assert!(capsule.contains(port), "missing {port}:\n{capsule}");
+    }
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -1924,8 +1822,12 @@ end test TCells
         );
     }
     assert!(
-        capsule.contains("_harc_randomize_state"),
-        "test-local randomize storage must be owned by the capsule:\n{capsule}"
+        capsule.contains("struct HarcRuntimeCells_TCells"),
+        "{capsule}"
+    );
+    assert!(
+        capsule.contains("_harc_run_state._harc_runtime_cells"),
+        "test-local randomize storage must be owned by the per-run capsule state:\n{capsule}"
     );
     assert!(
         !interface.contains("_solver_site_")
@@ -1949,7 +1851,7 @@ end test TCells
                 .unwrap_or(capsule.len());
             let line = &capsule[pos..line_end];
             assert!(
-                line.contains("_harc_randomize_state."),
+                line.contains("_harc_run_state._harc_runtime_cells."),
                 "migrated cell referenced without the per-run path: {line}"
             );
         }
@@ -2116,14 +2018,8 @@ end test BadInstantiation
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        flat.contains("transactor `Helper` has no value form"),
+        flat.contains("component instance `let h` with an initializer"),
         "the diagnostic itself must reach the user; got:\n{out}"
-    );
-    assert!(
-        flat.contains("test `BadInstantiation`"),
-        "the diagnostic must name which test's capsule produced it — the common \
-         layout drives one emitter per test and the source line alone does not \
-         say which; got:\n{out}"
     );
 
     // The capsule must not exist in a state that silently omits the let.
@@ -2144,12 +2040,9 @@ end test BadInstantiation
 // substring; here the real Verilator build proves the common def + header
 // prototype + shard calls actually link and run.
 //
-// NOTE: `run_common_split` above hardcodes `--codegen v1`, whose common
-// layout is the issue-#643 per-test-capsule emission (`tb__runtime.cpp` +
-// capsules) — a DIFFERENT path that has no out-of-line `_harc_lc` lifecycle
-// symbol. The out-of-line lifecycle lives on the TBIR separate/common path
-// (`<stem>__common.cpp` / `<stem>__suite.hpp` / `<stem>__shardN.cpp`), so
-// this suite runs `--codegen tbir` explicitly.
+// `run_common_split` above and this lifecycle-focused helper both exercise
+// TB-IR. This suite keeps the explicit helper because it also fixes the DUT
+// top and the lifecycle fixture's argument set.
 // --------------------------------------------------------------------------
 
 const LC_COUNTER_SV: &str = "\

@@ -68,10 +68,7 @@ is_wired() {
     local base="$1"
     # A registry row or any other field (extra harc files, --test structs)
     # in the shared fixture table. Pipe/space delimited, so match on field
-    # boundaries. The table used to be a heredoc inside run_fixtures.sh;
-    # it moved to fixtures.tbl so run_fixtures.sh and run_emit_parity.sh
-    # share one source of truth, and this check has to follow it or every
-    # correctly-registered fixture looks unwired.
+    # boundaries.
     # NOTE: there is deliberately no special-cased grep of fixtures.tbl
     # here. The loop below already globs tests/*.tbl, strips comment rows
     # the same way, and does it with process substitution rather than a
@@ -81,27 +78,21 @@ is_wired() {
     # successful match into "not wired" once the table outgrows the pipe
     # buffer. That bug has now been written three times in this codebase;
     # do not add a fourth.
-    # Any other shell runner, Rust test, or fixture list. Two kinds of
-    # file are excluded because naming a fixture in them means the
-    # OPPOSITE of "wired":
-    #   - the allowlist names fixtures that are deliberately not run;
-    #   - emit_parity_known.txt names backend asymmetries, and a row
-    #     there is an exemption, not an execution.
+    # Any other shell runner, Rust test, or fixture list. The allowlist is
+    # excluded because naming a fixture there means the opposite of "wired":
+    # the fixture is deliberately not run.
     # Comment lines are skipped for the same reason: "X is deliberately
     # absent from this registry" must not read as a registration.
     local candidate
     for candidate in tests/*.sh tests/*.rs tests/*.txt tests/*.tbl; do
         [ -e "$candidate" ] || continue
         [ "$candidate" = "$ALLOWLIST" ] && continue
-        [ "$candidate" = "tests/emit_parity_known.txt" ] && continue
         [ "$candidate" = "tests/check_fixture_registration.sh" ] && continue
         # NOT a pipeline into `grep -q`: under `set -o pipefail` the
         # downstream grep exits on first match, the upstream one dies with
         # SIGPIPE, and pipefail turns a successful match into rc 141. The
         # verdict would then depend on the byte offset of the match inside
-        # a 400 KB file. (run_emit_parity.sh's known_exemption had the
-        # identical bug; this copy was introduced by the same commit that
-        # removed it there.)
+        # a 400 KB file.
         if grep -qF "$base" <(grep -vE '^[[:space:]]*(#|//)' "$candidate" 2>/dev/null); then
             return 0
         fi

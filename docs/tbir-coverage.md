@@ -46,13 +46,14 @@ see tbir-mvp.md divergence 1). `probe_basic_test`, `probe_force_test`,
 and `testbench_probe_dut_test` (all `cpu_pipeline.sv`) are registered,
 trace-diff clean v1↔tbir at seed 1. See the **probe/force group** below.
 
-## ✅ COVERAGE COMPLETE (2026-06-13)
+## ✅ COVERAGE COMPLETE (2026-06-13 historical closure snapshot)
 
 The TB-IR (`--codegen tbir`) backend now covers the **entire admissible
-HARC fixture corpus**. The registry (`tests/tbir_equiv_fixtures.txt`)
+HARC fixture corpus**. At the time of this snapshot, the former registry
+(`tests/tbir_equiv_fixtures.txt`)
 holds **120 rows**, every one passing under BOTH `--codegen v1` and
 `--codegen tbir` with `harc trace-diff` clean at seed 1
-(`tests/run_tbir_equiv.sh` = 119 fixture-pairs + the registry-only
+(`tests/run_tbir_equiv.sh`, since retired, = 119 fixture-pairs + the registry-only
 `fatal_path_test` deliberate-failure row). The closing wave (#401–#405)
 landed the last constructs: the wide-value (>64-bit) method ABI
 (`aes_cipher`), the transactor-composition cluster (reactive-monitor
@@ -93,14 +94,14 @@ not a coverage gap:
    | `transactor_forward_ref_consumer_test` | `codegen.rs` struct-ordering unit-test fixture; v1 emits non-compilable C++ — no behavioral sim |
    | `transactor_hookable_call_graph_edge_test` | `codegen.rs` call-edge ordering unit-test fixture; targets a `DummyDut` with no SV — no runnable sim |
 
-**This file is a snapshot, not a source of truth.** The registry
-(`tests/tbir_equiv_fixtures.txt`) is the source of truth for what is
-covered. Regenerate this report by re-running the sweep: for every
-manifest row of `tests/run_fixtures.sh` not in the registry, run
-`harc dump-ir tests/fixtures/<test>.harc [extras...]`; rows that lower
-cleanly then go through the full v1-vs-tbir equivalence pair exactly as
-`tests/run_tbir_equiv.sh` does (both codegens, same seed, separate
-outdirs, `harc trace-diff`).
+**This file is a historical snapshot, not a current source of truth.**
+After V1 parity retirement, the current registry is
+`tests/tbir_regression_fixtures.txt`, consumed by
+`tests/run_tbir_regression.sh` and `tests/run_arch_dut_fixtures.sh`.
+Every registered row must reach its declared pass/fail verdict under TBIR;
+new runtime-capable fixtures should be added there and run through the
+TBIR regression sweep. The former V1-vs-TBIR trace-diff workflow above is
+retained only as migration history.
 
 ## Sweep result summary
 
@@ -1112,13 +1113,13 @@ v1-vs-tbir equivalence pair (verdicts + trace-diff clean), but could
 not be registered: it needs a second HARC file
 (`async_fifo_domains.harc`), and registry schema v2
 (`test_name | top | sv_files | arch_dut | expect`) had no extra-files
-column — `run_tbir_equiv.sh` built `HARC_FILES` from `test_name`
+column — the former `run_tbir_equiv.sh` built `HARC_FILES` from `test_name`
 alone.
 
 **Resolved**: schema v3 shipped with the wait-on-clock slice —
 optional trailing `extra_harc | ref_src | test_struct` columns (`-` =
 none; 5-column v2 rows parse unchanged in both consumers,
-`run_tbir_equiv.sh` and `run_arch_dut_fixtures.sh`).
+the current `run_tbir_regression.sh` and `run_arch_dut_fixtures.sh`).
 `synchronizer_basic_test` is registered with its domains file, as are
 the wait-on-clock fixtures needing extras (`synchronizer_pulse_test`,
 `multi_clock_test`). `ref_src` and `test_struct` are wired through to

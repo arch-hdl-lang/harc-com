@@ -10302,17 +10302,13 @@ end test T"#;
     );
 }
 
-// ── harc#551: backend subset gaps, pinned so they stay declared ──────
+// ── Legacy-backend diagnostic contracts retained until native deletion ──
 
-/// The exact strings `tests/run_emit_parity.sh` greps to decide that a
-/// TB-IR rejection is a real escape hatch rather than a divergence. Five
-/// diagnostics name `--codegen v1` and only these two mean "use v1
-/// instead"; the other three say v1 is broken on the construct. If a
-/// rendering here changes wording, the gate silently reclassifies a
-/// declared gap as a divergence (spurious red) — so pin the phrases, not
-/// merely the flag.
+/// Pin the legacy escape-hatch wording while `--codegen v1` remains a
+/// supported CLI option. The native-emitter deletion batch removes this
+/// diagnostic contract together with the route.
 #[test]
-fn the_escape_hatch_phrases_the_parity_gate_greps_are_stable() {
+fn the_legacy_escape_hatch_phrase_is_stable() {
     // Pin the diagnostic class directly. A concrete source gap is a poor
     // rendering fixture because successful burn-down intentionally makes
     // each such program stop producing this error.
@@ -10323,7 +10319,7 @@ fn the_escape_hatch_phrases_the_parity_gate_greps_are_stable() {
     .to_string();
     assert!(
         err.contains("re-run with `--codegen v1`"),
-        "run_emit_parity.sh greps this exact phrase; got: {err}"
+        "legacy escape-hatch wording changed: {err}"
     );
 }
 
@@ -10354,12 +10350,8 @@ end test WideShiftHatch"#;
     );
 }
 
-/// The other side of the same contract: a `NotImplemented` rendering must
-/// NOT look like an escape hatch. All three of its clauses mention
-/// `--codegen v1`, and two of them mean v1 accepts the construct and
-/// produces bad output — the shape the gate most needs to flag. An
-/// earlier version of the gate matched the bare flag and auto-exempted
-/// exactly these.
+/// The other side of the same diagnostic contract: a `NotImplemented`
+/// rendering must not look like an escape hatch while v1 remains reachable.
 #[test]
 fn a_not_implemented_rendering_is_not_mistakable_for_an_escape_hatch() {
     let src = r#"test NotImpl
@@ -10385,9 +10377,7 @@ end test NotImpl"#;
     );
     assert!(
         !err.contains("re-run with `--codegen v1`"),
-        "a NotImplemented rendering must not carry the escape-hatch phrase, or \
-         the parity gate will exempt a case where v1's output is known bad; \
-         got: {err}"
+        "a NotImplemented rendering must not carry the escape-hatch phrase: {err}"
     );
 }
 

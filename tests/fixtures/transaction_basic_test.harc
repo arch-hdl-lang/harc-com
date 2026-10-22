@@ -14,9 +14,8 @@
 //      reads in arithmetic, branch conditions, assert conditions,
 //      loop bounds, and log/fail format args.
 //
-// Uses only the v1-supported surface, so the same file passes under
-// `--codegen v1` and `--codegen tbir`; the equivalence harness
-// trace-diffs the two.
+// The TB-IR regression sweep runs the fixture and pins record behavior
+// with the assertions below.
 
 domain SysDomain
   freq_mhz: 100

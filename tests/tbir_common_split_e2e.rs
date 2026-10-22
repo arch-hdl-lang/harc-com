@@ -2166,71 +2166,6 @@ fn build_common_with_param(
     log
 }
 
-fn build_v1(sv: &Path, tb: &Path, top: &str, outdir: &Path) -> String {
-    let output = Command::new(harc_bin())
-        .arg("sim")
-        .arg("--sv")
-        .arg(sv)
-        .arg(tb)
-        .args(["--top", top, "--codegen", "v1"])
-        .arg("--outdir")
-        .arg(outdir)
-        .env("HARC_SEED", "1")
-        .output()
-        .expect("run v1 build");
-    let log = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(output.status.success(), "v1 build failed:\n{log}");
-    log
-}
-
-fn build_v1_common(sv: &Path, tb: &Path, top: &str, outdir: &Path) -> String {
-    let output = Command::new(harc_bin())
-        .arg("sim")
-        .arg("--sv")
-        .arg(sv)
-        .arg(tb)
-        .args(["--top", top, "--codegen", "v1"])
-        .args(["--cpp-split", "tests", "--cpp-split-layout", "common"])
-        .args(["--emit-jobs", "2", "--jobs", "2"])
-        .arg("--outdir")
-        .arg(outdir)
-        .env("HARC_SEED", "1")
-        .output()
-        .expect("run v1 common build");
-    let log = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(output.status.success(), "v1 common build failed:\n{log}");
-    log
-}
-
-fn build_v1_mt(sv: &Path, tb: &Path, top: &str, outdir: &Path) -> String {
-    let output = Command::new(harc_bin())
-        .arg("sim")
-        .arg("--sv")
-        .arg(sv)
-        .arg(tb)
-        .args(["--top", top, "--codegen", "v1", "--mt"])
-        .arg("--outdir")
-        .arg(outdir)
-        .env("HARC_SEED", "1")
-        .output()
-        .expect("run MT v1 build");
-    let log = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(output.status.success(), "MT v1 build failed:\n{log}");
-    log
-}
-
 fn manifest_abi(outdir: &Path, prefix: &str) -> String {
     let manifest = std::fs::read_to_string(outdir.join(format!("{prefix}artifacts.json")))
         .expect("read common manifest");
@@ -2489,8 +2424,11 @@ fn named_clock_wait_preserves_semantic_time_above_u64_in_every_layout() {
     let inputs = fresh_dir("wide_clock_time_inputs");
     let sv = inputs.join("WideClockTimeTop.sv");
     let tb = inputs.join("wide_clock_time.harc");
-    std::fs::write(&sv, "module WideClockTimeTop(input logic clk);\nendmodule\n")
-        .expect("write wide-clock DUT");
+    std::fs::write(
+        &sv,
+        "module WideClockTimeTop(input logic clk);\nendmodule\n",
+    )
+    .expect("write wide-clock DUT");
     std::fs::write(
         &tb,
         r#"test WideClockTime
@@ -2509,12 +2447,12 @@ end test WideClockTime
         let outdir = fresh_dir(&format!("wide_clock_time_{layout}"));
         let trace = outdir.join("semantic.jsonl");
         let mut command = Command::new(harc_bin());
-        command
-            .arg("sim")
-            .arg("--sv")
-            .arg(&sv)
-            .arg(&tb)
-            .args(["--top", "WideClockTimeTop", "--codegen", "tbir"]);
+        command.arg("sim").arg("--sv").arg(&sv).arg(&tb).args([
+            "--top",
+            "WideClockTimeTop",
+            "--codegen",
+            "tbir",
+        ]);
         if layout == "common" {
             command.args(["--cpp-split", "tests", "--cpp-split-layout", "common"]);
         }
@@ -2542,7 +2480,10 @@ end test WideClockTime
             .and_then(|tail| tail.split(',').next())
             .and_then(|value| value.parse::<u128>().ok())
             .expect("u128 semantic timestamp");
-        assert!(time > u64::MAX as u128, "{layout} trace wrapped: {log_line}");
+        assert!(
+            time > u64::MAX as u128,
+            "{layout} trace wrapped: {log_line}"
+        );
         let _ = std::fs::remove_dir_all(outdir);
     }
     let _ = std::fs::remove_dir_all(inputs);
@@ -2605,13 +2546,9 @@ end test RandomizeNames
     )
     .expect("write randomize-name HARC fixture");
 
-    let v1_out = fresh_dir("randomize_names_v1");
-    let v1_common_out = fresh_dir("randomize_names_v1_common");
     let self_out = fresh_dir("randomize_names_self");
     let common_out = fresh_dir("randomize_names_common");
     for log in [
-        build_v1(&sv, &tb, "RandomizeNamesTop", &v1_out),
-        build_v1_common(&sv, &tb, "RandomizeNamesTop", &v1_common_out),
         build_self_contained(&sv, &tb, "RandomizeNamesTop", &self_out),
         build_common_suite(&sv, &tb, "RandomizeNamesTop", &common_out),
     ] {
@@ -2625,7 +2562,7 @@ end test RandomizeNames
         );
     }
 
-    for path in [inputs, v1_out, v1_common_out, self_out, common_out] {
+    for path in [inputs, self_out, common_out] {
         let _ = std::fs::remove_dir_all(path);
     }
 }
@@ -2679,9 +2616,7 @@ end test GlobalNameCollision
     )
     .expect("write global-name collision HARC fixture");
 
-    let builders: [(&str, fn(&Path, &Path, &str, &Path) -> String); 4] = [
-        ("v1", build_v1),
-        ("v1_common", build_v1_common),
+    let builders: [(&str, fn(&Path, &Path, &str, &Path) -> String); 2] = [
         ("tbir_self", build_self_contained),
         ("tbir_common", build_common_suite),
     ];
@@ -2729,9 +2664,7 @@ end test EnumNameCollision
     )
     .expect("write enum-name collision HARC fixture");
 
-    let builders: [(&str, fn(&Path, &Path, &str, &Path) -> String); 4] = [
-        ("v1", build_v1),
-        ("v1_common", build_v1_common),
+    let builders: [(&str, fn(&Path, &Path, &str, &Path) -> String); 2] = [
         ("tbir_self", build_self_contained),
         ("tbir_common", build_common_suite),
     ];
@@ -2899,9 +2832,7 @@ end test Stable
             .unwrap_or_else(|| panic!("missing stable-target line:\n{log}"))
             .to_string()
     };
-    let builders: [(&str, fn(&Path, &Path, &str, &Path) -> String); 4] = [
-        ("v1", build_v1),
-        ("v1_common", build_v1_common),
+    let builders: [(&str, fn(&Path, &Path, &str, &Path) -> String); 2] = [
         ("tbir_self", build_self_contained),
         ("tbir_common", build_common_suite),
     ];
@@ -2968,9 +2899,7 @@ end test UniqueAcrossSites
     )
     .expect("write unique-scope HARC fixture");
 
-    let builders: [(&str, fn(&Path, &Path, &str, &Path) -> String); 4] = [
-        ("v1", build_v1),
-        ("v1_common", build_v1_common),
+    let builders: [(&str, fn(&Path, &Path, &str, &Path) -> String); 2] = [
         ("tbir_self", build_self_contained),
         ("tbir_common", build_common_suite),
     ];
@@ -3098,9 +3027,7 @@ end test SequencerUniqueCollision
     )
     .expect("write sequencer unique collision HARC fixture");
 
-    let builders: [(&str, fn(&Path, &Path, &str, &Path) -> String); 4] = [
-        ("v1", build_v1),
-        ("v1_common", build_v1_common),
+    let builders: [(&str, fn(&Path, &Path, &str, &Path) -> String); 2] = [
         ("tbir_self", build_self_contained),
         ("tbir_common", build_common_suite),
     ];
@@ -3211,10 +3138,10 @@ end test AutoCovIds
     .expect("write auto-coverage test fixture");
 
     let mut reference_ids = None;
-    for (layout, common) in [("v1", false), ("self", false), ("common", true)] {
+    for (layout, common) in [("self", false), ("common", true)] {
         let outdir = fresh_dir(&format!("source_qualified_auto_cov_{layout}"));
         let coverage = outdir.join("coverage.jsonl");
-        let codegen = if layout == "v1" { "v1" } else { "tbir" };
+        let codegen = "tbir";
         let mut command = Command::new(harc_bin());
         command
             .arg("sim")
@@ -3277,14 +3204,12 @@ fn tbir_common_solver_state_is_fresh_across_same_seed_same_process_runs() {
 
     let inputs = fresh_dir("solver_state_inputs");
     let self_out = fresh_dir("solver_state_self");
-    let v1_out = fresh_dir("solver_state_v1");
     let outdir = fresh_dir("solver_state_output");
     let sv = inputs.join("TbirCommonReg.sv");
     let tb = inputs.join("solver_state.harc");
     std::fs::write(&sv, DUT).expect("write DUT fixture");
     std::fs::write(&tb, SOLVER_STATE_TESTBENCH).expect("write solver-state fixture");
     build_self_contained(&sv, &tb, "TbirCommonReg", &self_out);
-    build_v1(&sv, &tb, "TbirCommonReg", &v1_out);
     build_common_suite(&sv, &tb, "TbirCommonReg", &outdir);
 
     let registry = outdir.join("solver_state__registry.cpp");
@@ -3406,7 +3331,7 @@ fn tbir_common_solver_state_is_fresh_across_same_seed_same_process_runs() {
         }),
         "wide solver value escaped its 130-bit representation: {first_draws:?}"
     );
-    for (layout, layout_out) in [("self", &self_out), ("v1", &v1_out)] {
+    for (layout, layout_out) in [("self", &self_out)] {
         let trace = layout_out.join(format!("{layout}.jsonl"));
         let run = Command::new(layout_out.join("obj_dir/VTbirCommonReg"))
             .args(["--test", "SolverState"])
@@ -3462,7 +3387,6 @@ fn tbir_common_solver_state_is_fresh_across_same_seed_same_process_runs() {
 
     let _ = std::fs::remove_dir_all(inputs);
     let _ = std::fs::remove_dir_all(self_out);
-    let _ = std::fs::remove_dir_all(v1_out);
     let _ = std::fs::remove_dir_all(outdir);
 }
 
@@ -3477,14 +3401,12 @@ fn tbir_common_coverage_json_is_owned_and_closed_per_run() {
 
     let inputs = fresh_dir("coverage_state_inputs");
     let self_out = fresh_dir("coverage_state_self");
-    let v1_out = fresh_dir("coverage_state_v1");
     let outdir = fresh_dir("coverage_state_output");
     let sv = inputs.join("TbirCommonReg.sv");
     let tb = inputs.join("coverage_state.harc");
     std::fs::write(&sv, DUT).expect("write DUT fixture");
     std::fs::write(&tb, COVERAGE_STATE_TESTBENCH).expect("write coverage-state fixture");
     build_self_contained(&sv, &tb, "TbirCommonReg", &self_out);
-    build_v1(&sv, &tb, "TbirCommonReg", &v1_out);
     build_common_suite(&sv, &tb, "TbirCommonReg", &outdir);
 
     let registry = outdir.join("coverage_state__registry.cpp");
@@ -3519,7 +3441,7 @@ fn tbir_common_coverage_json_is_owned_and_closed_per_run() {
         "coverage-state run failed:\n{run_log}"
     );
 
-    for (layout, layout_out) in [("self", &self_out), ("v1", &v1_out)] {
+    for (layout, layout_out) in [("self", &self_out)] {
         let coverage = layout_out.join(format!("{layout}.coverage.jsonl"));
         let run = Command::new(layout_out.join("obj_dir/VTbirCommonReg"))
             .args(["--test", "CoverageState"])
@@ -3557,15 +3479,8 @@ fn tbir_common_coverage_json_is_owned_and_closed_per_run() {
             .expect("read self-contained coverage report"),
         "self-contained coverage JSON differs from common"
     );
-    assert_eq!(
-        first,
-        std::fs::read_to_string(v1_out.join("v1.coverage.jsonl")).expect("read v1 coverage report"),
-        "v1 coverage JSON differs from common"
-    );
-
     let _ = std::fs::remove_dir_all(inputs);
     let _ = std::fs::remove_dir_all(self_out);
-    let _ = std::fs::remove_dir_all(v1_out);
     let _ = std::fs::remove_dir_all(outdir);
 }
 
@@ -3581,20 +3496,14 @@ fn tbir_common_hook_triggered_coverage_json_matches_all_layouts() {
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let self_out = fresh_dir("hook_coverage_self");
-    let v1_out = fresh_dir("hook_coverage_v1");
     let common_out = fresh_dir("hook_coverage_common");
     let sv = root.join("tests/dut/top_counter.sv");
     let tb = root.join("tests/fixtures/component_early_return_post_cover_test.harc");
     build_self_contained(&sv, &tb, "Top", &self_out);
-    build_v1(&sv, &tb, "Top", &v1_out);
     build_common_suite(&sv, &tb, "Top", &common_out);
 
     let mut reports = Vec::new();
-    for (layout, outdir) in [
-        ("self", &self_out),
-        ("v1", &v1_out),
-        ("common", &common_out),
-    ] {
+    for (layout, outdir) in [("self", &self_out), ("common", &common_out)] {
         let coverage = outdir.join(format!("{layout}.coverage.jsonl"));
         let run = Command::new(outdir.join("obj_dir/VTop"))
             .args(["--test", "EarlyReturnTest"])
@@ -3615,15 +3524,16 @@ fn tbir_common_hook_triggered_coverage_json_matches_all_layouts() {
         );
         reports.push(std::fs::read_to_string(coverage).expect("read hook coverage report"));
     }
-    assert_eq!(reports[0], reports[1], "v1 hook coverage JSON differs");
-    assert_eq!(reports[0], reports[2], "common hook coverage JSON differs");
+    assert_eq!(
+        reports[0], reports[1],
+        "common hook coverage JSON differs from self-contained TBIR"
+    );
     assert_eq!(reports[0].matches("\"type\":\"covergroup\"").count(), 1);
     assert_eq!(reports[0].matches("\"type\":\"coverpoint_bin\"").count(), 2);
     assert!(!reports[0].contains("\"type\":\"cross\""));
     assert!(!reports[0].contains("\"type\":\"cross_bin\""));
 
     let _ = std::fs::remove_dir_all(self_out);
-    let _ = std::fs::remove_dir_all(v1_out);
     let _ = std::fs::remove_dir_all(common_out);
 }
 
@@ -3776,7 +3686,7 @@ fn common_extern_signature_change_rejects_optimized_stale_capsule_in_both_backen
     let sv = root.join("tests/dut/top_counter.sv");
     let tb = inputs.join("extern_sig.harc");
     let reference = inputs.join("extern_impl.cpp");
-    for codegen in ["tbir", "v1"] {
+    for codegen in ["tbir"] {
         let outdir = fresh_dir(&format!("extern_signature_output_{codegen}"));
         let build = |two_args: bool, common: bool, build_out: &Path| {
             let declaration = if two_args {
@@ -5754,10 +5664,10 @@ fn tbir_common_declared_component_scoreboard_and_copy_state_match_self_contained
 }
 
 #[test]
-fn canonical_testbench_tlm_binding_order_matches_v1_and_common() {
+fn canonical_testbench_tlm_binding_order_matches_common_layout() {
     if !verilator_present() {
         eprintln!(
-            "SKIP canonical_testbench_tlm_binding_order_matches_v1_and_common: \
+            "SKIP canonical_testbench_tlm_binding_order_matches_common_layout: \
              `verilator` not found"
         );
         return;
@@ -5765,7 +5675,6 @@ fn canonical_testbench_tlm_binding_order_matches_v1_and_common() {
 
     let inputs = fresh_dir("tlm_binding_order_inputs");
     let tbir_out = fresh_dir("tlm_binding_order_tbir");
-    let v1_out = fresh_dir("tlm_binding_order_v1");
     let common_out = fresh_dir("tlm_binding_order_common");
     let sv = inputs.join("TlmMemory.sv");
     let tb = inputs.join("tlm_binding_order.harc");
@@ -5777,7 +5686,6 @@ fn canonical_testbench_tlm_binding_order_matches_v1_and_common() {
     std::fs::write(&tb, TESTBENCH_TLM_BINDING_ORDER_TESTBENCH).expect("write logical TLM fixture");
 
     build_self_contained(&sv, &tb, "TlmMemory", &tbir_out);
-    build_v1(&sv, &tb, "TlmMemory", &v1_out);
     build_common_suite(&sv, &tb, "TlmMemory", &common_out);
 
     for test in ["LogicalOrderA", "LogicalOrderB"] {
@@ -5792,13 +5700,8 @@ fn canonical_testbench_tlm_binding_order_matches_v1_and_common() {
                 .unwrap_or_else(|error| panic!("run {test} in {tag}: {error}"))
         };
         let tbir_run = run(&tbir_out, &format!("tbir_{test}"));
-        let v1_run = run(&v1_out, &format!("v1_{test}"));
         let common_run = run(&common_out, &format!("common_{test}"));
-        for (layout, result) in [
-            ("TB-IR", &tbir_run),
-            ("v1", &v1_run),
-            ("common", &common_run),
-        ] {
+        for (layout, result) in [("TB-IR", &tbir_run), ("common", &common_run)] {
             let log = format!(
                 "{}{}",
                 String::from_utf8_lossy(&result.stdout),
@@ -5809,11 +5712,6 @@ fn canonical_testbench_tlm_binding_order_matches_v1_and_common() {
         }
         assert_eq!(
             std::fs::read(tbir_out.join(format!("tbir_{test}.jsonl"))).unwrap(),
-            std::fs::read(v1_out.join(format!("v1_{test}.jsonl"))).unwrap(),
-            "v1/TB-IR trace mismatch for {test}"
-        );
-        assert_eq!(
-            std::fs::read(tbir_out.join(format!("tbir_{test}.jsonl"))).unwrap(),
             std::fs::read(common_out.join(format!("common_{test}.jsonl"))).unwrap(),
             "common/TB-IR trace mismatch for {test}"
         );
@@ -5821,7 +5719,6 @@ fn canonical_testbench_tlm_binding_order_matches_v1_and_common() {
 
     let _ = std::fs::remove_dir_all(inputs);
     let _ = std::fs::remove_dir_all(tbir_out);
-    let _ = std::fs::remove_dir_all(v1_out);
     let _ = std::fs::remove_dir_all(common_out);
 }
 
@@ -5837,7 +5734,6 @@ fn divergent_testbench_tlm_adapters_preserve_blocking_and_reverse_ooo_results() 
 
     let inputs = fresh_dir("divergent_tlm_inputs");
     let self_out = fresh_dir("divergent_tlm_self");
-    let v1_out = fresh_dir("divergent_tlm_v1");
     let common_out = fresh_dir("divergent_tlm_common");
     let sv = inputs.join("DualTlmMemory.sv");
     let tb = inputs.join("divergent_tlm.harc");
@@ -6041,7 +5937,6 @@ end impl DivergentTlmB
     .expect("write divergent TLM HARC fixture");
 
     build_self_contained(&sv, &tb, "DualTlmMemory", &self_out);
-    build_v1(&sv, &tb, "DualTlmMemory", &v1_out);
     build_common_suite(&sv, &tb, "DualTlmMemory", &common_out);
     let runtime = std::fs::read_to_string(common_out.join("divergent_tlm__runtime.cpp"))
         .expect("read divergent TLM runtime");
@@ -6065,13 +5960,8 @@ end impl DivergentTlmB
                 .unwrap_or_else(|error| panic!("run {test} in {tag}: {error}"))
         };
         let self_run = run(&self_out, &format!("self_{test}"));
-        let v1_run = run(&v1_out, &format!("v1_{test}"));
         let common_run = run(&common_out, &format!("common_{test}"));
-        for (layout, result) in [
-            ("self-contained", &self_run),
-            ("v1", &v1_run),
-            ("common", &common_run),
-        ] {
+        for (layout, result) in [("self-contained", &self_run), ("common", &common_run)] {
             let log = format!(
                 "{}{}",
                 String::from_utf8_lossy(&result.stdout),
@@ -6081,15 +5971,12 @@ end impl DivergentTlmB
             assert!(log.contains("DIVERGENT_TLM="), "{layout} {test}:\n{log}");
         }
         let self_trace = std::fs::read(self_out.join(format!("self_{test}.jsonl"))).unwrap();
-        let v1_trace = std::fs::read(v1_out.join(format!("v1_{test}.jsonl"))).unwrap();
         let common_trace = std::fs::read(common_out.join(format!("common_{test}.jsonl"))).unwrap();
-        assert_eq!(self_trace, v1_trace, "v1 trace mismatch for {test}");
         assert_eq!(self_trace, common_trace, "common trace mismatch for {test}");
     }
 
     let _ = std::fs::remove_dir_all(inputs);
     let _ = std::fs::remove_dir_all(self_out);
-    let _ = std::fs::remove_dir_all(v1_out);
     let _ = std::fs::remove_dir_all(common_out);
 }
 
@@ -6234,10 +6121,8 @@ fn qualified_clock_wait_services_passive_target_in_all_layouts() {
     let inputs = fresh_dir("qualified_wait_target_inputs");
     let sv = inputs.join("QualifiedWaitTargetTop.sv");
     let tb = inputs.join("qualified_wait_target.harc");
-    let v1_out = fresh_dir("qualified_wait_target_v1");
     let self_out = fresh_dir("qualified_wait_target_self");
     let common_out = fresh_dir("qualified_wait_target_common");
-    let v1_mt_out = fresh_dir("qualified_wait_target_v1_mt");
     let self_mt_out = fresh_dir("qualified_wait_target_self_mt");
     let common_mt_out = fresh_dir("qualified_wait_target_common_mt");
     std::fs::write(
@@ -6354,17 +6239,13 @@ end impl QualifiedWaitTargetTest
     )
     .expect("write qualified-wait target test");
 
-    build_v1(&sv, &tb, "QualifiedWaitTargetTop", &v1_out);
     build_self_contained(&sv, &tb, "QualifiedWaitTargetTop", &self_out);
     build_common_suite(&sv, &tb, "QualifiedWaitTargetTop", &common_out);
-    build_v1_mt(&sv, &tb, "QualifiedWaitTargetTop", &v1_mt_out);
     build_self_contained_mt(&sv, &tb, "QualifiedWaitTargetTop", &self_mt_out);
     build_common_suite_mt(&sv, &tb, "QualifiedWaitTargetTop", &common_mt_out);
     for (layout, outdir, tag) in [
-        ("v1", &v1_out, "v1"),
         ("self-contained", &self_out, "self"),
         ("common", &common_out, "common"),
-        ("v1-mt", &v1_mt_out, "v1_mt"),
         ("self-contained-mt", &self_mt_out, "self_mt"),
         ("common-mt", &common_mt_out, "common_mt"),
     ] {
@@ -6393,18 +6274,8 @@ end impl QualifiedWaitTargetTest
     let self_trace = std::fs::read(self_out.join("self.jsonl")).unwrap();
     assert_eq!(
         self_trace,
-        std::fs::read(v1_out.join("v1.jsonl")).unwrap(),
-        "v1 qualified-wait target trace mismatch"
-    );
-    assert_eq!(
-        self_trace,
         std::fs::read(common_out.join("common.jsonl")).unwrap(),
         "common qualified-wait target trace mismatch"
-    );
-    assert_eq!(
-        self_trace,
-        std::fs::read(v1_mt_out.join("v1_mt.jsonl")).unwrap(),
-        "MT v1 qualified-wait target trace mismatch"
     );
     assert_eq!(
         self_trace,
@@ -6418,10 +6289,8 @@ end impl QualifiedWaitTargetTest
     );
 
     let _ = std::fs::remove_dir_all(inputs);
-    let _ = std::fs::remove_dir_all(v1_out);
     let _ = std::fs::remove_dir_all(self_out);
     let _ = std::fs::remove_dir_all(common_out);
-    let _ = std::fs::remove_dir_all(v1_mt_out);
     let _ = std::fs::remove_dir_all(self_mt_out);
     let _ = std::fs::remove_dir_all(common_mt_out);
 }
@@ -6750,12 +6619,28 @@ fn tbir_common_mt_target_workers_are_selected_run_owned_and_torn_down() {
     assert!(runtime.contains("worker_shutdown"), "{runtime}");
     assert!(runtime.contains("actor_worker.join()"), "{runtime}");
     assert!(!runtime.contains("worker_turn"), "{runtime}");
-    assert_eq!(runtime.matches("std::thread actor_worker").count(), 1, "{runtime}");
-    assert!(runtime.contains("uint64_t remaining = (uint64_t)cycles;"), "{runtime}");
-    assert!(interface.contains("uint64_t cycle_count = 0;"), "{interface}");
+    assert_eq!(
+        runtime.matches("std::thread actor_worker").count(),
+        1,
+        "{runtime}"
+    );
+    assert!(
+        runtime.contains("uint64_t remaining = (uint64_t)cycles;"),
+        "{runtime}"
+    );
+    assert!(
+        interface.contains("uint64_t cycle_count = 0;"),
+        "{interface}"
+    );
     assert!(interface.contains("uint64_t rising_count;"), "{interface}");
-    assert!(interface.contains("unsigned __int128 now_ps = 0;"), "{interface}");
-    assert!(interface.contains("unsigned __int128 next_edge_ps;"), "{interface}");
+    assert!(
+        interface.contains("unsigned __int128 now_ps = 0;"),
+        "{interface}"
+    );
+    assert!(
+        interface.contains("unsigned __int128 next_edge_ps;"),
+        "{interface}"
+    );
     assert!(!runtime.contains("rising_count + cycles"), "{runtime}");
     assert!(
         capsule.contains("ctx.actor_schedulers.emplace_back"),
@@ -7378,11 +7263,9 @@ fn signed_blocking_and_record_ooo_targets_match_all_layouts() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let sv = root.join("tests/dut/TlmSignedRecordOooInitiator.sv");
     let tb = root.join("tests/fixtures/tlm_target_signed_record_ooo_test.harc");
-    let v1_out = fresh_dir("target_signed_record_v1");
     let self_out = fresh_dir("target_signed_record_self");
     let common_out = fresh_dir("target_signed_record_common");
 
-    build_v1(&sv, &tb, "TlmSignedRecordOooInitiator", &v1_out);
     build_self_contained(&sv, &tb, "TlmSignedRecordOooInitiator", &self_out);
     build_common_suite(&sv, &tb, "TlmSignedRecordOooInitiator", &common_out);
 
@@ -7406,11 +7289,7 @@ fn signed_blocking_and_record_ooo_targets_match_all_layouts() {
         "blocking and record-field signed widening must retain the sign bit:\n{capsule}"
     );
 
-    for (layout, outdir) in [
-        ("v1", &v1_out),
-        ("self-contained", &self_out),
-        ("common", &common_out),
-    ] {
+    for (layout, outdir) in [("self-contained", &self_out), ("common", &common_out)] {
         let run = Command::new(outdir.join("obj_dir/VTlmSignedRecordOooInitiator"))
             .args(["--test", "SignedRecordTargetTest"])
             .current_dir(outdir)
@@ -7432,7 +7311,6 @@ fn signed_blocking_and_record_ooo_targets_match_all_layouts() {
         );
     }
 
-    let _ = std::fs::remove_dir_all(v1_out);
     let _ = std::fs::remove_dir_all(self_out);
     let _ = std::fs::remove_dir_all(common_out);
 }
@@ -7497,15 +7375,12 @@ fn tbir_untagged_fork_join_matches_all_layouts() {
     let sv = root.join("tests/dut/TlmMemory.sv");
     let tb = root.join("tests/fixtures/tlm_method_blocking_fork_bus_test.harc");
     let self_out = fresh_dir("untagged_fork_self");
-    let v1_out = fresh_dir("untagged_fork_v1");
     let common_out = fresh_dir("untagged_fork_common");
 
     build_self_contained(&sv, &tb, "TlmMemory", &self_out);
-    build_v1(&sv, &tb, "TlmMemory", &v1_out);
     build_common_suite(&sv, &tb, "TlmMemory", &common_out);
     for (layout, outdir, tag) in [
         ("self-contained", &self_out, "self"),
-        ("v1", &v1_out, "v1"),
         ("common", &common_out, "common"),
     ] {
         let run = Command::new(outdir.join("obj_dir/VTlmMemory"))
@@ -7531,14 +7406,12 @@ fn tbir_untagged_fork_join_matches_all_layouts() {
         );
     }
     let self_trace = std::fs::read(self_out.join("self.jsonl")).unwrap();
-    assert_eq!(self_trace, std::fs::read(v1_out.join("v1.jsonl")).unwrap());
     assert_eq!(
         self_trace,
         std::fs::read(common_out.join("common.jsonl")).unwrap()
     );
 
     let _ = std::fs::remove_dir_all(self_out);
-    let _ = std::fs::remove_dir_all(v1_out);
     let _ = std::fs::remove_dir_all(common_out);
 }
 
@@ -7813,7 +7686,6 @@ fn tbir_common_bus_send_recv_backpressure_matches_all_layouts() {
     let sv = inputs.join("HandshakeLoop.sv");
     let tb = inputs.join("bus_send_recv.harc");
     let self_out = fresh_dir("bus_send_recv_self");
-    let v1_out = fresh_dir("bus_send_recv_v1");
     let common_out = fresh_dir("bus_send_recv_common");
     std::fs::write(
         &sv,
@@ -7889,11 +7761,9 @@ end impl PingTest
     .expect("write send/recv HARC fixture");
 
     build_self_contained(&sv, &tb, "HandshakeLoop", &self_out);
-    build_v1(&sv, &tb, "HandshakeLoop", &v1_out);
     build_common_suite(&sv, &tb, "HandshakeLoop", &common_out);
     for (layout, outdir, tag) in [
         ("self-contained", &self_out, "self"),
-        ("v1", &v1_out, "v1"),
         ("common", &common_out, "common"),
     ] {
         let run = Command::new(outdir.join("obj_dir/VHandshakeLoop"))
@@ -7926,7 +7796,6 @@ end impl PingTest
 
     let _ = std::fs::remove_dir_all(inputs);
     let _ = std::fs::remove_dir_all(self_out);
-    let _ = std::fs::remove_dir_all(v1_out);
     let _ = std::fs::remove_dir_all(common_out);
 }
 
@@ -7944,7 +7813,6 @@ fn tbir_common_blocking_tlm_timeout_is_bounded_and_diagnostic() {
     let sv = root.join("tests/dut/TlmStallMemory.sv");
     let tb = inputs.join("blocking_tlm_timeout.harc");
     let self_out = fresh_dir("blocking_tlm_timeout_self");
-    let v1_out = fresh_dir("blocking_tlm_timeout_v1");
     let common_out = fresh_dir("blocking_tlm_timeout_common");
     std::fs::write(
         &tb,
@@ -7982,13 +7850,8 @@ end impl TlmStallTimeoutTest
     .expect("write blocking timeout fixture");
 
     build_self_contained(&sv, &tb, "TlmStallMemory", &self_out);
-    build_v1(&sv, &tb, "TlmStallMemory", &v1_out);
     build_common_suite(&sv, &tb, "TlmStallMemory", &common_out);
-    for (layout, outdir) in [
-        ("self-contained", &self_out),
-        ("v1", &v1_out),
-        ("common", &common_out),
-    ] {
+    for (layout, outdir) in [("self-contained", &self_out), ("common", &common_out)] {
         let run = Command::new(outdir.join("obj_dir/VTlmStallMemory"))
             .args(["--test", "TlmStallTimeoutTest"])
             .current_dir(outdir)
@@ -8010,7 +7873,6 @@ end impl TlmStallTimeoutTest
 
     let _ = std::fs::remove_dir_all(inputs);
     let _ = std::fs::remove_dir_all(self_out);
-    let _ = std::fs::remove_dir_all(v1_out);
     let _ = std::fs::remove_dir_all(common_out);
 }
 
@@ -8565,7 +8427,6 @@ fn tbir_common_regblock_frontdoor_uses_per_capsule_bus_adapters_and_callbacks() 
     }
     let inputs = fresh_dir("regblock_remap_inputs");
     let self_out = fresh_dir("regblock_remap_self");
-    let v1_out = fresh_dir("regblock_remap_v1");
     let common_out = fresh_dir("regblock_remap_common");
     let sv = inputs.join("RalRemapTop.sv");
     let tb = inputs.join("regblock_remap.harc");
@@ -8705,7 +8566,6 @@ end impl RalRemapSecond
     .expect("write divergent RAL fixture");
 
     build_self_contained(&sv, &tb, "RalRemapTop", &self_out);
-    build_v1(&sv, &tb, "RalRemapTop", &v1_out);
     build_common_suite(&sv, &tb, "RalRemapTop", &common_out);
     let runtime = std::fs::read_to_string(common_out.join("regblock_remap__runtime.cpp"))
         .expect("read common RAL runtime");
@@ -8736,11 +8596,7 @@ end impl RalRemapSecond
 
     for test in ["RalRemapFirst", "RalRemapSecond"] {
         let mut traces = Vec::new();
-        for (layout, outdir) in [
-            ("self", &self_out),
-            ("v1", &v1_out),
-            ("common", &common_out),
-        ] {
+        for (layout, outdir) in [("self", &self_out), ("common", &common_out)] {
             let trace = outdir.join(format!("{layout}_{test}.jsonl"));
             let run = Command::new(outdir.join("obj_dir/VRalRemapTop"))
                 .args(["--test", test])
@@ -8759,13 +8615,14 @@ end impl RalRemapSecond
             assert!(log.contains("RAL_REMAP="), "{layout} {test}:\n{log}");
             traces.push(std::fs::read(trace).expect("read RAL trace"));
         }
-        assert_eq!(traces[0], traces[1], "v1 trace mismatch for {test}");
-        assert_eq!(traces[0], traces[2], "common trace mismatch for {test}");
+        assert_eq!(
+            traces[0], traces[1],
+            "common trace differs from self-contained TBIR for {test}"
+        );
     }
 
     let _ = std::fs::remove_dir_all(inputs);
     let _ = std::fs::remove_dir_all(self_out);
-    let _ = std::fs::remove_dir_all(v1_out);
     let _ = std::fs::remove_dir_all(common_out);
 }
 

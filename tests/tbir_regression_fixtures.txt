@@ -1,10 +1,9 @@
-# TB-IR equivalence-fixture registry — consumed by tests/run_tbir_equiv.sh
+# TB-IR regression-fixture registry — consumed by tests/run_tbir_regression.sh
 # and tests/run_arch_dut_fixtures.sh (single source of truth for the
-# equivalence matrix; do not duplicate these rows in scripts).
+# TB-IR behavior matrix; do not duplicate these rows in scripts).
 #
-# Each row names a fixture that must behave IDENTICALLY under BOTH C++
-# emitters (`harc sim --codegen v1` and `--codegen tbir`): same verdict,
-# and zero `harc trace-diff` divergences between the semantic traces.
+# Each row names a fixture that must reach the expected HARC verdict under
+# the TB-IR C++ emitter (`harc sim --codegen tbir`).
 #
 # Format (pipe-separated, one row per fixture — schema v3; the last
 # three columns are optional and may be omitted entirely, `-` = none;
@@ -18,11 +17,10 @@
 #   arch_dut    ARCH DUT source relative to tests/dut/ for the optional
 #               ARCH-native sweep (`harc sim --dut`, needs ARCH_BIN), or
 #               `-` when no proven .arch sibling exists (sweep skips row)
-#   expect      `pass` — both codegens must print ALL TESTS PASSED;
-#               `fail` — both codegens must exit nonzero WITHOUT printing
+#   expect      `pass` — TB-IR must print ALL TESTS PASSED;
+#               `fail` — TB-IR must exit nonzero WITHOUT printing
 #               ALL TESTS PASSED (deliberate-failure fixtures, e.g. the
-#               log(fatal, ...) path). Either way the two traces must
-#               trace-diff clean: the failure must be recorded identically.
+#               log(fatal, ...) path).
 #   extra_harc  space-separated ADDITIONAL .harc files relative to
 #               tests/fixtures/, loaded after <test_name>.harc (e.g.
 #               shared `domain` declaration files)
@@ -34,17 +32,11 @@
 #
 # Lines starting with '#' and blank lines are ignored.
 #
-# `--mt` variant: `MT=1 ./tests/run_tbir_equiv.sh` re-runs every row with
-# `--mt` appended to BOTH sim invocations. The multi-thread actor model is
-# execution-model only and functionally correct, so the MT sweep asserts
-# the per-codegen VERDICT (each `pass` row prints ALL TESTS PASSED under
-# both v1-mt and tbir-mt; each `fail` row fails identically). It does NOT
-# trace-diff v1-mt vs tbir-mt: under `--mt` the intra-cycle trace EVENT
-# ORDER is nondeterministic whenever two concurrent same-bus actors fire
-# in the same barrier window (the winning OS thread decides ordering).
-# This is inherent to the parallel model and affects v1 too — v1-mt is
-# itself run-to-run order-nondeterministic and differs from v1's own
-# cooperative trace. The actor-exercising rows — `tlm_target_thread_test`,
+# `--mt` variant: `MT=1 ./tests/run_tbir_regression.sh` re-runs every row with
+# `--mt` appended. The sweep asserts TB-IR's verdict without comparing traces:
+# intra-cycle event order is nondeterministic whenever concurrent same-bus
+# actors fire in the same barrier window. The actor-exercising rows —
+# `tlm_target_thread_test`,
 # `tlm_target_thread_monitor_test` (target actor + shared-host monitor),
 # `axilite_bound_mon_test` (active bound DRIVER + bound monitor),
 # `tlm_target_ooo_lanes_test` (OOO lanes), `tlm_pairing_arch_initiator_test`
@@ -59,12 +51,8 @@
 # tbir-mt's concurrent dispatch finishes earlier than the cooperative serial
 # `emit`-blocks-the-run-coroutine trace, an expected execution-model
 # difference, not a regression.
-# This file is APPEND-ONLY: each PR that brings a fixture into the TB-IR
-# subset (covergroups, helpers, wait-until, ...) adds its rows here in the
-# same PR. Merge conflicts resolve as the line union of both sides. Do not
-# add rows for constructs your PR does not enable — the harness fails the
-# whole run if any listed fixture does not behave as its `expect` column
-# specifies under `--codegen tbir`.
+# Keep this registry exhaustive for the dedicated TB-IR semantic sweep. The
+# harness fails if any row does not behave as its `expect` column specifies.
 
 top_counter_test | Top | top_counter.sv | top_counter.arch | pass
 sized_scalar_literal_test | Top | top_counter.sv | top_counter.arch | pass
@@ -161,8 +149,7 @@ testbench_lifecycle_test | Top | top_counter.sv | - | pass | - | - | LifecycleBu
 testbench_lifecycle_test | Top | top_counter.sv | - | pass | - | - | LifecycleBumpFive
 # #619 M4b: NON-SUSPENDING setup+check lifecycle bodies emitted OUT-OF-LINE
 # (a real call, once per suite) under HARC_TBIR_NATIVE_LIFECYCLE; bound by
-# two impls so both call sites hit the shared file-scope function. Both
-# codegens must trace-diff clean (v1 always inlines; tbir now calls).
+# two impls so both call sites hit the shared file-scope function.
 tb_lifecycle_nowait_test | Top | top_counter.sv | - | pass | - | - | NoWaitBumpTwo
 tb_lifecycle_nowait_test | Top | top_counter.sv | - | pass | - | - | NoWaitBumpFour
 # #619 M4b (suspending slice): a SUSPENDING setup (`wait N cycles` directly
@@ -176,7 +163,7 @@ tb_lifecycle_wait_setup_test | Top | top_counter.sv | - | pass | - | - | WaitSet
 # desugar marks a randomize-bearing testbench UNSAFE to share, so NO
 # TestbenchLifecycle is minted and the whole thing FALLS BACK to per-test
 # re-inline (0 out-of-line defs). This row proves that fallback is
-# equivalence-clean — RNG draw order is never at risk because such bodies
+# deterministic — RNG draw order is never at risk because such bodies
 # are never emitted out-of-line. Two impls.
 tb_lifecycle_rand_suspend_test | Top | top_counter.sv | - | pass | - | - | RandDelayUseSetup
 tb_lifecycle_rand_suspend_test | Top | top_counter.sv | - | pass | - | - | RandDelayReroll
@@ -231,11 +218,8 @@ tb_lifecycle_cast_read_test | Top | top_counter.sv | - | pass | - | - | CastLcTw
 # out-of-line classifier. Source-level `log(fatal)` is an out-of-line-safe Log
 # statement (the parser-unreachable Fatal terminator is pinned in a unit test).
 # Statement-position `on` is rejected earlier by ShareScan because it carries
-# per-test context. `cover` is pinned by the ownership test only: deprecated v1
-# still has the separately tracked #690 orphan-counter build bug for a cover in
-# a lifecycle, so it cannot join this real-build equivalence registry. The fatal
-# rows deliberately fail; every other row must pass and all rows must remain
-# trace-identical between v1 and tbir.
+# per-test context. `cover` is pinned by the ownership test. The fatal rows
+# deliberately fail; every other row must pass under TB-IR.
 tb_lifecycle_wait_until_test | Top | top_counter.sv | - | pass | - | - | WaitUntilLcThree
 tb_lifecycle_wait_until_test | Top | top_counter.sv | - | pass | - | - | WaitUntilLcFive
 tb_lifecycle_wallclock_fallback_test | Top | top_counter.sv | - | pass | - | - | WallclockLcTwo
@@ -384,17 +368,10 @@ scoreboard_list_state_test | Top | top_counter.sv | top_counter.arch | pass
 record_list_randomize_test | Top | top_counter.sv | - | pass
 record_list_unsat_test | Top | top_counter.sv | - | fail
 
-# Added by the harc#551 coverage audit. These ran under run_fixtures.sh
-# (default backend only) and were never trace-diffed across the two
-# emitters. Two are solver fixtures — the area harc#559 spent five review
-# passes in, and precisely the coverage that should not have been missing.
-#
-# `multi_active_instance_test` belongs here and is deliberately absent:
-# registering it turned up a v1 SIGSEGV at runtime (harc#576). Both
-# backends EMIT it, so tests/run_emit_parity.sh passes it — only the
-# trace-diff, which actually runs the binary, catches it. Re-add the row
-# when v1 is fixed, or drop the question with the backend (harc#548).
-backend_parity_test | Top | top_counter.sv | top_counter.arch | pass
+# Added by the harc#551 coverage audit. Keep the solver and multi-actor cases
+# in this runtime sweep so TB-IR acceptance alone cannot mask a broken binary.
+tbir_backend_smoke_test | Top | top_counter.sv | top_counter.arch | pass
+multi_active_instance_test | Top | top_counter.sv | - | pass
 soft_constraint_randomize_test | Top | top_counter.sv | - | pass
 target_record_state_test | TlmReadInitiator | TlmReadInitiator.sv | - | pass
 uint64_unique_randomize_test | Top | top_counter.sv | - | pass | - | uint64_unique_randomize_ref.cpp

@@ -17,9 +17,8 @@
 //   5. Passing the parent struct through a hookable transactor method
 //      by value (`drv.run_for(sc)` reads `sc.expected.count` inside).
 //
-// Uses only the v1-supported surface (native nested structs are valid
-// HARC), so the same file passes under `--codegen v1` and
-// `--codegen tbir`; the equivalence harness trace-diffs the two.
+// The TB-IR regression sweep runs the fixture and pins nested-record
+// behavior with the assertions below.
 
 domain SysDomain
   freq_mhz: 100

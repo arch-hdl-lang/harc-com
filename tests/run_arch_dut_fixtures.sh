@@ -10,7 +10,7 @@ HARC="${HARC:-./target/release/harc}"
 ARCH_BIN="${ARCH_BIN:-../arch-com/target/release/arch}"
 FIX_DIR="tests/fixtures"
 DUT_DIR="tests/dut"
-REGISTRY="tests/tbir_equiv_fixtures.txt"
+REGISTRY="tests/tbir_regression_fixtures.txt"
 SEED="${SEED:-1}"
 OUT="${ARCH_DUT_OUT:-harc_arch_dut_build}"
 
@@ -29,12 +29,9 @@ if [ ! -f "$REGISTRY" ]; then
     exit 1
 fi
 
-# TLM fixtures: run once with the default (v1) codegen. These four
-# still carry TB-IR blockers past the bus slice (`fork`/`join_all` TLM
-# issue for the pairing pair, `struct` for the burst pair — see
-# docs/tbir-coverage.md), so they stay v1-only and are NOT equivalence
-# fixtures — they keep their own table here rather than living in the
-# equivalence registry.
+# TLM fixtures that predate the shared registry. They run through the default
+# TB-IR backend and retain their own table here until the fixture manifests are
+# consolidated.
 read -r -d '' FIXTURES <<'EOF' || true
 tlm_pairing_arch_target_test    | TlmPairingArchTarget    | TlmPairingArchTarget.arch
 tlm_pairing_arch_initiator_test | TlmPairingArchInitiator | TlmPairingArchInitiator.arch
@@ -42,15 +39,13 @@ tlm_pairing_arch_burst_target_test    | TlmPairingArchBurstTarget    | TlmPairin
 tlm_pairing_arch_burst_initiator_test | TlmPairingArchBurstInitiator | TlmPairingArchBurstInitiator.arch
 EOF
 
-# TB-IR-capable fixtures: read from the equivalence registry
-# (tests/tbir_equiv_fixtures.txt — single source of truth; schema v3:
+# TB-IR fixtures: read from the regression registry
+# (tests/tbir_regression_fixtures.txt — single source of truth; schema v3:
 # test_name | top | sv_files | arch_dut | expect | extra_harc | ref_src
 # | test_struct, where the last three columns are optional and `-` =
 # none; v2 5-column rows parse unchanged). Every row whose arch_dut
-# column is not `-` runs under BOTH codegens (v1 and tbir) against the
-# ARCH-native DUT, then `harc trace-diff` the two semantic traces —
-# same structure as tests/run_tbir_equiv.sh, but on the `--dut`
-# backend. extra_harc files join the .harc input list and test_struct
+# column is not `-` runs under TB-IR against the ARCH-native DUT.
+# extra_harc files join the .harc input list and test_struct
 # is passed via `--test`; ref_src is parsed but ignored here (it names
 # C/C++ reference models for the Verilator path — not applicable to
 # the ARCH-native backend).
@@ -68,10 +63,12 @@ run_one() {
     [ -z "$test" ] && return 0
 
     rm -rf harc_sim_build
-    local out
-    out="$("$HARC" sim --arch-bin "$ARCH_BIN" --dut "$DUT_DIR/$dut" "$FIX_DIR/$test.harc" --top "$top" 2>&1)" || true
+    local out rc
+    out="$("$HARC" sim --arch-bin "$ARCH_BIN" --dut "$DUT_DIR/$dut" \
+        "$FIX_DIR/$test.harc" --top "$top" --codegen tbir 2>&1)"
+    rc=$?
 
-    if [[ "$out" == *"ALL TESTS PASSED"* ]]; then
+    if [ "$rc" -eq 0 ] && [[ "$out" == *"ALL TESTS PASSED"* ]]; then
         echo "  PASS  $test"
         PASS=$((PASS + 1))
     else
@@ -82,51 +79,48 @@ run_one() {
     fi
 }
 
-# run_equiv_sim <tag> <outdir> <codegen> <test> <top> <dut> <expect>
-# One `harc sim --dut` invocation under the given codegen, recording a
+# run_tbir_sim <tag> <outdir> <test> <top> <dut> <expect>
+# One TB-IR `harc sim --dut` invocation, recording a
 # semantic trace and requiring the registry verdict (`pass` rows must
 # print ALL TESTS PASSED; `fail` rows must exit nonzero without it).
-# Each codegen gets its OWN outdir (mirrors run_tbir_equiv.sh:
-# write_if_changed/obj_dir reuse keys off the emitted .cpp, so sharing
-# one directory across codegens risks stale objects).
-run_equiv_sim() {
-    local tag="$1" dir="$2" cg="$3" test="$4" top="$5" dut="$6" expect="$7"
+run_tbir_sim() {
+    local tag="$1" dir="$2" test="$3" top="$4" dut="$5" expect="$6"
     mkdir -p "$dir"
     local out rc
-    # HARC_FILES / ROW_TEST_ARGS are set per-row by run_equiv_one
+    # HARC_FILES / ROW_TEST_ARGS are set per-row by run_tbir_one
     # (schema-v3 extra_harc files and the optional --test selector).
     out="$("$HARC" sim --arch-bin "$ARCH_BIN" --dut "$DUT_DIR/$dut" \
         "${HARC_FILES[@]}" --top "$top" \
         ${ROW_TEST_ARGS[@]+"${ROW_TEST_ARGS[@]}"} \
-        --codegen "$cg" --seed "$SEED" --outdir "$dir" \
+        --codegen tbir --seed "$SEED" --outdir "$dir" \
         --record-trace "$dir/t.jsonl" 2>&1)"
     rc=$?
 
     if [ "$expect" = "fail" ]; then
-        # Mirrors run_tbir_equiv.sh: nonzero exit, no success sentinel,
+        # Nonzero exit, no success sentinel,
         # and a real "N TESTS FAILED" verdict (not infra breakage).
         if [ "$rc" -eq 0 ] || [[ "$out" == *"ALL TESTS PASSED"* ]]; then
-            echo "  FAIL  $tag (sim --codegen $cg passed, but registry expects fail)"
+            echo "  FAIL  $tag (TB-IR simulation passed, but registry expects fail)"
             echo "$out" | tail -20 | sed 's/^/      /'
             return 1
         fi
         if [[ "$out" != *"TESTS FAILED"* ]]; then
-            echo "  FAIL  $tag (sim --codegen $cg broke before reaching a test verdict)"
+            echo "  FAIL  $tag (TB-IR simulation broke before reaching a test verdict)"
             echo "$out" | tail -20 | sed 's/^/      /'
             return 1
         fi
         return 0
     fi
 
-    if [[ "$out" != *"ALL TESTS PASSED"* ]]; then
-        echo "  FAIL  $tag (sim --codegen $cg did not pass)"
+    if [ "$rc" -ne 0 ] || [[ "$out" != *"ALL TESTS PASSED"* ]]; then
+        echo "  FAIL  $tag (TB-IR simulation did not pass)"
         echo "$out" | tail -20 | sed 's/^/      /'
         return 1
     fi
     return 0
 }
 
-run_equiv_one() {
+run_tbir_one() {
     local row="$1"
     # Schema v3: the last three columns are optional (empty when a v2
     # row omits them; `-` = none).
@@ -165,24 +159,15 @@ run_equiv_one() {
     ROW_TEST_ARGS=()
     [ -n "$test_struct" ] && ROW_TEST_ARGS+=("--test" "$test_struct")
 
-    local pair_dir="$OUT/$test${test_struct:+__$test_struct}"
+    local run_dir="$OUT/$test${test_struct:+__$test_struct}"
     local tag="$test${test_struct:+ [$test_struct]} [arch-dut]"
-    if ! run_equiv_sim "$tag" "$pair_dir/v1" v1 "$test" "$top" "$arch_dut" "$expect" \
-        || ! run_equiv_sim "$tag" "$pair_dir/tbir" tbir "$test" "$top" "$arch_dut" "$expect"; then
+    if ! run_tbir_sim "$tag" "$run_dir" "$test" "$top" "$arch_dut" "$expect"; then
         FAIL=$((FAIL + 1))
         FAILED_NAMES+=("$tag")
         return 0
     fi
 
-    local out
-    if ! out="$("$HARC" trace-diff "$pair_dir/v1/t.jsonl" "$pair_dir/tbir/t.jsonl" 2>&1)"; then
-        echo "  FAIL  $tag (v1 vs tbir trace divergence)"
-        echo "$out" | tail -30 | sed 's/^/      /'
-        FAIL=$((FAIL + 1))
-        FAILED_NAMES+=("$tag")
-        return 0
-    fi
-    echo "  PASS  $tag (v1 == tbir, expect=$expect)"
+    echo "  PASS  $tag (TB-IR, expect=$expect)"
     PASS=$((PASS + 1))
 }
 
@@ -193,12 +178,12 @@ done <<<"$FIXTURES"
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
-echo "Running ${PWD}/$REGISTRY ARCH DUT v1-vs-tbir equivalence fixtures (seed $SEED)..."
+echo "Running ${PWD}/$REGISTRY ARCH DUT TB-IR regression fixtures (seed $SEED)..."
 while IFS= read -r row; do
     # Strip comments; skip blank lines.
     row="${row%%#*}"
     [ -z "$(echo "$row" | xargs)" ] && continue
-    run_equiv_one "$row"
+    run_tbir_one "$row"
 done < "$REGISTRY"
 
 echo

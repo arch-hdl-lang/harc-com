@@ -16,9 +16,8 @@
 //   4. Assignment-position record pop into an existing local and a
 //      whole-record testbench-field copy (`_tb.last = want`).
 //
-// Uses only the v1-supported surface, so the same file passes under
-// `--codegen v1` and `--codegen tbir`; the equivalence harness trace-diffs
-// the two.
+// The TB-IR regression sweep runs the fixture and pins these queue and
+// record operations with the assertions below.
 
 domain SysDomain
   freq_mhz: 100

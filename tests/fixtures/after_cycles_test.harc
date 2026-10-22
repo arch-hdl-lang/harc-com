@@ -5,9 +5,8 @@
 //
 // Timing: after reset is released with en=1, the counter increments
 // once per rising edge. Each `after K cycles` advances K cycles and the
-// body then observes the count at that point. Because the same source
-// drives both `--codegen v1` and `--codegen tbir`, the equivalence
-// harness trace-diffs the two and the wait counts must match exactly.
+// body then observes the count at that point. The TB-IR regression sweep
+// runs the fixture and its assertions pin the wait counts exactly.
 
 domain SysDomain
   freq_mhz: 100

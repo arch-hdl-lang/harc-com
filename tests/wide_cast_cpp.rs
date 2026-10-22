@@ -12,8 +12,8 @@
 //!     converts implicitly to both `uint64_t` and `_harc_u128` and so
 //!     makes `operator&` ambiguous.
 //!
-//! This test pins the emitted declarations and cast expressions for both
-//! backends and then feeds those same strings to the host C++ compiler
+//! This test pins TBIR's emitted declarations and cast expressions and then
+//! feeds those same strings to the host C++ compiler
 //! against the real runtime header, so a regression fails here rather
 //! than in a Verilator run nobody runs locally. The two halves interlock:
 //! the emitters cannot drift without failing the string match, and the
@@ -31,8 +31,8 @@ use std::process::Command;
 const EMITTED_DECLS: [&str; 2] = ["harc_rt::HarcWide<5> src130", "harc_rt::HarcWide<8> w200"];
 
 /// The cast expressions themselves, RHS only, so the probe can build both
-/// the TB-IR shape (declare, then assign) and the v1 shape (copy-initialise
-/// the slot from the cast) out of one pinned string.
+/// both assignment and copy-initialization compatibility shapes out of one
+/// pinned string.
 const CAST_EXPRS: [&str; 2] = [
     "harc_rt::harc_wide_zext<7>(src130, 130)",
     "((uint64_t)(((uint64_t)(src130) & 0xFFULL)))",
@@ -94,8 +94,8 @@ fn emit(codegen: &str, dir: &Path) -> String {
 }
 
 #[test]
-fn both_backends_emit_the_pinned_wide_cast_shapes() {
-    for codegen in ["v1", "tbir"] {
+fn tbir_emits_the_pinned_wide_cast_shapes() {
+    for codegen in ["tbir"] {
         let dir = fresh_outdir(codegen);
         let cpp = emit(codegen, &dir);
         let expected = EMITTED_DECLS
@@ -158,8 +158,8 @@ fn emitted_wide_cast_shapes_compile_and_evaluate() {
 
     let dir = fresh_outdir("probe");
     let probe = dir.join("probe.cpp");
-    // Both emitter shapes: TB-IR declares the slot and assigns into it,
-    // v1 copy-initialises the slot from the cast. Each needs the widening
+    // Exercise both C++ value forms: TB-IR declares the slot and assigns into
+    // it, while shared helpers also support copy-initialization. Each needs the widening
     // `HarcWide<7>` → `HarcWide<8>` conversion, but they are distinct C++
     // constructs (`operator=` vs a converting constructor), so pinning
     // only one would leave the other untested.
@@ -179,7 +179,7 @@ int main() {{
         low8 = {mask};
         ok += (w200 == 0x3FF) && (low8 == 0xFF);
     }}
-    {{  // v1 shape: copy-initialise the slot from the cast
+    {{  // compatibility shape: copy-initialise the slot from the cast
         {decl_src} = 0x3FF;
         {decl_slot} = {cast};
         uint64_t low8 = {mask};

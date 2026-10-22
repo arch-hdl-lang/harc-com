@@ -13,9 +13,8 @@
 // The DUT is `Top` (the counter from top_counter_test) used purely as a
 // background clock source — the agent logic runs host-side.
 //
-// Uses only the v1-supported surface, so the same file passes under
-// `--codegen v1` and `--codegen tbir`; the equivalence harness
-// trace-diffs the two.
+// The TB-IR regression sweep runs this fixture and pins the handler and
+// heartbeat behavior with the assertions below.
 
 domain SysDomain
   freq_mhz: 100

@@ -1,7 +1,7 @@
 // Regression fixture for #494 P2a / #521: file-scope `const`
 // initializers that are constant EXPRESSIONS (not just plain integer
-// literals) must fold identically under both `--codegen v1` and
-// `--codegen tbir`. Exercises shifted masks, an OR of two earlier
+// literals) must fold correctly under `--codegen tbir`. Exercises shifted
+// masks, an OR of two earlier
 // consts, arithmetic forms, chained/derived constants (#521's minimal
 // example), signed constants (arithmetic `>>`, truncating `/`), and
 // boundary widths. DUT `Top` (top_counter.sv) is only along for the

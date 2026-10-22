@@ -74,9 +74,6 @@ fn self_contained_backends_destroy_all_frames_before_dut_teardown() {
         ..Default::default()
     };
 
-    let v1 = cpp_tb::emit_with_opts(&merged, opts.clone()).expect("v1 emits");
-    assert_cleanup_order(&v1, "v1");
-
     let program = lower::lower_program(&merged).expect("fixture lowers");
     verify::verify_program(&program).expect("fixture verifies");
     let tbir = tbir::emit(&program, &merged, &opts).expect("TBIR emits");
@@ -84,7 +81,7 @@ fn self_contained_backends_destroy_all_frames_before_dut_teardown() {
 }
 
 #[test]
-fn fatal_suspended_mt_actors_exit_cleanly_in_both_self_contained_backends() {
+fn fatal_suspended_mt_actors_exit_cleanly_in_tbir() {
     if !verilator_present() {
         eprintln!("SKIP fatal_suspended_mt_actors_exit_cleanly: `verilator` not found");
         return;
@@ -98,7 +95,7 @@ fn fatal_suspended_mt_actors_exit_cleanly_in_both_self_contained_backends() {
     let source = scratch.join("fatal_actor.harc");
     std::fs::write(&source, fatal_actor_fixture()).expect("write HARC fixture");
 
-    for backend in ["v1", "tbir"] {
+    for backend in ["tbir"] {
         let outdir = scratch.join(backend);
         let build = Command::new(env!("CARGO_BIN_EXE_harc"))
             .arg("sim")
