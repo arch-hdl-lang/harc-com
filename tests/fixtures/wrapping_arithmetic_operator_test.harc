@@ -11,10 +11,9 @@
 //
 // This fixture is registered in tests/run_fixtures.sh, so the asserted wrap
 // values are checked at RUNTIME under `harc sim`, and in
-// tests/tbir_equiv_fixtures.txt, so both emitters must agree on every value
-// it covers. v1 used to treat `+%` as pass-through sugar — masking only in
-// tbir — which made this fixture a by-design divergence; v1 now emits the
-// same `max(W(lhs), W(rhs))` mask.
+// tests/tbir_regression_fixtures.txt, so TBIR must preserve every asserted
+// value it covers. The former V1 parity history motivated this fixture, but
+// its current gate is the self-checking TBIR run.
 //
 // The shapes below are unsigned with typed destinations, which is where the
 // two backends are known to agree. They are NOT the whole operand space: the

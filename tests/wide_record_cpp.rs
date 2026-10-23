@@ -13,16 +13,12 @@ fn fixture() -> String {
     .expect("read wide-record fixture")
 }
 
-fn emitted_records(codegen: &str) -> String {
+fn emitted_records() -> String {
     let parsed = parse_source(&fixture()).expect("fixture parses");
     let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
-    let cpp = if codegen == "v1" {
-        cpp_tb::emit(&merged).expect("v1 emits")
-    } else {
-        let prog = lower::lower_program(&merged).expect("TB-IR lowers");
-        verify::verify_program(&prog).expect("TB-IR verifies");
-        tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("TB-IR emits")
-    };
+    let prog = lower::lower_program(&merged).expect("TB-IR lowers");
+    verify::verify_program(&prog).expect("TB-IR verifies");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("TB-IR emits");
     let start = cpp.find("struct WideLeaf {").expect("record declarations");
     let end = cpp[start..]
         .find("struct HarcTestContext {")
@@ -57,7 +53,7 @@ fn outdir(codegen: &str) -> PathBuf {
 }
 
 #[test]
-fn both_backends_preserve_wide_record_bits_in_flat_and_structured_conversion() {
+fn tbir_preserves_wide_record_bits_in_flat_and_structured_conversion() {
     let Some(cxx) = cxx() else {
         assert!(
             std::env::var_os("HARC_SKIP_CXX_PROBE").is_some(),
@@ -69,7 +65,7 @@ fn both_backends_preserve_wide_record_bits_in_flat_and_structured_conversion() {
         return;
     }
 
-    for codegen in ["v1", "tbir"] {
+    for codegen in ["tbir"] {
         let dir = outdir(codegen);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create probe dir");
@@ -145,7 +141,7 @@ int main() {{
 "#,
                 runtime.display(),
                 random_runtime.display(),
-                emitted_records(codegen)
+                emitted_records()
             ),
         )
         .expect("write C++ probe");

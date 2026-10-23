@@ -120,7 +120,7 @@ int main() {
 }
 
 #[test]
-fn both_emitters_use_ranges_and_never_infer_blocked_from_preference_failure() {
+fn tbir_uses_ranges_and_never_infers_blocked_from_preference_failure() {
     let parsed = parse_source(
         r#"
 transaction T
@@ -144,10 +144,7 @@ end test RangePreferencesTest
     .unwrap();
     let opts = cpp_tb::EmitOpts::default();
     let program = harc::ir::lower::lower_program(&parsed).unwrap();
-    for cpp in [
-        cpp_tb::emit(&parsed).unwrap(),
-        tbir::emit(&program, &parsed, &opts).unwrap(),
-    ] {
+    for cpp in [tbir::emit(&program, &parsed, &opts).unwrap()] {
         assert!(cpp.contains("harc_prefer_range_u64(_harc_rt_seed, 0, 0ULL, 31ULL)"));
         assert!(cpp.contains("harc_prefer_range_i64(_harc_rt_seed, 1, -4LL, 3LL)"));
         assert!(cpp.contains("harc_prefer_range_u64(_harc_rt_seed, 2, 0ULL, 7ULL)"));
@@ -161,7 +158,7 @@ end test RangePreferencesTest
 }
 
 #[test]
-fn generated_ranges_replay_diversify_and_match_backends() {
+fn generated_ranges_replay_and_diversify() {
     let present = Command::new("verilator")
         .arg("--version")
         .output()
@@ -176,8 +173,7 @@ fn generated_ranges_replay_diversify_and_match_backends() {
     }
     let dir = std::env::temp_dir().join(format!("harc_range_sim_{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
-    let mut backend_traces = Vec::new();
-    for backend in ["v1", "tbir"] {
+    for backend in ["tbir"] {
         let mut traces = Vec::new();
         for seed in [1, 2, 424242, 1] {
             let trace = dir.join(format!("{backend}-{seed}.jsonl"));
@@ -224,9 +220,7 @@ fn generated_ranges_replay_diversify_and_match_backends() {
         assert_eq!(traces[0], traces[3], "same seed must replay");
         assert_ne!(traces[0], traces[1], "different seeds must vary");
         assert_ne!(traces[0], traces[2], "different seeds must vary");
-        backend_traces.push(traces);
     }
-    assert_eq!(backend_traces[0], backend_traces[1]);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -247,7 +241,7 @@ fn range_preference_boundary_and_fallback_contract() {
         let source = format!("transaction T\n a : {ty} with [range({bounds})]\nend transaction T\ntest BoundsTest\n let dut : Top\n run\n let t : T\n randomize(t) with\n t.a == t.a\n end randomize\n end run\nend test BoundsTest");
         let parsed = parse_source(&source).unwrap();
         let program = harc::ir::lower::lower_program(&parsed).unwrap();
-        for cpp in [cpp_tb::emit(&parsed).unwrap(), tbir::emit(&program, &parsed, &cpp_tb::EmitOpts::default()).unwrap()] {
+        for cpp in [tbir::emit(&program, &parsed, &cpp_tb::EmitOpts::default()).unwrap()] {
             assert!(cpp.contains(expected), "{ty} [{bounds}]: missing {expected}");
         }
     }
@@ -268,7 +262,7 @@ fn generated_boundary_ranges_preserve_adjacent_policies() {
         return;
     }
     let dir = std::env::temp_dir().join(format!("harc_range_boundary_{}", std::process::id()));
-    for backend in ["v1", "tbir"] {
+    for backend in ["tbir"] {
         for seed in [1, 2, 424242] {
             let out = Command::new(env!("CARGO_BIN_EXE_harc"))
                 .env("HARC_NO_LEARN", "1")

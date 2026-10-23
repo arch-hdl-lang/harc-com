@@ -57,7 +57,7 @@ static void _harc_eval_posedge(DUT* dut) {
 
 // HARC typed runtime randomization problem descriptors.
 inline constexpr harc_rt::random::HarcRuntimeProblemDescriptor _harc_runtime_random_problem_table_entries[] = {
-    {1ULL, "randomize(CountCmd)", "problem 1 randomize(CountCmd)\n  field expect u32 random=true default=false attrs=[]\n  field flag bool random=true default=true attrs=[]\n  field tag u16 random=false default=true attrs=[]\n  field ticks u8 random=true default=true attrs=[range]\n  constraint c_0 TransactionKeep { transaction: \"CountCmd\", span: Span { start: 1282, end: 1303 } } (ticks:u8 in [1:u8..16:u8]:range<u8>):bool\n  constraint c_1 FieldAttribute { field: \"ticks\", attr: \"range\", span: Span { start: 1167, end: 1180 } } (ticks:u8 in [1:u8..9:u8]):bool\n"},
+    {1ULL, "randomize(CountCmd)", "problem 1 randomize(CountCmd)\n  field expect u32 random=true default=false attrs=[]\n  field flag bool random=true default=true attrs=[]\n  field tag u16 random=false default=true attrs=[]\n  field ticks u8 random=true default=true attrs=[range]\n  constraint c_0 TransactionKeep { transaction: \"CountCmd\", span: Span { start: 1227, end: 1248 } } (ticks:u8 in [1:u8..16:u8]:range<u8>):bool\n  constraint c_1 FieldAttribute { field: \"ticks\", attr: \"range\", span: Span { start: 1112, end: 1125 } } (ticks:u8 in [1:u8..9:u8]):bool\n"},
 };
 inline constexpr harc_rt::random::HarcRuntimeProblemTable _harc_runtime_random_problem_table = {_harc_runtime_random_problem_table_entries, 1};
 

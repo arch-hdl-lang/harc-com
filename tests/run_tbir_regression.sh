@@ -1,30 +1,30 @@
 #!/bin/bash
-# v1-vs-tbir codegen equivalence harness.
+# TB-IR semantic regression harness.
 #
-# For every fixture row in tests/tbir_equiv_fixtures.txt, run the HARC
-# testbench through BOTH C++ emitters (`harc sim --codegen v1` and
-# `--codegen tbir`) against the vendored SV DUT, assert the row's
-# expected verdict under each, then `harc trace-diff` the two semantic
-# JSONL traces. Any verdict mismatch or trace divergence fails the run.
+# For every fixture row in tests/tbir_regression_fixtures.txt, run the HARC
+# testbench through the TB-IR C++ emitter against the vendored SV DUT and
+# assert the row's expected verdict. This preserves the broad positive and
+# deliberate-failure coverage that used to live in the V1 parity harness
+# without keeping the retiring emitter executable in the test suite.
 #
 # Verdicts (registry `expect` column, schema v3):
 #   pass — each sim must print "ALL TESTS PASSED".
 #   fail — each sim must exit nonzero AND not print "ALL TESTS PASSED"
 #          (deliberate-failure fixtures, e.g. the log(fatal, ...) path).
-# In both cases the v1/tbir traces must trace-diff clean — a failing
-# fixture must fail IDENTICALLY under both codegens.
+# In both cases the simulator must reach a real HARC verdict rather than fail
+# in compilation or infrastructure setup.
 #
 # Run from harc-com repo root:
-#     ./tests/run_tbir_equiv.sh
-#     SEED=7 ./tests/run_tbir_equiv.sh      # override the sim seed
+#     ./tests/run_tbir_regression.sh
+#     SEED=7 ./tests/run_tbir_regression.sh      # override the sim seed
 #
 # Set HARC=/path/to/harc to override the binary location (default: build
 # from `cargo build --release --bin harc`).
 #
 # Optional ARCH-native-DUT sweep: when ARCH_BIN points at an `arch`
 # binary AND the row's arch_dut column names a tests/dut/<file>.arch
-# source (rows with `-` self-skip), the same v1/tbir pair also runs
-# through `harc sim --dut` (ARCH native sim backend) and is trace-diffed.
+# source (rows with `-` self-skip), the same TB-IR fixture also runs
+# through `harc sim --dut` (ARCH native sim backend).
 # Skipped silently when ARCH_BIN is unset — CI has no arch checkout.
 set -uo pipefail
 
@@ -34,18 +34,14 @@ fixture_shard_init || exit 1
 HARC="${HARC:-./target/release/harc}"
 DUT_DIR="tests/dut"
 FIX_DIR="tests/fixtures"
-REGISTRY="tests/tbir_equiv_fixtures.txt"
+REGISTRY="tests/tbir_regression_fixtures.txt"
 SEED="${SEED:-1}"
-OUT="${TBIR_EQUIV_OUT:-harc_tbir_equiv_build}"
-# MT=1 appends `--mt` to BOTH sim invocations so the row exercises the
-# multi-thread actor model under each codegen. The v1-vs-tbir trace-diff
-# then asserts v1-mt == tbir-mt. `--mt` is execution-model only (no
-# semantic change), so an MT run of a given row must also trace-diff
-# clean against its default (cooperative) run — verified separately.
+OUT="${TBIR_REGRESSION_OUT:-harc_tbir_regression_build}"
+# MT=1 appends `--mt` so the row exercises TB-IR's multi-thread actor model.
 MT_ARGS=()
 [ "${MT:-0}" = "1" ] && MT_ARGS=("--mt")
-# Parallelism: each row is up to 4 verilator+clang compiles (v1/tbir ×
-# sv/arch-dut), dominated by compilation, not simulation. Fan out across
+# Parallelism: each row is up to 2 verilator+clang compiles (SV and optional
+# ARCH-DUT), dominated by compilation, not simulation. Fan out across
 # cores; override with JOBS=N, default to the online CPU count. Each row
 # already writes to its own $OUT/<test> subtree, so workers never collide.
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
@@ -74,18 +70,16 @@ PASS=0
 FAIL=0
 FAILED_NAMES=()
 
-# run_sim <verdict_tag> <outdir> <codegen> <dut|sv> <top> <files...>
+# run_sim <verdict_tag> <outdir> <dut|sv> <top> <files...>
 # Runs one `harc sim` invocation, requiring the verdict named by the
 # ROW_EXPECT global (`pass` or `fail`, set by run_one from the registry
 # row). Reads the HARC_FILES and ROW_EXTRA_ARGS global arrays (the
 # .harc inputs and the row's --ref-src/--test plumbing, set by
-# run_one). Each codegen gets its OWN outdir: harc's write_if_changed /
-# obj_dir reuse keys off the emitted .cpp in the outdir, so sharing one
-# directory across codegens would alternate rebuilds and risk
-# stale-object confusion.
+# run_one). The SV and optional ARCH-native runs get separate outdirs so
+# generated objects and traces cannot collide.
 run_sim() {
-    local tag="$1" dir="$2" cg="$3" backend="$4" top="$5"
-    shift 5
+    local tag="$1" dir="$2" backend="$3" top="$4"
+    shift 4
     local backend_args=()
     local f
     for f in "$@"; do backend_args+=("--$backend" "$f"); done
@@ -100,7 +94,7 @@ run_sim() {
     out="$("$HARC" sim "${backend_args[@]}" "${HARC_FILES[@]}" --top "$top" \
         ${ROW_EXTRA_ARGS[@]+"${ROW_EXTRA_ARGS[@]}"} \
         ${MT_ARGS[@]+"${MT_ARGS[@]}"} \
-        --codegen "$cg" --seed "$SEED" --outdir "$dir" \
+        --codegen tbir --seed "$SEED" --outdir "$dir" \
         --record-trace "$dir/t.jsonl" 2>&1)"
     rc=$?
 
@@ -108,64 +102,23 @@ run_sim() {
         # Expect-fail row: the sim must exit nonzero and must NOT claim
         # success. Requiring the "N TESTS FAILED" verdict line separates
         # a deliberate test failure from infrastructure breakage (compile
-        # error, Verilator failure). The trace-diff in run_pair then
-        # asserts the failure was recorded identically under both
-        # codegens.
+        # error or Verilator failure).
         if [ "$rc" -eq 0 ] || [[ "$out" == *"ALL TESTS PASSED"* ]]; then
-            echo "  FAIL  $tag (sim --codegen $cg passed, but registry expects fail)"
+            echo "  FAIL  $tag (TB-IR simulation passed, but registry expects fail)"
             echo "$out" | tail -20 | sed 's/^/      /'
             return 1
         fi
         if [[ "$out" != *"TESTS FAILED"* ]]; then
-            echo "  FAIL  $tag (sim --codegen $cg broke before reaching a test verdict)"
+            echo "  FAIL  $tag (TB-IR simulation broke before reaching a test verdict)"
             echo "$out" | tail -20 | sed 's/^/      /'
             return 1
         fi
         return 0
     fi
 
-    if [[ "$out" != *"ALL TESTS PASSED"* ]]; then
-        echo "  FAIL  $tag (sim --codegen $cg did not pass)"
+    if [ "$rc" -ne 0 ] || [[ "$out" != *"ALL TESTS PASSED"* ]]; then
+        echo "  FAIL  $tag (TB-IR simulation did not pass)"
         echo "$out" | tail -20 | sed 's/^/      /'
-        return 1
-    fi
-    return 0
-}
-
-# run_pair <verdict_tag> <pair_dir> <dut|sv> <top> <files...>
-# v1 run + tbir run + trace-diff. Fails fast within the pair: a failed
-# v1 run skips the tbir run and the diff.
-#
-# MT=1 caveat: under `--mt` the trace EVENT ORDER within a cycle is not
-# deterministic when two or more concurrent same-bus actors fire in the
-# same barrier window — the OS thread that wins decides which trace event
-# lands first. This is inherent to the parallel-worker model and affects
-# v1 identically (v1-mt is itself run-to-run order-nondeterministic and
-# differs from v1's own cooperative trace). So in MT mode we assert the
-# per-codegen VERDICT (pass/fail, checked in run_sim) but skip the
-# v1-vs-tbir trace-diff: the diff would flag a benign intra-cycle
-# reordering that is not a correctness difference. Single-actor and
-# cooperative-monitor fixtures stay deterministic, but the harness can't
-# cheaply tell them apart from multi-actor ones, so the whole MT sweep
-# drops the diff. The default (non-MT) sweep keeps the strict trace-diff.
-run_pair() {
-    local tag="$1" pair_dir="$2" backend="$3" top="$4"
-    shift 4
-
-    run_sim "$tag" "$pair_dir/v1" v1 "$backend" "$top" "$@" || return 1
-    run_sim "$tag" "$pair_dir/tbir" tbir "$backend" "$top" "$@" || return 1
-
-    if [ "${MT:-0}" = "1" ]; then
-        # Verdicts already asserted in run_sim; intra-cycle trace order is
-        # nondeterministic under --mt (see comment above), so no diff.
-        return 0
-    fi
-
-    local out
-    out="$("$HARC" trace-diff "$pair_dir/v1/t.jsonl" "$pair_dir/tbir/t.jsonl" 2>&1)"
-    if [ $? -ne 0 ]; then
-        echo "  FAIL  $tag (v1 vs tbir trace divergence)"
-        echo "$out" | tail -30 | sed 's/^/      /'
         return 1
     fi
     return 0
@@ -210,12 +163,12 @@ run_one() {
     # A fixture file with multiple test structs registers one row per
     # struct — suffix the label/outdir so the runs don't collide.
     local label="$test${test_struct:+ [$test_struct]}"
-    local pair_dir="$OUT/$test${test_struct:+__$test_struct}"
-    if ! run_pair "$label" "$pair_dir" sv "$top" "${sv_files[@]}"; then
+    local run_dir="$OUT/$test${test_struct:+__$test_struct}/sv"
+    if ! run_sim "$label" "$run_dir" sv "$top" "${sv_files[@]}"; then
         echo "__STATUS__ FAIL $label"
         return 0
     fi
-    echo "  PASS  $label (v1 == tbir, expect=$expect)"
+    echo "  PASS  $label (TB-IR, expect=$expect)"
     echo "__STATUS__ PASS $label"
 
     # Optional ARCH-native-DUT sweep. Only when ARCH_BIN is set AND the
@@ -226,16 +179,16 @@ run_one() {
             echo "__STATUS__ FAIL $label [arch-dut]"
             return 0
         fi
-        if ! run_pair "$label [arch-dut]" "${pair_dir}__arch_dut" dut "$top" "$DUT_DIR/$arch_dut"; then
+        if ! run_sim "$label [arch-dut]" "$OUT/$test${test_struct:+__$test_struct}/arch-dut" dut "$top" "$DUT_DIR/$arch_dut"; then
             echo "__STATUS__ FAIL $label [arch-dut]"
             return 0
         fi
-        echo "  PASS  $label [arch-dut] (v1 == tbir, expect=$expect)"
+        echo "  PASS  $label [arch-dut] (TB-IR, expect=$expect)"
         echo "__STATUS__ PASS $label [arch-dut]"
     fi
 }
 
-# Hidden re-exec entry point: `run_tbir_equiv.sh __worker <row>`.
+# Hidden re-exec entry point: `run_tbir_regression.sh __worker <row>`.
 # Lets the parent fan out one process per registry row via xargs -P.
 if [ "${1:-}" = "__worker" ]; then
     run_one "$2"
@@ -246,11 +199,11 @@ fi
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
-echo "Running ${PWD}/$REGISTRY v1-vs-tbir equivalence fixtures (seed $SEED, JOBS=$JOBS, shard=$SHARD_INDEX/$SHARD_COUNT)..."
+echo "Running ${PWD}/$REGISTRY TB-IR regression fixtures (seed $SEED, JOBS=$JOBS, shard=$SHARD_INDEX/$SHARD_COUNT)..."
 
 # Materialize cleaned rows to numbered files so workers can be addressed
 # by index without quoting the pipe-delimited row through xargs.
-RESDIR="$(mktemp -d "${TMPDIR:-/tmp}/harc_tbir_equiv.XXXXXX")"
+RESDIR="$(mktemp -d "${TMPDIR:-/tmp}/harc_tbir_regression.XXXXXX")"
 trap 'rm -rf "$RESDIR"' EXIT
 n=0
 row_index=0

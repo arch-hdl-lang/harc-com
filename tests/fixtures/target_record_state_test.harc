@@ -25,9 +25,8 @@
 //
 // This was tbir-only when written: `--codegen v1` miscompiled it, emitting
 // `error: unknown type name 'VBeat'`. v1 now emits the defined `Beat`
-// struct instead, so the fixture is registered in tbir_equiv_fixtures.txt
-// as well and both emitters are trace-diffed against each other (added by
-// the harc#551 coverage audit).
+// struct instead. The fixture remains in tbir_regression_fixtures.txt as a
+// direct TBIR runtime regression after the parity harness was retired.
 
 struct Beat
     addr : uint<8>

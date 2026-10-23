@@ -8,9 +8,8 @@
 //   - `sel_expr = [(dut.en + 4) .. 15]` — runtime bound over a binary expr
 //   - `const_hi = [8 .. 15]`            — constant range (fast path)
 //   - `mixed    = {[dut.en .. 2], 15}`  — set mixing a runtime range + literal
-// Under `--codegen v1` the bound expression is emitted per-sample; the
-// tbir backend now mirrors that byte-for-byte, so the same file passes
-// under BOTH backends and the equivalence harness trace-diffs the two.
+// TB-IR emits the bound expression per sample; the regression sweep runs
+// the self-checking fixture.
 //
 // Fully deterministic (no randomize): the counter walks 0->15 with `en`
 // toggled off at both ends. `dut.en` is 0 or 1, so:

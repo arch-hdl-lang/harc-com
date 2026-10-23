@@ -27,7 +27,7 @@
 //!   2. `--cpp-split-group-size 1` (the per-test shard path, which the
 //!      default group size never exercises) must also build, link, and
 //!      dispatch.
-//! Both checks run under v1 and TBIR codegen.
+//! These checks run under TBIR codegen.
 //!
 //! The DUT and multi-test testbench are written into the temp dir by the
 //! test itself: the inputs are trivial and are most legible sitting next to
@@ -318,7 +318,7 @@ fn split_build_links_and_dispatches_e2e() {
     std::fs::write(&tb, adder_tb()).expect("write TB");
 
     let mut outdirs = Vec::new();
-    for codegen in ["v1", "tbir"] {
+    for codegen in ["tbir"] {
         // 1. Default group size (4): 8 tests → 2 shards + dispatcher. This is
         //    the path that links more than one shard TU together.
         let out_default = fresh_outdir(&format!("{codegen}_default"));
@@ -351,7 +351,7 @@ fn split_build_rejects_mixed_dut_before_sharding() {
     std::fs::write(&tb, mixed_dut_tb()).expect("write mixed-DUT TB");
 
     let mut outdirs = Vec::new();
-    for codegen in ["v1", "tbir"] {
+    for codegen in ["tbir"] {
         let outdir = fresh_outdir(&format!("{codegen}_mixed_g1"));
         let (ok, log) = run_split_emit_only(&outdir, &sv, &tb, codegen, Some(1));
         assert!(
@@ -654,7 +654,7 @@ fn split_build_shared_lifecycle_coro_links_and_dispatches_e2e() {
     std::fs::write(&tb, LC_SHARED_TB).expect("write TB");
 
     let mut outdirs = Vec::new();
-    for codegen in ["v1", "tbir"] {
+    for codegen in ["tbir"] {
         // group_size 1 → one impl per shard → two SELF-CONTAINED shard TUs
         // that each define the shared lifecycle bodies and link together.
         let out = fresh_outdir(&format!("lc_{codegen}_g1"));
@@ -668,8 +668,7 @@ fn split_build_shared_lifecycle_coro_links_and_dispatches_e2e() {
         // link error the real build above would have already rejected; this
         // pins WHY the link stayed clean so a future external-linkage
         // regression fails here with a legible message, not just a linker
-        // wall of text. (v1 always inlines the lifecycle — no out-of-line
-        // symbol — so this shape is tbir-only.)
+        // wall of text.
         if codegen == "tbir" {
             let shards: Vec<PathBuf> = std::fs::read_dir(&out)
                 .expect("read outdir")

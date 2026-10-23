@@ -12,7 +12,7 @@
 //
 // tbir-only: legacy `--codegen v1` cannot resolve a bus-method call in a
 // message interpolation at all (`bus ... has no signal or channel named
-// read`), so this fixture is NOT in tbir_equiv_fixtures.txt.
+// read`), so this fixture is NOT in tbir_regression_fixtures.txt.
 //
 // The DUT (TlmMemory) initializes mem[addr] = 0x100 + addr, so
 // mem.read(5) == 0x105 == 261 and mem.read(8) == 0x108 == 264.

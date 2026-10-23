@@ -17,9 +17,8 @@
 //   4. The `check` phase reads scoreboard state after `run` finishes
 //      (the scoreboard lives on the `_tb` struct, shared run↔check).
 //
-// Uses only the v1-supported surface, so the same file passes under
-// `--codegen v1` and `--codegen tbir`; the equivalence harness
-// trace-diffs the two.
+// The TB-IR regression sweep runs the fixture and pins scoreboard state
+// with the assertions below.
 
 domain SysDomain
   freq_mhz: 100

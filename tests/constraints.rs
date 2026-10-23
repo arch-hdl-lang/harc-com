@@ -1,9 +1,10 @@
 use harc::ast::ExprKind;
-use harc::codegen::cpp_tb;
+use harc::codegen::{cpp_tb, tbir};
 use harc::constraints::{
     elaborate_constraints, ConstraintBinaryOp, ConstraintExpr, FieldAttrArgSchema, FieldTypeClass,
     RelationBodySchema, Signedness,
 };
+use harc::ir::{lower, verify};
 use harc::parser::parse_source;
 
 #[test]
@@ -304,7 +305,10 @@ end test SolverPathTest"#,
     .unwrap();
 
     let _schemas = elaborate_constraints(&parsed);
-    let cpp = cpp_tb::emit(&parsed).expect("existing codegen should still emit");
+    let program = lower::lower_program(&parsed).expect("TB-IR lowers solver paths");
+    verify::verify_program(&program).expect("solver paths verify");
+    let cpp = tbir::emit(&program, &parsed, &cpp_tb::EmitOpts::default())
+        .expect("TB-IR emits solver paths");
 
     assert!(
         cpp.contains("z3::context _ctx;") && cpp.contains("z3::solver _s(_ctx);"),

@@ -15,8 +15,8 @@
 //
 // tbir-only: legacy `--codegen v1` SEGFAULTS on this (it bakes one
 // instance name into the single per-type method body, so a second active
-// instance clobbers the first). Registered in run_fixtures.sh (default
-// tbir backend), NOT in tbir_equiv_fixtures.txt — v1 cannot be a baseline.
+// instance clobbers the first). Registered in both run_fixtures.sh and the
+// TBIR-only tbir_regression_fixtures.txt runtime sweep.
 domain SysDomain
   freq_mhz: 100
 end domain SysDomain

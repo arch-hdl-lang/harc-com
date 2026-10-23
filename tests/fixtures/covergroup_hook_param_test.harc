@@ -12,9 +12,8 @@
 // `cmd.expect` AFTER each call. With a fixed command schedule the hit
 // bins are fully determined and independent of the clock period.
 //
-// Uses only the v1-supported surface (record-by-value hook param +
-// hook-param coverpoints), so the same file passes under `--codegen v1`
-// and `--codegen tbir`; the equivalence harness trace-diffs the two.
+// The TB-IR regression sweep runs this record-by-value hook-param and
+// hook-param-coverpoint fixture.
 
 domain SysDomain
   freq_mhz: 100

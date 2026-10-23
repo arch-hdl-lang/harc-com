@@ -25,7 +25,7 @@
 //! `tests/fixtures/queue_empty_pop_test.harc` covers the reporter path
 //! end-to-end through `harc sim` under both codegens, but that needs
 //! Verilator and only runs under `tests/run_negative_fixtures.sh` and
-//! the equivalence harness. This test compiles the shipped runtime
+//! the semantic regression harness. This test compiles the shipped runtime
 //! header with a host compiler, so a regression fails in `cargo test`
 //! rather than in a job nobody runs locally.
 

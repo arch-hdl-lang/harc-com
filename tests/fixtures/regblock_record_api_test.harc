@@ -13,16 +13,10 @@
 // active frontdoor (`regs.REG = v`), which issues a bus access.
 //
 // This fixture deliberately registers NO `on regs.REG` callback: the
-// per-register write callback lowers (in v1) to a `[&]`-capturing
-// closure over run-scope state, fired from inside `record_write`, which
-// the function-per-CFG TB-IR cannot express (the same blocker as the
-// `axilite_hooks` pre/post method hooks). The callback-bearing corpus
-// fixtures (regblock_record_test, regblock_record_recursion_test) stay
-// rejected precisely; the passive API on its own is fully lowered, so
-// this fixture proves it under BOTH codegens (v1 == tbir, trace-diff
-// clean). The record decode + mirror update is pure host state with no
-// trace events, so the two backends record identical (empty) record-op
-// activity; the only observable signal is the final assert outcomes.
+// The fixture exercises the passive API without a per-register callback.
+// The record decode + mirror update is pure host state with no trace events;
+// the observable contract is the final assert outcomes, which the TB-IR
+// regression sweep runs directly.
 
 use BusAxiLite
 

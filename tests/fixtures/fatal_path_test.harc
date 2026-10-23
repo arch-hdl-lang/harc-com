@@ -7,13 +7,13 @@
 // the extra `log(error, ...)` would bump `errors` to 2 and add a trace
 // line, and `harc trace-diff` / the verdict check would flag it.
 //
-// Registry row (tests/tbir_equiv_fixtures.txt): expect=fail — both
-// codegens must exit nonzero WITHOUT printing ALL TESTS PASSED, and
-// their semantic traces must still match line-for-line.
+// Registry row (tests/tbir_regression_fixtures.txt): expect=fail — TB-IR
+// must exit nonzero WITHOUT printing ALL TESTS PASSED and must reach a
+// real HARC failure verdict rather than an infrastructure error.
 //
 // Deliberately NOT listed in run_fixtures.sh: that harness requires
 // every row to print ALL TESTS PASSED, and this fixture exists to fail.
-// Only tests/run_tbir_equiv.sh (and the registry-driven sweep in
+// Only tests/run_tbir_regression.sh (and the registry-driven sweep in
 // tests/run_arch_dut_fixtures.sh) runs it, under expect=fail rules.
 
 domain SysDomain

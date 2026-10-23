@@ -8,9 +8,8 @@
 //
 // Both carry a 100-cycle timeout safety net that must NOT fire in
 // steady state (the counter increments once per cycle, so each wait
-// completes well inside the budget). Uses only the v1-supported
-// surface, so the same file passes under `--codegen v1` and
-// `--codegen tbir`; the equivalence harness trace-diffs the two.
+// completes well inside the budget). The TB-IR regression sweep runs the
+// self-checking fixture.
 
 domain SysDomain
   freq_mhz: 100

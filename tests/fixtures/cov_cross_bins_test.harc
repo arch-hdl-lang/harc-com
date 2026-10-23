@@ -11,9 +11,8 @@
 //
 // Fully deterministic (no randomize): the counter walks 0→15 with
 // en toggled off at both ends, so every cp_count bin and both cp_en
-// bins are guaranteed hits. Uses only the v1-supported surface, so the
-// same file passes under `--codegen v1` and `--codegen tbir`; the
-// equivalence harness trace-diffs the two.
+// bins are guaranteed hits. The TB-IR regression sweep runs the fixture;
+// its self-checking bins pin the behavior.
 
 domain SysDomain
   freq_mhz: 100

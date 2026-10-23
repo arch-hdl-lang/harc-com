@@ -10,8 +10,8 @@
 // truncates to 0xFF in the mirror cell, but the callback — whose `data`
 // param is the full bus-width observed value — must still see 0x1FF and
 // forward it whole into the 32-bit SHADOW register. Pre-fix TB-IR
-// (const address) forwarded 0xFF; v1 forwarded 0x1FF; trace-diff caught
-// the mismatch. This fixture pins v1 == tbir.
+// (const address) forwarded 0xFF; the old parity gate caught the mismatch.
+// This fixture now pins the corrected TB-IR behavior directly.
 //
 // The passive API issues no bus traffic, so the DUT register widths are
 // irrelevant here — CTRL/SHADOW are pure host mirror state.
