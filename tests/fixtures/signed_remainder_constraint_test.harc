@@ -1,0 +1,60 @@
+// Native constrained-random signed remainder regression.
+// HARC `%` follows the dividend (truncation toward zero), including when
+// operands have opposite signs.
+
+const NEG_FIVE : sint<64> = -5
+const POS_FIVE : sint<64> = 5
+const NEG_THREE : sint<64> = -3
+const POS_THREE : sint<64> = 3
+const NEG_TWO : sint<64> = -2
+const POS_TWO : sint<64> = 2
+const POS_ONE : sint<64> = 1
+
+transaction NegPos
+    a : sint<64>
+    b : sint<64>
+    keep a == NEG_FIVE
+    keep b == POS_THREE
+    keep a % b == NEG_TWO
+end transaction NegPos
+
+transaction PosNeg
+    a : sint<64>
+    b : sint<64>
+    keep a == POS_FIVE
+    keep b == NEG_THREE
+    keep a % b == POS_TWO
+end transaction PosNeg
+
+transaction SameSign
+    a : sint<64>
+    b : sint<64>
+    keep a == NEG_FIVE
+    keep b == NEG_THREE
+    keep a % b == NEG_TWO
+end transaction SameSign
+
+testbench SignedRemainderTb
+    dut : Top
+end testbench SignedRemainderTb
+
+impl SignedRemainderConstraintTest for SignedRemainderTb
+    run
+        let np : NegPos
+        randomize(np)
+        assert np.a == NEG_FIVE else fail("negative dividend was not pinned")
+        assert np.b == POS_THREE else fail("positive divisor was not pinned")
+        assert np.a % np.b == NEG_TWO else fail("-5 % 3 must be -2")
+
+        let pn : PosNeg
+        randomize(pn)
+        assert pn.a == POS_FIVE else fail("positive dividend was not pinned")
+        assert pn.b == NEG_THREE else fail("negative divisor was not pinned")
+        assert pn.a % pn.b == POS_TWO else fail("5 % -3 must be 2")
+
+        let ss : SameSign
+        randomize(ss)
+        assert ss.a % ss.b == NEG_TWO else fail("-5 % -3 must be -2")
+        log(info, "PASS: signed remainder keeps follow truncation-toward-zero semantics")
+    end run
+end impl SignedRemainderConstraintTest

@@ -112,7 +112,14 @@ impl Emitter {
                     self.check_signed_wrap_destination(&l.name.name, w, v);
                 }
             }
-            if matches!(name, BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits) {
+            if matches!(
+                name,
+                BuiltinTy::UInt
+                    | BuiltinTy::UIntCap
+                    | BuiltinTy::SInt
+                    | BuiltinTy::SIntCap
+                    | BuiltinTy::Bits
+            ) {
                 if let Some(w) = type_arg_width(args) {
                     // Narrowing initializer: reject before emitting. v1
                     // used to emit `HarcWide<7> b = a;` for a 256-bit `a`,
@@ -138,7 +145,7 @@ impl Emitter {
                     }
                     let lw = LetWidth {
                         bits: dw,
-                        signed: matches!(name, BuiltinTy::SInt),
+                        signed: matches!(name, BuiltinTy::SInt | BuiltinTy::SIntCap),
                     };
                     if self.let_widths.insert(l.name.name.clone(), lw).is_some() {
                         self.shadowed_lets.insert(l.name.name.clone());

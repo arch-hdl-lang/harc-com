@@ -41,6 +41,9 @@ impl I for T
         assert m < n else fail("u128 lt")
         let md : sint<100> = m / n
         assert md == md else fail("u128 div")
+        let q65 : sint<65> = -8 / 3
+        let zero100 : sint<100> = 0
+        assert q65 + zero100 == -2 else fail("mixed signed add")
         wait 1 cycle
     end run
 end impl I
@@ -79,5 +82,9 @@ fn signed_wide_operators_route_to_twos_complement_helpers() {
     assert!(
         cpp.contains("harc_wide_mask_bits") || cpp.contains("harc_mask_u128"),
         "signed wide `==` must be width-aware:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("harc_sext_u128"),
+        "mixed signed scalar arithmetic must sign-extend to its common width:\n{cpp}"
     );
 }

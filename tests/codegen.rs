@@ -686,6 +686,35 @@ end test TraceTest
 }
 
 #[test]
+fn v1_signed_wide_ordering_uses_declared_sign_bit() {
+    let parsed = parse_source(
+        r#"test SignedWideOrdering
+    let dut : Top
+    run
+        let a : sint<65> = -8
+        let b : sint<65> = 3
+        assert a < b else fail("lt")
+        assert a <= b else fail("le")
+        assert b > a else fail("gt")
+        assert b >= a else fail("ge")
+    end run
+end test SignedWideOrdering
+"#,
+    )
+    .expect("signed wide source parses");
+    let cpp = cpp_tb::emit(&parsed).expect("v1 emits signed wide ordering");
+    assert!(cpp.contains("harc_rt::harc_slt_u128"), "{cpp}");
+    assert!(
+        cpp.contains(", 65)"),
+        "comparison must retain declared width: {cpp}"
+    );
+    assert!(
+        !cpp.contains("if (!(a < b))"),
+        "raw unsigned carrier comparison remains: {cpp}"
+    );
+}
+
+#[test]
 fn semantic_trace_tlm_method_calls_emit() {
     let parsed = parse_source(
         r#"bus B
@@ -5628,6 +5657,35 @@ end test SignedKeepTest"#,
             && cpp.contains("uint64_t _raw_delta = harc_z3_bv_low_u64(_ctx, _eval_delta);")
             && cpp.contains("int64_t _val_delta = (int64_t)_raw_delta;"),
         "signed fields should materialize model values as int64_t; got:\n{cpp}"
+    );
+}
+
+#[test]
+fn signed_keep_modulo_uses_bvsrem() {
+    let parsed = parse_source(
+        r#"transaction T
+    a : sint<64>
+    b : sint<64>
+    keep a % b == -2
+end transaction T
+
+test SignedModuloKeepTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test SignedModuloKeepTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("z3::srem(_z_a, _z_b)"),
+        "signed modulo constraints must use bvsrem, not z3's bvsmod `%` overload; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("_z_a % _z_b"),
+        "signed modulo constraints must not use z3::expr `%` overload; got:\n{cpp}"
     );
 }
 
@@ -13159,34 +13217,34 @@ end test StableB"#,
     let expected = vec![
         (
             "stable__suite_api.hpp".to_string(),
-            "27814eec4f7f6d60".to_string(),
+            "450bdb67181f050a".to_string(),
         ),
         (
             "stable__runtime.cpp".to_string(),
-            "491f1eb23d0dd8d4".to_string(),
+            "9fd33743b5d7f462".to_string(),
         ),
         (
             "stable__test_StableA.cpp".to_string(),
-            "b5ebe81372cd4ed3".to_string(),
+            "b85eaba9035b09af".to_string(),
         ),
         (
             "stable__test_StableB.cpp".to_string(),
-            "2d00d0d276011339".to_string(),
+            "a071ab01097939c5".to_string(),
         ),
         (
             "stable__registry.cpp".to_string(),
-            "ba75f52ebba6602a".to_string(),
+            "c7d7d898941958be".to_string(),
         ),
     ];
     assert_eq!(actual, expected);
-    assert_eq!(output.interface_abi, "f0db39446ecf52e8");
+    assert_eq!(output.interface_abi, "2db2a7d982be6992");
     assert_eq!(output.build_profile, "f11cada50936fa42");
     assert_eq!(
         output
             .artifact_plan
             .render_manifest(&output.interface_abi, &output.build_profile)
             .expect("render stable manifest"),
-        "{\"schema_version\":1,\"interface_abi\":\"f0db39446ecf52e8\",\"build_profile\":\"f11cada50936fa42\",\"tests\":[\"StableA\",\"StableB\"],\"artifacts\":[\"stable__suite_api.hpp\",\"stable__runtime.cpp\",\"stable__test_StableA.cpp\",\"stable__test_StableB.cpp\",\"stable__registry.cpp\",\"harc_thread_rt.h\",\"harc_random_rt.h\",\"harc_queue_rt.h\",\"harc_trace_rt.h\",\"harc_log_rt.h\",\"harc_z3_rt.h\"]}\n"
+        "{\"schema_version\":1,\"interface_abi\":\"2db2a7d982be6992\",\"build_profile\":\"f11cada50936fa42\",\"tests\":[\"StableA\",\"StableB\"],\"artifacts\":[\"stable__suite_api.hpp\",\"stable__runtime.cpp\",\"stable__test_StableA.cpp\",\"stable__test_StableB.cpp\",\"stable__registry.cpp\",\"harc_thread_rt.h\",\"harc_random_rt.h\",\"harc_queue_rt.h\",\"harc_trace_rt.h\",\"harc_log_rt.h\",\"harc_z3_rt.h\"]}\n"
     );
 }
 

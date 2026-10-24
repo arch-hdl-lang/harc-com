@@ -2205,6 +2205,180 @@ impl Emitter {
         }
     }
 
+    /// Classify operands using native usual arithmetic conversions. Untyped
+    /// literals are polymorphic: they take the signedness of a typed operand.
+    fn constraint_expr_signedness(
+        &self,
+        e: &Expr,
+        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        target_root: Option<&str>,
+    ) -> ConstraintOperandSignedness {
+        let recur = |x| self.constraint_expr_signedness(x, field_info, target_root);
+        match &*e.kind {
+            ExprKind::Ident(id) => field_info
+                .get(&id.name)
+                .map(|f| {
+                    if f.signed {
+                        ConstraintOperandSignedness::Signed
+                    } else {
+                        ConstraintOperandSignedness::Unsigned
+                    }
+                })
+                .or_else(|| {
+                    (!self.shadowed_lets.contains(&id.name))
+                        .then(|| self.let_widths.get(&id.name))
+                        .flatten()
+                        .map(|l| {
+                            if l.signed {
+                                ConstraintOperandSignedness::Signed
+                            } else {
+                                ConstraintOperandSignedness::Unsigned
+                            }
+                        })
+                })
+                .or_else(|| {
+                    self.consts.get(&id.name).map(|c| match c.signedness {
+                        crate::constraints::Signedness::Signed
+                            if c.width.is_none() && !c.literal.starts_with('-') =>
+                        {
+                            ConstraintOperandSignedness::UntypedLiteral
+                        }
+                        crate::constraints::Signedness::Signed => {
+                            ConstraintOperandSignedness::Signed
+                        }
+                        crate::constraints::Signedness::Unsigned => {
+                            ConstraintOperandSignedness::Unsigned
+                        }
+                        crate::constraints::Signedness::Unknown => {
+                            ConstraintOperandSignedness::UntypedLiteral
+                        }
+                        crate::constraints::Signedness::NotNumeric => {
+                            ConstraintOperandSignedness::Unsigned
+                        }
+                    })
+                })
+                .unwrap_or(ConstraintOperandSignedness::Unsigned),
+            ExprKind::Field { .. } => expr_field_path(e, target_root)
+                .and_then(|f| field_info.get(&f))
+                .map(|f| {
+                    if f.signed {
+                        ConstraintOperandSignedness::Signed
+                    } else {
+                        ConstraintOperandSignedness::Unsigned
+                    }
+                })
+                .unwrap_or(ConstraintOperandSignedness::Unsigned),
+            ExprKind::Index { target, .. } => {
+                list_field_name_from_expr(target, field_info, target_root)
+                    .and_then(|f| field_info.get(&f))
+                    .and_then(|f| f.list.as_ref())
+                    .map(|l| {
+                        if l.elem_signed {
+                            ConstraintOperandSignedness::Signed
+                        } else {
+                            ConstraintOperandSignedness::Unsigned
+                        }
+                    })
+                    .unwrap_or(ConstraintOperandSignedness::Unsigned)
+            }
+            ExprKind::Call { .. } => match sum_call_elem_signed(e, field_info, target_root) {
+                true => ConstraintOperandSignedness::Signed,
+                false => ConstraintOperandSignedness::Unsigned,
+            },
+            ExprKind::Paren(inner) => recur(inner),
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                expr,
+            } => match recur(expr) {
+                ConstraintOperandSignedness::Unsigned => ConstraintOperandSignedness::Unsigned,
+                _ => ConstraintOperandSignedness::Signed,
+            },
+            ExprKind::Unary { expr, .. } => recur(expr),
+            ExprKind::Cast { ty, .. } => match ty {
+                TypeExpr::Builtin {
+                    name: BuiltinTy::SInt | BuiltinTy::SIntCap,
+                    ..
+                } => ConstraintOperandSignedness::Signed,
+                _ => ConstraintOperandSignedness::Unsigned,
+            },
+            ExprKind::Int(_) => ConstraintOperandSignedness::UntypedLiteral,
+            ExprKind::Binary { op, lhs, rhs } => {
+                if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
+                    recur(lhs)
+                } else if self.constraint_binary_is_signed(lhs, rhs, field_info, target_root) {
+                    ConstraintOperandSignedness::Signed
+                } else if recur(lhs) == ConstraintOperandSignedness::UntypedLiteral
+                    && recur(rhs) == ConstraintOperandSignedness::UntypedLiteral
+                {
+                    ConstraintOperandSignedness::UntypedLiteral
+                } else {
+                    ConstraintOperandSignedness::Unsigned
+                }
+            }
+            ExprKind::Membership { expr, .. } => recur(expr),
+            _ => ConstraintOperandSignedness::Unsigned,
+        }
+    }
+
+    fn constraint_binary_is_signed(
+        &self,
+        lhs: &Expr,
+        rhs: &Expr,
+        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        target_root: Option<&str>,
+    ) -> bool {
+        let l = self.constraint_expr_signedness(lhs, field_info, target_root);
+        let r = self.constraint_expr_signedness(rhs, field_info, target_root);
+        if l == ConstraintOperandSignedness::Unsigned || r == ConstraintOperandSignedness::Unsigned
+        {
+            let (signed_expr, unsigned_expr) = if l == ConstraintOperandSignedness::Signed
+                && r == ConstraintOperandSignedness::Unsigned
+            {
+                (lhs, rhs)
+            } else if r == ConstraintOperandSignedness::Signed
+                && l == ConstraintOperandSignedness::Unsigned
+            {
+                (rhs, lhs)
+            } else {
+                return false;
+            };
+            let signed_width = self
+                .constraint_expr_native_width(signed_expr, field_info, target_root)
+                .unwrap_or(0);
+            let unsigned_width = self
+                .constraint_expr_native_width(unsigned_expr, field_info, target_root)
+                .unwrap_or(u32::MAX);
+            return (signed_width < 32 && unsigned_width < 32) || signed_width > unsigned_width;
+        }
+        l == ConstraintOperandSignedness::Signed || r == ConstraintOperandSignedness::Signed
+    }
+
+    fn constraint_expr_native_width(
+        &self,
+        e: &Expr,
+        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        target_root: Option<&str>,
+    ) -> Option<u32> {
+        if let Some(width) = self.constraint_expr_width(e, field_info, target_root) {
+            return Some(width);
+        }
+        match &*e.kind {
+            ExprKind::Paren(inner) | ExprKind::Unary { expr: inner, .. } => {
+                self.constraint_expr_native_width(inner, field_info, target_root)
+            }
+            ExprKind::Binary {
+                op: BinaryOp::Shl | BinaryOp::Shr,
+                lhs,
+                ..
+            } => self.constraint_expr_native_width(lhs, field_info, target_root),
+            ExprKind::Binary { lhs, rhs, .. } => Some(
+                self.constraint_expr_native_width(lhs, field_info, target_root)?
+                    .max(self.constraint_expr_native_width(rhs, field_info, target_root)?),
+            ),
+            _ => None,
+        }
+    }
+
     /// Signedness of a constraint expression, picking `<` vs `z3::ult`,
     /// `/` vs `z3::udiv` and `%` vs `z3::urem`.
     ///
@@ -2226,89 +2400,6 @@ impl Emitter {
     /// SHADOWED local is the one case still answered `false` — see the
     /// `shadowed_lets` guard on the `Ident` arm for why guessing there is
     /// worse than under-reporting.
-    fn constraint_expr_is_signed(
-        &self,
-        e: &Expr,
-        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
-        target_root: Option<&str>,
-    ) -> bool {
-        let recur = |inner| self.constraint_expr_is_signed(inner, field_info, target_root);
-        match &*e.kind {
-            // A transaction field first; failing that, a `let` inlined from
-            // the surrounding scope under `blocking randomize`.
-            //
-            // `let_widths` carries the declared signedness precisely so this
-            // needs no table of its own: harc#550 removed a flat
-            // `let_signed_widths` because a signed local in one function
-            // poisoned the name for every other, and harc#563 asks for the
-            // declared signedness to be threaded rather than for that
-            // mistake to be repeated. Without this, `t.x < s` on a
-            // `let s : sint<8> = 0 - 1` emitted `z3::ult(_z_x, 0xFFFF...)`,
-            // true for every `x`, where the source `x < -1` forbids all of
-            // them — the solver returned a value the source excludes.
-            //
-            // But `let_widths` is keyed by BARE NAME with no scoping, so a
-            // shadowed name's entry belongs to whichever `let` was seen
-            // last, not to the one in scope at the constraint. Signedness
-            // cannot ride that out the way a width check can: reading the
-            // wrong entry flips `udiv` to `/` and `ult` to `<`, changing
-            // the solved VALUE. An inner-block `let m : sint<64>` would
-            // make an outer `uint<64>` `m` divide signed, and an inner
-            // `uint<8>` would silently un-fix harc#563 for an outer signed
-            // one. So a shadowed name answers `false` — the pre-harc#563
-            // answer, which is under-reporting rather than a new wrong
-            // predicate — using the same `shadowed_lets` guard the width
-            // oracle already consults for the same reason.
-            ExprKind::Ident(id) => field_info
-                .get(&id.name)
-                .map(|f| f.signed)
-                .or_else(|| {
-                    if self.shadowed_lets.contains(&id.name) {
-                        return None;
-                    }
-                    self.let_widths.get(&id.name).map(|lw| lw.signed)
-                })
-                .unwrap_or(false),
-            ExprKind::Field { .. } => expr_field_path(e, target_root)
-                .and_then(|field| field_info.get(&field))
-                .map(|f| f.signed)
-                .unwrap_or(false),
-            // A list ELEMENT carries the list's signedness. Without this
-            // arm `v < 0` over a `list<sint<8>>` emitted `z3::ult(_z_vals_0,
-            // 0)` — unsigned, and so unsatisfiable for every value, where
-            // the source is satisfied by any negative element (harc#563).
-            // Resolved the same way `constraint_expr_width`'s `Index` arm
-            // does, so the two agree about what a subscript denotes: a list
-            // element, or a bit-select on a scalar. A bit-select is one
-            // unsigned bit, hence `false`.
-            // Note `elem_signed`, not `signed`: a list field's own `signed`
-            // is about the list, and is false for `list<sint<8>>`. The
-            // element's signedness lives on `ListFieldInfo`, which is why
-            // reading the obvious field here still emitted `ult`.
-            ExprKind::Index { target, .. } => {
-                list_field_name_from_expr(target, field_info, target_root)
-                    .and_then(|field| field_info.get(&field))
-                    .and_then(|f| f.list.as_ref())
-                    .map(|l| l.elem_signed)
-                    .unwrap_or(false)
-            }
-            // `sum(vals[0..vals.len()])` over a signed list. This was the
-            // OTHER way a signed list element reaches a constraint, and
-            // fixing only the `Index` arm left it emitting
-            // `z3::ult(<sum>, 0)` — false for every value, where the source
-            // is satisfied by any negative element (harc#598).
-            //
-            // A `.len()` call is unsigned and must keep answering `false`,
-            // which it does: only `sum` is matched here.
-            ExprKind::Call { .. } => sum_call_elem_signed(e, field_info, target_root),
-            ExprKind::Paren(inner) | ExprKind::Unary { expr: inner, .. } => recur(inner),
-            ExprKind::Binary { lhs, rhs, .. } => recur(lhs) || recur(rhs),
-            ExprKind::Membership { expr, .. } => recur(expr),
-            // A `const` and an enum variant are always emitted as a
-            // non-negative `uint64_t`, so unsigned is correct for those.
-            _ => false,
-        }
-    }
 
     /// A `${...}` capture that does not parse as an expression.
     ///
@@ -3207,12 +3298,12 @@ impl Emitter {
                 // `operator<<`/`operator>>` are not bit-vector overloads and
                 // can therefore fall through implicit `ast::operator bool()`
                 // conversions before C++ applies the native integer shift.
-                let signed = self.constraint_expr_is_signed(lhs, field_info, target_root)
-                    || self.constraint_expr_is_signed(rhs, field_info, target_root);
+                let signed = self.constraint_binary_is_signed(lhs, rhs, field_info, target_root);
                 // Shift signedness follows the value being shifted. A signed
                 // shift count must not turn an unsigned left operand's
                 // logical right shift into an arithmetic one.
-                let lhs_signed = self.constraint_expr_is_signed(lhs, field_info, target_root);
+                let lhs_signed = self.constraint_expr_signedness(lhs, field_info, target_root)
+                    == ConstraintOperandSignedness::Signed;
                 // `+% -% *%` mask the result to `max(W(lhs), W(rhs))`
                 // (spec §2.4). The solver variable is a 64-bit bitvector
                 // with the field's width carried as a separate range
@@ -3286,7 +3377,10 @@ impl Emitter {
                     Mul | MulWrap => (" * ", None),
                     Div if signed => (" / ", None),
                     Div => ("", Some("udiv")),
-                    Mod if signed => (" % ", None),
+                    // C++'s z3::expr `%` overload is bvsmod (the sign follows
+                    // the divisor). HARC signed remainder truncates toward
+                    // zero, so use the explicit bvsrem helper instead.
+                    Mod if signed => ("", Some("srem")),
                     Mod => ("", Some("urem")),
                     Eq => (" == ", None),
                     Ne => (" != ", None),
@@ -3435,7 +3529,8 @@ impl Emitter {
             ExprKind::RangeLit { lo, hi } => {
                 write!(self.out, "(").ok();
                 let mut has_any = false;
-                let signed = self.constraint_expr_is_signed(lhs, field_info, target_root);
+                let signed = self.constraint_expr_signedness(lhs, field_info, target_root)
+                    == ConstraintOperandSignedness::Signed;
                 if let Some(l) = lo {
                     if signed {
                         self.emit_constraint_expr_w(

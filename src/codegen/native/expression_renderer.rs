@@ -708,6 +708,21 @@ impl Emitter {
                         return;
                     }
                 }
+                // Wide signed carriers are stored as unsigned C++ values.
+                // Route ordered comparisons through the width-aware runtime
+                // helper so the declared sign bit, rather than carrier
+                // magnitude, determines the result. Keep this gate narrow:
+                // typed unsigned/mixed HarcWide pairs retain their existing
+                // unsupported/native behavior.
+                if matches!(
+                    op,
+                    BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+                ) {
+                    if let Some(width) = self.signed_wide_compare_width(lhs, rhs) {
+                        self.emit_signed_wide_compare(*op, lhs, rhs, width);
+                        return;
+                    }
+                }
                 self.emit_expr(lhs);
                 let s = c_binary_op(*op);
                 write!(self.out, " {s} ").ok();
@@ -754,6 +769,75 @@ impl Emitter {
                 ));
                 write!(self.out, "/* unsupported */ 0").ok();
             }
+        }
+    }
+
+    fn signed_wide_compare_width(&self, lhs: &Expr, rhs: &Expr) -> Option<u32> {
+        let lhs_width = self.infer_expr_width_best_effort(lhs);
+        let rhs_width = self.infer_expr_width_best_effort(rhs);
+        let width = lhs_width.max(rhs_width)?;
+        if width <= 64 {
+            return None;
+        }
+        let lhs_signed = self.infer_expr_signed_best_effort(lhs);
+        let rhs_signed = self.infer_expr_signed_best_effort(rhs);
+        // Match the lowering gate: a strictly signed pair, or a strictly
+        // signed operand with a widthless integer literal, is supported.
+        // A typed signed/unsigned mix remains unsupported.
+        (lhs_signed && rhs_signed).then_some(width)
+    }
+
+    fn emit_signed_wide_compare(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, width: u32) {
+        let lhs_cpp = self.signed_wide_compare_operand(lhs, width);
+        let rhs_cpp = self.signed_wide_compare_operand(rhs, width);
+        let lt = |a: &str, b: &str| {
+            if width > 128 {
+                format!("harc_rt::harc_wide_slt({a}, {b}, {width})")
+            } else {
+                format!("harc_rt::harc_slt_u128((_harc_u128)({a}), (_harc_u128)({b}), {width})")
+            }
+        };
+        let expr = match op {
+            BinaryOp::Lt => lt(&lhs_cpp, &rhs_cpp),
+            BinaryOp::Gt => lt(&rhs_cpp, &lhs_cpp),
+            BinaryOp::Le => format!("(!{})", lt(&rhs_cpp, &lhs_cpp)),
+            BinaryOp::Ge => format!("(!{})", lt(&lhs_cpp, &rhs_cpp)),
+            _ => unreachable!(),
+        };
+        write!(self.out, "{expr}").ok();
+    }
+
+    fn signed_wide_compare_operand(&mut self, expr: &Expr, width: u32) -> String {
+        let source_width = self.infer_expr_width_best_effort(expr);
+        let mut rendered = String::new();
+        let old = std::mem::take(&mut self.out);
+        self.emit_expr(expr);
+        rendered.push_str(&self.out);
+        self.out = old;
+        let Some(source_width) = source_width.filter(|w| *w < width) else {
+            return rendered;
+        };
+        // Width inference gives a bare positive literal its minimum bit
+        // width (e.g. `4` is three bits), but that width is unsigned. Sign
+        // extending it would turn 4 into -4 at the common signed width.
+        // Negative literals have no inferred width and already arrive as
+        // the correctly represented carrier value.
+        if Self::is_bare_positive_integer_literal(expr) {
+            return rendered;
+        }
+        if width > 128 {
+            let words = width.div_ceil(32);
+            format!("harc_rt::harc_wide_sext<{words}>({rendered}, {source_width}, {width})")
+        } else {
+            format!("harc_rt::harc_sext_u128((_harc_u128)({rendered}), {source_width}, {width})")
+        }
+    }
+
+    fn is_bare_positive_integer_literal(expr: &Expr) -> bool {
+        match &*expr.kind {
+            ExprKind::Paren(inner) => Self::is_bare_positive_integer_literal(inner),
+            ExprKind::Int(value) => !value.trim_start().starts_with('-'),
+            _ => false,
         }
     }
 }

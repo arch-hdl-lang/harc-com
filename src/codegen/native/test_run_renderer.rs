@@ -128,11 +128,18 @@ impl Emitter {
             // direction matches the source width, and so sext can emit
             // its shift-fill from the right MSB position.
             if let Some(TypeExpr::Builtin { name, args, .. }) = l.ty.as_ref() {
-                if matches!(name, BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits) {
+                if matches!(
+                    name,
+                    BuiltinTy::UInt
+                        | BuiltinTy::UIntCap
+                        | BuiltinTy::SInt
+                        | BuiltinTy::SIntCap
+                        | BuiltinTy::Bits
+                ) {
                     if let Some(w) = type_arg_width(args) {
                         let lw = LetWidth {
                             bits: w,
-                            signed: matches!(name, BuiltinTy::SInt),
+                            signed: matches!(name, BuiltinTy::SInt | BuiltinTy::SIntCap),
                         };
                         if self.let_widths.insert(l.name.name.clone(), lw).is_some() {
                             self.shadowed_lets.insert(l.name.name.clone());

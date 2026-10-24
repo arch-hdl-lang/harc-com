@@ -1266,21 +1266,30 @@ struct WaitCyclesAwaiter {
 // Short-circuit when pred is already true at entry: `await_ready`
 // returns true and the coroutine never suspends — matches the
 // existing polling-loop semantics where `pred-true-at-entry` doesn't
-// wait. The `ready_satisfied` flag is per-awaiter (lives in the
-// coroutine frame), not on the slot, so multiple in-flight
-// `wait_until_timeout` calls in the same coroutine don't interfere.
+// wait. The immediate-completion flags are per-awaiter (live in the
+// coroutine frame), not on the slot, so a zero-budget wait cannot consume
+// stale state left by an earlier suspended wait in the same coroutine.
 struct WaitUntilTimeoutAwaiter {
     std::function<bool()> pred;
     ThreadSlot* slot;
     uint32_t max_cycles;
     bool ready_satisfied = false;
+    bool completed_immediately = false;
 
     bool await_ready() noexcept {
-        if (pred && pred()) { ready_satisfied = true; return true; }
+        if (pred && pred()) {
+            ready_satisfied = true;
+            completed_immediately = true;
+            return true;
+        }
         // N == 0 + pred false: also short-circuit (immediate timeout).
         // Same semantics as the existing polling-loop's
         // `(cycle_count - start) < 0` guard skipping the loop body.
-        if (max_cycles == 0) { ready_satisfied = false; return true; }
+        if (max_cycles == 0) {
+            ready_satisfied = false;
+            completed_immediately = true;
+            return true;
+        }
         return false;
     }
     void await_suspend(std::coroutine_handle<>) noexcept {
@@ -1290,9 +1299,10 @@ struct WaitUntilTimeoutAwaiter {
         slot->timed_out = false;
     }
     bool await_resume() noexcept {
-        // Short-circuit path: ready_satisfied was set by await_ready.
-        // Suspend path: scheduler set slot->timed_out.
-        return ready_satisfied || !slot->timed_out;
+        // Short-circuit paths are complete independently of the slot's
+        // timed_out state, which may describe a prior wait on this slot.
+        // Suspended paths use the scheduler's result for this wait.
+        return completed_immediately ? ready_satisfied : !slot->timed_out;
     }
 };
 
@@ -1427,7 +1437,13 @@ inline WaitUntilAwaiter  wait_until (ThreadSlot* s, std::function<bool()> p) { r
 inline WaitCyclesAwaiter wait_cycles(ThreadSlot* s, uint32_t n)              { return {n, s}; }
 inline WaitUntilTimeoutAwaiter wait_until_timeout(
     ThreadSlot* s, std::function<bool()> p, uint32_t n
-) { return {std::move(p), s, n, /*ready_satisfied=*/false}; }
+) {
+    return {
+        std::move(p), s, n,
+        /*ready_satisfied=*/false,
+        /*completed_immediately=*/false,
+    };
+}
 
 // Awaiter: `co_await harc_lifecycle_yield()` (#619 M4b).
 //
