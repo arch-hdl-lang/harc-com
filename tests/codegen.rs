@@ -686,6 +686,35 @@ end test TraceTest
 }
 
 #[test]
+fn v1_signed_wide_ordering_uses_declared_sign_bit() {
+    let parsed = parse_source(
+        r#"test SignedWideOrdering
+    let dut : Top
+    run
+        let a : sint<65> = -8
+        let b : sint<65> = 3
+        assert a < b else fail("lt")
+        assert a <= b else fail("le")
+        assert b > a else fail("gt")
+        assert b >= a else fail("ge")
+    end run
+end test SignedWideOrdering
+"#,
+    )
+    .expect("signed wide source parses");
+    let cpp = cpp_tb::emit(&parsed).expect("v1 emits signed wide ordering");
+    assert!(cpp.contains("harc_rt::harc_slt_u128"), "{cpp}");
+    assert!(
+        cpp.contains(", 65)"),
+        "comparison must retain declared width: {cpp}"
+    );
+    assert!(
+        !cpp.contains("if (!(a < b))"),
+        "raw unsigned carrier comparison remains: {cpp}"
+    );
+}
+
+#[test]
 fn semantic_trace_tlm_method_calls_emit() {
     let parsed = parse_source(
         r#"bus B
