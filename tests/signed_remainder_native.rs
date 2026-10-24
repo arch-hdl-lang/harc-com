@@ -41,8 +41,34 @@ fn signed_remainder_native_accepts_sat_and_rejects_wrong_sat_keep() {
     );
 
     // This keep is satisfiable under bvsmod (+1) but impossible under HARC's
-    // native signed remainder (-5 % 3 == -2). It must fail randomization.
-    let wrong = valid.replace("keep a % b == NEG_TWO", "keep a % b == POS_ONE");
+    // native signed remainder (-5 % 3 == -2). Keep this source deliberately
+    // minimal: after UNSAT, randomized fields retain their zero defaults, so
+    // executing a post-randomize `%` assertion would evaluate 0 % 0 and
+    // raise SIGFPE on some native platforms instead of reporting UNSAT.
+    let wrong = r#"
+const NEG_FIVE : sint<64> = -5
+const POS_THREE : sint<64> = 3
+const POS_ONE : sint<64> = 1
+
+transaction WrongRemainder
+    a : sint<64>
+    b : sint<64>
+    keep a == NEG_FIVE
+    keep b == POS_THREE
+    keep a % b == POS_ONE
+end transaction WrongRemainder
+
+testbench WrongRemainderTb
+    dut : Top
+end testbench WrongRemainderTb
+
+impl WrongRemainderTest for WrongRemainderTb
+    run
+        let t : WrongRemainder
+        randomize(t)
+    end run
+end impl WrongRemainderTest
+"#;
     fs::write(&source, wrong).expect("write deliberately wrong fixture");
     let unsat = run(&source, &dir.join("unsat"));
     assert!(
