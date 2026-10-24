@@ -49,14 +49,13 @@ fn fn0 run_TransactionBasicTest [kind=Run, owner=tb0]
     -> Branch(%cmd.flag, b7, b8)
 
   b4:
-    Assign(%i, (%i + 1))
-    -> Jump(b2)
+    -> Branch((%i == 2), b5, b15)
 
   b5:
     DutWrite(dut.en, 0)
     RecordInit(%final_cmd, r0)
     RecordFieldWrite(%final_cmd.expect, %total)
-    -> WaitCycles(2, b14)
+    -> WaitCycles(2, b16)
 
   b6:
     Assign(%_anon, 1)
@@ -77,8 +76,7 @@ fn fn0 run_TransactionBasicTest [kind=Run, owner=tb0]
     -> WaitCycles(1, b13)
 
   b11:
-    Assign(%_anon, (%_anon + 1))
-    -> Jump(b9)
+    -> Branch((%_anon == %__t0), b12, b14)
 
   b12:
     DutRead(%got, dut.count_out)
@@ -90,6 +88,14 @@ fn fn0 run_TransactionBasicTest [kind=Run, owner=tb0]
     -> Jump(b11)
 
   b14:
+    Assign(%_anon, (%_anon + 1))
+    -> Jump(b9)
+
+  b15:
+    Assign(%i, (%i + 1))
+    -> Jump(b2)
+
+  b16:
     AssertCheck { cond: (dut.count_out == %final_cmd.expect), on_fail: "hold: count_out=%lld, expected %lld", dut.count_out, %final_cmd.expect }
     Log(info, "PASS: 3 commands, total=%lld", %final_cmd.expect)
     -> Return

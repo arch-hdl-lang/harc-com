@@ -64,8 +64,7 @@ fn fn2 AesXactor_wait_for_done [kind=TransactorBody(x0)]
     -> Branch((%__t0 == 0), b6, b7)
 
   b3:
-    Assign(%_anon, (%_anon + 1))
-    -> Jump(b1)
+    -> Branch((%_anon == 13), b4, b9)
 
   b4:
     -> Return
@@ -81,6 +80,10 @@ fn fn2 AesXactor_wait_for_done [kind=TransactorBody(x0)]
 
   b8:
     -> Jump(b5)
+
+  b9:
+    Assign(%_anon, (%_anon + 1))
+    -> Jump(b1)
 
 fn fn3 run_AesCipherTopTest [kind=Run, owner=tb0]
   entry = b0

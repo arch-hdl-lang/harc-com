@@ -244,12 +244,16 @@ int run_SequencerConnectTest(int argc, char** argv) {
                 break;
             }
             case 3: {
-                i = (i + 1);
-                __bb = 1;
+                if ((i == __t0)) { __bb = 4; } else { __bb = 5; }
                 break;
             }
             case 4: {
                 return;
+                break;
+            }
+            case 5: {
+                i = (i + 1);
+                __bb = 1;
                 break;
             }
             default: return;

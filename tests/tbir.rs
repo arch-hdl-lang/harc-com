@@ -21207,13 +21207,14 @@ end test LoopTest
     let prog = lower_src(src).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
     let f = prog.function(prog.tests[0].run);
-    // init block jumps to a header that branches on `i < 4`.
+    // init block jumps to a header that branches on `i <= 4`; the latch also
+    // branches around the increment at the inclusive terminal value.
     let n_branches = f
         .blocks
         .iter()
         .filter(|b| matches!(b.terminator, ir::Terminator::Branch(..)))
         .count();
-    assert_eq!(n_branches, 1, "one loop header:\n{f}");
+    assert_eq!(n_branches, 2, "header plus terminal latch:\n{f}");
     let has_latch = f.blocks.iter().any(|b| {
         matches!(b.terminator, ir::Terminator::Jump(_))
             && b.stmts

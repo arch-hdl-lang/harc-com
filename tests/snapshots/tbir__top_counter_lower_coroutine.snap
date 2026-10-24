@@ -7,22 +7,28 @@ coroutine-fsm fn0 run_TopCounterTest
     s0 = b0 (entry)
     s1 = b1
     s2 = b6
-    s3 = b11
-    s4 = b16
-    s5 = b17
+    s3 = b12
+    s4 = b18
+    s5 = b20
   transitions:
     s0 -> s1 on wait_cycles(3)
     s1 -> s2 on wait_cycles(1) if (%i <= 10)
     s1 -> s3 on wait_cycles(1) if !(%i <= 10) && (%_anon <= 4)
     s1 -> s4 on wait_cycles(1) if !(%i <= 10) && !(%_anon <= 4) && (%i_2 <= 5)
     s1 -> s5 on wait_cycles(1) if !(%i <= 10) && !(%_anon <= 4) && !(%i_2 <= 5)
-    s2 -> s2 on wait_cycles(1) if (%i <= 10)
-    s2 -> s3 on wait_cycles(1) if !(%i <= 10) && (%_anon <= 4)
-    s2 -> s4 on wait_cycles(1) if !(%i <= 10) && !(%_anon <= 4) && (%i_2 <= 5)
-    s2 -> s5 on wait_cycles(1) if !(%i <= 10) && !(%_anon <= 4) && !(%i_2 <= 5)
-    s3 -> s3 on wait_cycles(1) if (%_anon <= 4)
-    s3 -> s4 on wait_cycles(1) if !(%_anon <= 4) && (%i_2 <= 5)
-    s3 -> s5 on wait_cycles(1) if !(%_anon <= 4) && !(%i_2 <= 5)
-    s4 -> s4 on wait_cycles(1) if (%i_2 <= 5)
-    s4 -> s5 on wait_cycles(1) if !(%i_2 <= 5)
+    s2 -> s3 on wait_cycles(1) if (%i == 10) && (%_anon <= 4)
+    s2 -> s4 on wait_cycles(1) if (%i == 10) && !(%_anon <= 4) && (%i_2 <= 5)
+    s2 -> s5 on wait_cycles(1) if (%i == 10) && !(%_anon <= 4) && !(%i_2 <= 5)
+    s2 -> s2 on wait_cycles(1) if !(%i == 10) && (%i <= 10)
+    s2 -> s3 on wait_cycles(1) if !(%i == 10) && !(%i <= 10) && (%_anon <= 4)
+    s2 -> s4 on wait_cycles(1) if !(%i == 10) && !(%i <= 10) && !(%_anon <= 4) && (%i_2 <= 5)
+    s2 -> s5 on wait_cycles(1) if !(%i == 10) && !(%i <= 10) && !(%_anon <= 4) && !(%i_2 <= 5)
+    s3 -> s4 on wait_cycles(1) if (%_anon == 4) && (%i_2 <= 5)
+    s3 -> s5 on wait_cycles(1) if (%_anon == 4) && !(%i_2 <= 5)
+    s3 -> s3 on wait_cycles(1) if !(%_anon == 4) && (%_anon <= 4)
+    s3 -> s4 on wait_cycles(1) if !(%_anon == 4) && !(%_anon <= 4) && (%i_2 <= 5)
+    s3 -> s5 on wait_cycles(1) if !(%_anon == 4) && !(%_anon <= 4) && !(%i_2 <= 5)
+    s4 -> s5 on wait_cycles(1) if (%i_2 == 5)
+    s4 -> s4 on wait_cycles(1) if !(%i_2 == 5) && (%i_2 <= 5)
+    s4 -> s5 on wait_cycles(1) if !(%i_2 == 5) && !(%i_2 <= 5)
     s5 -> end on return

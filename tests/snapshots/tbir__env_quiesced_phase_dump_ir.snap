@@ -57,35 +57,38 @@ fn fn1 run_EnvQuiescedPhaseTest [kind=Run, owner=tb0]
     -> WaitCycles(3, b7)
 
   b5:
-    Assign(%i, (%i + 1))
-    -> Jump(b3)
+    -> Branch((%i == 2), b6, b8)
 
   b6:
-    -> Jump(b8)
+    -> Jump(b9)
 
   b7:
     -> Jump(b5)
 
   b8:
-    -> Branch(!ScoreboardQuery(top.sb.expected.empty()), b9, b10)
+    Assign(%i, (%i + 1))
+    -> Jump(b3)
 
   b9:
-    ScoreboardOp(top.sb, %drained = expected.pop())
-    ScoreboardOp(top.sb, popped = (ScoreboardQuery(top.sb.popped) + 1))
-    -> Jump(b8)
+    -> Branch(!ScoreboardQuery(top.sb.expected.empty()), b10, b11)
 
   b10:
-    Assign(%__t0, 200)
-    -> WaitUntilTimeout { (top.prod.idle(8) && top.sb.idle(8)), (top.prod.seen == 3) [all_of], cycles: %__t0, fire: b11, timeout: b12 }
+    ScoreboardOp(top.sb, %drained = expected.pop())
+    ScoreboardOp(top.sb, popped = (ScoreboardQuery(top.sb.popped) + 1))
+    -> Jump(b9)
 
   b11:
-    -> Return
+    Assign(%__t0, 200)
+    -> WaitUntilTimeout { (top.prod.idle(8) && top.sb.idle(8)), (top.prod.seen == 3) [all_of], cycles: %__t0, fire: b12, timeout: b13 }
 
   b12:
+    -> Return
+
+  b13:
     FailDiag { "environment did not quiesce" }
     FailDiag { unless: (top.prod.idle(8) && top.sb.idle(8)), "  not yet true: _tb.top.quiesced(8)" }
     FailDiag { unless: (top.prod.seen == 3), "  not yet true: _tb.top.prod.seen == 3" }
-    -> Jump(b11)
+    -> Jump(b12)
 
 fn fn2 check_EnvQuiescedPhaseTest [kind=Check, owner=tb0]
   entry = b0

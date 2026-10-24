@@ -49,8 +49,7 @@ fn fn0 run_IfWaitForInThenTest [kind=Run, owner=tb0]
     -> Branch(((%c % 3) == 0), b9, b10)
 
   b6:
-    Assign(%c, (%c + 1))
-    -> Jump(b4)
+    -> Branch((%c == 99), b7, b15)
 
   b7:
     Log(info, "done_pulses=%lld (expected 4)", %done_pulses)
@@ -86,3 +85,7 @@ fn fn0 run_IfWaitForInThenTest [kind=Run, owner=tb0]
   b14:
     Assign(%cycles_since_last_done, (%cycles_since_last_done + 1))
     -> Jump(b12)
+
+  b15:
+    Assign(%c, (%c + 1))
+    -> Jump(b4)

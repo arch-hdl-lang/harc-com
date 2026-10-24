@@ -53,29 +53,32 @@ fn fn1 run_HeartbeatIdleTest [kind=Run, owner=tb0]
     -> WaitCycles(3, b7)
 
   b5:
-    Assign(%i, (%i + 1))
-    -> Jump(b3)
+    -> Branch((%i == 2), b6, b8)
 
   b6:
     Assign(%waited, 0)
     Assign(%budget, 100)
-    -> Jump(b8)
+    -> Jump(b9)
 
   b7:
     -> Jump(b5)
 
   b8:
-    -> Branch((!prod.idle_in(8) && (%waited < %budget)), b9, b10)
+    Assign(%i, (%i + 1))
+    -> Jump(b3)
 
   b9:
-    -> WaitCycles(1, b11)
+    -> Branch((!prod.idle_in(8) && (%waited < %budget)), b10, b11)
 
   b10:
+    -> WaitCycles(1, b12)
+
+  b11:
     AssertCheck { cond: prod.idle_in(8), on_fail: "agent did not report idle_in(8) within %lld cycles after last emit; waited=%lld", %budget, %waited }
     AssertCheck { cond: (prod.seen == 3), on_fail: "expected 3 emits to register, got %lld", prod.seen }
     Log(info, "PASS: agent reported idle_in(8) after %lld cycles of inactivity; seen=%lld", %waited, prod.seen)
     -> Return
 
-  b11:
+  b12:
     Assign(%waited, (%waited + 1))
-    -> Jump(b8)
+    -> Jump(b9)

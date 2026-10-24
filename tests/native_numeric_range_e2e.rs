@@ -34,6 +34,12 @@ impl NumericRangeTest for NumericRangeTb
         end for
         assert count == 6 else fail("signed MAX range did not terminate")
 
+        let mixed_count = 0
+        for i in smax .. umax
+            mixed_count = mixed_count + 1
+        end for
+        assert mixed_count == 1 else fail("mixed range exceeded signed carrier")
+
         for i in 1 .. 3
             if i == 2
                 continue

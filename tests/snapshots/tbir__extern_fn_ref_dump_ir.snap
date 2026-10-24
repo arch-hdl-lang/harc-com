@@ -31,8 +31,7 @@ fn fn0 harc_crc8_step [kind=Helper]
     -> Branch(((%x & 128) != 0), b6, b7)
 
   b3:
-    Assign(%_anon, (%_anon + 1))
-    -> Jump(b1)
+    -> Branch((%_anon == 7), b4, b8)
 
   b4:
     Assign(%__ret, %x)
@@ -48,6 +47,10 @@ fn fn0 harc_crc8_step [kind=Helper]
   b7:
     Assign(%x, ((%x << 1) & 255))
     -> Jump(b5)
+
+  b8:
+    Assign(%_anon, (%_anon + 1))
+    -> Jump(b1)
 
 fn fn1 run_ExternFnRefTest [kind=Run, owner=tb0]
   locals:
@@ -83,9 +86,12 @@ fn fn1 run_ExternFnRefTest [kind=Run, owner=tb0]
     -> Jump(b5)
 
   b5:
-    Assign(%i, (%i + 1))
-    -> Jump(b3)
+    -> Branch((%i == 15), b6, b7)
 
   b6:
     Log(info, "PASS: 16-byte CRC-8 round-trip matched C reference; final=0x%02llx", %crc_ref)
     -> Return
+
+  b7:
+    Assign(%i, (%i + 1))
+    -> Jump(b3)

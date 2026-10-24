@@ -245,15 +245,28 @@ impl FuncBuilder<'_> {
                 width: 64,
                 src_width: None,
             };
-            Expr::Binary(
-                BinOp::And,
-                Box::new(nonnegative),
+            // A signed 64-bit induction variable cannot represent the
+            // unsigned values above INT64_MAX.  Stop at its carrier maximum
+            // rather than incrementing into signed host-language overflow;
+            // this is the maximal representable prefix of the mixed-domain
+            // range and keeps the existing negative/unsigned header test.
+            let reaches_upper = Expr::Binary(
+                BinOp::Or,
                 Box::new(Expr::Binary(
                     BinOp::Eq,
                     Box::new(unsigned_var),
                     Box::new(hi_operand.clone()),
                 )),
-            )
+                Box::new(Expr::Binary(
+                    BinOp::Eq,
+                    Box::new(Expr::Local(var)),
+                    Box::new(Expr::Literal {
+                        value: i64::MAX as u64,
+                        ty: IrType::SInt(Some(64)),
+                    }),
+                )),
+            );
+            Expr::Binary(BinOp::And, Box::new(nonnegative), Box::new(reaches_upper))
         } else {
             Expr::Binary(
                 BinOp::Eq,
