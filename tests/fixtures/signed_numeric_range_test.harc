@@ -24,5 +24,12 @@ test SignedNumericRange
             positive_sum = positive_sum + i
         end for
         assert positive_sum == 6 else fail("positive sum ${positive_sum}")
+
+        let dynamic_upper : sint<64> = -2
+        let dynamic_sum : sint<64> = 0
+        for i in -4 .. dynamic_upper
+            dynamic_sum = dynamic_sum + i
+        end for
+        assert dynamic_sum == -9 else fail("dynamic sum ${dynamic_sum}")
     end run
 end test SignedNumericRange

@@ -144,6 +144,7 @@ impl FuncBuilder<'_> {
         self.validate_numeric_expr(&lo_ir, "range lower bound")?;
         let lo_signed = self.range_bound_requires_signed(lo, &lo_ir);
         let var = self.declare(&f.var.name);
+        self.push(Stmt::Assign(var, lo_ir));
         // Upper bound — evaluated once; stash non-trivial expressions
         // in a synthesized local so the header re-reads a pure value.
         let hi_ir = self.lower_expr_no_ports(hi)?;
@@ -155,8 +156,7 @@ impl FuncBuilder<'_> {
         if signed_range {
             self.set_local_type(var, IrType::SInt(None));
         }
-        self.push(Stmt::Assign(var, lo_ir));
-        // The loop counter is a `uint64_t`, so a bound wider than 64
+        // An unsigned range counter is a `uint64_t`, so a bound wider than 64
         // bits reaches the header through `HarcWide`'s implicit
         // conversion and the loop runs over its low 64 bits. That is a
         // real sharp edge and worth a diagnostic one day.
@@ -954,7 +954,9 @@ impl FuncBuilder<'_> {
 
     fn range_bound_requires_signed(&self, source: &AstExpr, lowered: &Expr) -> bool {
         matches!(self.expr_type(lowered), Some(IrType::SInt(_)))
-            || ast_expr_may_be_negative(source)
+            || super::fold_const(source, &self.ctx.consts, "")
+                .map(|value| value.is_negative())
+                .unwrap_or(false)
     }
 
     /// Stash a non-trivial expression while preserving its known type. A
@@ -974,29 +976,5 @@ impl FuncBuilder<'_> {
                 Expr::Local(t)
             }
         }
-    }
-}
-
-fn ast_expr_may_be_negative(e: &AstExpr) -> bool {
-    match &*e.kind {
-        ExprKind::Paren(inner) => ast_expr_may_be_negative(inner),
-        ExprKind::Unary {
-            op: crate::ast::UnaryOp::Neg,
-            ..
-        } => true,
-        ExprKind::Binary {
-            op: crate::ast::BinaryOp::Sub,
-            lhs,
-            rhs,
-        } => match (&*lhs.kind, &*rhs.kind) {
-            (ExprKind::Int(a), ExprKind::Int(b)) => {
-                match (super::exprs::parse_int_literal(a), super::exprs::parse_int_literal(b)) {
-                    (Some(a), Some(b)) => a < b,
-                    _ => false,
-                }
-            }
-            _ => false,
-        },
-        _ => false,
     }
 }

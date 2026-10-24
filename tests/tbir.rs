@@ -1399,6 +1399,30 @@ fn numeric_range_induction_is_signed() {
         .find(|local| local.name == "i_3")
         .expect("positive numeric range induction local");
     assert_eq!(positive_induction.ty, ir::IrType::Unknown);
+    let dynamic_upper = function
+        .locals
+        .iter()
+        .find(|local| local.name == "dynamic_upper")
+        .expect("dynamic signed upper bound local");
+    assert_eq!(dynamic_upper.ty, ir::IrType::SInt(Some(64)));
+}
+
+#[test]
+fn positive_numeric_range_keeps_unsigned_port_assignment() {
+    let src = r#"
+test PositiveRangePort
+    let dut : Top
+    run
+        for i in 0 .. 1
+            dut.en = i
+        end for
+    end run
+end test PositiveRangePort
+"#;
+    let prog = lower_src(src).expect("positive range lowers");
+    verify::verify_program(&prog).expect("positive range verifies");
+    let cpp = emit_cpp_src(src);
+    assert!(cpp.contains("uint64_t i"), "positive range must retain unsigned induction: {cpp}");
 }
 
 #[test]
