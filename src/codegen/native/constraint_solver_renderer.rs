@@ -2295,6 +2295,10 @@ impl Emitter {
                     recur(lhs)
                 } else if self.constraint_binary_is_signed(lhs, rhs, field_info, target_root) {
                     ConstraintOperandSignedness::Signed
+                } else if recur(lhs) == ConstraintOperandSignedness::UntypedLiteral
+                    && recur(rhs) == ConstraintOperandSignedness::UntypedLiteral
+                {
+                    ConstraintOperandSignedness::UntypedLiteral
                 } else {
                     ConstraintOperandSignedness::Unsigned
                 }
@@ -2327,13 +2331,34 @@ impl Emitter {
                 return false;
             };
             return self
-                .constraint_expr_width(signed_expr, field_info, target_root)
+                .constraint_expr_native_width(signed_expr, field_info, target_root)
                 .unwrap_or(0)
                 > self
-                    .constraint_expr_width(unsigned_expr, field_info, target_root)
+                    .constraint_expr_native_width(unsigned_expr, field_info, target_root)
                     .unwrap_or(u32::MAX);
         }
         l == ConstraintOperandSignedness::Signed || r == ConstraintOperandSignedness::Signed
+    }
+
+    fn constraint_expr_native_width(
+        &self,
+        e: &Expr,
+        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        target_root: Option<&str>,
+    ) -> Option<u32> {
+        if let Some(width) = self.constraint_expr_width(e, field_info, target_root) {
+            return Some(width);
+        }
+        match &*e.kind {
+            ExprKind::Paren(inner) | ExprKind::Unary { expr: inner, .. } => {
+                self.constraint_expr_native_width(inner, field_info, target_root)
+            }
+            ExprKind::Binary { lhs, rhs, .. } => Some(
+                self.constraint_expr_native_width(lhs, field_info, target_root)?
+                    .max(self.constraint_expr_native_width(rhs, field_info, target_root)?),
+            ),
+            _ => None,
+        }
     }
 
     /// Signedness of a constraint expression, picking `<` vs `z3::ult`,

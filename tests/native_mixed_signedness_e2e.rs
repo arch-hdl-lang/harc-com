@@ -21,6 +21,14 @@ transaction NarrowMixed
     keep s + u == -4
     keep s < u
 end transaction NarrowMixed
+transaction NestedMixed
+    u : uint<8>
+    s : sint<64>
+    keep u == MIXED_U8
+    keep s == -6
+    keep s + (u + 0) == -4
+    keep s < (1 + 2)
+end transaction NestedMixed
 test MixedSignedness
     let dut : Top
     run
@@ -30,6 +38,9 @@ test MixedSignedness
         let n : NarrowMixed
         randomize(n)
         assert n.s == -6 else fail("narrow signed promotion")
+        let x : NestedMixed
+        randomize(x)
+        assert x.s == -6 else fail("nested signed promotion")
     end run
 end test MixedSignedness
 "#;
