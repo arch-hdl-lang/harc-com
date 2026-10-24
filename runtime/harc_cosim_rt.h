@@ -236,6 +236,9 @@ struct UnpackedElemRef {
         harc_sv_set_elem(id, idx, static_cast<long long>(v));
         return *this;
     }
+    UnpackedElemRef& operator=(const UnpackedElemRef& o) {
+        return *this = static_cast<uint64_t>(o);
+    }
 };
 
 // An unpacked-array DUT port (`input logic [W-1:0] p [NELEMS]`),

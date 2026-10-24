@@ -575,3 +575,69 @@ end transaction T"#,
         "{messages:?}"
     );
 }
+
+#[test]
+fn rejects_self_recursive_record_types_with_a_structured_error() {
+    let parsed = parse_source(
+        r#"transaction Cycle
+    self : Cycle
+end transaction Cycle"#,
+    )
+    .unwrap();
+
+    let elaborated = elaborate_constraints(&parsed);
+    assert_eq!(elaborated.errors.len(), 1);
+    assert!(elaborated.errors[0]
+        .message
+        .contains("recursive record type"));
+    assert!(elaborated.errors[0].message.contains("self"));
+    assert!(elaborated.errors[0].span.start > 0);
+}
+
+#[test]
+fn rejects_mutually_recursive_record_types_with_a_structured_error() {
+    let parsed = parse_source(
+        r#"struct A
+    b : B
+end struct A
+
+struct B
+    a : A
+end struct B"#,
+    )
+    .unwrap();
+
+    let elaborated = elaborate_constraints(&parsed);
+    assert!(!elaborated.errors.is_empty());
+    assert!(elaborated
+        .errors
+        .iter()
+        .all(|error| error.message.contains("recursive record type")));
+}
+
+#[test]
+fn allows_reusing_a_finite_record_child() {
+    let parsed = parse_source(
+        r#"struct Child
+    value : uint<8>
+end struct Child
+
+transaction Parent
+    left : Child
+    right : Child
+end transaction Parent"#,
+    )
+    .unwrap();
+
+    let elaborated = elaborate_constraints(&parsed);
+    assert!(elaborated.errors.is_empty(), "{:?}", elaborated.errors);
+    let parent = elaborated.transaction("Parent").expect("Parent schema");
+    assert_eq!(
+        parent
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["left.value", "right.value"]
+    );
+}

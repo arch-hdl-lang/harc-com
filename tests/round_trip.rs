@@ -2,6 +2,7 @@
 //! output, and verify both parse trees match structurally. Snapshot the
 //! pretty-printed form for stability.
 
+use harc::ast::{ExprKind, Item, StmtKind};
 use harc::parser::parse_source;
 use harc::pretty::print;
 
@@ -10,6 +11,43 @@ fn parse_print_reparse(src: &str) -> String {
     let printed = print(&parsed);
     let _ = parse_source(&printed).expect("re-parse of pretty output should succeed");
     printed
+}
+
+#[test]
+fn expression_randomize_constraints_round_trip() {
+    let src = r#"
+function F() -> bool
+    return randomize(t) with
+        t > 0
+        t < 10
+    end randomize
+end function F
+"#;
+    let parsed = parse_source(src).expect("first parse should succeed");
+    let Item::Function(function) = &parsed.items[0] else {
+        panic!("expected function item");
+    };
+    let StmtKind::Return(Some(expr)) = &function.body.stmts[0].kind else {
+        panic!("expected return statement");
+    };
+    let ExprKind::Randomize { with_body, .. } = &*expr.kind else {
+        panic!("expected randomize expression");
+    };
+    assert_eq!(with_body.len(), 2);
+
+    let printed = print(&parsed);
+    let reparsed = parse_source(&printed).expect("re-parse of pretty output should succeed");
+    let Item::Function(function) = &reparsed.items[0] else {
+        panic!("expected function item after reparse");
+    };
+    let StmtKind::Return(Some(expr)) = &function.body.stmts[0].kind else {
+        panic!("expected return statement after reparse");
+    };
+    let ExprKind::Randomize { with_body, .. } = &*expr.kind else {
+        panic!("expected randomize expression after reparse");
+    };
+    assert_eq!(with_body.len(), 2);
+    assert_eq!(printed, print(&reparsed));
 }
 
 #[test]

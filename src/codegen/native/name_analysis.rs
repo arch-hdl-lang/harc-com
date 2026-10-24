@@ -3,6 +3,20 @@
 use super::*;
 
 impl Emitter {
+    pub(super) fn fresh_internal_name(&mut self, stem: &str) -> String {
+        let mut suffix = 0usize;
+        loop {
+            let name = format!("__harc_{stem}_{suffix}");
+            suffix += 1;
+            if !self.declared_value_names.contains(&name)
+                && !self.internal_reserved_names.contains(&name)
+            {
+                self.internal_reserved_names.insert(name.clone());
+                return name;
+            }
+        }
+    }
+
     /// File-scope C++ names this backend writes into EVERY generated file,
     /// which therefore cannot also be an enum variant's `constexpr`.
     /// Unlike a record or component name, nothing in the user's program
@@ -208,6 +222,42 @@ impl Emitter {
             }
         }
         self.declared_value_names = out;
+        // Keep file-scope names in a separate set: `declared_value_names` is
+        // intentionally local/parameter-only because expression emission uses
+        // it to suppress diagnostics for legal local shadowing of enum values.
+        for item in &file.items {
+            match item {
+                Item::Const(c) => {
+                    self.internal_reserved_names.insert(c.name.name.clone());
+                }
+                Item::Enum(e) => {
+                    self.internal_reserved_names
+                        .extend(e.variants.iter().map(|v| v.name.clone()));
+                }
+                Item::Relation(r) => {
+                    self.internal_reserved_names.insert(r.name.name.clone());
+                }
+                Item::Function(f) => {
+                    self.internal_reserved_names.insert(f.name.name.clone());
+                }
+                Item::Tseq(t) => {
+                    self.internal_reserved_names.insert(t.name.name.clone());
+                }
+                Item::Property(p) => {
+                    self.internal_reserved_names.insert(p.name.name.clone());
+                }
+                Item::Pseq(p) => {
+                    self.internal_reserved_names.insert(p.name.name.clone());
+                }
+                Item::CoverSequence(c) => {
+                    self.internal_reserved_names.insert(c.name.name.clone());
+                }
+                Item::ExternFn(f) => {
+                    self.internal_reserved_names.insert(f.name.name.clone());
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Variant names that must NOT get a file-scope `constexpr`, mapped to

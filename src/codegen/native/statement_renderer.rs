@@ -237,9 +237,10 @@ impl Emitter {
             }
             StmtKind::Repeat(r) => {
                 self.pad(depth);
-                write!(self.out, "for (int64_t _r = 0; _r < ").ok();
+                let counter = self.fresh_internal_name("repeat_counter");
+                write!(self.out, "for (int64_t {counter} = 0; {counter} < ").ok();
                 self.emit_expr(&r.count);
-                writeln!(self.out, "; _r++) {{").ok();
+                writeln!(self.out, "; {counter}++) {{").ok();
                 self.emit_block(&r.body, depth + 1);
                 self.pad(depth);
                 writeln!(self.out, "}}").ok();

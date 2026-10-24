@@ -4283,6 +4283,30 @@ impl FuncBuilder<'_> {
                     inner_index,
                 }
             }
+            // Record-field vector selectors can contain transactor calls in
+            // either the intermediate record selections or the leaf index.
+            // Visit both collections in source order so every call reaches
+            // the statement-level seam before the record read is evaluated.
+            Expr::RecordField {
+                local,
+                field,
+                path,
+                mid_indices,
+                index,
+            } => {
+                let mid_indices = mid_indices
+                    .into_iter()
+                    .map(|(p, idx)| (p, self.hoist_transactor_calls(idx)))
+                    .collect();
+                let index = index.map(|idx| Box::new(self.hoist_transactor_calls(*idx)));
+                Expr::RecordField {
+                    local,
+                    field,
+                    path,
+                    mid_indices,
+                    index,
+                }
+            }
             Expr::TransactorStateRecordField {
                 instance,
                 field,

@@ -35,6 +35,12 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LEARN_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// One recorded learning event. v1 only emits `kind: "error_fix"`.
 #[derive(Debug, Clone)]
 pub struct Event {
@@ -60,6 +66,11 @@ struct PendingFailure {
 
 /// Resolve the learning directory, creating it if missing.
 pub fn learn_dir() -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = TEST_LEARN_DIR.with(|path| path.borrow().clone()) {
+        fs::create_dir_all(dir.join("pending"))?;
+        return Ok(dir);
+    }
     let home = std::env::var("HOME")
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "$HOME not set"))?;
     let dir = PathBuf::from(home).join(".harc").join("learn");
@@ -103,6 +114,10 @@ fn store_size_bytes(dir: &std::path::Path) -> u64 {
         total
     }
     walk(dir)
+}
+
+fn capacity_allows(dir: &std::path::Path, cap: u64) -> bool {
+    cap != 0 && store_size_bytes(dir) < cap
 }
 
 /// Print a one-time privacy notice the first time learning capture runs.
@@ -194,6 +209,16 @@ pub fn record_failure(
         return Ok(());
     }
     let dir = learn_dir()?;
+    record_failure_at(&dir, file_path, error_code, error_message, src)
+}
+
+fn record_failure_at(
+    dir: &std::path::Path,
+    file_path: &str,
+    error_code: &str,
+    error_message: &str,
+    src: &str,
+) -> std::io::Result<()> {
     let pending_file = dir
         .join("pending")
         .join(format!("{}.json", path_hash(file_path)));
@@ -208,6 +233,21 @@ pub fn record_failure(
     Ok(())
 }
 
+#[cfg(test)]
+fn record_failure_at_with_cap(
+    dir: &std::path::Path,
+    cap: u64,
+    file_path: &str,
+    error_code: &str,
+    error_message: &str,
+    src: &str,
+) -> std::io::Result<()> {
+    if !capacity_allows(dir, cap) {
+        return Ok(());
+    }
+    record_failure_at(dir, file_path, error_code, error_message, src)
+}
+
 /// If a pending failure exists for this file, emit an error_fix event
 /// comparing its stored src with the current (successful) src, then delete
 /// the pending entry. Returns the event if one was emitted.
@@ -215,7 +255,22 @@ pub fn record_success_if_pending(
     file_path: &str,
     src_after: &str,
 ) -> std::io::Result<Option<Event>> {
+    if !check_capacity() {
+        return Ok(None);
+    }
     let dir = learn_dir()?;
+    record_success_if_pending_at(&dir, max_bytes(), file_path, src_after)
+}
+
+fn record_success_if_pending_at(
+    dir: &std::path::Path,
+    cap: u64,
+    file_path: &str,
+    src_after: &str,
+) -> std::io::Result<Option<Event>> {
+    if !capacity_allows(dir, cap) {
+        return Ok(None);
+    }
     let pending_file = dir
         .join("pending")
         .join(format!("{}.json", path_hash(file_path)));
@@ -247,13 +302,17 @@ pub fn record_success_if_pending(
         src_after: src_after.to_string(),
         diff_summary,
     };
-    append_event(&event)?;
+    append_event_at(dir, &event)?;
     let _ = fs::remove_file(&pending_file);
     Ok(Some(event))
 }
 
 fn append_event(e: &Event) -> std::io::Result<()> {
     let dir = learn_dir()?;
+    append_event_at(&dir, e)
+}
+
+fn append_event_at(dir: &std::path::Path, e: &Event) -> std::io::Result<()> {
     let path = dir.join("events.jsonl");
     let mut f = fs::OpenOptions::new()
         .create(true)
@@ -301,6 +360,12 @@ where
         return Ok(0);
     }
 
+    // Derive the replacement scope from every AST item before filtering out
+    // docless items. A valid file can produce zero events after its docs are
+    // removed, but its old feature events still need to be purged.
+    let touched_files: std::collections::HashSet<String> =
+        ast.items.iter().map(&file_path_for).collect();
+
     // Collect new feature events first so we can purge per-file in one pass.
     let mut new_events: Vec<Event> = Vec::new();
     let frontmatter = ast.frontmatter.clone().unwrap_or_default();
@@ -339,14 +404,12 @@ where
         });
     }
 
+    // Replace any existing feature events for the files we're harvesting.
+    purge_features_for_files(&touched_files)?;
+
     if new_events.is_empty() {
         return Ok(0);
     }
-
-    // Replace any existing feature events for the files we're harvesting.
-    let touched_files: std::collections::HashSet<String> =
-        new_events.iter().map(|e| e.file_path.clone()).collect();
-    purge_features_for_files(&touched_files)?;
 
     let mut count = 0;
     for e in &new_events {
@@ -1117,6 +1180,17 @@ pub fn classify_error(msg: &str) -> String {
 mod tests {
     use super::*;
 
+    fn isolated_learn_dir(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("harc-learn-{label}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(dir.join("pending")).expect("create isolated learn dir");
+        dir
+    }
+
     #[test]
     fn tokenize_basic() {
         let tokens = tokenize("width mismatch: uint<8> vs uint<9>");
@@ -1193,6 +1267,73 @@ mod tests {
     }
 
     #[test]
+    fn successful_capture_skips_event_when_capacity_is_disabled() {
+        let dir = isolated_learn_dir("capacity-zero");
+        let file = "capacity-zero.harc";
+        record_failure_at_with_cap(
+            &dir,
+            1024 * 1024,
+            file,
+            "parse_error",
+            "expected end",
+            "bad",
+        )
+        .expect("record pending failure");
+
+        let event = record_success_if_pending_at(&dir, 0, file, "fixed")
+            .expect("capacity-disabled success capture");
+        assert!(event.is_none());
+        assert!(!dir.join("events.jsonl").exists());
+        assert!(dir
+            .join("pending")
+            .join(format!("{}.json", path_hash(file)))
+            .exists());
+
+        fs::remove_dir_all(&dir).expect("remove isolated learn dir");
+    }
+
+    #[test]
+    fn successful_capture_skips_event_when_capacity_is_full() {
+        let dir = isolated_learn_dir("capacity-full");
+        let file = "capacity-full.harc";
+        let cap = 1024 * 1024;
+        record_failure_at_with_cap(&dir, cap, file, "parse_error", "expected end", "bad")
+            .expect("record pending failure");
+        fs::write(dir.join("filler"), vec![b'x'; cap as usize]).expect("fill isolated store");
+
+        let event = record_success_if_pending_at(&dir, cap, file, "fixed")
+            .expect("full-capacity success capture");
+        assert!(event.is_none());
+        assert!(!dir.join("events.jsonl").exists());
+        assert!(dir
+            .join("pending")
+            .join(format!("{}.json", path_hash(file)))
+            .exists());
+
+        fs::remove_dir_all(&dir).expect("remove isolated learn dir");
+    }
+
+    #[test]
+    fn successful_capture_records_event_when_capacity_allows() {
+        let dir = isolated_learn_dir("capacity-available");
+        let file = "capacity-available.harc";
+        let cap = 1024 * 1024;
+        record_failure_at_with_cap(&dir, cap, file, "parse_error", "expected end", "bad")
+            .expect("record pending failure");
+
+        let event = record_success_if_pending_at(&dir, cap, file, "fixed")
+            .expect("available-capacity success capture");
+        assert!(event.is_some());
+        assert!(dir.join("events.jsonl").exists());
+        assert!(!dir
+            .join("pending")
+            .join(format!("{}.json", path_hash(file)))
+            .exists());
+
+        fs::remove_dir_all(&dir).expect("remove isolated learn dir");
+    }
+
+    #[test]
     fn extract_doc_returns_construct_kind_name_and_doc() {
         // Use a HARC source with a struct that has an outer doc comment.
         let src = r#"
@@ -1243,5 +1384,47 @@ end struct BeatCounter
             kept[1].contains("\"file_path\":\"other.harc\""),
             "feature events for non-targeted files should be retained"
         );
+    }
+
+    #[test]
+    fn reharvest_without_docs_purges_stale_features_and_keeps_other_events() {
+        let dir = std::env::temp_dir().join(format!(
+            "harc-learn-b04-{}-{}",
+            std::process::id(),
+            iso8601_now().replace(['-', ':', 'T', 'Z'], "")
+        ));
+        let previous = TEST_LEARN_DIR.with(|path| path.replace(Some(dir.clone())));
+        let result = (|| -> std::io::Result<()> {
+            fs::create_dir_all(dir.join("pending"))?;
+            let documented = crate::parser::parse_source(
+                "/// obsolete_unique_feature\nstruct Packet\nend struct Packet\n",
+            )
+            .expect("documented fixture parses");
+            let docless = crate::parser::parse_source("struct Packet\nend struct Packet\n")
+                .expect("docless fixture parses");
+            let file = "packet.harc";
+
+            assert_eq!(harvest_features(&documented, |_| file.to_string())?, 1);
+            append_event(&Event {
+                ts: "2026-01-01T00:00:00Z".to_string(),
+                kind: "error_fix".to_string(),
+                error_code: "parse_error".to_string(),
+                error_message: "unrelated_error_fix".to_string(),
+                file_path: "other.harc".to_string(),
+                src_before: "".to_string(),
+                src_after: "".to_string(),
+                diff_summary: "unrelated".to_string(),
+            })?;
+            assert_eq!(harvest_features(&docless, |_| file.to_string())?, 0);
+
+            let raw = fs::read_to_string(dir.join("events.jsonl"))?;
+            assert!(!raw.contains("obsolete_unique_feature"));
+            assert!(raw.contains("unrelated_error_fix"));
+            assert!(peek("obsolete_unique_feature", 10)?.is_empty());
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(&dir);
+        TEST_LEARN_DIR.with(|path| path.replace(previous));
+        result.expect("temporary learning store regression");
     }
 }

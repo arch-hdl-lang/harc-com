@@ -77,7 +77,7 @@ fn parse_inner_doc(lex: &mut logos::Lexer<TokenKind>) -> String {
 #[derive(Logos, Debug, Clone, PartialEq)]
 #[logos(skip r"[ \t\r\n\f]+")]
 #[logos(skip r"//[^\n]*")]
-#[logos(skip r"/\*([^*]|\*[^/])*\*/")]
+#[logos(skip r"/\*[^*]*\*+([^/*][^*]*\*+)*/")]
 pub enum TokenKind {
     // ── Doc comments ──────────────────────────────────────────────────────────
     #[regex(r"///[^\n]*", parse_outer_doc, priority = 5)]
@@ -885,6 +885,29 @@ mod tests {
     fn doc_outer_strip_space() {
         let toks = tokenize("/// hello\n").unwrap();
         assert!(matches!(&toks[0].kind, TokenKind::DocOuter(s) if s == "hello"));
+    }
+
+    #[test]
+    fn ordinary_block_comments_allow_any_stars_and_newlines() {
+        for comment in [
+            "/**/",
+            "/***/",
+            "/****/",
+            "/*****/",
+            "/* normal **/",
+            "/* first line\n second line ***/",
+        ] {
+            let toks = tokenize(&format!("{comment} let x = 1"))
+                .unwrap_or_else(|err| panic!("{comment:?}: {err:?}"));
+            assert!(matches!(toks.first().map(|t| &t.kind), Some(TokenKind::Let)));
+            assert!(matches!(toks.last().map(|t| &t.kind), Some(TokenKind::DecLiteral(s)) if s == "1"));
+        }
+
+        let toks = tokenize("/* first */ let a = 1 /* second ***/ let b = 2").unwrap();
+        assert!(matches!(toks.first().map(|t| &t.kind), Some(TokenKind::Let)));
+        assert!(matches!(toks.get(4).map(|t| &t.kind), Some(TokenKind::Let)));
+        assert_eq!(toks.len(), 8);
+        assert!(tokenize("/* unterminated").is_err());
     }
 
     #[test]

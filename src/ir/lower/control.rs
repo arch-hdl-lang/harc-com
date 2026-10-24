@@ -8,6 +8,7 @@ use crate::ast::{
 };
 use crate::ir::{
     BinOp, BlockId, Expr, FmtArg, FmtArgs, IrType, LocalId, PredSrc, Stmt, Terminator, WaitMode,
+    WidthCastKind,
 };
 
 impl FuncBuilder<'_> {
@@ -142,13 +143,21 @@ impl FuncBuilder<'_> {
         // Loop counter init — evaluated once, outside the loop.
         let lo_ir = self.lower_expr_no_ports(lo)?;
         self.validate_numeric_expr(&lo_ir, "range lower bound")?;
+        let lo_signed = self.range_bound_requires_signed(lo, &lo_ir);
         let var = self.declare(&f.var.name);
         self.push(Stmt::Assign(var, lo_ir));
         // Upper bound — evaluated once; stash non-trivial expressions
         // in a synthesized local so the header re-reads a pure value.
         let hi_ir = self.lower_expr_no_ports(hi)?;
         self.validate_numeric_expr(&hi_ir, "range upper bound")?;
-        // The loop counter is a `uint64_t`, so a bound wider than 64
+        let signed_range = lo_signed || self.range_bound_requires_signed(hi, &hi_ir);
+        // Keep positive ranges' historical unsigned induction type for
+        // assignments to unsigned DUT ports. Signedness is required only
+        // when a bound is signed or syntactically carries negative values.
+        if signed_range {
+            self.set_local_type(var, IrType::SInt(None));
+        }
+        // An unsigned range counter is a `uint64_t`, so a bound wider than 64
         // bits reaches the header through `HarcWide`'s implicit
         // conversion and the loop runs over its low 64 bits. That is a
         // real sharp edge and worth a diagnostic one day.
@@ -159,7 +168,12 @@ impl FuncBuilder<'_> {
         // TB-IR lower LESS than v1 rather than more (harc#662). A
         // `for` loop must not differ from `for i in 0 .. 3` in whether
         // it compiles because someone widened the bound's type.
-        let hi_operand = self.stash_if_impure(hi_ir);
+        let fallback = if signed_range {
+            IrType::SInt(None)
+        } else {
+            IrType::Unknown
+        };
+        let hi_operand = self.stash_if_impure_with_fallback(hi_ir, fallback);
 
         // `for i in lo .. hi` is INCLUSIVE of `hi` (`lo, lo+1, …, hi`),
         // matching ARCH's `lo..hi` range semantics so the two co-authored
@@ -168,7 +182,39 @@ impl FuncBuilder<'_> {
         // path below keeps its `i < seq.size()` half-open counter — that
         // iterates the element indices `0 … size-1`, unrelated to the
         // user-facing numeric range.)
-        let cond = Expr::Binary(BinOp::Le, Box::new(Expr::Local(var)), Box::new(hi_operand));
+        let upper_is_negative = super::fold_const(hi, &self.ctx.consts, "")
+            .map(|value| value.is_negative())
+            .unwrap_or(false);
+        let unsigned_upper = !upper_is_negative
+            && matches!(self.expr_type(&hi_operand), Some(IrType::UInt(_) | IrType::Unknown));
+        let cond = if signed_range && unsigned_upper {
+            // A signed lower bound with a known unsigned upper bound needs
+            // two domains: every negative induction value is below the
+            // non-negative upper bound, while non-negative values compare
+            // as uint64_t. This also preserves UINT64_MAX upper bounds.
+            let negative = Expr::Binary(
+                BinOp::Lt,
+                Box::new(Expr::Local(var)),
+                Box::new(Expr::Literal {
+                    value: 0,
+                    ty: IrType::Unknown,
+                }),
+            );
+            let unsigned_var = Expr::WidthCast {
+                inner: Box::new(Expr::Local(var)),
+                kind: WidthCastKind::Zext,
+                width: 64,
+                src_width: None,
+            };
+            let nonnegative = Expr::Binary(
+                BinOp::Le,
+                Box::new(unsigned_var),
+                Box::new(hi_operand),
+            );
+            Expr::Binary(BinOp::Or, Box::new(negative), Box::new(nonnegative))
+        } else {
+            Expr::Binary(BinOp::Le, Box::new(Expr::Local(var)), Box::new(hi_operand))
+        };
         let step = Stmt::Assign(
             var,
             Expr::Binary(
@@ -936,10 +982,29 @@ impl FuncBuilder<'_> {
     /// Stash a non-trivial expression into a synthesized local so it is
     /// evaluated exactly once (loop bounds).
     fn stash_if_impure(&mut self, e: Expr) -> Expr {
+        self.stash_if_impure_with_fallback(e, IrType::Unknown)
+    }
+
+    fn range_bound_requires_signed(&self, source: &AstExpr, lowered: &Expr) -> bool {
+        matches!(self.expr_type(lowered), Some(IrType::SInt(_)))
+            || super::fold_const(source, &self.ctx.consts, "")
+                .map(|value| value.is_negative())
+                .unwrap_or(false)
+    }
+
+    /// Stash a non-trivial expression while preserving its known type. A
+    /// numeric range supplies signedness for an otherwise unknown bound so a
+    /// cached negative upper bound cannot become an unsigned `uint64_t`.
+    fn stash_if_impure_with_fallback(&mut self, e: Expr, fallback: IrType) -> Expr {
         match e {
             Expr::Literal { .. } | Expr::Local(_) => e,
             other => {
                 let t = self.fresh_temp();
+                let ty = self
+                    .expr_type(&other)
+                    .filter(|ty| *ty != IrType::Unknown)
+                    .unwrap_or(fallback);
+                self.set_local_type(t, ty);
                 self.push(Stmt::Assign(t, other));
                 Expr::Local(t)
             }

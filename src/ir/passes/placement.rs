@@ -206,7 +206,7 @@ pub fn run(prog: &TbProgram, profile: &TargetProfile) -> PlacementTable {
         }
         for (bi, block) in func.blocks.iter().enumerate() {
             let bid = BlockId(bi as u32);
-            let feat = block_features(block);
+            let feat = block_features(prog, block);
             let timing = classify_timing(&feat);
             let tier = classify_tier(&feat, profile);
             table.blocks.insert((func.id, bid), (tier, timing));
@@ -237,7 +237,7 @@ struct BlockFeatures {
     solves: bool,
 }
 
-fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
+fn block_features(prog: &TbProgram, block: &super::super::BasicBlock) -> BlockFeatures {
     let mut accesses: Vec<PortAccess> = Vec::new();
     let mut transactor = false;
     let mut has_pin_stmt = false;
@@ -382,8 +382,48 @@ fn block_features(block: &super::super::BasicBlock) -> BlockFeatures {
             | Stmt::EventEmit { .. } => {
                 host_service_only = false;
             }
-            Stmt::PropertyCheck(_) | Stmt::CoverCheck(_) | Stmt::CycleHandler(_) => {
+            Stmt::PropertyCheck(id) => {
                 host_service_only = false;
+                if let Some(schema) = prog.property_checks.get(id.index()) {
+                    match &schema.shape {
+                        crate::ir::PropertyShape::Implies { ante, cons }
+                        | crate::ir::PropertyShape::ImpliesNext { ante, cons } => {
+                            visit_expr(ante, &mut accesses, &mut transactor);
+                            visit_expr(cons, &mut accesses, &mut transactor);
+                        }
+                        crate::ir::PropertyShape::Invariant(expr) => {
+                            visit_expr(expr, &mut accesses, &mut transactor);
+                        }
+                    }
+                    for temporal in &schema.temporals {
+                        visit_expr(&temporal.inner, &mut accesses, &mut transactor);
+                    }
+                    if let Some(message) = &schema.message {
+                        visit_fmt(message, &mut accesses, &mut transactor);
+                    }
+                }
+            }
+            Stmt::CoverCheck(id) => {
+                host_service_only = false;
+                if let Some(schema) = prog.cover_checks.get(id.index()) {
+                    visit_expr(&schema.cond, &mut accesses, &mut transactor);
+                    for temporal in &schema.temporals {
+                        visit_expr(&temporal.inner, &mut accesses, &mut transactor);
+                    }
+                }
+            }
+            Stmt::CycleHandler(id) => {
+                host_service_only = false;
+                if let Some(schema) = prog.cycle_handlers.get(id.index()) {
+                    match &schema.kind {
+                        crate::ir::CycleHandlerKind::Trigger { trigger, .. } => {
+                            visit_expr(trigger, &mut accesses, &mut transactor);
+                        }
+                        crate::ir::CycleHandlerKind::Periodic { period } => {
+                            visit_expr(period, &mut accesses, &mut transactor);
+                        }
+                    }
+                }
             }
             Stmt::ScoreboardOp { op, .. } => {
                 // Host state on the scoreboard struct — no pin access of
@@ -986,5 +1026,59 @@ mod tests {
         assert!(TargetProfile::by_name("single-site").is_some());
         assert!(TargetProfile::by_name("split_strict").is_some());
         assert!(TargetProfile::by_name("gpu").is_none());
+    }
+
+    #[test]
+    fn observer_schemas_are_checked_without_making_registration_cycle_exact() {
+        let mut prog = prog_with_run(
+            vec![block(
+                vec![
+                    Stmt::PropertyCheck(crate::ir::PropertyCheckId(0)),
+                    Stmt::CoverCheck(crate::ir::CoverCheckId(0)),
+                    Stmt::CycleHandler(crate::ir::CycleHandlerId(0)),
+                ],
+                Terminator::Return,
+            )],
+            vec![],
+        );
+        let probe = Expr::Port(port(PortAccess::Probe));
+        prog.property_checks.push(crate::ir::PropertyCheckSchema {
+            tag: "p".to_string(),
+            label: "p".to_string(),
+            severity: crate::ir::PropertySeverity::Fail,
+            shape: crate::ir::PropertyShape::Invariant(probe.clone()),
+            temporals: vec![],
+            message: None,
+        });
+        prog.cover_checks.push(crate::ir::CoverCheckSchema {
+            tag: "c".to_string(),
+            label: "c".to_string(),
+            cond: Expr::Port(port(PortAccess::Force)),
+            temporals: vec![],
+        });
+        prog.cycle_handlers.push(crate::ir::CycleHandlerSchema {
+            site: crate::ir::TestHookSiteId {
+                owner: crate::ir::TestHookSiteOwner {
+                    test: "placement".to_string(),
+                    member: crate::ir::TestCallableMember::Run,
+                },
+                ordinal: 0,
+            },
+            kind: crate::ir::CycleHandlerKind::Trigger {
+                trigger: probe,
+                edge: crate::ir::CycleEdge::Level,
+            },
+            function: FunctionId(0),
+            phase: crate::ir::HandlerPhase::Checker,
+        });
+
+        let strict = run(&prog, &TargetProfile::split_strict());
+        assert_eq!(strict.diagnostics.len(), 2, "{:?}", strict.diagnostics);
+        assert!(strict.diagnostics[0].message.contains("probe signal"));
+        assert!(strict.diagnostics[1].message.contains("force point"));
+        assert_eq!(entry_class(&strict).1, TimingClass::TimingTolerant);
+
+        let single = run(&prog, &TargetProfile::single_site());
+        assert!(single.diagnostics.is_empty());
     }
 }

@@ -2469,6 +2469,7 @@ fn emitter_from_seed(seed: EmitterSeed) -> Emitter {
         out: String::new(),
         errors: Vec::new(),
         declared_value_names: Default::default(),
+        internal_reserved_names: Default::default(),
         pointer_vars: std::collections::HashSet::new(),
         let_types: std::collections::HashMap::new(),
         let_widths: std::collections::HashMap::new(),
@@ -4780,6 +4781,10 @@ struct Emitter {
     /// produced before), while a missing entry costs a REJECTED working
     /// program. Those are not symmetric, so the set errs toward silence.
     declared_value_names: std::collections::HashSet<String>,
+    /// File-scope names unavailable to compiler-generated locals. Separate
+    /// from `declared_value_names`, which only suppresses unsafe-enum
+    /// diagnostics for local/parameter shadowing.
+    internal_reserved_names: std::collections::HashSet<String>,
     /// Folded file-scope scalar constants. Randomize constraints may reference
     /// these by source name; emission lowers them to typed Z3 values.
     consts: std::collections::HashMap<String, crate::constraints::IntegerConstSchema>,

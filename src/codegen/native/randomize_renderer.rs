@@ -174,6 +174,7 @@ fn build_randomize_emitter(file: &SourceFile, opts: &EmitOpts) -> Emitter {
         errors: Vec::new(),
         unsafe_variants: Default::default(),
         declared_value_names: Default::default(),
+        internal_reserved_names: Default::default(),
         txn_fields,
         record_fields,
         txn_keeps: std::collections::HashMap::new(),

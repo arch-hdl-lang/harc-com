@@ -387,3 +387,6 @@ enum_variant_scope_test | Top | top_counter.sv | top_counter.arch | pass
 
 randomize_range_preference_test | Top | top_counter.sv | top_counter.arch | pass
 randomize_range_boundary_test | Top | top_counter.sv | top_counter.arch | pass
+
+signed_numeric_range_test | Top | top_counter.sv | - | pass
+ternary_impure_helper_test | Top | top_counter.sv | - | pass
