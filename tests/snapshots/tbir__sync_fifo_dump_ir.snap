@@ -17,9 +17,9 @@ fn fn0 sample_SyncFifoTest_cov [kind=SamplerAuto(cg0), owner=tb0]
 
 fn fn1 run_SyncFifoTest [kind=Run, owner=tb0]
   locals:
-    %0 i : unknown
-    %1 i_2 : unknown
-    %2 expected : unknown
+    %0 i : sint
+    %1 i_2 : sint
+    %2 expected : sint
   entry = b0
 
   b0:

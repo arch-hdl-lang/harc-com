@@ -8,11 +8,11 @@ tb-ir program
 
 fn fn0 run_TopCounterTest [kind=Run, owner=tb0]
   locals:
-    %0 i : unknown
+    %0 i : sint
     %1 held : unknown
-    %2 _anon : unknown
-    %3 i_2 : unknown
-    %4 expected : unknown
+    %2 _anon : sint
+    %3 i_2 : sint
+    %4 expected : sint
   entry = b0
 
   b0:

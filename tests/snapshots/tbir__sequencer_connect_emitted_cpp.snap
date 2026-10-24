@@ -222,7 +222,7 @@ int run_SequencerConnectTest(int argc, char** argv) {
     harc_rt::ThreadScheduler sched;
     SeqEnv env;
     auto CountSeq_dispatch = [&](CountSeq& self, uint64_t n) -> void {
-        uint64_t i = 0; (void)i;
+        int64_t i = 0; (void)i;
         uint64_t __t0 = 0; (void)__t0;
         int __bb = 0;
         while (true) {

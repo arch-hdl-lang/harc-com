@@ -195,11 +195,11 @@ int run_TopCounterTest(int argc, char** argv) {
     auto _run_slot_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
         _tb.dut = dut;
         { // run_TopCounterTest (TB-IR loop-switch)
-            uint64_t i = 0; (void)i;
+            int64_t i = 0; (void)i;
             uint64_t held = 0; (void)held;
-            uint64_t _anon = 0; (void)_anon;
-            uint64_t i_2 = 0; (void)i_2;
-            uint64_t expected = 0; (void)expected;
+            int64_t _anon = 0; (void)_anon;
+            int64_t i_2 = 0; (void)i_2;
+            int64_t expected = 0; (void)expected;
             int __bb = 0;
             bool __done = false;
             while (!__done) {

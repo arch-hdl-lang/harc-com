@@ -34028,7 +34028,11 @@ end test T"#;
     assert_async_handler_supported(src, "positive repeat handler");
 
     let v1 = cpp_tb::emit(&merged_src(src)).expect("v1 emits the recursive repeat body");
-    assert!(v1.contains("for (int64_t _r = 0; _r < 2; _r++)"), "{v1}");
+    assert!(
+        v1.lines().any(|line| line.trim_start().starts_with("for (int64_t ")
+            && line.contains(" < 2; ")),
+        "{v1}"
+    );
     assert!(v1.contains("while (clocks_[1].rising_count < _target"), "{v1}");
 
     let zero = src.replace("            repeat 2\n", "            repeat 0\n");

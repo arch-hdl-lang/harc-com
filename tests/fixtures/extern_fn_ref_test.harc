@@ -62,7 +62,7 @@ impl ExternFnRefTest for ExternFnRefTb
         let crc_ref = 0xFF
         let crc_harc = 0xFF
         for i in 0 .. 15
-            let b = (i * 17 + 42) & 0xFF
+            let b = ((i * 17 + 42) & 0xFF) as uint<8>
             crc_ref = ref_crc8_step(crc_ref, b)
             crc_harc = harc_crc8_step(crc_harc, b)
             assert crc_ref == crc_harc

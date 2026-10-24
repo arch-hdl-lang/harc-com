@@ -24,7 +24,7 @@ fn fn0 comp_on_0 [kind=ComponentMethod(c0)]
 
 fn fn1 run_HeartbeatIdleTest [kind=Run, owner=tb0]
   locals:
-    %0 i : unknown
+    %0 i : sint
     %1 t : record(r0)
     %2 waited : unknown
     %3 budget : unknown

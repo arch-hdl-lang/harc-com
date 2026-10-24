@@ -151,7 +151,7 @@ impl LinklistBasicTest for LinklistBasicTb
         // ── Test 5: fill to DEPTH=8 ───────────────────────────────
         reset_dut(dut)
         for i in 0 .. 7
-            insert_tail_one(dut, 256 + i)        // 0x100 + i
+            insert_tail_one(dut, (256 + i) as uint<32>) // 0x100 + i
         end for
         assert dut.full == 1 else fail("full after 8 inserts")
         assert dut.length == 8 else fail("length=${dut.length}, expected 8")

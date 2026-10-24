@@ -15,10 +15,10 @@ tb-ir program
 fn fn0 run_TransactionBasicTest [kind=Run, owner=tb0]
   locals:
     %0 total : unknown
-    %1 i : unknown
+    %1 i : sint
     %2 cmd : record(r0)
-    %3 _anon : unknown
-    %4 __t0 : unknown
+    %3 _anon : sint
+    %4 __t0 : uint<8>
     %5 got : unknown
     %6 final_cmd : record(r0)
   entry = b0

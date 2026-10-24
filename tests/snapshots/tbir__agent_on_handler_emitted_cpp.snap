@@ -223,7 +223,7 @@ int run_AgentOnHandlerTest(int argc, char** argv) {
     sched.slots.push_back(&_run_slot);
     auto _run_slot_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
         { // run_AgentOnHandlerTest (TB-IR loop-switch)
-            uint64_t i = 0; (void)i;
+            int64_t i = 0; (void)i;
             uint64_t waited = 0; (void)waited;
             int __bb = 0;
             bool __done = false;

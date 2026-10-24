@@ -32,7 +32,7 @@ fn fn1 comp_watchdog_1 [kind=ComponentMethod(c0)]
 
 fn fn2 run_WatchdogQuiesceTest [kind=Run, owner=tb0]
   locals:
-    %0 i : unknown
+    %0 i : sint
     %1 t : record(r0)
     %2 __t0 : unknown
   entry = b0

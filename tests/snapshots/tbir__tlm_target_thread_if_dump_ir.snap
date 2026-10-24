@@ -17,7 +17,7 @@ fn fn0 TlmMemTarget_target_read [kind=TransactorBody(x0)]
     %0 addr : uint<8>
     %1 __ret : uint<32>
     %2 req_seq : uint<32>
-    %3 i : unknown
+    %3 i : sint
   ret = %__ret
   entry = b0
 

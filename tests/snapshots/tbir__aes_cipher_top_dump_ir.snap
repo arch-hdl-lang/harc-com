@@ -48,7 +48,7 @@ fn fn1 AesXactor_load_block [kind=TransactorBody(x0)]
 
 fn fn2 AesXactor_wait_for_done [kind=TransactorBody(x0)]
   locals:
-    %0 _anon : unknown
+    %0 _anon : sint
     %1 __t0 : unknown
   entry = b0
 

@@ -67,14 +67,14 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
     %56 __t37 : unknown
     %57 d_5 : unknown
     %58 __t38 : unknown
-    %59 i : unknown
+    %59 i : sint
     %60 __t39 : uint<32>
     %61 data_6 : uint<32>
     %62 __t40 : unknown
     %63 __t41 : unknown
     %64 h_8 : unknown
-    %65 i_2 : unknown
-    %66 want : unknown
+    %65 i_2 : sint
+    %66 want : sint
     %67 __t42 : uint<32>
     %68 __t43 : unknown
     %69 __t44 : unknown
@@ -581,7 +581,7 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
 
   b58:
     Assign(%__t39, 0)
-    Assign(%data_6, (256 + %i))
+    Assign(%data_6, (256 + %i).zext<32>())
     DutWrite(dut.insert_tail_req_valid, 1)
     DutWrite(dut.insert_tail_req_data, %data_6)
     -> WaitCyclesSync(1, b62)
