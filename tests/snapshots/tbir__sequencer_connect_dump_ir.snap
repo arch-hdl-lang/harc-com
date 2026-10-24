@@ -23,7 +23,7 @@ fn fn0 comp_method_0 [kind=ComponentMethod(c0)]
   locals:
     %0 n : uint<8>
     %1 i : unknown
-    %2 __t0 : unknown
+    %2 __t0 : uint<8>
   entry = b0
 
   b0:

@@ -18,7 +18,7 @@ fn fn0 run_TransactionBasicTest [kind=Run, owner=tb0]
     %1 i : unknown
     %2 cmd : record(r0)
     %3 _anon : unknown
-    %4 __t0 : unknown
+    %4 __t0 : uint<8>
     %5 got : unknown
     %6 final_cmd : record(r0)
   entry = b0
