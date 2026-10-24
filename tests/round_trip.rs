@@ -803,3 +803,38 @@ end impl ListQueueTest"#;
     let printed = parse_print_reparse(src);
     assert!(printed.contains("queue<list#(bool)>"));
 }
+
+#[test]
+fn generic_transactor_params_round_trip() {
+    let src = r#"transactor Generic#(WIDTH: int = 8, DEPTH: uint<4> = 2)
+    data : uint<WIDTH>
+end transactor Generic
+"#;
+    let parsed = parse_source(src).expect("generic transactor should parse");
+    let Item::Transactor(transactor) = &parsed.items[0] else {
+        panic!("expected transactor item");
+    };
+    assert_eq!(transactor.params.len(), 2);
+    assert_eq!(transactor.params[0].name.name, "WIDTH");
+    assert!(transactor.params[0].ty.is_some());
+    assert!(transactor.params[0].default.is_some());
+    assert_eq!(transactor.params[1].name.name, "DEPTH");
+    assert!(transactor.params[1].ty.is_some());
+    assert!(transactor.params[1].default.is_some());
+
+    let printed = print(&parsed);
+    assert!(printed.contains("transactor Generic#(WIDTH: int = 8, DEPTH: uint<4> = 2)"));
+
+    let reparsed = parse_source(&printed).expect("pretty output should re-parse");
+    let Item::Transactor(reparsed_transactor) = &reparsed.items[0] else {
+        panic!("expected transactor item after reparse");
+    };
+    assert_eq!(reparsed_transactor.params.len(), 2);
+    assert_eq!(reparsed_transactor.params[0].name.name, "WIDTH");
+    assert!(reparsed_transactor.params[0].ty.is_some());
+    assert!(reparsed_transactor.params[0].default.is_some());
+    assert_eq!(reparsed_transactor.params[1].name.name, "DEPTH");
+    assert!(reparsed_transactor.params[1].ty.is_some());
+    assert!(reparsed_transactor.params[1].default.is_some());
+    assert_eq!(printed, print(&reparsed));
+}

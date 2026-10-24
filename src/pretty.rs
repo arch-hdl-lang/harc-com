@@ -547,7 +547,7 @@ fn print_transactor(out: &mut String, t: &TransactorDecl, depth: usize) {
     pad(out, depth);
     write!(out, "transactor {}", t.name.name).ok();
     if !t.params.is_empty() {
-        print_paren_params(out, &t.params);
+        print_generic_params(out, &t.params);
     }
     if let Some(b) = &t.bound_to {
         write!(out, " bound to ").ok();
