@@ -1,0 +1,35 @@
+// Behavioral regression for native solver bit-vector shifts. Every field is
+// pinned to one value, and the shift count is itself symbolic to exercise the
+// generated Z3 operation rather than a literal-only path.
+
+transaction ConstraintShiftBehavior
+    left : uint<64>
+    logical : uint<64>
+    signed_value : sint<64>
+    count : uint<64>
+
+    keep count == 1
+    keep left == 2
+    keep (left << count) == 4
+    keep logical == 0x8000000000000000
+    keep (logical >> count) == 0x4000000000000000
+    keep signed_value == -8
+    keep (signed_value >> count) == -4
+end transaction ConstraintShiftBehavior
+
+test ConstraintShiftBehaviorTest
+    let dut : Top
+    run
+        let value : ConstraintShiftBehavior
+        randomize(value)
+
+        assert value.count == 1
+            else fail("shift count: expected 1, got ${value.count}")
+        assert value.left == 2
+            else fail("left shift input: expected 2, got ${value.left}")
+        assert value.logical == 0x8000000000000000
+            else fail("logical shift input: expected high bit, got ${value.logical}")
+        assert value.signed_value == -8
+            else fail("arithmetic shift input: expected -8, got ${value.signed_value}")
+    end run
+end test ConstraintShiftBehaviorTest
