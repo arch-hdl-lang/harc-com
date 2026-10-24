@@ -126,7 +126,7 @@ impl MshrCocotbTest for MshrCocotbTb
         dut.finalize_valid = 0
         for i in 0 .. MSHR_SIZE - 1
             dut.allocate_rw = i & 1
-            dut.allocate_data = i * 17
+            dut.allocate_data = (i * 17) as uint<56>
             wait 1 cycle
             assert dut.allocate_id == i
                 else fail("Test 2: at i=${i}, allocate_id=${dut.allocate_id}, expected ${i}")

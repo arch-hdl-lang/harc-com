@@ -276,7 +276,7 @@ int run_SyncFifoTest(int argc, char** argv) {
                 }
                 case 3: {
                     harc_rt::harc_assign(dut->push_valid, 1);
-                    harc_rt::harc_assign(dut->push_data, (i + 1));
+                    harc_rt::harc_assign(dut->push_data, ((uint64_t)((i + 1))));
                     harc_rt::harc_assign(dut->pop_ready, 0);
                     if (!((harc_rt::harc_read(dut->push_ready) == 1))) {
                         sim_log_line("FAIL", "FIFO unexpectedly full at push %lld", harc_rt::harc_printf_ll(i));

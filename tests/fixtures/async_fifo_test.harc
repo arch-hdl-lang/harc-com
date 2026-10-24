@@ -32,7 +32,7 @@ impl AsyncFifoTest for AsyncFifoTb
         log(info, "pushing 8 items on wr_clk")
         for i in 0 .. 7
             dut.push_valid = 1
-            dut.push_data = i + 1
+            dut.push_data = (i + 1) as uint<8>
             wait 5ns
         end for
         dut.push_valid = 0

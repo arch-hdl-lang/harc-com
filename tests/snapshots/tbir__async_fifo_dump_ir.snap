@@ -36,7 +36,7 @@ fn fn0 run_AsyncFifoTest [kind=Run, owner=tb0]
 
   b4:
     DutWrite(dut.push_valid, 1)
-    DutWrite(dut.push_data, (%i + 1))
+    DutWrite(dut.push_data, (%i + 1).zext<8>())
     -> WaitTimePs(5000, b7)
 
   b5:

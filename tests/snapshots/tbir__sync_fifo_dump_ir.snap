@@ -42,7 +42,7 @@ fn fn1 run_SyncFifoTest [kind=Run, owner=tb0]
 
   b3:
     DutWrite(dut.push_valid, 1)
-    DutWrite(dut.push_data, (%i + 1))
+    DutWrite(dut.push_data, (%i + 1).zext<8>())
     DutWrite(dut.pop_ready, 0)
     AssertCheck { cond: (dut.push_ready == 1), on_fail: "FIFO unexpectedly full at push %lld", %i }
     -> WaitCycles(1, b6)
