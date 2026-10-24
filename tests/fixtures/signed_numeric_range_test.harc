@@ -31,5 +31,12 @@ test SignedNumericRange
             dynamic_sum = dynamic_sum + i
         end for
         assert dynamic_sum == -9 else fail("dynamic sum ${dynamic_sum}")
+
+        let unsigned_upper : uint<8> = 2
+        let mixed_sum : sint<64> = 0
+        for i in -2 .. unsigned_upper
+            mixed_sum = mixed_sum + i
+        end for
+        assert mixed_sum == 0 else fail("mixed sum ${mixed_sum}")
     end run
 end test SignedNumericRange

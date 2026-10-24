@@ -8,6 +8,7 @@ use crate::ast::{
 };
 use crate::ir::{
     BinOp, BlockId, Expr, FmtArg, FmtArgs, IrType, LocalId, PredSrc, Stmt, Terminator, WaitMode,
+    WidthCastKind,
 };
 
 impl FuncBuilder<'_> {
@@ -181,7 +182,36 @@ impl FuncBuilder<'_> {
         // path below keeps its `i < seq.size()` half-open counter — that
         // iterates the element indices `0 … size-1`, unrelated to the
         // user-facing numeric range.)
-        let cond = Expr::Binary(BinOp::Le, Box::new(Expr::Local(var)), Box::new(hi_operand));
+        let cond = if signed_range
+            && matches!(self.expr_type(&hi_operand), Some(IrType::UInt(_)))
+        {
+            // A signed lower bound with a known unsigned upper bound needs
+            // two domains: every negative induction value is below the
+            // non-negative upper bound, while non-negative values compare
+            // as uint64_t. This also preserves UINT64_MAX upper bounds.
+            let negative = Expr::Binary(
+                BinOp::Lt,
+                Box::new(Expr::Local(var)),
+                Box::new(Expr::Literal {
+                    value: 0,
+                    ty: IrType::Unknown,
+                }),
+            );
+            let unsigned_var = Expr::WidthCast {
+                inner: Box::new(Expr::Local(var)),
+                kind: WidthCastKind::Zext,
+                width: 64,
+                src_width: None,
+            };
+            let nonnegative = Expr::Binary(
+                BinOp::Le,
+                Box::new(unsigned_var),
+                Box::new(hi_operand),
+            );
+            Expr::Binary(BinOp::Or, Box::new(negative), Box::new(nonnegative))
+        } else {
+            Expr::Binary(BinOp::Le, Box::new(Expr::Local(var)), Box::new(hi_operand))
+        };
         let step = Stmt::Assign(
             var,
             Expr::Binary(
