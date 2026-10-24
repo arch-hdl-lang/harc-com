@@ -1,0 +1,28 @@
+test SignedNumericRange
+    let dut : Top
+    run
+        let mixed_count : sint<64> = 0
+        let mixed_sum : sint<64> = 0
+        for i in -2 .. 2
+            mixed_count = mixed_count + 1
+            mixed_sum = mixed_sum + i
+        end for
+        assert mixed_count == 5 else fail("mixed count ${mixed_count}")
+        assert mixed_sum == 0 else fail("mixed sum ${mixed_sum}")
+
+        let negative_count : sint<64> = 0
+        let negative_sum : sint<64> = 0
+        for i in -3 .. (0 - 1)
+            negative_count = negative_count + 1
+            negative_sum = negative_sum + i
+        end for
+        assert negative_count == 3 else fail("negative count ${negative_count}")
+        assert negative_sum == -6 else fail("negative sum ${negative_sum}")
+
+        let positive_sum : sint<64> = 0
+        for i in 1 .. 3
+            positive_sum = positive_sum + i
+        end for
+        assert positive_sum == 6 else fail("positive sum ${positive_sum}")
+    end run
+end test SignedNumericRange

@@ -301,6 +301,17 @@ pub fn elaborate_constraints(file: &SourceFile) -> ConstraintElaboration {
     let mut relations = Vec::new();
     let mut errors = Vec::new();
 
+    validate_record_cycles(&record_fields, &enum_domains, &mut errors);
+    if !errors.is_empty() {
+        return ConstraintElaboration {
+            structs,
+            transactions,
+            relations,
+            consts,
+            errors,
+        };
+    }
+
     for item in &file.items {
         match item {
             Item::Struct(s) => {
@@ -501,6 +512,67 @@ fn collect_record_fields(file: &SourceFile) -> BTreeMap<String, Vec<Field>> {
         .into_iter()
         .map(|(name, body)| (name, direct_fields(&body)))
         .collect()
+}
+
+fn validate_record_cycles(
+    record_fields: &BTreeMap<String, Vec<Field>>,
+    enum_domains: &BTreeMap<String, EnumDomainSchema>,
+    errors: &mut Vec<ElaborationError>,
+) {
+    let mut ancestry = Vec::new();
+    let mut reported = std::collections::BTreeSet::new();
+    for record_name in record_fields.keys() {
+        validate_record_cycles_from(
+            record_name,
+            record_fields,
+            enum_domains,
+            &mut ancestry,
+            &mut reported,
+            errors,
+        );
+    }
+}
+
+fn validate_record_cycles_from(
+    record_name: &str,
+    record_fields: &BTreeMap<String, Vec<Field>>,
+    enum_domains: &BTreeMap<String, EnumDomainSchema>,
+    ancestry: &mut Vec<String>,
+    reported: &mut std::collections::BTreeSet<(u32, u32)>,
+    errors: &mut Vec<ElaborationError>,
+) {
+    ancestry.push(record_name.to_string());
+    if let Some(fields) = record_fields.get(record_name) {
+        for field in fields {
+            let Some(child_name) = record_type_name(&field.ty) else {
+                continue;
+            };
+            if enum_domains.contains_key(child_name) || !record_fields.contains_key(child_name) {
+                continue;
+            }
+            if ancestry.iter().any(|ancestor| ancestor == child_name) {
+                if reported.insert((field.span.start, field.span.end)) {
+                    errors.push(ElaborationError {
+                        span: field.span,
+                        message: format!(
+                            "recursive record type `{child_name}` through field `{}`",
+                            field.name.name
+                        ),
+                    });
+                }
+                continue;
+            }
+            validate_record_cycles_from(
+                child_name,
+                record_fields,
+                enum_domains,
+                ancestry,
+                reported,
+                errors,
+            );
+        }
+    }
+    ancestry.pop();
 }
 
 fn collect_enum_variants(

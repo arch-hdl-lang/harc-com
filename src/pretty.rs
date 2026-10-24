@@ -1652,7 +1652,7 @@ pub fn print_expr(out: &mut String, e: &Expr) {
                 write!(out, " with ").ok();
                 for (i, e) in with_body.iter().enumerate() {
                     if i > 0 {
-                        write!(out, "; ").ok();
+                        write!(out, " ").ok();
                     }
                     print_randomize_constraint_inline(out, e);
                 }

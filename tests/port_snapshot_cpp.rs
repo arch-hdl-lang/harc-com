@@ -48,13 +48,21 @@ fn dpi_port_snapshots_materialize_values() {
 
 static unsigned long long scalar_value;
 static unsigned wide_words[4];
-static unsigned long long unpacked_values[4];
+static unsigned long long unpacked_values[4][4];
+static unsigned unpacked_reads;
+static unsigned unpacked_writes;
 extern "C" long long harc_sv_get(int) { return (long long)scalar_value; }
 extern "C" void harc_sv_set(int, long long v) { scalar_value = v; }
 extern "C" long long harc_sv_get_word(int, int word) { return wide_words[word]; }
 extern "C" void harc_sv_set_word(int, int word, long long v) { wide_words[word] = v; }
-extern "C" long long harc_sv_get_elem(int, int idx) { return unpacked_values[idx]; }
-extern "C" void harc_sv_set_elem(int, int idx, long long v) { unpacked_values[idx] = v; }
+extern "C" long long harc_sv_get_elem(int id, int idx) {
+    ++unpacked_reads;
+    return unpacked_values[id][idx];
+}
+extern "C" void harc_sv_set_elem(int id, int idx, long long v) {
+    ++unpacked_writes;
+    unpacked_values[id][idx] = v;
+}
 
 int main() {
     harc_rt::cosim::SigProxy<0> scalar;
@@ -68,14 +76,25 @@ int main() {
     wide_words[0] = 7;
 
     harc_rt::cosim::UnpackedSigProxy<2, 4> unpacked;
-    unpacked_values[1] = 11;
+    unpacked_values[2][1] = 11;
     auto unpacked_snap = harc_rt::harc_port_snapshot(unpacked);
-    unpacked_values[1] = 13;
+    unpacked_values[2][1] = 13;
 
-    std::printf("%llu %u %llu\n",
+    harc_rt::cosim::UnpackedSigProxy<2, 4> same_port;
+    harc_rt::cosim::UnpackedSigProxy<3, 4> cross_port;
+    unpacked_values[2][0] = 7;
+    unpacked_values[2][1] = 41;
+    unpacked_values[3][0] = 5;
+    unpacked_writes = 0;
+    same_port[0] = same_port[1];
+    cross_port[0] = same_port[1];
+
+    std::printf("%llu %u %llu %llu %llu %u %u\n",
         (unsigned long long)(uint64_t)scalar_snap,
         (unsigned)(uint32_t)wide_snap[0],
-        (unsigned long long)(uint64_t)unpacked_snap[1]);
+        (unsigned long long)(uint64_t)unpacked_snap[1],
+        unpacked_values[2][0], unpacked_values[3][0],
+        unpacked_reads, unpacked_writes);
 }
 "#,
     )
@@ -101,5 +120,5 @@ int main() {
         .output()
         .expect("run DPI snapshot probe");
     assert!(ran.status.success(), "DPI snapshot probe failed");
-    assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "3 5 11");
+    assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "3 5 11 41 41 6 2");
 }

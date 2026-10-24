@@ -1,0 +1,51 @@
+// Regression for lazy ternary lowering: an impure helper in an unselected
+// arm must not run, while a selected arm runs exactly once.
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+function bump(dut: Top) -> uint<8>
+    dut.en = dut.en + 1
+    return 7
+end function bump
+
+test TernaryImpureHelper
+    let dut : Top
+    clock clk = SysDomain
+    run
+        dut.en = 0
+        let selected_then = dut.en == 0 ? bump(dut) : 99
+        assert selected_then == 7 else fail("selected then value")
+        assert dut.en == 1 else fail("selected then did not run exactly once")
+
+        dut.en = 0
+        let selected_else = dut.en != 0 ? 99 : bump(dut)
+        assert selected_else == 7 else fail("selected else value")
+        assert dut.en == 1 else fail("selected else did not run exactly once")
+
+        dut.en = 0
+        let skipped_else = dut.en == 0 ? 3 : bump(dut)
+        assert skipped_else == 3 else fail("skipped else value")
+        assert dut.en == 0 else fail("unselected else arm ran")
+
+        dut.en = 0
+        let skipped_then = dut.en != 0 ? bump(dut) : 3
+        assert skipped_then == 3 else fail("skipped then value")
+        assert dut.en == 0 else fail("unselected then arm ran")
+
+        // A direct DUT read in the arm opposite an impure helper must be
+        // hoisted before the branch, rather than left on an Assign RHS.
+        dut.en = 0
+        let port_then = dut.en == 0 ? dut.en : bump(dut)
+        assert port_then == 0 else fail("direct then port arm")
+        assert dut.en == 0 else fail("opposite helper arm ran")
+
+        dut.en = 0
+        let port_else = dut.en != 0 ? bump(dut) : dut.en
+        assert port_else == 0 else fail("direct else port arm")
+        assert dut.en == 0 else fail("opposite helper arm ran")
+
+        let pure = true ? 11 : 22
+        assert pure == 11 else fail("pure ternary value")
+    end run
+end test TernaryImpureHelper

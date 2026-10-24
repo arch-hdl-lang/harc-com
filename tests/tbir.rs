@@ -1370,6 +1370,50 @@ fn top_counter_dump_ir_snapshot() {
     insta::assert_snapshot!("top_counter_dump_ir", format!("{prog}"));
 }
 
+/// Numeric range induction variables must retain v1's signed int64 semantics
+/// in TB-IR, including when the range starts below zero.
+#[test]
+fn numeric_range_induction_is_signed() {
+    let prog = lower_src(&fixture("signed_numeric_range_test.harc")).expect("lowers");
+    verify::verify_program(&prog).expect("verifies");
+    let function = prog
+        .functions
+        .iter()
+        .find(|f| f.name.contains("SignedNumericRange"))
+        .expect("signed numeric range test function");
+    let induction = function
+        .locals
+        .iter()
+        .find(|local| local.name == "i")
+        .expect("numeric range induction local");
+    assert_eq!(induction.ty, ir::IrType::SInt(None));
+    let cached_bound = function
+        .locals
+        .iter()
+        .find(|local| local.name.starts_with("__t"))
+        .expect("cached negative upper bound local");
+    assert_eq!(cached_bound.ty, ir::IrType::SInt(None));
+}
+
+#[test]
+fn pure_ternary_stays_an_expression() {
+    let src = r#"
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+test PureTernary
+    let dut : Top
+    clock clk = SysDomain
+    run
+        let selected = true ? 11 : 22
+        assert selected == 11 else fail("pure ternary")
+    end run
+end test PureTernary
+"#;
+    let cpp = emit_cpp_src(src);
+    assert!(cpp.contains("? 11 : 22"), "pure ternary was lowered into CFG: {cpp}");
+}
+
 /// Locks the dump-ir text for the arbiter fixture: request-mask
 /// writes with single-cycle waits, grant asserts carrying inline port
 /// reads, a two-point covergroup, and check-phase CovBin reads.
@@ -53262,6 +53306,78 @@ end impl CT"#;
     let nested_connected =
         lower_src(nested_connected).expect("nested vector event connects to matching hookable");
     verify::verify_program(&nested_connected).expect("nested vector event connect verifies");
+}
+
+/// Record-field vector selectors use two separate IR slots: `mid_indices`
+/// for selections before the leaf and `index` for the leaf selection. A
+/// value-returning transactor call in either slot must cross the same
+/// statement-level call seam as a testbench-field vector selector.
+#[test]
+fn transactor_calls_in_record_field_indices_hoist_in_source_order() {
+    let src = r#"
+struct Bundle
+    data : Vec<uint<8>, 2>
+    matrix : Vec<Vec<uint<8>, 2>, 2>
+end struct Bundle
+
+transactor Xt
+    dut : Top
+    when active
+        hookable first() -> uint<8>
+            return 0
+        end first
+        hookable second() -> uint<8>
+            return 1
+        end second
+    end when
+end transactor Xt
+
+test RecordIndex
+    let dut : Top
+    let xt : Xt active
+    run
+        xt.dut = dut
+        let b : Bundle
+        b.data[0] = 7
+        assert b.data[xt.first()] == 7 else fail("bad leaf")
+        b.matrix[0][1] = 7
+        assert b.matrix[xt.first()][xt.second()] == 7 else fail("bad chain")
+    end run
+end test RecordIndex
+"#;
+    let prog = lower_src(src).expect("record-field selectors lower");
+    verify::verify_program(&prog).expect("record-field selectors verify");
+
+    let run = prog.function(prog.tests[0].run);
+    let calls: Vec<&ir::Stmt> = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .filter(|stmt| matches!(stmt, ir::Stmt::TransactorCall { .. }))
+        .collect();
+    let methods: Vec<&str> = calls
+        .iter()
+        .map(|stmt| match stmt {
+            ir::Stmt::TransactorCall {
+                call: ir::Expr::Call(ir::CallTarget::TransactorMethod { method, .. }, _),
+                ..
+            } => method.as_str(),
+            other => panic!("unexpected transactor call payload: {other:?}"),
+        })
+        .collect();
+    assert_eq!(methods, ["first", "first", "second"]);
+
+    let mut seen_calls = 0;
+    for stmt in run.blocks.iter().flat_map(|block| &block.stmts) {
+        match stmt {
+            ir::Stmt::TransactorCall { .. } => seen_calls += 1,
+            ir::Stmt::AssertCheck { .. } => {
+                assert!(seen_calls > 0, "assertion call must precede its check")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(seen_calls, 3, "all record-field index calls must be hoisted");
 }
 
 #[test]

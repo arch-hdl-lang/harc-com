@@ -673,24 +673,75 @@ fn parse_json_string(bytes: &[u8], mut i: usize) -> std::result::Result<(String,
                     b'r' => out.push('\r'),
                     b't' => out.push('\t'),
                     b'u' => {
-                        let hex = bytes
-                            .get(i + 1..i + 5)
-                            .ok_or_else(|| "short JSON unicode escape".to_string())?;
-                        let s = std::str::from_utf8(hex).map_err(|e| e.to_string())?;
-                        let cp = u16::from_str_radix(s, 16).map_err(|e| e.to_string())?;
-                        if let Some(ch) = char::from_u32(cp as u32) {
-                            out.push(ch);
+                        let (unit, next) = parse_json_unicode_escape(bytes, i)?;
+                        match unit {
+                            0xD800..=0xDBFF => {
+                                if bytes.get(next..next + 2) != Some(b"\\u") {
+                                    return Err(
+                                        "JSON high surrogate is not followed by a low surrogate"
+                                            .into(),
+                                    );
+                                }
+                                let (low, end) = parse_json_unicode_escape(bytes, next + 1)?;
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return Err(
+                                        "JSON high surrogate is not followed by a low surrogate"
+                                            .into(),
+                                    );
+                                }
+                                let cp = 0x10000
+                                    + (((unit as u32) - 0xD800) << 10)
+                                    + ((low as u32) - 0xDC00);
+                                out.push(char::from_u32(cp).expect("valid surrogate pair"));
+                                i = end - 1;
+                            }
+                            0xDC00..=0xDFFF => {
+                                return Err("JSON low surrogate has no high surrogate".into());
+                            }
+                            unit => {
+                                out.push(
+                                    char::from_u32(unit as u32).expect("valid JSON code unit"),
+                                );
+                                i = next - 1;
+                            }
                         }
-                        i += 4;
                     }
                     _ => return Err("unsupported JSON escape".into()),
                 }
             }
-            _ => out.push(b as char),
+            _ if b < 0x20 => return Err("unescaped JSON control character".into()),
+            _ if b.is_ascii() => out.push(b as char),
+            _ => {
+                let width = match b {
+                    0xC2..=0xDF => 2,
+                    0xE0..=0xEF => 3,
+                    0xF0..=0xF4 => 4,
+                    _ => return Err("invalid UTF-8 in JSON string".into()),
+                };
+                let scalar = bytes
+                    .get(i..i + width)
+                    .ok_or_else(|| "invalid UTF-8 in JSON string".to_string())?;
+                let ch = std::str::from_utf8(scalar)
+                    .map_err(|e| e.to_string())?
+                    .chars()
+                    .next()
+                    .ok_or_else(|| "invalid UTF-8 in JSON string".to_string())?;
+                out.push(ch);
+                i += width - 1;
+            }
         }
         i += 1;
     }
     Err("unterminated JSON string".into())
+}
+
+fn parse_json_unicode_escape(bytes: &[u8], i: usize) -> std::result::Result<(u16, usize), String> {
+    let hex = bytes
+        .get(i + 1..i + 5)
+        .ok_or_else(|| "short JSON unicode escape".to_string())?;
+    let s = std::str::from_utf8(hex).map_err(|e| e.to_string())?;
+    let unit = u16::from_str_radix(s, 16).map_err(|e| e.to_string())?;
+    Ok((unit, i + 5))
 }
 
 fn skip_json_container(bytes: &[u8], mut i: usize) -> std::result::Result<usize, String> {
@@ -807,6 +858,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(events[0].vcd_time, u128::MAX);
+    }
+
+    #[test]
+    fn preserves_raw_and_escaped_unicode_trace_labels() {
+        let raw = r#"{"type":"log","vcd_time":1,"message":"café 😀"}"#;
+        let escaped = r#"{"type":"log","vcd_time":1,"message":"caf\u00e9 \ud83d\ude00"}"#;
+        let raw_events = parse_trace_events(raw).unwrap();
+        let escaped_events = parse_trace_events(escaped).unwrap();
+        assert_eq!(raw_events[0].label, "log: café 😀");
+        assert_eq!(escaped_events[0].label, raw_events[0].label);
+    }
+
+    #[test]
+    fn preserves_ascii_and_control_escapes_and_rejects_lone_surrogates() {
+        let fields =
+            parse_json_object_top(r#"{"message":"ascii \"quote\" \\ slash\nline\t\b"}"#).unwrap();
+        assert_eq!(
+            string_field(&fields, "message").unwrap(),
+            "ascii \"quote\" \\ slash\nline\t\u{0008}"
+        );
+
+        for input in [r#""\ud83d""#, r#""\ude00""#, r#""\ud83d\u0041""#] {
+            assert!(
+                parse_json_string(input.as_bytes(), 0).is_err(),
+                "accepted malformed {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_long_mixed_raw_utf8_strings() {
+        let message = format!("{} café 😀 {}", "ascii ".repeat(4096), "tail ".repeat(4096));
+        let trace = format!(r#"{{"type":"log","vcd_time":1,"message":"{message}"}}"#);
+        let events = parse_trace_events(&trace).unwrap();
+        assert_eq!(events[0].label, format!("log: {message}"));
     }
 
     #[test]

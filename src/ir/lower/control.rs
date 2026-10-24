@@ -143,6 +143,10 @@ impl FuncBuilder<'_> {
         let lo_ir = self.lower_expr_no_ports(lo)?;
         self.validate_numeric_expr(&lo_ir, "range lower bound")?;
         let var = self.declare(&f.var.name);
+        // Numeric ranges use v1's signed int64_t induction variable. Keep
+        // that signedness in TB-IR so a negative lower bound is compared as
+        // a negative value rather than wrapping through uint64_t.
+        self.set_local_type(var, IrType::SInt(None));
         self.push(Stmt::Assign(var, lo_ir));
         // Upper bound — evaluated once; stash non-trivial expressions
         // in a synthesized local so the header re-reads a pure value.
@@ -159,7 +163,7 @@ impl FuncBuilder<'_> {
         // TB-IR lower LESS than v1 rather than more (harc#662). A
         // `for` loop must not differ from `for i in 0 .. 3` in whether
         // it compiles because someone widened the bound's type.
-        let hi_operand = self.stash_if_impure(hi_ir);
+        let hi_operand = self.stash_if_impure_with_fallback(hi_ir, IrType::SInt(None));
 
         // `for i in lo .. hi` is INCLUSIVE of `hi` (`lo, lo+1, …, hi`),
         // matching ARCH's `lo..hi` range semantics so the two co-authored
@@ -936,10 +940,22 @@ impl FuncBuilder<'_> {
     /// Stash a non-trivial expression into a synthesized local so it is
     /// evaluated exactly once (loop bounds).
     fn stash_if_impure(&mut self, e: Expr) -> Expr {
+        self.stash_if_impure_with_fallback(e, IrType::Unknown)
+    }
+
+    /// Stash a non-trivial expression while preserving its known type. A
+    /// numeric range supplies signedness for an otherwise unknown bound so a
+    /// cached negative upper bound cannot become an unsigned `uint64_t`.
+    fn stash_if_impure_with_fallback(&mut self, e: Expr, fallback: IrType) -> Expr {
         match e {
             Expr::Literal { .. } | Expr::Local(_) => e,
             other => {
                 let t = self.fresh_temp();
+                let ty = self
+                    .expr_type(&other)
+                    .filter(|ty| *ty != IrType::Unknown)
+                    .unwrap_or(fallback);
+                self.set_local_type(t, ty);
                 self.push(Stmt::Assign(t, other));
                 Expr::Local(t)
             }

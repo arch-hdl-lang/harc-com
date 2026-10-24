@@ -5088,6 +5088,15 @@ mod tests {
     }
 
     #[test]
+    fn block_comments_preserve_following_top_level_item() {
+        for comment in ["/***/", "/* normal **/", "/* first\n second *****/"] {
+            let f = parse(&format!("{comment} const A = 1")).unwrap();
+            assert_eq!(f.items.len(), 1);
+            assert!(matches!(f.items[0], Item::Const(_)));
+        }
+    }
+
+    #[test]
     fn use_decl() {
         let f = parse("use arc.stdlib.BusAxi4").unwrap();
         assert_eq!(f.items.len(), 1);
