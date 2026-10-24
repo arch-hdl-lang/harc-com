@@ -817,11 +817,27 @@ impl Emitter {
         let Some(source_width) = source_width.filter(|w| *w < width) else {
             return rendered;
         };
+        // Width inference gives a bare positive literal its minimum bit
+        // width (e.g. `4` is three bits), but that width is unsigned. Sign
+        // extending it would turn 4 into -4 at the common signed width.
+        // Negative literals have no inferred width and already arrive as
+        // the correctly represented carrier value.
+        if Self::is_bare_positive_integer_literal(expr) {
+            return rendered;
+        }
         if width > 128 {
             let words = width.div_ceil(32);
             format!("harc_rt::harc_wide_sext<{words}>({rendered}, {source_width}, {width})")
         } else {
             format!("harc_rt::harc_sext_u128((_harc_u128)({rendered}), {source_width}, {width})")
+        }
+    }
+
+    fn is_bare_positive_integer_literal(expr: &Expr) -> bool {
+        match &*expr.kind {
+            ExprKind::Paren(inner) => Self::is_bare_positive_integer_literal(inner),
+            ExprKind::Int(value) => !value.trim_start().starts_with('-'),
+            _ => false,
         }
     }
 }

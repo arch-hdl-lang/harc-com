@@ -10,6 +10,11 @@ test SignedWideOrderingV1
         assert pos65 > neg65 else fail("65-bit signed greater-than")
         assert pos65 >= neg65 else fail("65-bit signed greater-equal")
         assert neg65 <= neg65 else fail("65-bit signed equality boundary")
+        assert pos65 < 4 else fail("65-bit positive literal less-than")
+        assert 3 <= pos65 else fail("65-bit reversed literal less-equal")
+        assert pos65 >= 3 else fail("65-bit literal greater-equal")
+        assert pos65 == 3 else fail("65-bit literal equality")
+        assert 3 == pos65 else fail("65-bit reversed literal equality")
 
         let neg128 : sint<128> = -8
         let pos128 : sint<128> = 3
@@ -18,5 +23,8 @@ test SignedWideOrderingV1
         assert pos128 > neg128 else fail("128-bit signed greater-than")
         assert pos128 >= neg128 else fail("128-bit signed greater-equal")
         assert pos128 >= pos128 else fail("128-bit signed equality boundary")
+        assert pos128 < 4 else fail("128-bit positive literal less-than")
+        assert 3 <= pos128 else fail("128-bit reversed literal less-equal")
+        assert pos128 == 3 else fail("128-bit literal equality")
     end run
 end test SignedWideOrderingV1
