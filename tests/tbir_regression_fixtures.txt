@@ -56,6 +56,7 @@
 
 top_counter_test | Top | top_counter.sv | top_counter.arch | pass
 sized_scalar_literal_test | Top | top_counter.sv | top_counter.arch | pass
+constraint_shift_behavior_test | Top | top_counter.sv | top_counter.arch | pass
 const_expr_init_test | Top | top_counter.sv | top_counter.arch | pass
 signed_use_site_test | Top | top_counter.sv | top_counter.arch | pass
 signed_helper_param_test | Top | top_counter.sv | top_counter.arch | pass
@@ -80,6 +81,7 @@ time_literal_test | Top | top_counter.sv | top_counter.arch | pass
 rom_lut_test | RomLut | rom_lut.sv | rom_lut.arch | pass
 check_phase_let_test | Top | top_counter.sv | top_counter.arch | pass
 check_phase_shadow_let_test | Top | top_counter.sv | top_counter.arch | pass
+impl_local_shadow_test | Top | top_counter.sv | top_counter.arch | pass
 log_paths_test | Top | top_counter.sv | top_counter.arch | pass
 fatal_path_test | Top | top_counter.sv | top_counter.arch | fail
 rom_lut_inline_test | RomLut | rom_lut.sv | rom_lut.arch | pass
@@ -335,6 +337,7 @@ tlm_pairing_arch_burst_initiator_test | TlmPairingArchBurstInitiator | TlmPairin
 bind_remap_test | axil_amba | axil_amba.sv | - | pass
 axilite_hooks_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 regblock_record_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
+regblock_wide_fields_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 regblock_record_narrow_callback_test | AxiLiteRegs | AxiLiteRegs.sv | - | pass
 regblock_record_recursion_test | AxiLiteRegs | AxiLiteRegs.sv | - | fail
 queue_empty_pop_test | Top | top_counter.sv | - | fail

@@ -1,0 +1,20 @@
+// Statement locals shadow testbench fields only after their initializer and
+// only within the block where they are declared.
+testbench ImplLocalShadowTb
+    dut : Top
+    value : uint<8> default 7
+end testbench ImplLocalShadowTb
+
+impl ImplLocalShadow for ImplLocalShadowTb
+    run
+        let value : uint<8> = value + 1
+        assert value == 8 else fail("local initializer did not read the field")
+        assert _tb.value == 7 else fail("explicit field access changed")
+
+        if true
+            let value : uint<8> = 3
+            assert value == 3 else fail("nested local did not shadow field")
+        end if
+        assert value == 8 else fail("nested local escaped its block")
+    end run
+end impl ImplLocalShadow

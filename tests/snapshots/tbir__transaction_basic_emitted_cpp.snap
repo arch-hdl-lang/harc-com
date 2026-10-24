@@ -301,8 +301,7 @@ int run_TransactionBasicTest(int argc, char** argv) {
                     break;
                 }
                 case 4: {
-                    i = (i + 1);
-                    __bb = 2;
+                    if ((i == 2)) { __bb = 5; } else { __bb = 15; }
                     break;
                 }
                 case 5: {
@@ -310,7 +309,7 @@ int run_TransactionBasicTest(int argc, char** argv) {
                     final_cmd = CountCmd{};
                     final_cmd.expect = total;
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(2));
-                    __bb = 14;
+                    __bb = 16;
                     break;
                 }
                 case 6: {
@@ -338,8 +337,7 @@ int run_TransactionBasicTest(int argc, char** argv) {
                     break;
                 }
                 case 11: {
-                    _anon = (_anon + 1);
-                    __bb = 9;
+                    if ((_anon == __t0)) { __bb = 12; } else { __bb = 14; }
                     break;
                 }
                 case 12: {
@@ -357,6 +355,16 @@ int run_TransactionBasicTest(int argc, char** argv) {
                     break;
                 }
                 case 14: {
+                    _anon = (_anon + 1);
+                    __bb = 9;
+                    break;
+                }
+                case 15: {
+                    i = (i + 1);
+                    __bb = 2;
+                    break;
+                }
+                case 16: {
                     if (!((harc_rt::harc_read(dut->count_out) == final_cmd.expect))) {
                         sim_log_line("FAIL", "hold: count_out=%lld, expected %lld", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->count_out)), harc_rt::harc_printf_ll(final_cmd.expect));
                         ctx.errors++;

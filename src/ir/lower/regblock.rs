@@ -1493,15 +1493,16 @@ fn bin(op: BinOp, a: Expr, b: Expr) -> Expr {
     Expr::Binary(op, Box::new(a), Box::new(b))
 }
 
-/// Right-aligned bit mask for a `width`-bit field. Mirrors v1's
-/// `field_mask_literal`: clamped at 32 bits (Phase 1b fields cap at
-/// register width 32, so a wider mask never arises in the corpus; the
-/// 64-bit mirror makes the clamp value-identical for the fixtures).
+/// Right-aligned bit mask for a `width`-bit field.
+///
+/// Regblock validation accepts fields up to the 64-bit register width, so
+/// preserve all supported bits here. Handle 64 before shifting because a
+/// shift by the type width is invalid in Rust.
 fn field_mask(width: u32) -> u64 {
-    if width >= 32 {
-        0xFFFF_FFFF
-    } else {
-        (1u64 << width) - 1
+    match width {
+        0 => 0,
+        1..=63 => (1u64 << width) - 1,
+        _ => u64::MAX,
     }
 }
 

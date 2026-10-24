@@ -233,8 +233,7 @@ int run_TopCounterTest(int argc, char** argv) {
                     break;
                 }
                 case 4: {
-                    i = (i + 1);
-                    __bb = 2;
+                    if ((i == 10)) { __bb = 5; } else { __bb = 7; }
                     break;
                 }
                 case 5: {
@@ -242,7 +241,7 @@ int run_TopCounterTest(int argc, char** argv) {
                     harc_rt::harc_assign(dut->en, 0);
                     held = harc_rt::harc_read(dut->count_out);
                     _anon = 0;
-                    __bb = 7;
+                    __bb = 8;
                     break;
                 }
                 case 6: {
@@ -254,65 +253,78 @@ int run_TopCounterTest(int argc, char** argv) {
                     break;
                 }
                 case 7: {
-                    if ((_anon <= 4)) { __bb = 8; } else { __bb = 10; }
+                    i = (i + 1);
+                    __bb = 2;
                     break;
                 }
                 case 8: {
-                    co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
-                    __bb = 11;
+                    if ((_anon <= 4)) { __bb = 9; } else { __bb = 11; }
                     break;
                 }
                 case 9: {
-                    _anon = (_anon + 1);
-                    __bb = 7;
-                    break;
-                }
-                case 10: {
-                    sim_log_line("INFO", "PASS: counter holds at %lld when en=0", harc_rt::harc_printf_ll(held));
-                    harc_rt::harc_assign(dut->en, 1);
-                    i_2 = 1;
+                    co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
                     __bb = 12;
                     break;
                 }
+                case 10: {
+                    if ((_anon == 4)) { __bb = 11; } else { __bb = 13; }
+                    break;
+                }
                 case 11: {
+                    sim_log_line("INFO", "PASS: counter holds at %lld when en=0", harc_rt::harc_printf_ll(held));
+                    harc_rt::harc_assign(dut->en, 1);
+                    i_2 = 1;
+                    __bb = 14;
+                    break;
+                }
+                case 12: {
                     if (!((harc_rt::harc_read(dut->count_out) == held))) {
                         sim_log_line("FAIL", "en=0: count changed from %lld to %lld", harc_rt::harc_printf_ll(held), harc_rt::harc_printf_ll(harc_rt::harc_read(dut->count_out)));
                         ctx.errors++;
                     }
-                    __bb = 9;
-                    break;
-                }
-                case 12: {
-                    if ((i_2 <= 5)) { __bb = 13; } else { __bb = 15; }
+                    __bb = 10;
                     break;
                 }
                 case 13: {
-                    co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
-                    __bb = 16;
+                    _anon = (_anon + 1);
+                    __bb = 8;
                     break;
                 }
                 case 14: {
-                    i_2 = (i_2 + 1);
-                    __bb = 12;
+                    if ((i_2 <= 5)) { __bb = 15; } else { __bb = 17; }
                     break;
                 }
                 case 15: {
-                    sim_log_line("INFO", "PASS: counter resumes correctly after re-enable");
-                    harc_rt::harc_assign(dut->rst, 1);
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
-                    __bb = 17;
+                    __bb = 18;
                     break;
                 }
                 case 16: {
+                    if ((i_2 == 5)) { __bb = 17; } else { __bb = 19; }
+                    break;
+                }
+                case 17: {
+                    sim_log_line("INFO", "PASS: counter resumes correctly after re-enable");
+                    harc_rt::harc_assign(dut->rst, 1);
+                    co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
+                    __bb = 20;
+                    break;
+                }
+                case 18: {
                     expected = (held + i_2);
                     if (!((harc_rt::harc_read(dut->count_out) == expected))) {
                         sim_log_line("FAIL", "resume cycle %lld: count_out=%lld, expected %lld", harc_rt::harc_printf_ll(i_2), harc_rt::harc_printf_ll(harc_rt::harc_read(dut->count_out)), harc_rt::harc_printf_ll(expected));
                         ctx.errors++;
                     }
+                    __bb = 16;
+                    break;
+                }
+                case 19: {
+                    i_2 = (i_2 + 1);
                     __bb = 14;
                     break;
                 }
-                case 17: {
+                case 20: {
                     if (!((harc_rt::harc_read(dut->count_out) == 0))) {
                         sim_log_line("FAIL", "mid-count reset: count_out=%lld, expected 0", harc_rt::harc_printf_ll(harc_rt::harc_read(dut->count_out)));
                         ctx.errors++;

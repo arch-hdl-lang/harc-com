@@ -287,14 +287,13 @@ int run_SyncFifoTest(int argc, char** argv) {
                     break;
                 }
                 case 4: {
-                    i = (i + 1);
-                    __bb = 2;
+                    if ((i == 15)) { __bb = 5; } else { __bb = 7; }
                     break;
                 }
                 case 5: {
                     harc_rt::harc_assign(dut->push_valid, 0);
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
-                    __bb = 7;
+                    __bb = 8;
                     break;
                 }
                 case 6: {
@@ -302,6 +301,11 @@ int run_SyncFifoTest(int argc, char** argv) {
                     break;
                 }
                 case 7: {
+                    i = (i + 1);
+                    __bb = 2;
+                    break;
+                }
+                case 8: {
                     if (!((harc_rt::harc_read(dut->full) == 1))) {
                         sim_log_line("FAIL", "FIFO should be full after 16 pushes");
                         ctx.errors++;
@@ -312,14 +316,14 @@ int run_SyncFifoTest(int argc, char** argv) {
                     }
                     sim_log_line("INFO", "PASS: FIFO full after 16 pushes");
                     i_2 = 0;
-                    __bb = 8;
-                    break;
-                }
-                case 8: {
-                    if ((i_2 <= 15)) { __bb = 9; } else { __bb = 11; }
+                    __bb = 9;
                     break;
                 }
                 case 9: {
+                    if ((i_2 <= 15)) { __bb = 10; } else { __bb = 12; }
+                    break;
+                }
+                case 10: {
                     harc_rt::harc_assign(dut->pop_ready, 1);
                     if (!((harc_rt::harc_read(dut->pop_valid) == 1))) {
                         sim_log_line("FAIL", "pop_valid unexpectedly low at pop %lld", harc_rt::harc_printf_ll(i_2));
@@ -331,25 +335,29 @@ int run_SyncFifoTest(int argc, char** argv) {
                         ctx.errors++;
                     }
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
-                    __bb = 12;
-                    break;
-                }
-                case 10: {
-                    i_2 = (i_2 + 1);
-                    __bb = 8;
-                    break;
-                }
-                case 11: {
-                    harc_rt::harc_assign(dut->pop_ready, 0);
-                    co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
                     __bb = 13;
                     break;
                 }
+                case 11: {
+                    if ((i_2 == 15)) { __bb = 12; } else { __bb = 14; }
+                    break;
+                }
                 case 12: {
-                    __bb = 10;
+                    harc_rt::harc_assign(dut->pop_ready, 0);
+                    co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
+                    __bb = 15;
                     break;
                 }
                 case 13: {
+                    __bb = 11;
+                    break;
+                }
+                case 14: {
+                    i_2 = (i_2 + 1);
+                    __bb = 9;
+                    break;
+                }
+                case 15: {
                     if (!((harc_rt::harc_read(dut->empty) == 1))) {
                         sim_log_line("FAIL", "FIFO should be empty after popping all items");
                         ctx.errors++;

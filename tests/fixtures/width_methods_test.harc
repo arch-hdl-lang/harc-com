@@ -44,6 +44,23 @@ impl WidthMethodsTest for WidthMethodsTb
         assert z32 == 0x000000AB
             else fail("zext<32>: got 0x${z32:08x}")
 
+        // Explicit zext is bit-pattern preserving, even when a signed
+        // narrow source is carried in a wider host integer.
+        let neg8 : sint<8> = -1
+        let neg8_z16 = neg8.zext<16>()
+        let neg8_z64 = neg8.zext<64>()
+        let neg8_z128 : uint<128> = neg8.zext<128>()
+        let neg64 : sint<64> = -1
+        let neg64_z128 : uint<128> = neg64.zext<128>()
+        assert neg8_z16 == 255
+            else fail("sint<8>(-1).zext<16> did not produce 0x00ff")
+        assert neg8_z64 == 255
+            else fail("sint<8>(-1).zext<64> did not produce 0xff")
+        assert neg8_z128 == 255
+            else fail("sint<8>(-1).zext<128> did not produce 0xff")
+        assert neg64_z128 == 0xFFFFFFFFFFFFFFFF
+            else fail("sint<64>(-1).zext<128> did not preserve 64 source bits")
+
         // ── sext: sign-extension ────────────────────────────────────
         let s8 : uint<8> = 0xFF              // MSB set → sign-extends to all-ones
         let se16 = s8.sext<16>()

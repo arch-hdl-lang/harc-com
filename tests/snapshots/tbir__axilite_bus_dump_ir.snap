@@ -66,12 +66,11 @@ fn fn0 run_AxiLiteBusTest [kind=Run, owner=tb0]
     -> WaitCycles(1, b9)
 
   b7:
-    Assign(%_anon, (%_anon + 1))
-    -> Jump(b5)
+    -> Branch((%_anon == 9), b8, b16)
 
   b8:
     DutWrite(dut.axil.ar.valid, 0)
-    -> WaitCycles(1, b16)
+    -> WaitCycles(1, b17)
 
   b9:
     DutRead(%__t0, dut.axil.r.valid)
@@ -100,6 +99,10 @@ fn fn0 run_AxiLiteBusTest [kind=Run, owner=tb0]
     -> Jump(b13)
 
   b16:
+    Assign(%_anon, (%_anon + 1))
+    -> Jump(b5)
+
+  b17:
     AssertCheck { cond: (%val == 3405691582), on_fail: "read got 0x%08llx, expected 0xCAFEBABE", %val }
     Log(info, "PASS: bus-typed AXI-Lite write/read round-trip")
     -> Return

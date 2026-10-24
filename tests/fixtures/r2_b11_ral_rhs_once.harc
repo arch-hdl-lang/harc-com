@@ -1,0 +1,77 @@
+extern function next_value() -> uint<32>
+extern function next_value_calls() -> uint<32>
+
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            bus.aw.addr = addr
+            bus.aw.valid = 1
+            bus.w.send(data, 15)
+            bus.aw.valid = 0
+            wait 1 cycle
+        end write
+
+        hookable read(addr: uint<8>) -> uint<32>
+            bus.ar.addr = addr
+            bus.ar.valid = 1
+            let r = bus.r.recv()
+            bus.ar.valid = 0
+            wait 1 cycle
+            return r.data
+        end read
+    end when
+end transactor AxilHelper
+
+regblock DmaRegs via AxilHelper width 32
+    register DMACR @ 0x00 reset 0 access rw
+    register MM2S_SA @ 0x18 reset 0 access rw
+    register MM2S_LEN @ 0x28 reset 0 access rw
+end regblock DmaRegs
+
+testbench RegblockBasicTb
+    dut : AxiLiteRegs
+end testbench RegblockBasicTb
+
+impl RegblockBasicTest for RegblockBasicTb
+    let axil   : BusAxiLite = bind dut
+    let helper : AxilHelper active = bind axil
+    let regs   : DmaRegs = bind helper
+
+    run
+        dut.rst = 1
+        axil.aw.valid = 0
+        axil.w.valid = 0
+        axil.b.ready = 1
+        axil.ar.valid = 0
+        axil.r.ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        regs.DMACR = next_value()
+        assert (regs.DMACR & 1) == 1
+            else fail("DMACR readback was not one")
+        assert next_value_calls() == 1
+            else fail("RHS extern evaluated more than once")
+
+        regs.MM2S_SA = 3735879680
+        assert regs.MM2S_SA == 3735879680
+            else fail("MM2S_SA readback mismatch")
+        regs.MM2S_LEN = 64
+        assert regs.MM2S_LEN == 64
+            else fail("MM2S_LEN readback mismatch")
+        log(info, "PASS: RAL RHS evaluated once")
+    end run
+end impl RegblockBasicTest

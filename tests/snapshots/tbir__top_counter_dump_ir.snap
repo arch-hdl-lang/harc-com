@@ -35,61 +35,70 @@ fn fn0 run_TopCounterTest [kind=Run, owner=tb0]
     -> WaitCycles(1, b6)
 
   b4:
-    Assign(%i, (%i + 1))
-    -> Jump(b2)
+    -> Branch((%i == 10), b5, b7)
 
   b5:
     Log(info, "PASS: counter incremented 1..10 correctly")
     DutWrite(dut.en, 0)
     DutRead(%held, dut.count_out)
     Assign(%_anon, 0)
-    -> Jump(b7)
+    -> Jump(b8)
 
   b6:
     AssertCheck { cond: (dut.count_out == %i), on_fail: "cycle %lld: count_out=%lld, expected %lld", %i, dut.count_out, %i }
     -> Jump(b4)
 
   b7:
-    -> Branch((%_anon <= 4), b8, b10)
+    Assign(%i, (%i + 1))
+    -> Jump(b2)
 
   b8:
-    -> WaitCycles(1, b11)
+    -> Branch((%_anon <= 4), b9, b11)
 
   b9:
-    Assign(%_anon, (%_anon + 1))
-    -> Jump(b7)
+    -> WaitCycles(1, b12)
 
   b10:
+    -> Branch((%_anon == 4), b11, b13)
+
+  b11:
     Log(info, "PASS: counter holds at %lld when en=0", %held)
     DutWrite(dut.en, 1)
     Assign(%i_2, 1)
-    -> Jump(b12)
-
-  b11:
-    AssertCheck { cond: (dut.count_out == %held), on_fail: "en=0: count changed from %lld to %lld", %held, dut.count_out }
-    -> Jump(b9)
-
-  b12:
-    -> Branch((%i_2 <= 5), b13, b15)
-
-  b13:
-    -> WaitCycles(1, b16)
-
-  b14:
-    Assign(%i_2, (%i_2 + 1))
-    -> Jump(b12)
-
-  b15:
-    Log(info, "PASS: counter resumes correctly after re-enable")
-    DutWrite(dut.rst, 1)
-    -> WaitCycles(1, b17)
-
-  b16:
-    Assign(%expected, (%held + %i_2))
-    AssertCheck { cond: (dut.count_out == %expected), on_fail: "resume cycle %lld: count_out=%lld, expected %lld", %i_2, dut.count_out, %expected }
     -> Jump(b14)
 
+  b12:
+    AssertCheck { cond: (dut.count_out == %held), on_fail: "en=0: count changed from %lld to %lld", %held, dut.count_out }
+    -> Jump(b10)
+
+  b13:
+    Assign(%_anon, (%_anon + 1))
+    -> Jump(b8)
+
+  b14:
+    -> Branch((%i_2 <= 5), b15, b17)
+
+  b15:
+    -> WaitCycles(1, b18)
+
+  b16:
+    -> Branch((%i_2 == 5), b17, b19)
+
   b17:
+    Log(info, "PASS: counter resumes correctly after re-enable")
+    DutWrite(dut.rst, 1)
+    -> WaitCycles(1, b20)
+
+  b18:
+    Assign(%expected, (%held + %i_2))
+    AssertCheck { cond: (dut.count_out == %expected), on_fail: "resume cycle %lld: count_out=%lld, expected %lld", %i_2, dut.count_out, %expected }
+    -> Jump(b16)
+
+  b19:
+    Assign(%i_2, (%i_2 + 1))
+    -> Jump(b14)
+
+  b20:
     AssertCheck { cond: (dut.count_out == 0), on_fail: "mid-count reset: count_out=%lld, expected 0", dut.count_out }
     Log(info, "PASS: mid-count reset works")
     -> Return

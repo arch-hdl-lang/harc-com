@@ -6278,9 +6278,17 @@ impl TbirRandomizeEmitter {
                 // comparisons, udiv for division, urem for modulus.
                 // C++ has no `%%` infix — the old `" %% "` mapping was
                 // a half-finished placeholder. Equality (`==`, `!=`),
-                // logical / bitwise / shift use the natural overloads.
+                // logical / bitwise use the natural overloads. Z3's C++ API
+                // exposes bit-vector shifts as shl/lshr/ashr functions;
+                // `operator<<`/`operator>>` are not bit-vector overloads and
+                // can therefore fall through implicit `ast::operator bool()`
+                // conversions before C++ applies the native integer shift.
                 let signed = self.constraint_expr_is_signed(lhs, field_info, target_root)
                     || self.constraint_expr_is_signed(rhs, field_info, target_root);
+                // Shift signedness follows the value being shifted. A signed
+                // shift count must not turn an unsigned left operand's
+                // logical right shift into an arithmetic one.
+                let lhs_signed = self.constraint_expr_is_signed(lhs, field_info, target_root);
                 // `+% -% *%` mask the result to `max(W(lhs), W(rhs))`
                 // (spec §2.4). The solver variable is a 64-bit bitvector
                 // with the field's width carried as a separate range
@@ -6409,8 +6417,9 @@ impl TbirRandomizeEmitter {
                     BitAnd => (" & ", None),
                     BitOr => (" | ", None),
                     BitXor => (" ^ ", None),
-                    Shl => (" << ", None),
-                    Shr => (" >> ", None),
+                    Shl => ("", Some("shl")),
+                    Shr if lhs_signed => ("", Some("ashr")),
+                    Shr => ("", Some("lshr")),
                     _ => {
                         self.errors.push(format!(
                             "constraint operator `{:?}` not supported in v0 solver path",

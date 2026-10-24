@@ -16,6 +16,12 @@ impl Emitter {
         depth: usize,
     ) {
         self.push_probe_shadow_scope();
+        // A `let` must remain visible to later siblings in this source block,
+        // so guarding only its declaration would change lexical scope. Keep
+        // one guard open from each declaration through the end of the block:
+        // the declaration is skipped after an earlier return, while later
+        // statements can still refer to it on the live path.
+        let mut let_regions = 0usize;
         for (index, stmt) in block.stmts.iter().enumerate() {
             let prior_source_id = self.current_source_id;
             let source_id = block.stmt_source(index);
@@ -23,19 +29,28 @@ impl Emitter {
                 self.current_source_id = source_id;
             }
             if matches!(stmt.kind, StmtKind::Let(_)) {
-                self.emit_target_tlm_stmt(stmt, rsp_var, rsp_ty, returned_var, depth);
+                let region_depth = depth + let_regions;
+                self.pad(region_depth);
+                writeln!(self.out, "if (!{returned_var}) {{").ok();
+                self.emit_target_tlm_stmt(stmt, rsp_var, rsp_ty, returned_var, region_depth + 1);
                 if let StmtKind::Let(let_stmt) = &stmt.kind {
                     self.declare_probe_shadow(&let_stmt.name.name);
                 }
+                let_regions += 1;
                 self.current_source_id = prior_source_id;
                 continue;
             }
-            self.pad(depth);
+            let stmt_depth = depth + let_regions;
+            self.pad(stmt_depth);
             writeln!(self.out, "if (!{returned_var}) {{").ok();
-            self.emit_target_tlm_stmt(stmt, rsp_var, rsp_ty, returned_var, depth + 1);
-            self.pad(depth);
+            self.emit_target_tlm_stmt(stmt, rsp_var, rsp_ty, returned_var, stmt_depth + 1);
+            self.pad(stmt_depth);
             writeln!(self.out, "}}").ok();
             self.current_source_id = prior_source_id;
+        }
+        for region in (0..let_regions).rev() {
+            self.pad(depth + region);
+            writeln!(self.out, "}}").ok();
         }
         self.pop_probe_shadow_scope();
     }

@@ -60,21 +60,24 @@ fn fn2 run_WatchdogQuiesceTest [kind=Run, owner=tb0]
     -> WaitCycles(3, b7)
 
   b5:
-    Assign(%i, (%i + 1))
-    -> Jump(b3)
+    -> Branch((%i == 19), b6, b8)
 
   b6:
     Assign(%__t0, 200)
-    -> WaitUntilTimeout { (prod.seen == 20) [single], cycles: %__t0, fire: b8, timeout: b9 }
+    -> WaitUntilTimeout { (prod.seen == 20) [single], cycles: %__t0, fire: b9, timeout: b10 }
 
   b7:
     -> Jump(b5)
 
   b8:
+    Assign(%i, (%i + 1))
+    -> Jump(b3)
+
+  b9:
     Log(info, "PASS: watchdog watched %lld emits without tripping", prod.seen)
     -> Return
 
-  b9:
+  b10:
     FailDiag { "agent did not finish all 20 emits" }
     FailDiag { unless: (prod.seen == 20), "  not yet true: _tb.prod.seen == 20" }
-    -> Jump(b8)
+    -> Jump(b9)

@@ -344,12 +344,11 @@ int run_EnvQuiescedPhaseTest(int argc, char** argv) {
                     break;
                 }
                 case 5: {
-                    i = (i + 1);
-                    __bb = 3;
+                    if ((i == 2)) { __bb = 6; } else { __bb = 8; }
                     break;
                 }
                 case 6: {
-                    __bb = 8;
+                    __bb = 9;
                     break;
                 }
                 case 7: {
@@ -357,27 +356,32 @@ int run_EnvQuiescedPhaseTest(int argc, char** argv) {
                     break;
                 }
                 case 8: {
-                    if (!(top.sb.expected.empty())) { __bb = 9; } else { __bb = 10; }
+                    i = (i + 1);
+                    __bb = 3;
                     break;
                 }
                 case 9: {
-                    drained = top.sb.expected.pop();
-                    top.sb.popped = (top.sb.popped + 1);
-                    __bb = 8;
+                    if (!(top.sb.expected.empty())) { __bb = 10; } else { __bb = 11; }
                     break;
                 }
                 case 10: {
-                    __t0 = 200;
-                    int64_t _wu_budget = (int64_t)(harc_rt::harc_u64_shift_count((uint64_t)(__t0), 4294967295ULL));
-                    bool _wu_satisfied = co_await harc_rt::wait_until_timeout(_slot, [&]{ return ((((((uint64_t)cycle_count - top.prod._last_in_cycle) >= (uint64_t)(8)) && (((uint64_t)cycle_count - top.prod._last_out_cycle) >= (uint64_t)(8))) && ((((uint64_t)cycle_count - top.sb._last_in_cycle) >= (uint64_t)(8)) && (((uint64_t)cycle_count - top.sb._last_out_cycle) >= (uint64_t)(8))))) && ((top.prod.seen == 3)); }, (uint32_t)_wu_budget);
-                    if (_wu_satisfied) { __bb = 11; } else { ctx.errors++; __bb = 12; }
+                    drained = top.sb.expected.pop();
+                    top.sb.popped = (top.sb.popped + 1);
+                    __bb = 9;
                     break;
                 }
                 case 11: {
-                    __done = true;
+                    __t0 = 200;
+                    int64_t _wu_budget = (int64_t)(harc_rt::harc_u64_shift_count((uint64_t)(__t0), 4294967295ULL));
+                    bool _wu_satisfied = co_await harc_rt::wait_until_timeout(_slot, [&]{ return ((((((uint64_t)cycle_count - top.prod._last_in_cycle) >= (uint64_t)(8)) && (((uint64_t)cycle_count - top.prod._last_out_cycle) >= (uint64_t)(8))) && ((((uint64_t)cycle_count - top.sb._last_in_cycle) >= (uint64_t)(8)) && (((uint64_t)cycle_count - top.sb._last_out_cycle) >= (uint64_t)(8))))) && ((top.prod.seen == 3)); }, (uint32_t)_wu_budget);
+                    if (_wu_satisfied) { __bb = 12; } else { ctx.errors++; __bb = 13; }
                     break;
                 }
                 case 12: {
+                    __done = true;
+                    break;
+                }
+                case 13: {
                     sim_log_line("FAIL", "environment did not quiesce");
                     if (!((((((uint64_t)cycle_count - top.prod._last_in_cycle) >= (uint64_t)(8)) && (((uint64_t)cycle_count - top.prod._last_out_cycle) >= (uint64_t)(8))) && ((((uint64_t)cycle_count - top.sb._last_in_cycle) >= (uint64_t)(8)) && (((uint64_t)cycle_count - top.sb._last_out_cycle) >= (uint64_t)(8)))))) {
                         sim_log_line("FAIL", "  not yet true: _tb.top.quiesced(8)");
@@ -385,7 +389,7 @@ int run_EnvQuiescedPhaseTest(int argc, char** argv) {
                     if (!((top.prod.seen == 3))) {
                         sim_log_line("FAIL", "  not yet true: _tb.top.prod.seen == 3");
                     }
-                    __bb = 11;
+                    __bb = 12;
                     break;
                 }
                 default: __done = true; break;

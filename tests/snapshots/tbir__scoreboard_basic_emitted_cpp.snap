@@ -288,8 +288,7 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                     break;
                 }
                 case 4: {
-                    i = (i + 1);
-                    __bb = 2;
+                    if ((i == 2)) { __bb = 5; } else { __bb = 13; }
                     break;
                 }
                 case 5: {
@@ -310,14 +309,13 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                     break;
                 }
                 case 8: {
-                    _anon = (_anon + 1);
-                    __bb = 6;
+                    if ((_anon == bump)) { __bb = 9; } else { __bb = 11; }
                     break;
                 }
                 case 9: {
                     harc_rt::harc_assign(dut->en, 0);
                     co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
-                    __bb = 11;
+                    __bb = 12;
                     break;
                 }
                 case 10: {
@@ -325,6 +323,11 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                     break;
                 }
                 case 11: {
+                    _anon = (_anon + 1);
+                    __bb = 6;
+                    break;
+                }
+                case 12: {
                     want = _tb.sb.expected.pop();
                     _tb.sb.reads = (_tb.sb.reads + 1);
                     got = harc_rt::harc_read(dut->count_out);
@@ -334,6 +337,11 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                     }
                     sim_log_line("INFO", "run[%lld] bump=%lld count_out=%lld matched expected=%lld", harc_rt::harc_printf_ll(i), harc_rt::harc_printf_ll(bump), harc_rt::harc_printf_ll(got), harc_rt::harc_printf_ll(want));
                     __bb = 4;
+                    break;
+                }
+                case 13: {
+                    i = (i + 1);
+                    __bb = 2;
                     break;
                 }
                 default: __done = true; break;

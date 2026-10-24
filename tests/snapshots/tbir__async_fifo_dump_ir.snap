@@ -40,42 +40,48 @@ fn fn0 run_AsyncFifoTest [kind=Run, owner=tb0]
     -> WaitTimePs(5000, b7)
 
   b5:
-    Assign(%i, (%i + 1))
-    -> Jump(b3)
+    -> Branch((%i == 7), b6, b8)
 
   b6:
     DutWrite(dut.push_valid, 0)
     Log(debug, "letting CDC synchronizers settle")
-    -> WaitTimePs(200000, b8)
+    -> WaitTimePs(200000, b9)
 
   b7:
     -> Jump(b5)
 
   b8:
-    Log(info, "popping 8 items on rd_clk")
-    Assign(%i_2, 0)
-    -> Jump(b9)
+    Assign(%i, (%i + 1))
+    -> Jump(b3)
 
   b9:
-    -> Branch((%i_2 <= 7), b10, b12)
+    Log(info, "popping 8 items on rd_clk")
+    Assign(%i_2, 0)
+    -> Jump(b10)
 
   b10:
+    -> Branch((%i_2 <= 7), b11, b13)
+
+  b11:
     AssertCheck { cond: dut.pop_valid, on_fail: "pop_valid low on item %lld", %i_2 }
     DutRead(%got, dut.pop_data)
     Assign(%want, (%i_2 + 1))
     Log(file("async_fifo.log", info), "pop[%lld] got=%08llx want=%08llx", %i_2, %got, %want)
     AssertCheck { cond: (%got == %want), on_fail: "data mismatch at pop[%lld]: got %lld, want %lld", %i_2, %got, %want }
     DutWrite(dut.pop_ready, 1)
-    -> WaitTimePs(20000, b13)
-
-  b11:
-    Assign(%i_2, (%i_2 + 1))
-    -> Jump(b9)
+    -> WaitTimePs(20000, b14)
 
   b12:
+    -> Branch((%i_2 == 7), b13, b15)
+
+  b13:
     Log(info, "PASS: 8/8 items round-tripped through async FIFO")
     -> Return
 
-  b13:
+  b14:
     DutWrite(dut.pop_ready, 0)
-    -> Jump(b11)
+    -> Jump(b12)
+
+  b15:
+    Assign(%i_2, (%i_2 + 1))
+    -> Jump(b10)

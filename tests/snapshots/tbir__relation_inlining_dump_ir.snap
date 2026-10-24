@@ -36,8 +36,7 @@ fn fn0 run_RelationInliningTest [kind=Run, owner=tb0]
     -> Randomize { %r, constraints: c0, b7 }
 
   b5:
-    Assign(%i, (%i + 1))
-    -> Jump(b3)
+    -> Branch((%i == 19), b6, b8)
 
   b6:
     Log(info, "PASS: 20 randomize-with-relation calls satisfied all 3 inlined constraints")
@@ -48,3 +47,7 @@ fn fn0 run_RelationInliningTest [kind=Run, owner=tb0]
     AssertCheck { cond: ((%r.addr % 4) == 0), on_fail: "iter %lld: addr=0x%08llx not 4-aligned", %i, %r.addr }
     AssertCheck { cond: (%r.addr >= 65536), on_fail: "iter %lld: addr=0x%08llx below 0x10000", %i, %r.addr }
     -> Jump(b5)
+
+  b8:
+    Assign(%i, (%i + 1))
+    -> Jump(b3)

@@ -51,8 +51,7 @@ fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
     -> Jump(b6)
 
   b4:
-    Assign(%i, (%i + 1))
-    -> Jump(b2)
+    -> Branch((%i == 2), b5, b13)
 
   b5:
     AssertCheck { cond: ScoreboardQuery(sb0.sb.expected.empty()), on_fail: "queue not drained: %lld value(s) left", ScoreboardQuery(sb0.sb.expected.size()) }
@@ -65,23 +64,30 @@ fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
     -> WaitCycles(1, b10)
 
   b8:
-    Assign(%_anon, (%_anon + 1))
-    -> Jump(b6)
+    -> Branch((%_anon == %bump), b9, b11)
 
   b9:
     DutWrite(dut.en, 0)
-    -> WaitCycles(1, b11)
+    -> WaitCycles(1, b12)
 
   b10:
     -> Jump(b8)
 
   b11:
+    Assign(%_anon, (%_anon + 1))
+    -> Jump(b6)
+
+  b12:
     ScoreboardOp(sb0.sb, %want = expected.pop())
     ScoreboardOp(sb0.sb, reads = (ScoreboardQuery(sb0.sb.reads) + 1))
     DutRead(%got, dut.count_out)
     AssertCheck { cond: (%got == %want), on_fail: "run[%lld]: count_out=%lld, expected %lld", %i, %got, %want }
     Log(info, "run[%lld] bump=%lld count_out=%lld matched expected=%lld", %i, %bump, %got, %want)
     -> Jump(b4)
+
+  b13:
+    Assign(%i, (%i + 1))
+    -> Jump(b2)
 
 fn fn1 check_ScoreboardBasicTest [kind=Check, owner=tb0]
   entry = b0

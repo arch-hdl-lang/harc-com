@@ -2,7 +2,7 @@
 //! output, and verify both parse trees match structurally. Snapshot the
 //! pretty-printed form for stability.
 
-use harc::ast::{ExprKind, Item, StmtKind};
+use harc::ast::{EdgeMode, ExprKind, Item, StmtKind, TestItem};
 use harc::parser::parse_source;
 use harc::pretty::print;
 
@@ -426,6 +426,52 @@ end test T
     );
 }
 
+#[test]
+fn on_handler_edge_modes_round_trip_after_phase() {
+    let src = r#"
+test T
+    on signal phase post_eval falling
+    end on
+    on signal phase post_eval level
+    end on
+    on signal phase post_eval rising
+    end on
+end test T
+"#;
+    let parsed = parse_source(src).expect("first parse should succeed");
+    let printed = print(&parsed);
+    let reparsed = parse_source(&printed).expect("re-parse of pretty output should succeed");
+
+    let edges = |item: &Item| {
+        let Item::Test(test) = item else {
+            panic!("expected test item");
+        };
+        test.items
+            .iter()
+            .map(|item| {
+                let TestItem::Stmt(stmt) = item else {
+                    panic!("expected statement test item");
+                };
+                let StmtKind::On(handler) = &stmt.kind else {
+                    panic!("expected on-handler statement");
+                };
+                handler.edge
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        edges(&parsed.items[0]),
+        [EdgeMode::Falling, EdgeMode::Level, EdgeMode::Rising]
+    );
+    assert_eq!(
+        edges(&reparsed.items[0]),
+        [EdgeMode::Falling, EdgeMode::Level, EdgeMode::Rising]
+    );
+    assert!(printed.contains("on signal phase post_eval falling"));
+    assert!(printed.contains("on signal phase post_eval level"));
+}
+
 /// `extern function name(params) -> ret` (spec §9) round-trips: no
 /// body, no `end function` — terminates after the return type. Also
 /// works without a return type (void). The pretty-printer uses the
@@ -756,4 +802,39 @@ impl ListQueueTest for ListQueueTb
 end impl ListQueueTest"#;
     let printed = parse_print_reparse(src);
     assert!(printed.contains("queue<list#(bool)>"));
+}
+
+#[test]
+fn generic_transactor_params_round_trip() {
+    let src = r#"transactor Generic#(WIDTH: int = 8, DEPTH: uint<4> = 2)
+    data : uint<WIDTH>
+end transactor Generic
+"#;
+    let parsed = parse_source(src).expect("generic transactor should parse");
+    let Item::Transactor(transactor) = &parsed.items[0] else {
+        panic!("expected transactor item");
+    };
+    assert_eq!(transactor.params.len(), 2);
+    assert_eq!(transactor.params[0].name.name, "WIDTH");
+    assert!(transactor.params[0].ty.is_some());
+    assert!(transactor.params[0].default.is_some());
+    assert_eq!(transactor.params[1].name.name, "DEPTH");
+    assert!(transactor.params[1].ty.is_some());
+    assert!(transactor.params[1].default.is_some());
+
+    let printed = print(&parsed);
+    assert!(printed.contains("transactor Generic#(WIDTH: int = 8, DEPTH: uint<4> = 2)"));
+
+    let reparsed = parse_source(&printed).expect("pretty output should re-parse");
+    let Item::Transactor(reparsed_transactor) = &reparsed.items[0] else {
+        panic!("expected transactor item after reparse");
+    };
+    assert_eq!(reparsed_transactor.params.len(), 2);
+    assert_eq!(reparsed_transactor.params[0].name.name, "WIDTH");
+    assert!(reparsed_transactor.params[0].ty.is_some());
+    assert!(reparsed_transactor.params[0].default.is_some());
+    assert_eq!(reparsed_transactor.params[1].name.name, "DEPTH");
+    assert!(reparsed_transactor.params[1].ty.is_some());
+    assert!(reparsed_transactor.params[1].default.is_some());
+    assert_eq!(printed, print(&reparsed));
 }

@@ -49,29 +49,32 @@ fn fn1 run_AgentOnHandlerTest [kind=Run, owner=tb0]
     -> WaitCycles(2, b7)
 
   b5:
-    Assign(%i, (%i + 1))
-    -> Jump(b3)
+    -> Branch((%i == 2), b6, b8)
 
   b6:
     AssertCheck { cond: (tagger.seen == 3), on_fail: "expected 3 handled events, got %lld", tagger.seen }
     AssertCheck { cond: (tagger.last == 3), on_fail: "expected last payload 3, got %lld", tagger.last }
     Assign(%waited, 0)
-    -> Jump(b8)
+    -> Jump(b9)
 
   b7:
     -> Jump(b5)
 
   b8:
-    -> Branch((!tagger.idle_in(4) && (%waited < 100)), b9, b10)
+    Assign(%i, (%i + 1))
+    -> Jump(b3)
 
   b9:
-    -> WaitCycles(1, b11)
+    -> Branch((!tagger.idle_in(4) && (%waited < 100)), b10, b11)
 
   b10:
+    -> WaitCycles(1, b12)
+
+  b11:
     AssertCheck { cond: tagger.idle_in(4), on_fail: "agent never reported idle_in(4); waited=%lld", %waited }
     Log(info, "PASS: agent handled %lld events, idle_in(4) after %lld cycles", tagger.seen, %waited)
     -> Return
 
-  b11:
+  b12:
     Assign(%waited, (%waited + 1))
-    -> Jump(b8)
+    -> Jump(b9)

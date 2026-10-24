@@ -15,17 +15,23 @@ fn fn0 run_WidthMethodsTest [kind=Run, owner=tb0]
     %4 v8 : uint<8>
     %5 z16 : unknown
     %6 z32 : unknown
-    %7 s8 : uint<8>
-    %8 se16 : sint<16>
-    %9 se32 : sint<32>
-    %10 p8 : uint<8>
-    %11 pe16 : sint<16>
-    %12 pe32 : sint<32>
-    %13 wide : uint<32>
-    %14 r16 : unknown
-    %15 r32 : unknown
-    %16 big : unknown
-    %17 chained : unknown
+    %7 neg8 : sint<8>
+    %8 neg8_z16 : unknown
+    %9 neg8_z64 : unknown
+    %10 neg8_z128 : uint<128>
+    %11 neg64 : sint<64>
+    %12 neg64_z128 : uint<128>
+    %13 s8 : uint<8>
+    %14 se16 : sint<16>
+    %15 se32 : sint<32>
+    %16 p8 : uint<8>
+    %17 pe16 : sint<16>
+    %18 pe32 : sint<32>
+    %19 wide : uint<32>
+    %20 r16 : unknown
+    %21 r32 : unknown
+    %22 big : unknown
+    %23 chained : unknown
   entry = b0
 
   b0:
@@ -41,6 +47,16 @@ fn fn0 run_WidthMethodsTest [kind=Run, owner=tb0]
     Assign(%z32, %v8.zext<32 from 8>())
     AssertCheck { cond: (%z16 == 171), on_fail: "zext<16>: got 0x%04llx", %z16 }
     AssertCheck { cond: (%z32 == 171), on_fail: "zext<32>: got 0x%08llx", %z32 }
+    Assign(%neg8, -1)
+    Assign(%neg8_z16, %neg8.zext<16 from 8>())
+    Assign(%neg8_z64, %neg8.zext<64 from 8>())
+    Assign(%neg8_z128, %neg8.zext<128 from 8>())
+    Assign(%neg64, -1)
+    Assign(%neg64_z128, %neg64.zext<128 from 64>())
+    AssertCheck { cond: (%neg8_z16 == 255), on_fail: "sint<8>(-1).zext<16> did not produce 0x00ff" }
+    AssertCheck { cond: (%neg8_z64 == 255), on_fail: "sint<8>(-1).zext<64> did not produce 0xff" }
+    AssertCheck { cond: (%neg8_z128 == 255), on_fail: "sint<8>(-1).zext<128> did not produce 0xff" }
+    AssertCheck { cond: (%neg64_z128 == 18446744073709551615), on_fail: "sint<64>(-1).zext<128> did not preserve 64 source bits" }
     Assign(%s8, 255)
     Assign(%se16, %s8.sext<16 from 8>())
     Assign(%se32, %s8.sext<32 from 8>())
@@ -56,7 +72,7 @@ fn fn0 run_WidthMethodsTest [kind=Run, owner=tb0]
     Assign(%r32, %wide.resize<32 from 32>())
     AssertCheck { cond: (%r16 == 48879), on_fail: "resize<16> narrow: got 0x%04llx", %r16 }
     AssertCheck { cond: (%r32 == 3735928559), on_fail: "resize<32> same: got 0x%08llx", %r32 }
-    Assign(%big, 244837814094590.zext<48 from 48>().trunc<32 from 48>())
+    Assign(%big, 244837814094590.zext<48>().trunc<32 from 48>())
     AssertCheck { cond: (%big == 3203386110), on_fail: "anon-cast trunc<32>: got 0x%08llx", %big }
     Assign(%chained, %s8.sext<16 from 8>().trunc<8 from 16>())
     AssertCheck { cond: (%chained == 255), on_fail: "chained sext<16>.trunc<8>: got 0x%02llx", %chained }

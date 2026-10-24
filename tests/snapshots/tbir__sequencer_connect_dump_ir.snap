@@ -39,11 +39,14 @@ fn fn0 comp_method_0 [kind=ComponentMethod(c0)]
     -> Jump(b3)
 
   b3:
-    Assign(%i, (%i + 1))
-    -> Jump(b1)
+    -> Branch((%i == %__t0), b4, b5)
 
   b4:
     -> Return
+
+  b5:
+    Assign(%i, (%i + 1))
+    -> Jump(b1)
 
 fn fn1 comp_method_1 [kind=ComponentMethod(c1)]
   params:

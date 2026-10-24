@@ -8078,10 +8078,11 @@ end impl T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
-    // Plain `(uint64_t)(...)` widening — no mask, no shift.
+    // Known source widths are normalized before widening so signed carrier
+    // padding cannot leak into a zero-extension.
     assert!(
-        cpp.contains("(uint64_t)(") && !cpp.contains("0xFFFFFFFFULL"),
-        "expected plain widening cast for zext; got:\n{cpp}",
+        cpp.contains("harc_rt::harc_trunc_u128") && cpp.contains(", 8)))"),
+        "expected source-width normalization for zext; got:\n{cpp}",
     );
 }
 
@@ -9045,6 +9046,88 @@ end test T"#,
          The active frontdoor write path must NOT dispatch callbacks \
          per docs/ral-support.md §3.2. Full output:\n{cpp}"
     );
+}
+
+#[test]
+fn regblock_frontdoor_write_evaluates_rhs_once_for_mirror_and_bus() {
+    let parsed = parse_source(
+        r#"extern function next_value() -> uint<32>
+
+bus B
+    handshake_channel ch: send kind: valid_ready
+        data: uint<32>;
+    end handshake_channel ch
+end bus B
+
+transactor H bound to B
+end transactor H
+
+regblock R via H width 32
+    register A @ 0x00 access rw
+end regblock R
+
+test T
+    let dut : SomeDut
+    let bus : B = bind dut
+    let helper : H active = bind bus
+    let regs : R = bind helper
+    run
+        regs.A = next_value()
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+    assert_eq!(
+        cpp.matches("::next_value()").count(),
+        1,
+        "RHS must be snapshotted once:\n{cpp}"
+    );
+    assert!(cpp.contains("auto __harc_ral_write_value_"));
+}
+
+#[test]
+fn addrmap_frontdoor_write_evaluates_rhs_once_for_mirror_and_bus() {
+    let parsed = parse_source(
+        r#"extern function next_value() -> uint<32>
+
+bus B
+    handshake_channel ch: send kind: valid_ready
+        data: uint<32>;
+    end handshake_channel ch
+end bus B
+
+transactor H bound to B
+end transactor H
+
+regblock R via H width 32
+    register A @ 0x00 access rw
+end regblock R
+
+addrmap M via H
+    instance r : R @ 0x100
+end addrmap M
+
+test T
+    let dut : SomeDut
+    let bus : B = bind dut
+    let helper : H active = bind bus
+    let chip : M = bind helper
+    run
+        chip.r.A = next_value()
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+    assert_eq!(
+        cpp.matches("::next_value()").count(),
+        1,
+        "RHS must be snapshotted once:\n{cpp}"
+    );
+    assert!(cpp.contains("auto __harc_ral_write_value_"));
 }
 
 #[test]
@@ -12394,7 +12477,7 @@ fn real_conditions_still_emit_after_the_bool_position_check() {
         ),
         (
             "(len << 2) == 0",
-            "(_z_len << _ctx.bv_val((uint64_t)2, 64)) == _ctx.bv_val((uint64_t)0, 64)",
+            "z3::shl(_z_len, _ctx.bv_val((uint64_t)2, 64))",
         ),
         ("len == 3", "_s.add(_z_len == _ctx.bv_val((uint64_t)3, 64))"),
         ("len != 3", "_s.add(_z_len != _ctx.bv_val((uint64_t)3, 64))"),
@@ -12438,6 +12521,40 @@ fn real_conditions_still_emit_after_the_bool_position_check() {
         tbir_constraint_snippets(&src)
             .unwrap_or_else(|e| panic!("`keep {c}` must still lower under tbir: {e}"));
     }
+}
+
+#[test]
+fn native_constraint_shifts_use_z3_bitvector_operations_and_lhs_signedness() {
+    let cpp = v1_cpp(
+        r#"transaction ShiftTxn
+    u : uint<64>
+    s : sint<64>
+    count : sint<64>
+end transaction ShiftTxn
+test ShiftTest
+    let dut : Top
+    run
+        let t : ShiftTxn
+        randomize(t) with
+            (t.u << t.count) == 0
+            (t.u >> t.count) == 0
+            (t.s >> t.count) == 0
+        end randomize
+    end run
+end test ShiftTest"#,
+    );
+    assert!(
+        cpp.contains("z3::shl(_z_u, _z_count)"),
+        "left shifts must use the Z3 bit-vector API; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("z3::lshr(_z_u, _z_count)"),
+        "unsigned left operands must use logical right shift even with a signed count; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("z3::ashr(_z_s, _z_count)"),
+        "signed left operands must use arithmetic right shift; got:\n{cpp}"
+    );
 }
 
 /// `a in b` on a scalar lowers to `a == b`, and that `==` is NOT the

@@ -1131,7 +1131,7 @@ fn index_item(
     let construct = item.as_construct();
     let kind = node_kind(item);
     let name = construct.name().name.clone();
-    let node_id = node_id(&kind, &name, &file.display);
+    let node_id = scoped_node_id(&kind, &name, &file.display, stack.last());
     let summary = match item {
         Item::ExternalModule(m) => format!("{} external DUT", m.kind.name),
         _ => format!("{} {name}", construct.kind_label()),
@@ -1160,7 +1160,7 @@ fn index_item(
         label: None,
     });
     if construct.doc().is_some() {
-        let doc_id = format!("doc:{}:{kind}:{name}", file.display);
+        let doc_id = scoped_doc_id(&kind, &name, &file.display, stack.last());
         builder.add_node(NodeRecord {
             id: doc_id.clone(),
             kind: "doc".to_string(),
@@ -2423,6 +2423,20 @@ fn node_id(kind: &str, name: &str, file: &str) -> String {
     format!("{kind}:{file}:{name}")
 }
 
+fn scoped_node_id(kind: &str, name: &str, file: &str, parent: Option<&String>) -> String {
+    match parent {
+        Some(parent) => format!("{kind}:{file}:{parent}:{name}"),
+        None => node_id(kind, name, file),
+    }
+}
+
+fn scoped_doc_id(kind: &str, name: &str, file: &str, parent: Option<&String>) -> String {
+    match parent {
+        Some(parent) => format!("doc:{file}:{kind}:{parent}:{name}"),
+        None => format!("doc:{file}:{kind}:{name}"),
+    }
+}
+
 fn display_path(path: &Path) -> String {
     let cwd = std::env::current_dir().ok();
     if let Some(cwd) = cwd {
@@ -2889,6 +2903,39 @@ mod tests {
         assert_eq!(def.kind, "dut");
         assert!(builder.nodes.contains_key("dut:d.harc:D"));
         assert!(!builder.nodes.contains_key("external_module:d.harc:D"));
+    }
+
+    #[test]
+    fn package_children_keep_distinct_scoped_ast_identity() {
+        let source = "package A\n    struct Data\n        x : uint<8>\n    end struct Data\nend package A\npackage B\n    struct Data\n        y : bool\n    end struct Data\nend package B\n";
+        let ast = parser::parse_source(source).expect("packages parse");
+        let file = ParsedFile {
+            display: "packages.harc".into(),
+            source: source.into(),
+            ast,
+        };
+        let mut builder = GraphBuilder::default();
+        index_ast_file(&mut builder, &file, false);
+
+        let a = "construct:packages.harc:A";
+        let b = "construct:packages.harc:B";
+        let a_data = "construct:packages.harc:construct:packages.harc:A:Data";
+        let b_data = "construct:packages.harc:construct:packages.harc:B:Data";
+        assert!(builder.nodes.contains_key(a));
+        assert!(builder.nodes.contains_key(b));
+        assert!(builder.nodes.contains_key(a_data));
+        assert!(builder.nodes.contains_key(b_data));
+        assert_eq!(builder.nodes.values().filter(|node| node.name == "Data").count(), 2);
+        assert_eq!(builder.nodes[a_data].span.expect("A Data span").line, 2);
+        assert_eq!(builder.nodes[b_data].span.expect("B Data span").line, 7);
+
+        let contains: Vec<_> = builder
+            .edges
+            .values()
+            .filter(|edge| edge.kind == "contains")
+            .collect();
+        assert!(contains.iter().any(|edge| edge.from == a && edge.to == a_data));
+        assert!(contains.iter().any(|edge| edge.from == b && edge.to == b_data));
     }
 
     #[test]

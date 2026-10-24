@@ -5980,14 +5980,13 @@ fn field_bit_width(t: &TypeExpr) -> u32 {
 }
 
 /// Right-aligned bit mask for a `width`-bit field, suitable for emit
-/// as `0x{mask:x}u`. Clamped at 32 bits because Phase 1b fields cap at
-/// register width 32 (mirror is `uint32_t`); wider fields are a
-/// downstream extension along with the wider mirror types.
+/// as `0x{mask:x}u`. Regblock validation accepts fields up to 64 bits,
+/// and mirrors wider than 32 bits use `uint64_t`.
 fn field_mask_literal(width: u32) -> u64 {
-    if width >= 32 {
-        0xFFFFFFFFu64
-    } else {
-        (1u64 << width) - 1
+    match width {
+        0 => 0,
+        1..=63 => (1u64 << width) - 1,
+        _ => u64::MAX,
     }
 }
 

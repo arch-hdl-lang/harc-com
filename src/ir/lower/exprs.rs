@@ -2198,9 +2198,14 @@ impl FuncBuilder<'_> {
                     let src_width = if matches!(kind, WidthCastKind::Sext) {
                         Some(width)
                     } else {
-                        // `Some(0)` (a `uint<0>` receiver) is not usable
-                        // emission metadata — see `infer_expr_width`.
-                        self.infer_expr_width(expr).filter(|w| *w > 0)
+                        // An explicit `as uint<W>` is a carrier relabel,
+                        // not a value-changing zero-extension. Keep its
+                        // source width unknown so TB-IR emits the same
+                        // plain cast shape as native code. A later explicit
+                        // `.zext<N>()` around this cast gets its own source
+                        // width from the AST receiver and normalizes the
+                        // relabelled carrier at that operation boundary.
+                        None
                     };
                     let inner = self.lower_expr(expr)?;
                     if matches!(self.expr_type(&inner), Some(IrType::FixedVec { .. })) {

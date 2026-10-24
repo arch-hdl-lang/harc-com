@@ -1291,17 +1291,24 @@ fn rewrite_stmts_for_impl(
     transactors: &std::collections::HashMap<String, TransactorDecl>,
     regblock_bindings: &std::collections::HashSet<String>,
 ) {
+    // Bindings declared in this statement list shadow testbench fields from
+    // the following statements onward. Keep the scope local to this list so
+    // nested blocks cannot leak their locals into siblings or the parent.
+    let mut visible_shadow = shadow.clone();
     for s in stmts.iter_mut() {
         rewrite_stmt_for_impl(
             s,
             fields,
             methods,
             pointers,
-            shadow,
+            &visible_shadow,
             field_types,
             transactors,
             regblock_bindings,
         );
+        if let StmtKind::Let(l) = &s.kind {
+            visible_shadow.insert(l.name.name.clone());
+        }
     }
 }
 

@@ -31,8 +31,7 @@ fn fn0 run_LogPathsTest [kind=Run, owner=tb0]
     -> WaitCycles(1, b6)
 
   b4:
-    Assign(%i, (%i + 1))
-    -> Jump(b2)
+    -> Branch((%i == 4), b5, b7)
 
   b5:
     Log(info, "PASS: counted to %lld with per-file logging", dut.count_out)
@@ -45,3 +44,7 @@ fn fn0 run_LogPathsTest [kind=Run, owner=tb0]
     AssertCheck { cond: (dut.count_out == %i), on_fail: "cycle %lld: count_out=%lld, expected %lld", %i, dut.count_out, %i }
     Log(file("log_paths.log", info), "cycle %lld: count_out=%lld", %i, dut.count_out)
     -> Jump(b4)
+
+  b7:
+    Assign(%i, (%i + 1))
+    -> Jump(b2)

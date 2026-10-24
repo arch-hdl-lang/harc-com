@@ -213,25 +213,29 @@ int run_TlmTargetThreadIfTest(int argc, char** argv) {
                         break;
                     }
                     case 3: {
-                        i = (i + 1);
-                        __bb = 1;
+                        if ((i == 3)) { __bb = 4; } else { __bb = 5; }
                         break;
                     }
                     case 4: {
                         co_await harc_rt::wait_cycles(_slot, (uint32_t)(1));
-                        __bb = 5;
+                        __bb = 6;
                         break;
                     }
                     case 5: {
-                        if ((addr < 8)) { __bb = 6; } else { __bb = 7; }
+                        i = (i + 1);
+                        __bb = 1;
                         break;
                     }
                     case 6: {
+                        if ((addr < 8)) { __bb = 7; } else { __bb = 8; }
+                        break;
+                    }
+                    case 7: {
                         __ret = (((256 + addr) + req_seq) + target.prep_acc);
                         __done = true;
                         break;
                     }
-                    case 7: {
+                    case 8: {
                         __ret = (((512 + addr) + req_seq) + target.prep_acc);
                         __done = true;
                         break;

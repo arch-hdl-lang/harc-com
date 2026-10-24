@@ -1408,6 +1408,29 @@ fn numeric_range_induction_is_signed() {
 }
 
 #[test]
+fn numeric_range_rejects_unsigned_upper_beyond_signed_carrier() {
+    let src = r#"
+test MixedRange
+    let dut : Top
+    run
+        let lo : sint<64> = 0x7fffffffffffffff
+        let hi : uint<64> = 0xffffffffffffffff
+        for i in lo .. hi
+            log(info, "unreachable ${i}")
+        end for
+    end run
+end test MixedRange
+"#;
+    let program = lower_src(src).expect("dynamic mixed range lowers with a runtime failure guard");
+    assert!(
+        program.functions.iter().flat_map(|f| &f.blocks).any(|b| {
+            b.stmts.iter().any(|stmt| matches!(stmt, ir::Stmt::ErrorIncrement))
+        }),
+        "dynamic mixed range must contain a structured runtime failure"
+    );
+}
+
+#[test]
 fn positive_numeric_range_keeps_unsigned_port_assignment() {
     let src = r#"
 test PositiveRangePort
@@ -21207,13 +21230,14 @@ end test LoopTest
     let prog = lower_src(src).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
     let f = prog.function(prog.tests[0].run);
-    // init block jumps to a header that branches on `i < 4`.
+    // init block jumps to a header that branches on `i <= 4`; the latch also
+    // branches around the increment at the inclusive terminal value.
     let n_branches = f
         .blocks
         .iter()
         .filter(|b| matches!(b.terminator, ir::Terminator::Branch(..)))
         .count();
-    assert_eq!(n_branches, 1, "one loop header:\n{f}");
+    assert_eq!(n_branches, 2, "header plus terminal latch:\n{f}");
     let has_latch = f.blocks.iter().any(|b| {
         matches!(b.terminator, ir::Terminator::Jump(_))
             && b.stmts
