@@ -7,8 +7,8 @@ use crate::ast::{
     Block, Expr as AstExpr, ExprKind, ForStmt, IfStmt, RepeatStmt, WaitTimeout, WaitUntilMode,
 };
 use crate::ir::{
-    BinOp, BlockId, Expr, FmtArg, FmtArgs, IrType, LocalId, PredSrc, Stmt, Terminator, WaitMode,
-    WidthCastKind,
+    BinOp, BlockId, Expr, FmtArg, FmtArgs, IrType, LocalId, PredSrc, Stmt, Terminator, UnOp,
+    WaitMode, WidthCastKind,
 };
 
 impl FuncBuilder<'_> {
@@ -186,7 +186,10 @@ impl FuncBuilder<'_> {
             .map(|value| value.is_negative())
             .unwrap_or(false);
         let unsigned_upper = !upper_is_negative
-            && matches!(self.expr_type(&hi_operand), Some(IrType::UInt(_) | IrType::Unknown));
+            && matches!(
+                self.expr_type(&hi_operand),
+                Some(IrType::UInt(_) | IrType::Unknown)
+            );
         let cond = if signed_range && unsigned_upper {
             // A signed lower bound with a known unsigned upper bound needs
             // two domains: every negative induction value is below the
@@ -209,11 +212,54 @@ impl FuncBuilder<'_> {
             let nonnegative = Expr::Binary(
                 BinOp::Le,
                 Box::new(unsigned_var),
-                Box::new(hi_operand),
+                Box::new(hi_operand.clone()),
             );
             Expr::Binary(BinOp::Or, Box::new(negative), Box::new(nonnegative))
         } else {
-            Expr::Binary(BinOp::Le, Box::new(Expr::Local(var)), Box::new(hi_operand))
+            Expr::Binary(
+                BinOp::Le,
+                Box::new(Expr::Local(var)),
+                Box::new(hi_operand.clone()),
+            )
+        };
+        // Inclusive ranges must leave the loop before incrementing the
+        // terminal value.  Incrementing UINT64_MAX wraps, while incrementing
+        // INT64_MAX is host-language UB.  Mixed signed/unsigned ranges use
+        // the same non-negative domain as the header, so a negative signed
+        // value is never accidentally compared as an unsigned value.
+        let terminal = if signed_range && unsigned_upper {
+            let nonnegative = Expr::Unary(
+                UnOp::Not,
+                Box::new(Expr::Binary(
+                    BinOp::Lt,
+                    Box::new(Expr::Local(var)),
+                    Box::new(Expr::Literal {
+                        value: 0,
+                        ty: IrType::Unknown,
+                    }),
+                )),
+            );
+            let unsigned_var = Expr::WidthCast {
+                inner: Box::new(Expr::Local(var)),
+                kind: WidthCastKind::Zext,
+                width: 64,
+                src_width: None,
+            };
+            Expr::Binary(
+                BinOp::And,
+                Box::new(nonnegative),
+                Box::new(Expr::Binary(
+                    BinOp::Eq,
+                    Box::new(unsigned_var),
+                    Box::new(hi_operand.clone()),
+                )),
+            )
+        } else {
+            Expr::Binary(
+                BinOp::Eq,
+                Box::new(Expr::Local(var)),
+                Box::new(hi_operand.clone()),
+            )
         };
         let step = Stmt::Assign(
             var,
@@ -226,7 +272,7 @@ impl FuncBuilder<'_> {
                 }),
             ),
         );
-        self.lower_counted_loop(cond, step, &f.body)?;
+        self.lower_counted_loop_with_terminal(cond, terminal, step, &f.body)?;
         self.pop_scope();
         Ok(())
     }
@@ -415,7 +461,24 @@ impl FuncBuilder<'_> {
         latch_step: Stmt,
         body: &Block,
     ) -> Result<(), LowerError> {
-        self.lower_counted_loop_impl(header_cond, latch_step, None, None, body)
+        self.lower_counted_loop_impl(header_cond, latch_step, None, None, None, body)
+    }
+
+    fn lower_counted_loop_with_terminal(
+        &mut self,
+        header_cond: Expr,
+        terminal_cond: Expr,
+        latch_step: Stmt,
+        body: &Block,
+    ) -> Result<(), LowerError> {
+        self.lower_counted_loop_impl(
+            header_cond,
+            latch_step,
+            None,
+            None,
+            Some(terminal_cond),
+            body,
+        )
     }
 
     /// `lower_counted_loop` with a prologue statement injected at the top
@@ -438,7 +501,14 @@ impl FuncBuilder<'_> {
         no_write: Option<LocalId>,
         body: &Block,
     ) -> Result<(), LowerError> {
-        self.lower_counted_loop_impl(header_cond, latch_step, Some(prologue), no_write, body)
+        self.lower_counted_loop_impl(
+            header_cond,
+            latch_step,
+            Some(prologue),
+            no_write,
+            None,
+            body,
+        )
     }
 
     fn lower_counted_loop_impl(
@@ -447,6 +517,7 @@ impl FuncBuilder<'_> {
         latch_step: Stmt,
         prologue: Option<Stmt>,
         no_write: Option<LocalId>,
+        terminal_cond: Option<Expr>,
         body: &Block,
     ) -> Result<(), LowerError> {
         let header = self.new_block();
@@ -478,6 +549,11 @@ impl FuncBuilder<'_> {
         self.loop_stack.pop();
 
         self.start_block(latch);
+        if let Some(terminal_cond) = terminal_cond {
+            let step = self.new_block();
+            self.terminate(Terminator::Branch(terminal_cond, exit, step));
+            self.start_block(step);
+        }
         self.push(latch_step);
         self.terminate(Terminator::Jump(header));
 
