@@ -54,6 +54,18 @@ impl SignedWideOpsTest for SignedWideTb
         let big : sint<256> = 0 - (one256 << 200)
         assert big < n else fail("mixed-width signed: very negative < -5")
 
+        // --- mixed signed scalar arithmetic (narrower sign-extends) ---
+        let q65 : sint<65> = -8 / 3
+        let zero100 : sint<100> = 0
+        let one100 : sint<100> = 1
+        assert q65 + zero100 == -2 else fail("mixed-width signed add")
+        assert zero100 + q65 == -2 else fail("mixed-width signed add reversed")
+        assert q65 - zero100 == -2 else fail("mixed-width signed sub")
+        assert zero100 - q65 == 2 else fail("mixed-width signed sub reversed")
+        assert q65 * one100 == -2 else fail("mixed-width signed mul")
+        assert (q65 | zero100) == -2 else fail("mixed-width signed or")
+        assert (q65 ^ zero100) == -2 else fail("mixed-width signed xor")
+
         // --- signed equality with a negative literal (padding-safe) ---
         let e : sint<129> = -4
         assert e == -4 else fail("sint129 == negative literal")

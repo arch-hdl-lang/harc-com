@@ -1182,6 +1182,14 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                     | BinOp::BitOr
                     | BinOp::BitXor
             ) {
+                let signed_wide_arithmetic = a_signed
+                    && b_signed
+                    && expr_binary_operand_width(cx, a)
+                        .max(expr_binary_operand_width(cx, b))
+                        .is_some_and(|width| (65..=128).contains(&width));
+                if signed_wide_arithmetic {
+                    (a_cpp, b_cpp) = coerce_signed_wide_pair(cx, a, b)?;
+                }
                 (a_cpp, b_cpp) = coerce_unsigned_wide_pair(cx, a, b, a_cpp, b_cpp);
             }
             let shift_count = shift_count_cpp(cx, b, &b_cpp, a_width.unwrap_or(64));
@@ -2198,6 +2206,30 @@ fn coerce_unsigned_wide_pair(
             target_width,
         ),
     )
+}
+
+/// Sign-extend signed scalar operands to their common `_harc_u128` width
+/// before native arithmetic. Unlike `HarcWide<N>`, the 65..=128-bit scalar
+/// carrier has no operator overload that can preserve the declared sign bit;
+/// without this normalization a masked negative result from a narrower
+/// signed operation is promoted as a positive `_harc_u128` value.
+fn coerce_signed_wide_pair(
+    cx: &ECx<'_>,
+    lhs: &Expr,
+    rhs: &Expr,
+) -> Result<(String, String), EmitError> {
+    let lhs_width = expr_binary_operand_width(cx, lhs);
+    let rhs_width = expr_binary_operand_width(cx, rhs);
+    let Some(target_width) = lhs_width
+        .max(rhs_width)
+        .filter(|width| (65..=128).contains(width))
+    else {
+        return Ok((expr_cpp(cx, lhs)?, expr_cpp(cx, rhs)?));
+    };
+    Ok((
+        wide_operand_to_width(cx, lhs, lhs_width, target_width)?,
+        wide_operand_to_width(cx, rhs, rhs_width, target_width)?,
+    ))
 }
 
 fn truthy_cpp(cx: &ECx<'_>, expr: &Expr, rendered: String) -> String {
