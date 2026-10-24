@@ -3286,7 +3286,10 @@ impl Emitter {
                     Mul | MulWrap => (" * ", None),
                     Div if signed => (" / ", None),
                     Div => ("", Some("udiv")),
-                    Mod if signed => (" % ", None),
+                    // C++'s z3::expr `%` overload is bvsmod (the sign follows
+                    // the divisor). HARC signed remainder truncates toward
+                    // zero, so use the explicit bvsrem helper instead.
+                    Mod if signed => ("", Some("srem")),
                     Mod => ("", Some("urem")),
                     Eq => (" == ", None),
                     Ne => (" != ", None),

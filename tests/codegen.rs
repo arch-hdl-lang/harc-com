@@ -5632,6 +5632,35 @@ end test SignedKeepTest"#,
 }
 
 #[test]
+fn signed_keep_modulo_uses_bvsrem() {
+    let parsed = parse_source(
+        r#"transaction T
+    a : sint<64>
+    b : sint<64>
+    keep a % b == -2
+end transaction T
+
+test SignedModuloKeepTest
+    let dut : DummyDut
+    run
+        let t : T
+        randomize(t)
+    end run
+end test SignedModuloKeepTest"#,
+    )
+    .unwrap();
+    let cpp = cpp_tb::emit(&parsed).expect("emit");
+    assert!(
+        cpp.contains("z3::srem(_z_a, _z_b)"),
+        "signed modulo constraints must use bvsrem, not z3's bvsmod `%` overload; got:\n{cpp}"
+    );
+    assert!(
+        !cpp.contains("_z_a % _z_b"),
+        "signed modulo constraints must not use z3::expr `%` overload; got:\n{cpp}"
+    );
+}
+
+#[test]
 fn enum_fields_get_solver_domain_constraints() {
     let parsed = parse_source(
         r#"enum Color { RED, GREEN, BLUE }

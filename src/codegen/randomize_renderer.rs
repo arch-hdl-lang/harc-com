@@ -6362,7 +6362,10 @@ impl TbirRandomizeEmitter {
                     Mul | MulWrap => (" * ", None),
                     Div if signed => (" / ", None),
                     Div => ("", Some("udiv")),
-                    Mod if signed => (" % ", None),
+                    // z3::expr `%` is bvsmod (sign follows the divisor),
+                    // while HARC signed `%` truncates toward zero. Use the
+                    // explicit bvsrem helper to preserve the dividend sign.
+                    Mod if signed => ("", Some("srem")),
                     Mod => ("", Some("urem")),
                     Eq => (" == ", None),
                     Ne => (" != ", None),
