@@ -2,7 +2,7 @@
 //! output, and verify both parse trees match structurally. Snapshot the
 //! pretty-printed form for stability.
 
-use harc::ast::{ExprKind, Item, StmtKind};
+use harc::ast::{EdgeMode, ExprKind, Item, StmtKind, TestItem};
 use harc::parser::parse_source;
 use harc::pretty::print;
 
@@ -424,6 +424,52 @@ end test T
         printed.contains("agent Baz\n    watchdog\n    end watchdog"),
         "defaults-only watchdog should round-trip; got:\n{printed}"
     );
+}
+
+#[test]
+fn on_handler_edge_modes_round_trip_after_phase() {
+    let src = r#"
+test T
+    on signal phase post_eval falling
+    end on
+    on signal phase post_eval level
+    end on
+    on signal phase post_eval rising
+    end on
+end test T
+"#;
+    let parsed = parse_source(src).expect("first parse should succeed");
+    let printed = print(&parsed);
+    let reparsed = parse_source(&printed).expect("re-parse of pretty output should succeed");
+
+    let edges = |item: &Item| {
+        let Item::Test(test) = item else {
+            panic!("expected test item");
+        };
+        test.items
+            .iter()
+            .map(|item| {
+                let TestItem::Stmt(stmt) = item else {
+                    panic!("expected statement test item");
+                };
+                let StmtKind::On(handler) = &stmt.kind else {
+                    panic!("expected on-handler statement");
+                };
+                handler.edge
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        edges(&parsed.items[0]),
+        [EdgeMode::Falling, EdgeMode::Level, EdgeMode::Rising]
+    );
+    assert_eq!(
+        edges(&reparsed.items[0]),
+        [EdgeMode::Falling, EdgeMode::Level, EdgeMode::Rising]
+    );
+    assert!(printed.contains("on signal phase post_eval falling"));
+    assert!(printed.contains("on signal phase post_eval level"));
 }
 
 /// `extern function name(params) -> ret` (spec §9) round-trips: no

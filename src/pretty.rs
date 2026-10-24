@@ -755,6 +755,15 @@ fn print_on_handler(out: &mut String, h: &OnHandler, depth: usize) {
     if h.phase == OnPhase::PostEval {
         write!(out, " phase post_eval").ok();
     }
+    match h.edge {
+        EdgeMode::Rising => {}
+        EdgeMode::Falling => {
+            write!(out, " falling").ok();
+        }
+        EdgeMode::Level => {
+            write!(out, " level").ok();
+        }
+    };
     writeln!(out).ok();
     print_block_inner(out, &h.body, depth + 1);
     pad(out, depth);
