@@ -2,6 +2,9 @@
 // pinned to one value, and the shift count is itself symbolic to exercise the
 // generated Z3 operation rather than a literal-only path.
 
+const SHIFT_NEG8 : sint<64> = -8
+const SHIFT_NEG4 : sint<64> = -4
+
 transaction ConstraintShiftBehavior
     left : uint<64>
     logical : uint<64>
@@ -13,8 +16,8 @@ transaction ConstraintShiftBehavior
     keep (left << count) == 4
     keep logical == 0x8000000000000000
     keep (logical >> count) == 0x4000000000000000
-    keep signed_value == -8
-    keep (signed_value >> count) == -4
+    keep signed_value == SHIFT_NEG8
+    keep (signed_value >> count) == SHIFT_NEG4
 end transaction ConstraintShiftBehavior
 
 test ConstraintShiftBehaviorTest
