@@ -9049,6 +9049,88 @@ end test T"#,
 }
 
 #[test]
+fn regblock_frontdoor_write_evaluates_rhs_once_for_mirror_and_bus() {
+    let parsed = parse_source(
+        r#"extern function next_value() -> uint<32>
+
+bus B
+    handshake_channel ch: send kind: valid_ready
+        data: uint<32>;
+    end handshake_channel ch
+end bus B
+
+transactor H bound to B
+end transactor H
+
+regblock R via H width 32
+    register A @ 0x00 access rw
+end regblock R
+
+test T
+    let dut : SomeDut
+    let bus : B = bind dut
+    let helper : H active = bind bus
+    let regs : R = bind helper
+    run
+        regs.A = next_value()
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+    assert_eq!(
+        cpp.matches("::next_value()").count(),
+        1,
+        "RHS must be snapshotted once:\n{cpp}"
+    );
+    assert!(cpp.contains("auto __harc_ral_write_value_"));
+}
+
+#[test]
+fn addrmap_frontdoor_write_evaluates_rhs_once_for_mirror_and_bus() {
+    let parsed = parse_source(
+        r#"extern function next_value() -> uint<32>
+
+bus B
+    handshake_channel ch: send kind: valid_ready
+        data: uint<32>;
+    end handshake_channel ch
+end bus B
+
+transactor H bound to B
+end transactor H
+
+regblock R via H width 32
+    register A @ 0x00 access rw
+end regblock R
+
+addrmap M via H
+    instance r : R @ 0x100
+end addrmap M
+
+test T
+    let dut : SomeDut
+    let bus : B = bind dut
+    let helper : H active = bind bus
+    let chip : M = bind helper
+    run
+        chip.r.A = next_value()
+    end run
+end test T"#,
+    )
+    .unwrap();
+    let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
+    let cpp = cpp_tb::emit(&merged).expect("emit");
+    assert_eq!(
+        cpp.matches("::next_value()").count(),
+        1,
+        "RHS must be snapshotted once:\n{cpp}"
+    );
+    assert!(cpp.contains("auto __harc_ral_write_value_"));
+}
+
+#[test]
 fn regblock_record_write_emits_recursion_guard() {
     // record_write callbacks can re-enter the decode block. The
     // codegen wraps each decode in a per-binding depth counter and

@@ -720,13 +720,22 @@ impl Emitter {
         if let Some((_chip_var, inst_path, helper_var, helper_ty, effective_off, access)) =
             self.resolve_addrmap_register_lookup(target)
         {
+            // Evaluate the RHS exactly once.  Besides extern functions, a
+            // register read here can have bus-visible side effects, so
+            // re-emitting it for the mirror and helper write is incorrect.
+            // Capture before either operation can yield and let the hygienic
+            // name allocator avoid collisions with user declarations.
+            let rhs = self.fresh_internal_name("ral_write_value");
+            write!(self.out, "auto {rhs} = ").ok();
+            self.emit_expr(value);
+            writeln!(self.out, ";").ok();
             // The outer Field's `name` is the register name itself.
             write!(self.out, "{inst_path}.").ok();
             if let ExprKind::Field { name, .. } = &*target.kind {
                 write!(self.out, "{}", name.name).ok();
             }
             write!(self.out, " = ").ok();
-            self.emit_expr(value);
+            write!(self.out, "{rhs}").ok();
             writeln!(self.out, ";").ok();
             if access.writes_to_bus() {
                 self.pad(depth);
@@ -735,7 +744,7 @@ impl Emitter {
                     "{helper_ty}_write({helper_var}, {effective_off}, "
                 )
                 .ok();
-                self.emit_expr(value);
+                write!(self.out, "{rhs}").ok();
                 writeln!(self.out, ");").ok();
             } else {
                 self.pad(depth);
@@ -814,17 +823,23 @@ impl Emitter {
         if let Some((regs_var, helper_var, helper_ty, offset_lit, access)) =
             self.resolve_regblock_field_write(target)
         {
+            // Snapshot side-effecting RHS expressions once before updating
+            // the mirror or yielding to the bus helper.
+            let rhs = self.fresh_internal_name("ral_write_value");
+            write!(self.out, "auto {rhs} = ").ok();
+            self.emit_expr(value);
+            writeln!(self.out, ";").ok();
             write!(self.out, "{regs_var}.").ok();
             if let ExprKind::Field { name, .. } = &*target.kind {
                 write!(self.out, "{}", name.name).ok();
             }
             write!(self.out, " = ").ok();
-            self.emit_expr(value);
+            write!(self.out, "{rhs}").ok();
             writeln!(self.out, ";").ok();
             if access.writes_to_bus() {
                 self.pad(depth);
                 write!(self.out, "{helper_ty}_write({helper_var}, {offset_lit}, ").ok();
-                self.emit_expr(value);
+                write!(self.out, "{rhs}").ok();
                 writeln!(self.out, ");").ok();
             } else {
                 self.pad(depth);
