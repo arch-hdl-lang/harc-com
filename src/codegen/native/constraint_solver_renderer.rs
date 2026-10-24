@@ -2237,10 +2237,20 @@ impl Emitter {
                         })
                 })
                 .or_else(|| {
-                    self.consts.get(&id.name).map(|c| {
-                        if c.signedness == crate::constraints::Signedness::Signed {
+                    self.consts.get(&id.name).map(|c| match c.signedness {
+                        crate::constraints::Signedness::Signed if c.width.is_none() => {
+                            ConstraintOperandSignedness::UntypedLiteral
+                        }
+                        crate::constraints::Signedness::Signed => {
                             ConstraintOperandSignedness::Signed
-                        } else {
+                        }
+                        crate::constraints::Signedness::Unsigned => {
+                            ConstraintOperandSignedness::Unsigned
+                        }
+                        crate::constraints::Signedness::Unknown => {
+                            ConstraintOperandSignedness::UntypedLiteral
+                        }
+                        crate::constraints::Signedness::NotNumeric => {
                             ConstraintOperandSignedness::Unsigned
                         }
                     })
