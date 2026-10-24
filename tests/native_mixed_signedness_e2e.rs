@@ -19,6 +19,7 @@ transaction NarrowMixed
     u : uint<8>
     s : sint<64>
     keep u == MIXED_U8
+    keep u == POSITIVE_UNTYPED
     keep s == -6
     keep s + u == -4
     keep s < u
@@ -27,6 +28,7 @@ transaction NestedMixed
     u : uint<8>
     s : sint<64>
     keep u == MIXED_U8
+    keep u == POSITIVE_UNTYPED
     keep s == -6
     keep s + (u + 0) == -4
     keep s < (1 + 2)
@@ -116,9 +118,17 @@ fn native_negative_untyped_constant_is_not_false_sat() {
         .env("HARC_NO_LEARN", "1")
         .output()
         .expect("run negative constant fixture");
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         !output.status.success(),
-        "negative uint constraint unexpectedly solved: {}",
-        String::from_utf8_lossy(&output.stdout)
+        "negative uint constraint unexpectedly solved: {log}"
+    );
+    assert!(
+        log.contains("UNSAT"),
+        "expected solver UNSAT diagnostic: {log}"
     );
 }
