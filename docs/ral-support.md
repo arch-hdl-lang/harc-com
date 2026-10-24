@@ -169,6 +169,14 @@ end register
 Reset values are part of the decl and form the initial mirror state. Width
 is checked against the declared field type at compile time.
 
+When a register declares both a whole-register `reset` and field resets, the
+whole-register value supplies the baseline for bits without a field reset, and
+each declared field reset overlays its own bit range in source order. A field
+reset therefore takes precedence over the corresponding bits of the
+whole-register reset; omitted field resets contribute zero only when no
+whole-register baseline is present. This same composed value is used by the
+mirror initializer and `reset_all()`.
+
 ### 3.2 Passive record API + per-register write callbacks  *(shipped, Phase 1f)*
 
 The Phase 1a frontdoor (`regs.REG = v` / `let x = regs.REG`) is *active*:

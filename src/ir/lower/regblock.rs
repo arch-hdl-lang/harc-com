@@ -113,6 +113,7 @@ pub(crate) fn lower_regblock(
         // read-modify-write on that cell, mirroring v1's bit-slice
         // extract/insert.
         let mut reg_fields: Vec<RegFieldSchema> = Vec::new();
+        let mut field_reset_overlays: Vec<(u32, u32, u64)> = Vec::new();
         for fld in &reg.fields {
             let fname = &fld.name.name;
             if reg_fields.iter().any(|x| x.name == *fname) {
@@ -138,6 +139,32 @@ pub(crate) fn lower_regblock(
                      exceeds the register width {width}",
                     fld.bit_pos
                 )));
+            }
+            let field_reset = match &fld.reset {
+                None => None,
+                Some(rv) => match &*rv.kind {
+                    ExprKind::Bool(b) => Some(*b as u64),
+                    _ => Some(super::fold_addr_const(
+                        rv,
+                        consts,
+                        &format!(
+                            "reset value on regblock `{name}` register `{rname}` field `{fname}`"
+                        ),
+                    )?),
+                },
+            };
+            if let Some(field_reset) = field_reset {
+                let field_limit = if bit_width == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << bit_width) - 1
+                };
+                if field_reset > field_limit {
+                    return Err(LowerError::Invalid(format!(
+                        "the reset value on regblock `{name}` register `{rname}` field `{fname}` is {field_reset}, which does not fit its {bit_width}-bit width (max {field_limit})"
+                    )));
+                }
+                field_reset_overlays.push((fld.bit_pos, bit_width, field_reset));
             }
             reg_fields.push(RegFieldSchema {
                 name: fname.clone(),
@@ -183,12 +210,29 @@ pub(crate) fn lower_regblock(
                 )));
             }
         }
+        // A register reset supplies the baseline for bits not covered by a
+        // field reset. Field resets then overlay their own masks in source
+        // order, matching the field declaration order used by the decoder.
+        // This keeps the whole-register and field-level reset forms
+        // composable without inventing a second mirror state.
+        let has_explicit_field_reset = !field_reset_overlays.is_empty();
+        let mut mirror_default = reset.unwrap_or(0);
+        for (bit_pos, bit_width, field_reset) in field_reset_overlays {
+            let field_mask = if bit_width == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bit_width) - 1
+            } << bit_pos;
+            mirror_default = (mirror_default & !field_mask)
+                | ((field_reset << bit_pos) & field_mask);
+        }
         let access = lower_access(reg.access);
         fields.push(RecordFieldSchema {
             name: rname.clone(),
             ty: IrType::UInt(Some(width)),
             vec_len: None,
-            default: reset,
+            default: (reset.is_some() || has_explicit_field_reset)
+                .then_some(mirror_default),
             non_random: false,
             attr_src: Vec::new(),
         });

@@ -30438,6 +30438,39 @@ fn regblock_fields_corpus_lowers() {
     );
 }
 
+#[test]
+fn regblock_field_resets_compose_into_mirror_default() {
+    let fixture = fixture("regblock_fields_test.harc");
+    let src = format!(
+        "const MODE_RESET : uint<3> = 1 + 2\n\n{}",
+        fixture
+            .replace(
+                "register DMACR @ 0x00 access rw",
+                "register DMACR @ 0x00 reset 0x8001 access rw",
+            )
+            .replace(
+                "field MODE : uint<3> @ 4  reset 0",
+                "field MODE : uint<3> @ 4  reset MODE_RESET",
+            )
+    );
+    let prog = lower_with_stdlib_bus_src(&src).expect("field resets lower");
+    let record = prog
+        .records
+        .iter()
+        .find(|record| record.name == "DmaRegs")
+        .expect("regblock mirror record");
+    assert_eq!(record.field("DMACR").and_then(|field| field.default), Some(0x8030));
+
+    let too_wide = src.replace("reset MODE_RESET", "reset 8");
+    let error = lower_with_stdlib_bus_src(&too_wide)
+        .expect_err("a field reset wider than its declared type must be rejected");
+    assert!(
+        error.to_string().contains("field `MODE`")
+            && error.to_string().contains("does not fit its 3-bit width"),
+        "unexpected field reset diagnostic: {error}"
+    );
+}
+
 /// The corpus `regblock_addrmap_test` fixture — two `DmaChan` instances
 /// at distinct bases composed by an `addrmap`, accessed 3-level
 /// (`chip.inst.REG`) and 4-level (`chip.inst.REG.FIELD`) — FULLY lowers.
