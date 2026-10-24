@@ -12394,7 +12394,7 @@ fn real_conditions_still_emit_after_the_bool_position_check() {
         ),
         (
             "(len << 2) == 0",
-            "(_z_len << _ctx.bv_val((uint64_t)2, 64)) == _ctx.bv_val((uint64_t)0, 64)",
+            "z3::shl(_z_len, _ctx.bv_val((uint64_t)2, 64))",
         ),
         ("len == 3", "_s.add(_z_len == _ctx.bv_val((uint64_t)3, 64))"),
         ("len != 3", "_s.add(_z_len != _ctx.bv_val((uint64_t)3, 64))"),
@@ -12438,6 +12438,40 @@ fn real_conditions_still_emit_after_the_bool_position_check() {
         tbir_constraint_snippets(&src)
             .unwrap_or_else(|e| panic!("`keep {c}` must still lower under tbir: {e}"));
     }
+}
+
+#[test]
+fn native_constraint_shifts_use_z3_bitvector_operations_and_lhs_signedness() {
+    let cpp = v1_cpp(
+        r#"transaction ShiftTxn
+    u : uint<64>
+    s : sint<64>
+    count : sint<64>
+end transaction ShiftTxn
+test ShiftTest
+    let dut : Top
+    run
+        let t : ShiftTxn
+        randomize(t) with
+            (t.u << t.count) == 0
+            (t.u >> t.count) == 0
+            (t.s >> t.count) == 0
+        end randomize
+    end run
+end test ShiftTest"#,
+    );
+    assert!(
+        cpp.contains("z3::shl(_z_u, _z_count)"),
+        "left shifts must use the Z3 bit-vector API; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("z3::lshr(_z_u, _z_count)"),
+        "unsigned left operands must use logical right shift even with a signed count; got:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("z3::ashr(_z_s, _z_count)"),
+        "signed left operands must use arithmetic right shift; got:\n{cpp}"
+    );
 }
 
 /// `a in b` on a scalar lowers to `a == b`, and that `==` is NOT the
