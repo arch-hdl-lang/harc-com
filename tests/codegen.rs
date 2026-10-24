@@ -8078,10 +8078,11 @@ end impl T"#,
     )
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
-    // Plain `(uint64_t)(...)` widening — no mask, no shift.
+    // Known source widths are normalized before widening so signed carrier
+    // padding cannot leak into a zero-extension.
     assert!(
-        cpp.contains("(uint64_t)(") && !cpp.contains("0xFFFFFFFFULL"),
-        "expected plain widening cast for zext; got:\n{cpp}",
+        cpp.contains("harc_rt::harc_trunc_u128") && cpp.contains(", 8)))"),
+        "expected source-width normalization for zext; got:\n{cpp}",
     );
 }
 

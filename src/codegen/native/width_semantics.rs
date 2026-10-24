@@ -167,9 +167,24 @@ impl Emitter {
                     }
                     write!(self.out, ")").ok();
                 } else {
-                    write!(self.out, "(({c_unsigned})(").ok();
-                    self.emit_expr(target);
-                    write!(self.out, "))").ok();
+                    if let Some(sw) = source_width {
+                        // A scalar carrier can be wider than the logical
+                        // source bit-vector (for example sint<8>(-1) is
+                        // held as int64_t all-ones). Normalize the source
+                        // bits before widening. harc_trunc_u128 handles
+                        // widths through 128 without shift-by-64/128 UB.
+                        write!(
+                            self.out,
+                            "(({c_unsigned})(harc_rt::harc_trunc_u128((_harc_u128)("
+                        )
+                        .ok();
+                        self.emit_expr(target);
+                        write!(self.out, "), {sw})))").ok();
+                    } else {
+                        write!(self.out, "(({c_unsigned})(").ok();
+                        self.emit_expr(target);
+                        write!(self.out, "))").ok();
+                    }
                 }
             }
             "sext" => {

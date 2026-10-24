@@ -1884,9 +1884,19 @@ fn width_cast_cpp(
         }
     };
     let plain_cast = |e: &str| format!("(({c_unsigned})({e}))");
+    // A scalar carrier can be wider than the logical source bit-vector. In
+    // particular, a signed 8-bit -1 is commonly held in int64_t as all ones;
+    // zext must retain only the declared source bits before widening. The
+    // runtime helper masks 1..=128 safely, including the 128-bit boundary.
+    let zext_shape = |e: &str| match src_width {
+        Some(sw) => format!(
+            "(({c_unsigned})(harc_rt::harc_trunc_u128((_harc_u128)({e}), {sw})))"
+        ),
+        None => plain_cast(e),
+    };
     Ok(match kind {
         WidthCastKind::Trunc => trunc_shape(&e),
-        WidthCastKind::Zext => plain_cast(&e),
+        WidthCastKind::Zext => zext_shape(&e),
         WidthCastKind::Sext => match src_width {
             Some(sw) if sw < width => {
                 if width > 64 {
