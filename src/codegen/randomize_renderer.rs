@@ -5335,7 +5335,9 @@ impl TbirRandomizeEmitter {
                 })
                 .or_else(|| {
                     self.consts.get(&id.name).map(|c| match c.signedness {
-                        crate::constraints::Signedness::Signed if c.width.is_none() => {
+                        crate::constraints::Signedness::Signed
+                            if c.width.is_none() && !c.literal.starts_with('-') =>
+                        {
                             ConstraintOperandSignedness::UntypedLiteral
                         }
                         crate::constraints::Signedness::Signed => {

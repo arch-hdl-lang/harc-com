@@ -4,6 +4,8 @@ use std::{fs, path::PathBuf, process::Command};
 
 const TEST: &str = r#"
 const MIXED_U8 : uint<8> = 2
+const POSITIVE_UNTYPED = 2
+const NEGATIVE_UNTYPED = -1
 transaction Mixed64
     u : uint<64>
     s : sint<64>
@@ -38,6 +40,11 @@ transaction ShiftMixed
     keep s == -6
     keep s < (u >> sh)
 end transaction ShiftMixed
+transaction NegativeConstant
+    x : uint<8>
+    keep x == 0
+    keep x < NEGATIVE_UNTYPED
+end transaction NegativeConstant
 test MixedSignedness
     let dut : Top
     run
@@ -83,4 +90,35 @@ fn native_mixed_signedness_solver_controls() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("ALL TESTS PASSED"));
+}
+
+#[test]
+fn native_negative_untyped_constant_is_not_false_sat() {
+    let outdir =
+        std::env::temp_dir().join(format!("harc_native_negative_const_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&outdir);
+    fs::create_dir_all(&outdir).expect("create output directory");
+    let source = outdir.join("negative_const.harc");
+    fs::write(
+        &source,
+        TEST.replace(
+            "let m : Mixed64",
+            "let n : NegativeConstant\n        randomize(n)\n        let m : Mixed64",
+        ),
+    )
+    .expect("write negative constant fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_harc"))
+        .args(["sim", "--sv"])
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/dut/top_counter.sv"))
+        .arg(&source)
+        .args(["--top", "Top", "--jobs", "2", "--outdir"])
+        .arg(&outdir)
+        .env("HARC_NO_LEARN", "1")
+        .output()
+        .expect("run negative constant fixture");
+    assert!(
+        !output.status.success(),
+        "negative uint constraint unexpectedly solved: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
