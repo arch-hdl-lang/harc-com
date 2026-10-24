@@ -29,6 +29,15 @@ transaction NestedMixed
     keep s + (u + 0) == -4
     keep s < (1 + 2)
 end transaction NestedMixed
+transaction ShiftMixed
+    u : uint<8>
+    sh : uint<64>
+    s : sint<64>
+    keep u == 2
+    keep sh == 64
+    keep s == -6
+    keep s < (u >> sh)
+end transaction ShiftMixed
 test MixedSignedness
     let dut : Top
     run
@@ -41,6 +50,9 @@ test MixedSignedness
         let x : NestedMixed
         randomize(x)
         assert x.s == -6 else fail("nested signed promotion")
+        let q : ShiftMixed
+        randomize(q)
+        assert q.s == -6 else fail("shift result width promotion")
     end run
 end test MixedSignedness
 "#;

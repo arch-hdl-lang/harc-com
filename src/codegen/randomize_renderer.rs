@@ -5430,12 +5430,13 @@ impl TbirRandomizeEmitter {
             } else {
                 return false;
             };
-            return self
+            let signed_width = self
                 .constraint_expr_native_width(signed_expr, field_info, target_root)
-                .unwrap_or(0)
-                > self
-                    .constraint_expr_native_width(unsigned_expr, field_info, target_root)
-                    .unwrap_or(u32::MAX);
+                .unwrap_or(0);
+            let unsigned_width = self
+                .constraint_expr_native_width(unsigned_expr, field_info, target_root)
+                .unwrap_or(u32::MAX);
+            return (signed_width < 32 && unsigned_width < 32) || signed_width > unsigned_width;
         }
         l == ConstraintOperandSignedness::Signed || r == ConstraintOperandSignedness::Signed
     }
@@ -5453,6 +5454,11 @@ impl TbirRandomizeEmitter {
             ExprKind::Paren(inner) | ExprKind::Unary { expr: inner, .. } => {
                 self.constraint_expr_native_width(inner, field_info, target_root)
             }
+            ExprKind::Binary {
+                op: BinaryOp::Shl | BinaryOp::Shr,
+                lhs,
+                ..
+            } => self.constraint_expr_native_width(lhs, field_info, target_root),
             ExprKind::Binary { lhs, rhs, .. } => Some(
                 self.constraint_expr_native_width(lhs, field_info, target_root)?
                     .max(self.constraint_expr_native_width(rhs, field_info, target_root)?),
