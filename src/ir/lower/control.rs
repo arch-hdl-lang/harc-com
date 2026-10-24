@@ -7,8 +7,8 @@ use crate::ast::{
     Block, Expr as AstExpr, ExprKind, ForStmt, IfStmt, RepeatStmt, WaitTimeout, WaitUntilMode,
 };
 use crate::ir::{
-    BinOp, BlockId, Expr, FmtArg, FmtArgs, IrType, LocalId, PredSrc, Stmt, Terminator, UnOp,
-    WaitMode, WidthCastKind,
+    BinOp, BlockId, Expr, FmtArg, FmtArgs, IrType, LocalId, LogLevel, PredSrc, Stmt, Terminator,
+    UnOp, WaitMode, WidthCastKind,
 };
 
 impl FuncBuilder<'_> {
@@ -594,6 +594,14 @@ impl FuncBuilder<'_> {
                 self.start_block(check);
                 self.terminate(Terminator::Branch(failure_cond, failure, step));
                 self.start_block(failure);
+                self.push(Stmt::Log {
+                    level: LogLevel::Error,
+                    args: FmtArgs {
+                        fmt: "numeric range upper bound exceeds signed 64-bit induction variable"
+                            .to_string(),
+                        args: Vec::new(),
+                    },
+                });
                 self.push(Stmt::ErrorIncrement);
                 self.terminate(Terminator::Jump(exit));
             }

@@ -72,6 +72,22 @@ impl NumericRangeTest for NumericRangeTb
 end impl NumericRangeTest
 "#;
 
+const BAD_TB: &str = r#"
+testbench MixedRangeTb
+    dut : Top
+end testbench MixedRangeTb
+
+impl MixedRangeTest for MixedRangeTb
+    run
+        let lo : sint<64> = 0x7fffffffffffffff
+        let hi : uint<64> = 0xffffffffffffffff
+        for i in lo .. hi
+            log(info, "body=${i}")
+        end for
+    end run
+end impl MixedRangeTest
+"#;
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -106,5 +122,37 @@ fn native_numeric_range_terminal_values_execute_once() {
         String::from_utf8_lossy(&output.stdout).contains("ALL TESTS PASSED"),
         "native numeric range fixture did not report success:\n{}",
         String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn native_mixed_range_reports_carrier_failure() {
+    let outdir = std::env::temp_dir().join(format!(
+        "harc_native_mixed_range_e2e_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&outdir);
+    std::fs::create_dir_all(&outdir).expect("create output directory");
+    let source = outdir.join("mixed_range.harc");
+    std::fs::write(&source, BAD_TB).expect("write mixed range fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_harc"))
+        .args(["sim", "--sv"])
+        .arg(repo_root().join("tests/dut/top_counter.sv"))
+        .arg(&source)
+        .args(["--top", "Top", "--outdir"])
+        .arg(&outdir)
+        .args(["--jobs", "2"])
+        .env("HARC_NO_LEARN", "1")
+        .output()
+        .expect("run mixed range fixture");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "mixed range unexpectedly passed:\n{log}");
+    assert!(
+        log.contains("numeric range upper bound exceeds signed 64-bit induction variable"),
+        "missing mixed range diagnostic:\n{log}"
     );
 }
