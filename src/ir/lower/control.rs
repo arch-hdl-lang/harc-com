@@ -182,11 +182,11 @@ impl FuncBuilder<'_> {
         // path below keeps its `i < seq.size()` half-open counter — that
         // iterates the element indices `0 … size-1`, unrelated to the
         // user-facing numeric range.)
-        let unsigned_upper = matches!(
-            hi_operand,
-            Expr::Local(local)
-                if matches!(self.local_type(local), IrType::UInt(_) | IrType::Unknown)
-        );
+        let upper_is_negative = super::fold_const(hi, &self.ctx.consts, "")
+            .map(|value| value.is_negative())
+            .unwrap_or(false);
+        let unsigned_upper = !upper_is_negative
+            && matches!(self.expr_type(&hi_operand), Some(IrType::UInt(_) | IrType::Unknown));
         let cond = if signed_range && unsigned_upper {
             // A signed lower bound with a known unsigned upper bound needs
             // two domains: every negative induction value is below the

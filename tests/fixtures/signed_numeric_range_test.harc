@@ -1,3 +1,5 @@
+const MIXED_CONST_UPPER : uint<8> = 2
+
 test SignedNumericRange
     let dut : Top
     run
@@ -51,5 +53,14 @@ test SignedNumericRange
         end for
         assert untyped_count == 5 else fail("untyped count ${untyped_count}")
         assert untyped_sum == 0 else fail("untyped sum ${untyped_sum}")
+
+        let const_count : sint<64> = 0
+        let const_sum : sint<64> = 0
+        for i in -2 .. MIXED_CONST_UPPER
+            const_count = const_count + 1
+            const_sum = const_sum + i
+        end for
+        assert const_count == 5 else fail("const count ${const_count}")
+        assert const_sum == 0 else fail("const sum ${const_sum}")
     end run
 end test SignedNumericRange
