@@ -1408,6 +1408,29 @@ fn numeric_range_induction_is_signed() {
 }
 
 #[test]
+fn numeric_range_rejects_unsigned_upper_beyond_signed_carrier() {
+    let src = r#"
+test MixedRange
+    let dut : Top
+    run
+        let lo : sint<64> = 0x7fffffffffffffff
+        let hi : uint<64> = 0xffffffffffffffff
+        for i in lo .. hi
+            log(info, "unreachable ${i}")
+        end for
+    end run
+end test MixedRange
+"#;
+    let program = lower_src(src).expect("dynamic mixed range lowers with a runtime failure guard");
+    assert!(
+        program.functions.iter().flat_map(|f| &f.blocks).any(|b| {
+            b.stmts.iter().any(|stmt| matches!(stmt, ir::Stmt::ErrorIncrement))
+        }),
+        "dynamic mixed range must contain a structured runtime failure"
+    );
+}
+
+#[test]
 fn positive_numeric_range_keeps_unsigned_port_assignment() {
     let src = r#"
 test PositiveRangePort

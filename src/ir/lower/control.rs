@@ -151,6 +151,15 @@ impl FuncBuilder<'_> {
         let hi_ir = self.lower_expr_no_ports(hi)?;
         self.validate_numeric_expr(&hi_ir, "range upper bound")?;
         let signed_range = lo_signed || self.range_bound_requires_signed(hi, &hi_ir);
+        if signed_range
+            && super::fold_const(hi, &self.ctx.consts, "")
+                .is_ok_and(|value| !value.signed && value.bits > i64::MAX as u64)
+        {
+            return Err(LowerError::Invalid(
+                "numeric range upper bound exceeds the signed 64-bit induction variable "
+                    .to_string(),
+            ));
+        }
         // Keep positive ranges' historical unsigned induction type for
         // assignments to unsigned DUT ports. Signedness is required only
         // when a bound is signed or syntactically carries negative values.
@@ -222,6 +231,29 @@ impl FuncBuilder<'_> {
                 Box::new(hi_operand.clone()),
             )
         };
+        let carrier_overflow = if signed_range && unsigned_upper {
+            Some(Expr::Binary(
+                BinOp::And,
+                Box::new(Expr::Unary(
+                    UnOp::Not,
+                    Box::new(Expr::Binary(
+                        BinOp::Lt,
+                        Box::new(Expr::Local(var)),
+                        Box::new(Expr::Literal { value: 0, ty: IrType::Unknown }),
+                    )),
+                )),
+                Box::new(Expr::Binary(
+                    BinOp::Eq,
+                    Box::new(Expr::Local(var)),
+                    Box::new(Expr::Literal {
+                        value: i64::MAX as u64,
+                        ty: IrType::SInt(Some(64)),
+                    }),
+                )),
+            ))
+        } else {
+            None
+        };
         // Inclusive ranges must leave the loop before incrementing the
         // terminal value.  Incrementing UINT64_MAX wraps, while incrementing
         // INT64_MAX is host-language UB.  Mixed signed/unsigned ranges use
@@ -245,28 +277,15 @@ impl FuncBuilder<'_> {
                 width: 64,
                 src_width: None,
             };
-            // A signed 64-bit induction variable cannot represent the
-            // unsigned values above INT64_MAX.  Stop at its carrier maximum
-            // rather than incrementing into signed host-language overflow;
-            // this is the maximal representable prefix of the mixed-domain
-            // range and keeps the existing negative/unsigned header test.
-            let reaches_upper = Expr::Binary(
-                BinOp::Or,
+            Expr::Binary(
+                BinOp::And,
+                Box::new(nonnegative),
                 Box::new(Expr::Binary(
                     BinOp::Eq,
                     Box::new(unsigned_var),
                     Box::new(hi_operand.clone()),
                 )),
-                Box::new(Expr::Binary(
-                    BinOp::Eq,
-                    Box::new(Expr::Local(var)),
-                    Box::new(Expr::Literal {
-                        value: i64::MAX as u64,
-                        ty: IrType::SInt(Some(64)),
-                    }),
-                )),
-            );
-            Expr::Binary(BinOp::And, Box::new(nonnegative), Box::new(reaches_upper))
+            )
         } else {
             Expr::Binary(
                 BinOp::Eq,
@@ -285,7 +304,7 @@ impl FuncBuilder<'_> {
                 }),
             ),
         );
-        self.lower_counted_loop_with_terminal(cond, terminal, step, &f.body)?;
+        self.lower_counted_loop_with_terminal(cond, terminal, carrier_overflow, step, &f.body)?;
         self.pop_scope();
         Ok(())
     }
@@ -474,13 +493,14 @@ impl FuncBuilder<'_> {
         latch_step: Stmt,
         body: &Block,
     ) -> Result<(), LowerError> {
-        self.lower_counted_loop_impl(header_cond, latch_step, None, None, None, body)
+        self.lower_counted_loop_impl(header_cond, latch_step, None, None, None, None, body)
     }
 
     fn lower_counted_loop_with_terminal(
         &mut self,
         header_cond: Expr,
         terminal_cond: Expr,
+        failure_cond: Option<Expr>,
         latch_step: Stmt,
         body: &Block,
     ) -> Result<(), LowerError> {
@@ -490,6 +510,7 @@ impl FuncBuilder<'_> {
             None,
             None,
             Some(terminal_cond),
+            failure_cond,
             body,
         )
     }
@@ -520,6 +541,7 @@ impl FuncBuilder<'_> {
             Some(prologue),
             no_write,
             None,
+            None,
             body,
         )
     }
@@ -531,6 +553,7 @@ impl FuncBuilder<'_> {
         prologue: Option<Stmt>,
         no_write: Option<LocalId>,
         terminal_cond: Option<Expr>,
+        failure_cond: Option<Expr>,
         body: &Block,
     ) -> Result<(), LowerError> {
         let header = self.new_block();
@@ -564,7 +587,16 @@ impl FuncBuilder<'_> {
         self.start_block(latch);
         if let Some(terminal_cond) = terminal_cond {
             let step = self.new_block();
-            self.terminate(Terminator::Branch(terminal_cond, exit, step));
+            let check = failure_cond.is_some().then(|| self.new_block());
+            let failure = failure_cond.as_ref().map(|_| self.new_block());
+            self.terminate(Terminator::Branch(terminal_cond, exit, check.unwrap_or(step)));
+            if let (Some(failure_cond), Some(check), Some(failure)) = (failure_cond, check, failure) {
+                self.start_block(check);
+                self.terminate(Terminator::Branch(failure_cond, failure, step));
+                self.start_block(failure);
+                self.push(Stmt::ErrorIncrement);
+                self.terminate(Terminator::Jump(exit));
+            }
             self.start_block(step);
         }
         self.push(latch_step);
