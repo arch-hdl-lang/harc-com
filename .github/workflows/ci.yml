@@ -54,6 +54,19 @@ jobs:
         run: cargo test --release
         env:
           HARC_REQUIRE_VERILATOR: "1"
+          HARC_CONFORMANCE_OUT: target/conformance
+
+      - name: Preserve arithmetic and solver conformance failures
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: arithmetic-solver-conformance
+          path: |
+            target/conformance/**
+            !target/conformance/**/obj_dir/**
+            !target/conformance/**/core*
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Set up Python for MCP smoke
         uses: actions/setup-python@v6
