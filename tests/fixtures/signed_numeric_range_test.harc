@@ -33,10 +33,23 @@ test SignedNumericRange
         assert dynamic_sum == -9 else fail("dynamic sum ${dynamic_sum}")
 
         let unsigned_upper : uint<8> = 2
+        let mixed_count : sint<64> = 0
         let mixed_sum : sint<64> = 0
         for i in -2 .. unsigned_upper
+            mixed_count = mixed_count + 1
             mixed_sum = mixed_sum + i
         end for
+        assert mixed_count == 5 else fail("mixed count ${mixed_count}")
         assert mixed_sum == 0 else fail("mixed sum ${mixed_sum}")
+
+        let untyped_upper = 2
+        let untyped_count : sint<64> = 0
+        let untyped_sum : sint<64> = 0
+        for i in -2 .. untyped_upper
+            untyped_count = untyped_count + 1
+            untyped_sum = untyped_sum + i
+        end for
+        assert untyped_count == 5 else fail("untyped count ${untyped_count}")
+        assert untyped_sum == 0 else fail("untyped sum ${untyped_sum}")
     end run
 end test SignedNumericRange
