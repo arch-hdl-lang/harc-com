@@ -1,0 +1,22 @@
+// Narrow native-v1 regression for signed scalar ordering above 64 bits.
+// The same source must pass under both the legacy v1 and default TB-IR paths.
+test SignedWideOrderingV1
+    let dut : Top
+    run
+        let neg65 : sint<65> = -8
+        let pos65 : sint<65> = 3
+        assert neg65 < pos65 else fail("65-bit signed less-than")
+        assert neg65 <= pos65 else fail("65-bit signed less-equal")
+        assert pos65 > neg65 else fail("65-bit signed greater-than")
+        assert pos65 >= neg65 else fail("65-bit signed greater-equal")
+        assert neg65 <= neg65 else fail("65-bit signed equality boundary")
+
+        let neg128 : sint<128> = -8
+        let pos128 : sint<128> = 3
+        assert neg128 < pos128 else fail("128-bit signed less-than")
+        assert neg128 <= pos128 else fail("128-bit signed less-equal")
+        assert pos128 > neg128 else fail("128-bit signed greater-than")
+        assert pos128 >= neg128 else fail("128-bit signed greater-equal")
+        assert pos128 >= pos128 else fail("128-bit signed equality boundary")
+    end run
+end test SignedWideOrderingV1
