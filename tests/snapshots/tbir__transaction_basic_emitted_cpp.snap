@@ -248,9 +248,9 @@ int run_TransactionBasicTest(int argc, char** argv) {
         _tb.dut = dut;
         { // run_TransactionBasicTest (TB-IR loop-switch)
             uint64_t total = 0; (void)total;
-            int64_t i = 0; (void)i;
+            uint64_t i = 0; (void)i;
             CountCmd cmd{}; (void)cmd;
-            int64_t _anon = 0; (void)_anon;
+            uint64_t _anon = 0; (void)_anon;
             uint64_t __t0 = 0; (void)__t0;
             uint64_t got = 0; (void)got;
             CountCmd final_cmd{}; (void)final_cmd;

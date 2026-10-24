@@ -10,10 +10,10 @@ fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
   locals:
     %0 one : uint<256>
     %1 total : unknown
-    %2 i : sint
-    %3 bump : sint
+    %2 i : unknown
+    %3 bump : unknown
     %4 queued : uint<32>
-    %5 _anon : sint
+    %5 _anon : unknown
     %6 want : uint<32>
     %7 got : unknown
   entry = b0

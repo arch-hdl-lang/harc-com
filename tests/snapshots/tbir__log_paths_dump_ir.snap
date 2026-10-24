@@ -8,7 +8,7 @@ tb-ir program
 
 fn fn0 run_LogPathsTest [kind=Run, owner=tb0]
   locals:
-    %0 i : sint
+    %0 i : unknown
   entry = b0
 
   b0:

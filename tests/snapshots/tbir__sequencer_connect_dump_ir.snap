@@ -22,8 +22,8 @@ fn fn0 comp_method_0 [kind=ComponentMethod(c0)]
     n : uint<8>
   locals:
     %0 n : uint<8>
-    %1 i : sint
-    %2 __t0 : uint<8>
+    %1 i : unknown
+    %2 __t0 : unknown
   entry = b0
 
   b0:

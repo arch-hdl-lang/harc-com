@@ -34,7 +34,7 @@ impl SinglePortRamTest for SinglePortRamTb
 
         // Write 8 values: addr i -> (i*7+3) & 0xFF.
         for i in 0 .. 7
-            ram_write(dut, i as uint<8>, ((i * 7 + 3) & 255) as uint<8>)
+            ram_write(dut, i, (i * 7 + 3) & 255)
         end for
         dut.access_en = 0
         dut.access_wen = 0
@@ -42,7 +42,7 @@ impl SinglePortRamTest for SinglePortRamTb
 
         // Read them back.
         for i in 0 .. 7
-            let got = ram_read(dut, i as uint<8>)
+            let got = ram_read(dut, i)
             let expected = (i * 7 + 3) & 255
             assert got == expected
                 else fail("read addr ${i}: got=${got} expected=${expected}")

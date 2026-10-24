@@ -291,7 +291,7 @@ int run_WatchdogQuiesceTest(int argc, char** argv) {
     auto _run_slot_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
         _tb.dut = dut;
         { // run_WatchdogQuiesceTest (TB-IR loop-switch)
-            int64_t i = 0; (void)i;
+            uint64_t i = 0; (void)i;
             TinyTxn t{}; (void)t;
             uint64_t __t0 = 0; (void)__t0;
             int __bb = 0;

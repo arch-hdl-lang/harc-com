@@ -35,9 +35,9 @@ impl VecLaneVarIndexTest for VecLaneVarIndexTb
         // per-lane addressing bug shows up as a wrong read-back.
         for i in 0 .. 2
             dut.lane_valid_in[i] = i & 1
-            dut.lane_id_in[i]    = (i + 1) as uint<5>
-            dut.lane_data_in[i]  = (0x10 + i) as uint<32>
-            dut.pass_uvec_in[i]  = (0x20 + i) as uint<8>
+            dut.lane_id_in[i]    = i + 1
+            dut.lane_data_in[i]  = 0x10 + i
+            dut.pass_uvec_in[i]  = 0x20 + i
         end for
 
         wait 1 cycle

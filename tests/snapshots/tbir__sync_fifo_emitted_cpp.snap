@@ -239,9 +239,9 @@ int run_SyncFifoTest(int argc, char** argv) {
     auto _run_slot_lambda = [&](harc_rt::ThreadSlot* _slot) -> harc_rt::HarcThread {
         _tb.dut = dut;
         { // run_SyncFifoTest (TB-IR loop-switch)
-            int64_t i = 0; (void)i;
-            int64_t i_2 = 0; (void)i_2;
-            int64_t expected = 0; (void)expected;
+            uint64_t i = 0; (void)i;
+            uint64_t i_2 = 0; (void)i_2;
+            uint64_t expected = 0; (void)expected;
             int __bb = 0;
             bool __done = false;
             while (!__done) {
@@ -276,7 +276,7 @@ int run_SyncFifoTest(int argc, char** argv) {
                 }
                 case 3: {
                     harc_rt::harc_assign(dut->push_valid, 1);
-                    harc_rt::harc_assign(dut->push_data, ((uint64_t)((i + 1))));
+                    harc_rt::harc_assign(dut->push_data, (i + 1));
                     harc_rt::harc_assign(dut->pop_ready, 0);
                     if (!((harc_rt::harc_read(dut->push_ready) == 1))) {
                         sim_log_line("FAIL", "FIFO unexpectedly full at push %lld", harc_rt::harc_printf_ll(i));

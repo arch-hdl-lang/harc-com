@@ -190,7 +190,7 @@ int run_TlmTargetThreadIfTest(int argc, char** argv) {
             { // TlmMemTarget_target_read (TB-IR responder loop-switch)
                 uint64_t __ret = 0; (void)__ret;
                 uint64_t req_seq = 0; (void)req_seq;
-                int64_t i = 0; (void)i;
+                uint64_t i = 0; (void)i;
                 int __bb = 0;
                 bool __done = false;
                 while (!__done) {

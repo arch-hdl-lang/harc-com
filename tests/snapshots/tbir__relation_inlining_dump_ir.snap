@@ -11,7 +11,7 @@ tb-ir program
 
 fn fn0 run_RelationInliningTest [kind=Run, owner=tb0]
   locals:
-    %0 i : sint
+    %0 i : unknown
     %1 r : record(r0)
   entry = b0
 

@@ -225,10 +225,10 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
         { // run_ScoreboardBasicTest (TB-IR loop-switch)
             harc_rt::HarcWide<8> one = 0; (void)one;
             uint64_t total = 0; (void)total;
-            int64_t i = 0; (void)i;
-            int64_t bump = 0; (void)bump;
+            uint64_t i = 0; (void)i;
+            uint64_t bump = 0; (void)bump;
             uint64_t queued = 0; (void)queued;
-            int64_t _anon = 0; (void)_anon;
+            uint64_t _anon = 0; (void)_anon;
             uint64_t want = 0; (void)want;
             uint64_t got = 0; (void)got;
             int __bb = 0;

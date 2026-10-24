@@ -39,7 +39,7 @@ impl SyncFifoTest for SyncFifoTb
         // Push 16 items (fill to capacity).
         for i in 0 .. 15
             dut.push_valid = 1
-            dut.push_data = (i + 1) as uint<8>
+            dut.push_data = i + 1
             dut.pop_ready = 0
             assert dut.push_ready == 1
                 else fail("FIFO unexpectedly full at push ${i}")
