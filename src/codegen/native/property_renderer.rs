@@ -397,7 +397,7 @@ impl Emitter {
         // Update delay slots from current values for next-cycle reads.
         for (i, _t) in temporals.iter().enumerate() {
             self.pad(depth + 1);
-            writeln!(self.out, "{tag}_ps{i} = {tag}_cur{i};").ok();
+            writeln!(self.out, "{} = {tag}_cur{i};", ps_cells[i]).ok();
         }
         // Clear substitutions so they don't leak into other emissions.
         self.prop_subs.clear();
