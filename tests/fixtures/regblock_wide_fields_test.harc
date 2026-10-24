@@ -1,0 +1,80 @@
+// Passive regblock mirror regression for field masks wider than 32 bits.
+// The helper stays 32-bit because all accesses below are mirror-only WO
+// fields; record_write and field assignment must still preserve 64-bit data.
+
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            bus.aw.addr = addr
+            bus.aw.valid = 1
+            bus.w.send(data, 15)
+            bus.aw.valid = 0
+            wait 1 cycle
+        end write
+
+        hookable read(addr: uint<8>) -> uint<32>
+            bus.ar.addr = addr
+            bus.ar.valid = 1
+            let r = bus.r.recv()
+            bus.ar.valid = 0
+            wait 1 cycle
+            return r.data
+        end read
+    end when
+end transactor AxilHelper
+
+regblock WideRegs via AxilHelper width 64
+    register W31 @ 0x00 access wo
+        field DATA : uint<31> @ 0 access wo
+    end register W31
+    register W32 @ 0x04 access wo
+        field DATA : uint<32> @ 0 access wo
+    end register W32
+    register W33 @ 0x08 access wo
+        field DATA : uint<33> @ 0 access wo
+    end register W33
+    register W40_OFFSET @ 0x0c access wo
+        field DATA : uint<40> @ 24 access wo
+    end register W40_OFFSET
+    register W63 @ 0x10 access wo
+        field DATA : uint<63> @ 0 access wo
+    end register W63
+    register W64 @ 0x14 access wo
+        field DATA : uint<64> @ 0 access wo
+    end register W64
+end regblock WideRegs
+
+testbench WideFieldsTb
+    dut : AxiLiteRegs
+end testbench WideFieldsTb
+
+impl WideFieldsTest for WideFieldsTb
+    let axil   : BusAxiLite = bind dut
+    let helper : AxilHelper active = bind axil
+    let regs   : WideRegs = bind helper
+
+    run
+        regs.record_write(0x00, 0x3456789a)
+        assert regs.W31.DATA == 0x3456789a else fail("31-bit field got ${regs.W31.DATA:x}")
+
+        regs.record_write(0x04, 0x12345678)
+        assert regs.W32.DATA == 0x12345678 else fail("32-bit field got ${regs.W32.DATA:x}")
+
+        regs.record_write(0x08, 0x1_23456789)
+        assert regs.W33.DATA == 0x1_23456789 else fail("33-bit field got ${regs.W33.DATA:x}")
+
+        regs.record_write(0x0c, 0xabcdef0123000000)
+        assert regs.W40_OFFSET.DATA == 0xabcdef0123 else fail("offset 40-bit field got ${regs.W40_OFFSET.DATA:x}")
+
+        regs.record_write(0x10, 0x7fff_ffff_ffff_ffff)
+        assert regs.W63.DATA == 0x7fff_ffff_ffff_ffff else fail("63-bit field got ${regs.W63.DATA:x}")
+
+        regs.record_write(0x14, 0xffff_ffff_ffff_ffff)
+        assert regs.W64.DATA == 0xffff_ffff_ffff_ffff else fail("64-bit field got ${regs.W64.DATA:x}")
+
+        // record_write is the passive mirror write API; the field reads above
+        // verify that the full-width write survives extraction.
+    end run
+end impl WideFieldsTest
