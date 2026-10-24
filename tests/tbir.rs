@@ -1393,6 +1393,12 @@ fn numeric_range_induction_is_signed() {
         .find(|local| local.name.starts_with("__t"))
         .expect("cached negative upper bound local");
     assert_eq!(cached_bound.ty, ir::IrType::SInt(None));
+    let positive_induction = function
+        .locals
+        .iter()
+        .find(|local| local.name == "i_3")
+        .expect("positive numeric range induction local");
+    assert_eq!(positive_induction.ty, ir::IrType::Unknown);
 }
 
 #[test]

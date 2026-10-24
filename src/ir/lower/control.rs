@@ -142,16 +142,20 @@ impl FuncBuilder<'_> {
         // Loop counter init — evaluated once, outside the loop.
         let lo_ir = self.lower_expr_no_ports(lo)?;
         self.validate_numeric_expr(&lo_ir, "range lower bound")?;
+        let lo_signed = self.range_bound_requires_signed(lo, &lo_ir);
         let var = self.declare(&f.var.name);
-        // Numeric ranges use v1's signed int64_t induction variable. Keep
-        // that signedness in TB-IR so a negative lower bound is compared as
-        // a negative value rather than wrapping through uint64_t.
-        self.set_local_type(var, IrType::SInt(None));
-        self.push(Stmt::Assign(var, lo_ir));
         // Upper bound — evaluated once; stash non-trivial expressions
         // in a synthesized local so the header re-reads a pure value.
         let hi_ir = self.lower_expr_no_ports(hi)?;
         self.validate_numeric_expr(&hi_ir, "range upper bound")?;
+        let signed_range = lo_signed || self.range_bound_requires_signed(hi, &hi_ir);
+        // Keep positive ranges' historical unsigned induction type for
+        // assignments to unsigned DUT ports. Signedness is required only
+        // when a bound is signed or syntactically carries negative values.
+        if signed_range {
+            self.set_local_type(var, IrType::SInt(None));
+        }
+        self.push(Stmt::Assign(var, lo_ir));
         // The loop counter is a `uint64_t`, so a bound wider than 64
         // bits reaches the header through `HarcWide`'s implicit
         // conversion and the loop runs over its low 64 bits. That is a
@@ -163,7 +167,12 @@ impl FuncBuilder<'_> {
         // TB-IR lower LESS than v1 rather than more (harc#662). A
         // `for` loop must not differ from `for i in 0 .. 3` in whether
         // it compiles because someone widened the bound's type.
-        let hi_operand = self.stash_if_impure_with_fallback(hi_ir, IrType::SInt(None));
+        let fallback = if signed_range {
+            IrType::SInt(None)
+        } else {
+            IrType::Unknown
+        };
+        let hi_operand = self.stash_if_impure_with_fallback(hi_ir, fallback);
 
         // `for i in lo .. hi` is INCLUSIVE of `hi` (`lo, lo+1, …, hi`),
         // matching ARCH's `lo..hi` range semantics so the two co-authored
@@ -943,6 +952,11 @@ impl FuncBuilder<'_> {
         self.stash_if_impure_with_fallback(e, IrType::Unknown)
     }
 
+    fn range_bound_requires_signed(&self, source: &AstExpr, lowered: &Expr) -> bool {
+        matches!(self.expr_type(lowered), Some(IrType::SInt(_)))
+            || ast_expr_may_be_negative(source)
+    }
+
     /// Stash a non-trivial expression while preserving its known type. A
     /// numeric range supplies signedness for an otherwise unknown bound so a
     /// cached negative upper bound cannot become an unsigned `uint64_t`.
@@ -960,5 +974,29 @@ impl FuncBuilder<'_> {
                 Expr::Local(t)
             }
         }
+    }
+}
+
+fn ast_expr_may_be_negative(e: &AstExpr) -> bool {
+    match &*e.kind {
+        ExprKind::Paren(inner) => ast_expr_may_be_negative(inner),
+        ExprKind::Unary {
+            op: crate::ast::UnaryOp::Neg,
+            ..
+        } => true,
+        ExprKind::Binary {
+            op: crate::ast::BinaryOp::Sub,
+            lhs,
+            rhs,
+        } => match (&*lhs.kind, &*rhs.kind) {
+            (ExprKind::Int(a), ExprKind::Int(b)) => {
+                match (super::exprs::parse_int_literal(a), super::exprs::parse_int_literal(b)) {
+                    (Some(a), Some(b)) => a < b,
+                    _ => false,
+                }
+            }
+            _ => false,
+        },
+        _ => false,
     }
 }
