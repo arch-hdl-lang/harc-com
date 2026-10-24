@@ -1,0 +1,79 @@
+const FIELD_RESET : uint<3> = 1 + 2
+const REG_RESET : uint<32> = 1 << 7
+// Field reset values initialize the passive mirror and are restored by reset_all.
+
+domain SysDomain
+  freq_mhz: 100
+end domain SysDomain
+
+transactor RegHelper
+    dut : Top
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            dut.en = 1
+        end write
+
+        hookable read(addr: uint<8>) -> uint<32>
+            dut.en = 0
+            return addr
+        end read
+    end when
+end transactor RegHelper
+
+regblock DmaRegs via RegHelper width 32
+    register CMD @ 0x20 access wo
+        field MODE : uint<3> @ 4 reset 3 access wo
+        field CHAN : uint<4> @ 8 reset 5 access wo
+        field ZERO : uint<2> @ 2 reset 0 access wo
+        field DEFAULT : uint<2> @ 0 access wo
+    end register CMD
+    register CONST @ 0x24 access wo
+        field MODE : uint<3> @ 4 reset FIELD_RESET access wo
+    end register CONST
+    register ZERO @ 0x28 access wo
+        field ZERO : uint<2> @ 2 reset 0 access wo
+        field DEFAULT : uint<2> @ 0 access wo
+    end register ZERO
+    register WHOLE @ 0x2c reset REG_RESET access wo
+end regblock DmaRegs
+
+testbench RegblockTb
+    dut : Top
+end testbench RegblockTb
+
+impl RegblockSubsetTest for RegblockTb
+    clock clk = SysDomain
+    let h    : RegHelper active
+    let regs : DmaRegs = bind h
+
+    run
+        h.dut = dut
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        let initial = regs.record_read(0x20)
+        let folded = regs.record_read(0x24)
+        let zero = regs.record_read(0x28)
+        let whole = regs.record_read(0x2c)
+        assert initial == 1328 else fail("composed initial=${initial}, expected 1328")
+        assert folded == 48 else fail("const initial=${folded}, expected 48")
+        assert zero == 0 else fail("zero/default initial=${zero}, expected 0")
+        assert whole == 128 else fail("register const initial=${whole}, expected 128")
+        regs.record_write(0x20, 0xffffffff)
+        regs.record_write(0x24, 0xffffffff)
+        regs.record_write(0x28, 0xffffffff)
+        regs.record_write(0x2c, 0xffffffff)
+        regs.reset_all()
+        let restored = regs.record_read(0x20)
+        let restored_folded = regs.record_read(0x24)
+        let restored_zero = regs.record_read(0x28)
+        let restored_whole = regs.record_read(0x2c)
+        assert restored == 1328 else fail("composed reset_all=${restored}, expected 1328")
+        assert restored_folded == 48 else fail("const reset_all=${restored_folded}, expected 48")
+        assert restored_zero == 0 else fail("zero/default reset_all=${restored_zero}, expected 0")
+        assert restored_whole == 128 else fail("register const reset_all=${restored_whole}, expected 128")
+    end run
+end impl RegblockSubsetTest

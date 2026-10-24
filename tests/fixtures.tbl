@@ -211,3 +211,4 @@ enum_variant_scope_test | Top            | top_counter.sv         |
 
 randomize_range_preference_test | Top | top_counter.sv | | |
 randomize_range_boundary_test | Top | top_counter.sv | | |
+regblock_field_reset_defaults_test | Top | top_counter.sv |
