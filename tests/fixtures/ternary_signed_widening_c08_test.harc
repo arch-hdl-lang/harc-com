@@ -1,0 +1,39 @@
+// C08: signed ternary arms must widen from their declared sign bit.
+
+testbench TernarySignedWideningC08Tb
+    dut : Top
+end testbench TernarySignedWideningC08Tb
+
+impl TernarySignedWideningC08Test for TernarySignedWideningC08Tb
+    run
+        let one65 : sint<65> = 1
+        let neg65 : sint<65> = -8 / 3
+        let min65 : sint<65> = 0 - (one65 << 64)
+        let zero100 : sint<100> = 0
+        let neg100 : sint<100> = -2
+        let zero128 : sint<128> = 0
+
+        // Direct widening controls the value and the declared sign bit.
+        let direct100 : sint<100> = neg65
+        assert direct100 == -2 else fail("direct sint65 to sint100 widening")
+        let direct128 : sint<128> = min65
+        assert direct128 < 0 else fail("direct sint65 signed-min widening")
+
+        // Both arm orders and both constant condition values select the
+        // narrow signed negative arm at runtime.
+        let true100 : sint<100> = true ? neg65 : zero100
+        assert true100 == -2 else fail("true ternary sint65 to sint100")
+        let false100 : sint<100> = false ? zero100 : neg65
+        assert false100 == -2 else fail("false ternary sint65 to sint100")
+
+        // A runtime boolean keeps the conditional lazy while exercising the
+        // 65-to-128 path and signed-min padding.
+        let choose : bool = false
+        let runtime128 : sint<128> = choose ? zero128 : min65
+        assert runtime128 < 0 else fail("runtime ternary signed-min widening")
+
+        // The wider signed arm also participates in the common-width path.
+        let mixed128 : sint<128> = true ? neg100 : zero128
+        assert mixed128 == -2 else fail("sint100 to sint128 ternary widening")
+    end run
+end impl TernarySignedWideningC08Test
