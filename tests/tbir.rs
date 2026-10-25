@@ -19077,6 +19077,50 @@ test HelperMixTest
 end test HelperMixTest
 "#;
 
+#[test]
+fn expression_only_bool_helper_converts_truthy_result_live() {
+    let src = r#"
+function pred(d: Top) -> bool
+    return 2
+end function pred
+
+test HelperBoolFastPathTest
+    let dut : Top
+    run
+        assert pred(dut) == true else fail("declared bool return")
+    end run
+end test HelperBoolFastPathTest
+"#;
+    let prog = lower_src(src).expect("expression-only bool helper lowers");
+    verify::verify_program(&prog).expect("expression-only bool helper verifies");
+    let run = prog.function(prog.tests[0].run);
+    let has_truthy_conversion = run.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+        let ir::Stmt::AssertCheck { cond, .. } = stmt else {
+            return false;
+        };
+        matches!(
+            cond,
+            ir::Expr::Binary(
+                ir::BinOp::Eq,
+                lhs,
+                rhs,
+            ) if matches!(
+                lhs.as_ref(),
+                ir::Expr::Binary(
+                    ir::BinOp::Ne,
+                    value,
+                    zero,
+                ) if matches!(value.as_ref(), ir::Expr::Literal { value: 2, .. })
+                    && matches!(zero.as_ref(), ir::Expr::Literal { value: 0, .. })
+            ) && matches!(rhs.as_ref(), ir::Expr::Literal { value: 1, .. })
+        )
+    });
+    assert!(
+        has_truthy_conversion,
+        "declared bool fast path must compare the live expression against zero:\n{run}"
+    );
+}
+
 /// Locks the inlined-CFG dump-ir text: the impure helper's body
 /// (DutWrite / WaitCycles / DutRead-return) appears inline in the run
 /// function with remapped blocks and deduplicated param locals, while

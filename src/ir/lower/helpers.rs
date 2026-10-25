@@ -43,8 +43,8 @@ use crate::ir::scalar::{
     contextual_value_bits, scalar_value_evidence, signed_value_bits, ScalarValueEvidence,
 };
 use crate::ir::{
-    CallTarget, Expr, FunctionId, FunctionKind, IrType, RecordId, Stmt, TbFunction, Terminator,
-    TypedParam,
+    BinOp, CallTarget, Expr, FunctionId, FunctionKind, IrType, RecordId, Stmt, TbFunction,
+    Terminator, TypedParam,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -434,7 +434,27 @@ impl FuncBuilder<'_> {
                     });
                     let lowered = self.lower_expr(value);
                     self.inline_frames.pop();
-                    return lowered;
+                    let lowered = lowered?;
+                    let return_ty = inlined_helper_signature_type(
+                        name,
+                        "return type",
+                        decl.return_ty.as_ref(),
+                        &self.ctx.record_ids,
+                    )?;
+                    if matches!(return_ty, IrType::Bool) {
+                        // Preserve the expression-only fast path so DUT reads
+                        // remain live, while applying the declared bool
+                        // conversion at the expression's evaluation site.
+                        return Ok(Expr::Binary(
+                            BinOp::Ne,
+                            Box::new(lowered),
+                            Box::new(Expr::Literal {
+                                value: 0,
+                                ty: IrType::Unknown,
+                            }),
+                        ));
+                    }
+                    return Ok(lowered);
                 }
         }
         if self.in_fmt_args {
