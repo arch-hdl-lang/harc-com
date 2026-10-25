@@ -4,6 +4,10 @@ use harc::solver::problem_table::{build_typed_solver_problem_table, TypedSolverP
 use std::{fs, path::Path, process::Command};
 
 fn python(root: &Path, out: &Path, phase: &str) {
+    python_seed(root, out, phase, None);
+}
+
+fn python_seed(root: &Path, out: &Path, phase: &str, seed: Option<&str>) {
     let mut command = Command::new("python3");
     command
         .arg(root.join("tests/conformance/expression_models.py"))
@@ -11,7 +15,9 @@ fn python(root: &Path, out: &Path, phase: &str) {
         .arg(out)
         .arg("--harc")
         .arg(env!("CARGO_BIN_EXE_harc"));
-    if let Some(seed) = std::env::var_os("HARC_EXPRESSION_SEED") {
+    if let Some(seed) = seed {
+        command.arg("--seed").arg(seed);
+    } else if let Some(seed) = std::env::var_os("HARC_EXPRESSION_SEED") {
         command.arg("--seed").arg(seed);
     }
     let output = command
@@ -64,6 +70,9 @@ fn expression_trees_and_solver_models_match_independent_interpretation() {
     }
     python(root, &out, "typed");
     python(root, &out, "expressions");
+    let alternate = out.join("seed1");
+    python_seed(root, &alternate, "generate", Some("1"));
+    python_seed(root, &alternate, "expressions", Some("1"));
     python(root, &out, "models");
     fs::remove_dir_all(out).unwrap();
 }

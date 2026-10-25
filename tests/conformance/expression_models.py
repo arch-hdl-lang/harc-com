@@ -168,7 +168,10 @@ def trees(seed):
         if op == 'neg':
             return Node(op, (cast(Node('%', (number(depth-1), lit(127))), I),))
         if op == '~':
-            return Node(op, (number(depth-1),))
+            # File constants complement all 64 carrier bits. TBIR runtime
+            # complements at the operand's declared width; explicit uint64
+            # keeps this cross-context property in their shared domain.
+            return Node(op, (cast(number(depth-1), U),))
         if op in ('/', '%'):
             return Node(op, (number(depth-1), lit(rng.choice([1, 2, 3]))))
         if op in ('<<', '>>'):
@@ -522,8 +525,8 @@ end transaction S8
         blocking randomize(b) with
             b.x == -1
             b.x < lim8
+            !((b.x < 0) != flag)
             flag
-            (b.x < 0) == flag
         end randomize
         log(info, "RANK_END B ${b.x:016x}")
         log(info, "RANK_BEGIN C")
