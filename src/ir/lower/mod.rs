@@ -742,6 +742,15 @@ fn const_expr_scalar_shape(
                 })
             } else if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
                 Ok(lhs)
+            } else if matches!(op, BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap) {
+                // Wrapping arithmetic is an unsigned low-width residue even
+                // when both operands originate as signed literals. Keep this
+                // in the shape pass so a surrounding constant ternary uses
+                // the same common type as numeric folding.
+                Ok(ConstScalarShape {
+                    signed: false,
+                    boolean: false,
+                })
             } else {
                 Ok(common(lhs, rhs))
             }
@@ -932,173 +941,111 @@ fn fold_const_inner(
         }
         ExprKind::Binary { op, lhs, rhs } => {
             let a = fold_const_inner(lhs, consts, self_name, helpers, call_stack)?;
+            // Logical operators are short-circuiting expressions. Validate the
+            // RHS shape before deciding whether to evaluate it, so unresolved
+            // names and unsupported forms still produce diagnostics while
+            // arithmetic errors in an unreachable arm remain unobservable.
+            if matches!(
+                op,
+                BinaryOp::AndAnd | BinaryOp::AndKw | BinaryOp::OrOr | BinaryOp::OrKw
+            ) {
+                const_expr_scalar_shape(rhs, consts, helpers)?;
+                let lhs_true = a.bits != 0;
+                let short_circuits = match op {
+                    BinaryOp::AndAnd | BinaryOp::AndKw => !lhs_true,
+                    BinaryOp::OrOr | BinaryOp::OrKw => lhs_true,
+                    _ => unreachable!(),
+                };
+                if short_circuits {
+                    return boolean(matches!(op, BinaryOp::OrOr | BinaryOp::OrKw));
+                }
+            }
             let b = fold_const_inner(rhs, consts, self_name, helpers, call_stack)?;
-            // C++ usual arithmetic conversions at rank 64: the result
-            // (and the comparison/division domain) is signed only when
-            // both operands are.
-            let signed = a.signed && b.signed;
-            let arith = |bits: u64| Ok(ConstVal::untyped(bits, signed));
-            // Shift-amount validation shared by `<<`/`>>`. v1 forwards
-            // the raw expression to C++, where an out-of-range amount
-            // is UB — reject loudly instead of silently masking.
-            let shift_amount = |b: ConstVal| -> Result<u32, ConstFoldErr> {
-                if b.is_negative() {
+            use crate::numeric_semantics::{self, NumericError, Scalar};
+            let wrap_width = if matches!(
+                op,
+                BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap
+            ) {
+                let (wl, wr) = (
+                    const_operand_width(lhs, consts),
+                    const_operand_width(rhs, consts),
+                );
+                let (Some(wl), Some(wr)) = (wl, wr) else {
                     return Err(FoldInvalid(format!(
-                        "negative shift amount ({})",
-                        b.as_i64()
-                    )));
-                }
-                if b.bits >= 64 {
-                    return Err(FoldInvalid(format!(
-                        "shift amount {} is out of range (constant evaluation \
-                         is 64-bit; shift amounts must be 0..=63)",
-                        b.bits
-                    )));
-                }
-                Ok(b.bits as u32)
-            };
-            match op {
-                BinaryOp::Add => arith(a.bits.wrapping_add(b.bits)),
-                BinaryOp::Sub => arith(a.bits.wrapping_sub(b.bits)),
-                BinaryOp::Mul => arith(a.bits.wrapping_mul(b.bits)),
-                BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap => {
-                    // Fold at `max(W(lhs), W(rhs))` per spec §2.4. The
-                    // widths come from the operand *expressions* — a
-                    // literal is self-sized, an `as uint<W>` cast carries
-                    // W — which is the same best-effort rule v1 applies
-                    // when it emits the mask into the `constexpr`
-                    // initializer, so the two backends now accept and
-                    // fold the same set. An operand whose width is not
-                    // statically known (a `const` reference, whose
-                    // declared type this table does not carry) still
-                    // cannot be folded, and v1 rejects it too.
-                    let (wl, wr) = (
-                        const_operand_width(lhs, consts),
-                        const_operand_width(rhs, consts),
-                    );
-                    let (Some(wl), Some(wr)) = (wl, wr) else {
-                        return Err(FoldInvalid(format!(
-                            "the wrapping `{}` operator needs both operands to have a \
+                        "the wrapping `{}` operator needs both operands to have a \
                              statically known bit-width so its §2.4 mask is defined \
                              (left is {}, right is {}). Use an integer literal or an \
                              `as uint<N>` cast for the operand(s), or spell the mask \
                              explicitly with the plain operator.",
-                            match op {
-                                BinaryOp::SubWrap => "-%",
-                                BinaryOp::MulWrap => "*%",
-                                _ => "+%",
-                            },
-                            if wl.is_some() { "known" } else { "unknown" },
-                            if wr.is_some() { "known" } else { "unknown" },
-                        )));
-                    };
-                    let width = wl.max(wr);
-                    if width > 64 {
-                        return Err(FoldInvalid(format!(
-                            "the wrapping operators are evaluable in a constant \
+                        match op {
+                            BinaryOp::SubWrap => "-%",
+                            BinaryOp::MulWrap => "*%",
+                            _ => "+%",
+                        },
+                        if wl.is_some() { "known" } else { "unknown" },
+                        if wr.is_some() { "known" } else { "unknown" },
+                    )));
+                };
+                let width = wl.max(wr);
+                if width > 64 {
+                    return Err(FoldInvalid(format!(
+                        "the wrapping operators are evaluable in a constant \
                              initializer only up to 64 bits (this one masks to \
                              {width})"
-                        )));
-                    }
-                    let raw = match op {
-                        BinaryOp::SubWrap => a.bits.wrapping_sub(b.bits),
-                        BinaryOp::MulWrap => a.bits.wrapping_mul(b.bits),
-                        _ => a.bits.wrapping_add(b.bits),
-                    };
-                    let masked = if width == 64 {
-                        raw
-                    } else {
-                        raw & ((1u64 << width) - 1)
-                    };
-                    // The residue is unsigned (§2.4), regardless of the
-                    // operands' signedness.
-                    Ok(ConstVal::untyped(masked, false))
+                    )));
                 }
-                BinaryOp::Div | BinaryOp::Mod => {
-                    let is_div = matches!(op, BinaryOp::Div);
-                    let label = if is_div { "division" } else { "modulo" };
-                    if b.bits == 0 {
-                        return Err(FoldInvalid(format!("{label} by zero")));
-                    }
-                    if signed {
-                        if a.as_i64() == i64::MIN && b.as_i64() == -1 {
-                            return Err(FoldInvalid(format!(
-                                "signed {label} overflow ({} / -1 exceeds the \
-                                 64-bit constant-evaluation domain)",
-                                i64::MIN
-                            )));
+                Some(width)
+            } else {
+                None
+            };
+            let scalar = |v: &ConstVal| Scalar {
+                bits: v.bits,
+                signed: v.signed,
+                boolean: v.is_boolean_kind(),
+            };
+            match numeric_semantics::fold_binary(*op, scalar(&a), scalar(&b), wrap_width) {
+                Ok(v) => Ok(ConstVal {
+                    bits: v.bits,
+                    signed: v.signed,
+                    provenance: if v.boolean {
+                        ConstProvenance::UntypedBool
+                    } else {
+                        ConstProvenance::Untyped
+                    },
+                }),
+                Err(err) => {
+                    let label = if matches!(op, BinaryOp::Div) {
+                        "division"
+                    } else {
+                        "modulo"
+                    };
+                    match err {
+                        NumericError::ZeroDivisor => Err(FoldInvalid(format!("{label} by zero"))),
+                        NumericError::SignedDivisionOverflow => Err(FoldInvalid(format!(
+                            "signed {label} overflow ({} / -1 exceeds the \
+                             64-bit constant-evaluation domain)",
+                            i64::MIN
+                        ))),
+                        NumericError::NegativeShift => Err(FoldInvalid(format!(
+                            "negative shift amount ({})",
+                            b.as_i64()
+                        ))),
+                        NumericError::ShiftOutOfRange => Err(FoldInvalid(format!(
+                            "shift amount {} is out of range (constant evaluation \
+                             is 64-bit; shift amounts must be 0..=63)",
+                            b.bits
+                        ))),
+                        NumericError::InvalidWrapWidth => {
+                            unreachable!("wrapping width was validated above")
                         }
-                        let r = if is_div {
-                            a.as_i64().wrapping_div(b.as_i64())
-                        } else {
-                            a.as_i64().wrapping_rem(b.as_i64())
-                        };
-                        arith(r as u64)
-                    } else if is_div {
-                        arith(a.bits / b.bits)
-                    } else {
-                        arith(a.bits % b.bits)
+                        NumericError::Unsupported => Err(ConstFoldErr::Unsupported(format!(
+                            "the `{op:?}` operator in a constant expression"
+                        ))),
                     }
                 }
-                BinaryOp::Shl => {
-                    let n = shift_amount(b)?;
-                    // C++: the result's signedness is the (promoted)
-                    // left operand's, not the pair's.
-                    Ok(ConstVal::untyped(a.bits << n, a.signed))
-                }
-                BinaryOp::Shr => {
-                    let n = shift_amount(b)?;
-                    let bits = if a.signed {
-                        // Arithmetic shift for signed operands — what
-                        // v1's `int64_t` constexpr evaluation does.
-                        (a.as_i64() >> n) as u64
-                    } else {
-                        a.bits >> n
-                    };
-                    Ok(ConstVal::untyped(bits, a.signed))
-                }
-                BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor
-                    if a.is_boolean_kind() && b.is_boolean_kind() =>
-                {
-                    let bits = match op {
-                        BinaryOp::BitAnd => a.bits & b.bits,
-                        BinaryOp::BitOr => a.bits | b.bits,
-                        _ => a.bits ^ b.bits,
-                    };
-                    Ok(ConstVal::boolean(bits != 0))
-                }
-                BinaryOp::BitAnd => arith(a.bits & b.bits),
-                BinaryOp::BitOr => arith(a.bits | b.bits),
-                BinaryOp::BitXor => arith(a.bits ^ b.bits),
-                BinaryOp::Eq => boolean(a.bits == b.bits),
-                BinaryOp::Ne => boolean(a.bits != b.bits),
-                BinaryOp::Lt => boolean(if signed {
-                    a.as_i64() < b.as_i64()
-                } else {
-                    a.bits < b.bits
-                }),
-                BinaryOp::Le => boolean(if signed {
-                    a.as_i64() <= b.as_i64()
-                } else {
-                    a.bits <= b.bits
-                }),
-                BinaryOp::Gt => boolean(if signed {
-                    a.as_i64() > b.as_i64()
-                } else {
-                    a.bits > b.bits
-                }),
-                BinaryOp::Ge => boolean(if signed {
-                    a.as_i64() >= b.as_i64()
-                } else {
-                    a.bits >= b.bits
-                }),
-                BinaryOp::AndAnd | BinaryOp::AndKw => boolean(a.bits != 0 && b.bits != 0),
-                BinaryOp::OrOr | BinaryOp::OrKw => boolean(a.bits != 0 || b.bits != 0),
-                _ => Err(ConstFoldErr::Unsupported(format!(
-                    "the `{op:?}` operator in a constant expression"
-                ))),
             }
         }
+
         ExprKind::Ternary {
             cond,
             then_branch,
@@ -8792,7 +8739,8 @@ fn lower_function<'a>(
         // Addrmap per-instance mirror locals: one default-constructed
         // record local per non-aliased instance (alias instances share
         // their target's cell). Declared with the mangled
-        // `__addrmap_<chip>_<inst>` name the access resolution computes.
+        // Length-prefixed `__addrmap_<chip-len>_<chip>_<inst-len>_<inst>`
+        // names match the access resolution's collision-free keys.
         for (key, rec) in &ctx.addrmap_init_order {
             let id = b.declare(key);
             b.set_local_type(id, IrType::Record(*rec));

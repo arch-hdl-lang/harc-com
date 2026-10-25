@@ -1,0 +1,45 @@
+name: Formal arithmetic
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arithmetic:
+    name: CBMC and Kani arithmetic contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install pinned proof tools
+        run: |
+          curl --fail --location --retry 3 -o /tmp/cbmc.deb https://github.com/diffblue/cbmc/releases/download/cbmc-6.11.0/ubuntu-24.04-cbmc-6.11.0-Linux.deb
+          echo 'b3721aa541038384d7801ea3aeabbcddc3e8845ac8f1cbff637cf8dec7481ac8  /tmp/cbmc.deb' | sha256sum --check
+          sudo apt-get update
+          sudo apt-get install -y /tmp/cbmc.deb z3
+          cargo install --locked kani-verifier --version 0.67.0
+          cargo kani setup
+
+      - name: Runner checks and deliberate defect detection
+        run: python3 proofs/arithmetic/test_runner.py
+
+      - name: Prove arithmetic contracts
+        run: python3 proofs/arithmetic/run.py --timeout 300
+
+      - name: Preserve proof evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: formal-arithmetic
+          path: |
+            target/formal/**
+            !target/formal/**/kani-build/**
+          if-no-files-found: error
+          retention-days: 14

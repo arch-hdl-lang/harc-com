@@ -437,6 +437,9 @@ pub struct ConstraintSite {
     /// `randomize(t)` (false) vs blocking `randomize(t) with ...` (the
     /// AST `blocking` flag) — selects v1's queued vs blocking solve shell.
     pub blocking: bool,
+    /// Lexically visible scalar bindings at this site. Preserve local identity
+    /// across shadowing and backend-specific C++ name assignment.
+    pub scalar_bindings: Vec<(String, LocalId, IrType)>,
     /// Stable problem-table identity (`ConstraintProblemId.0`) when the typed
     /// constraint IR built a Z3-ready problem for this site; `None` when
     /// the site has no solver problem (lower/backend error — v1 then

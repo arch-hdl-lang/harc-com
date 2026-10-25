@@ -5470,14 +5470,7 @@ struct LetWidth {
     signed: bool,
 }
 
-/// Signedness used by native solver operators. Untyped literals participate
-/// in the usual arithmetic conversion of their other operand.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ConstraintOperandSignedness {
-    Signed,
-    Unsigned,
-    UntypedLiteral,
-}
+pub(crate) use crate::numeric_semantics::ConstraintOperandSignedness;
 
 fn scalar_let_width(ty: &TypeExpr) -> Option<LetWidth> {
     let TypeExpr::Builtin { name, args, .. } = ty else {
@@ -6101,7 +6094,44 @@ fn c_value_literal(s: &str) -> String {
         out.push_str("})");
         return out;
     }
+    c_value_literal_with_rank(s)
+}
+
+/// Render radix literals with a carrier whose C++ rank matches HARC's
+/// 64-bit integer domain. In particular, an unadorned `0x80000000` is an
+/// unsigned 32-bit C++ literal; applying unary `-` to it wraps before the
+/// result reaches a signed HARC local.
+fn c_value_literal_with_rank(s: &str) -> String {
+    let normalized = normalized_int_literal(s);
+    let Some((radix, digits)) = radix_digits(&normalized) else {
+        return c_int_literal(s);
+    };
+    let Some(value) = u128::from_str_radix(digits, radix).ok() else {
+        return c_int_literal(s);
+    };
+    if value == 0 {
+        return normalized;
+    }
+    if value <= u64::MAX as u128 {
+        let carrier = if value <= i64::MAX as u128 {
+            "int64_t"
+        } else {
+            "uint64_t"
+        };
+        return format!("(({carrier})({normalized}))");
+    }
+    // Values above 64 bits retain the established c_int_literal route.
+    // C09 covers only the host-rank boundary in the 32-bit-to-64-bit tier.
     c_int_literal(s)
+}
+
+fn radix_digits(normalized: &str) -> Option<(u32, &str)> {
+    normalized
+        .strip_prefix("0x")
+        .map(|digits| (16, digits))
+        .or_else(|| normalized.strip_prefix("0X").map(|digits| (16, digits)))
+        .or_else(|| normalized.strip_prefix("0b").map(|digits| (2, digits)))
+        .or_else(|| normalized.strip_prefix("0B").map(|digits| (2, digits)))
 }
 
 /// If the integer literal `s` is hex with > 32 hex digits (i.e. >

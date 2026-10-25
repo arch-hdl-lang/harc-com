@@ -384,6 +384,62 @@ end test T"#,
     }
 }
 
+/// Boolean-origin metadata is retained for dimension checks, while bitwise
+/// constant folding preserves the full 64-bit result of noncanonical Boolean
+/// operands such as `~true`.
+#[test]
+fn const_bitwise_boolean_origin_preserves_raw_bits() {
+    let src = r#"const A = (~true) & (~false)
+const B = (~true) | false
+const C = (true ? ~true : false) | false
+const D = (false ? ~false : ~true) & (~false)
+const E = ~true
+const F = ~false
+const G = true & false
+const H : bool = true
+const I = ~(H & H)
+
+test T
+    let dut : Top
+    run
+        assert A == -2 else fail("A")
+        assert B == -2 else fail("B")
+        assert C == -2 else fail("C")
+        assert D == -2 else fail("D")
+        assert E == -2 else fail("E")
+        assert F == -1 else fail("F")
+        assert G == 0 else fail("G")
+        assert I < 0 else fail("typed Boolean promotion")
+    end run
+end test T"#;
+    let program = lower_src(src).expect("bitwise Boolean constants lower");
+    verify::verify_program(&program).expect("bitwise Boolean constants verify");
+    let ir = format!("{program}");
+    assert!(
+        ir.matches("18446744073709551614").count() >= 4,
+        "all complement-derived constants must retain 0xfffffffffffffffe: {ir}"
+    );
+    assert!(
+        !ir.contains("(1 == -2)"),
+        "bitwise Boolean result must not be canonicalized to 1: {ir}"
+    );
+
+    let invalid = r#"scoreboard S
+    lanes : Vec<uint<8>, (~true) & (~false)>
+end scoreboard S
+
+test T
+    let dut : Top
+    run
+    end run
+end test T"#;
+    let err = lower_src(invalid).expect_err("Boolean-origin vector length must be rejected");
+    assert!(
+        err.to_string().contains("integer expression"),
+        "Boolean-origin metadata must remain visible to dimension checks: {err}"
+    );
+}
+
 /// #494 P2a / #521: a `const` initializer referencing an undefined name
 /// is rejected with a precise `Invalid` diagnostic naming both the
 /// const and the unknown reference — never silently accepted.
@@ -1207,10 +1263,10 @@ end test T"#,
         cpp.contains("static int64_t harc_helper_halve_twice(int64_t x)"),
         "sint helper with internal sint local must declare int64_t; got:\n{cpp}"
     );
-    // A `bool` return keeps uint64_t; only the sint param flips.
+    // A `bool` return uses its canonical Boolean carrier; the sint param stays signed.
     assert!(
-        cpp.contains("static uint64_t harc_helper_isneg(int64_t x)"),
-        "bool-returning helper keeps uint64_t return, int64_t sint param; got:\n{cpp}"
+        cpp.contains("static bool harc_helper_isneg(int64_t x)"),
+        "bool-returning helper uses bool return and int64_t sint param; got:\n{cpp}"
     );
 }
 
@@ -18568,7 +18624,7 @@ fn fixed_vector_pure_helper_signatures_are_typed_end_to_end() {
     let cpp = emit_cpp_src(&src);
     assert!(
         cpp.contains("static std::array<uint64_t, 2> harc_helper_echo_vec(std::array<uint64_t, 2> values);")
-            && cpp.contains("static uint64_t harc_helper_vec_matches(std::array<uint64_t, 2> values, std::array<uint64_t, 2> expected);")
+            && cpp.contains("static bool harc_helper_vec_matches(std::array<uint64_t, 2> values, std::array<uint64_t, 2> expected);")
             && cpp.contains("std::array<uint64_t, 2> __ret{};")
             && cpp.contains("default: return {};"),
         "{cpp}"
@@ -19020,6 +19076,50 @@ test HelperMixTest
     end run
 end test HelperMixTest
 "#;
+
+#[test]
+fn expression_only_bool_helper_converts_truthy_result_live() {
+    let src = r#"
+function pred(d: Top) -> bool
+    return 2
+end function pred
+
+test HelperBoolFastPathTest
+    let dut : Top
+    run
+        assert pred(dut) == true else fail("declared bool return")
+    end run
+end test HelperBoolFastPathTest
+"#;
+    let prog = lower_src(src).expect("expression-only bool helper lowers");
+    verify::verify_program(&prog).expect("expression-only bool helper verifies");
+    let run = prog.function(prog.tests[0].run);
+    let has_truthy_conversion = run.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+        let ir::Stmt::AssertCheck { cond, .. } = stmt else {
+            return false;
+        };
+        matches!(
+            cond,
+            ir::Expr::Binary(
+                ir::BinOp::Eq,
+                lhs,
+                rhs,
+            ) if matches!(
+                lhs.as_ref(),
+                ir::Expr::Binary(
+                    ir::BinOp::Ne,
+                    value,
+                    zero,
+                ) if matches!(value.as_ref(), ir::Expr::Literal { value: 2, .. })
+                    && matches!(zero.as_ref(), ir::Expr::Literal { value: 0, .. })
+            ) && matches!(rhs.as_ref(), ir::Expr::Literal { value: 1, .. })
+        )
+    });
+    assert!(
+        has_truthy_conversion,
+        "declared bool fast path must compare the live expression against zero:\n{run}"
+    );
+}
 
 /// Locks the inlined-CFG dump-ir text: the impure helper's body
 /// (DutWrite / WaitCycles / DutRead-return) appears inline in the run
@@ -30482,7 +30582,8 @@ fn regblock_addrmap_corpus_lowers() {
     let dump = format!("{prog}");
     // Two distinct per-instance mirror locals (mangled), not one.
     assert!(
-        dump.contains("__addrmap_chip_mm2s") && dump.contains("__addrmap_chip_s2mm"),
+        dump.contains("__addrmap_4_chip_4_mm2s")
+            && dump.contains("__addrmap_4_chip_4_s2mm"),
         "expected two per-instance addrmap mirror locals: {dump}"
     );
 }
@@ -30497,13 +30598,13 @@ fn regblock_alias_corpus_lowers() {
         lower_with_stdlib_bus("regblock_alias_test.harc", "BusAxiLite.arch").expect("lowers");
     let dump = format!("{prog}");
     // The alias instance shares the primary's mirror — only ONE mirror
-    // local is declared (no `__addrmap_chip_mm2s_view`).
+    // local is declared (no `__addrmap_4_chip_9_mm2s_view`).
     assert!(
-        dump.contains("__addrmap_chip_mm2s"),
+        dump.contains("__addrmap_4_chip_4_mm2s"),
         "expected the primary mirror local: {dump}"
     );
     assert!(
-        !dump.contains("__addrmap_chip_mm2s_view"),
+        !dump.contains("__addrmap_4_chip_9_mm2s_view"),
         "alias must NOT get its own mirror local (shares the target's cell): {dump}"
     );
 }
@@ -41178,7 +41279,7 @@ fn v1_working_coverpoint_value_forms_lower_and_verify() {
             "sized literal",
             "32'h7",
             "uint64_t _v = (uint64_t)(7)",
-            "(uint64_t)(0x7)",
+            "(uint64_t)(((int64_t)(0x7)))",
         ),
         (
             "sized slice bounds",
@@ -52923,6 +53024,96 @@ end function Pick
     }
 }
 
+/// Wrapping arithmetic has an unsigned result even when its operands are
+/// signed literals. The shape pass must carry that result through a constant
+/// ternary, including when the wrapping arm is unselected.
+#[test]
+fn const_ternary_inline_wraps_are_unsigned_in_both_arm_orders() {
+    let src = r#"
+const AddThen : bool = (false ? (7 +% 1) : -1) < 0
+const AddElse : bool = (false ? -1 : (7 +% 1)) < 0
+const SubThen : bool = (false ? (7 -% 1) : -1) < 0
+const SubElse : bool = (false ? -1 : (7 -% 1)) < 0
+const MulThen : bool = (false ? (7 *% 1) : -1) < 0
+const MulElse : bool = (false ? -1 : (7 *% 1)) < 0
+const Nested : bool = (false ? ((7 +% (1 + 0))) : -1) < 0
+const Ordinary : bool = (false ? (7 + 1) : -1) < 0
+
+test T
+    let dut : Top
+    run
+        assert AddThen == false else fail("add then")
+        assert AddElse == false else fail("add else")
+        assert SubThen == false else fail("sub then")
+        assert SubElse == false else fail("sub else")
+        assert MulThen == false else fail("mul then")
+        assert MulElse == false else fail("mul else")
+        assert Nested == false else fail("nested")
+        assert Ordinary == true else fail("ordinary control")
+    end run
+end test T
+"#;
+    let program = lower_src(src).expect("inline wrapping ternaries lower");
+    verify::verify_program(&program).expect("inline wrapping ternaries verify");
+    let text = format!("{program}");
+    assert_eq!(
+        text.matches("(0 == 0)").count(),
+        7,
+        "wrap ternaries must fold false: {text}"
+    );
+    assert_eq!(
+        text.matches("(1 == 1)").count(),
+        1,
+        "ordinary signed control must stay true: {text}"
+    );
+    tbir::emit(&program, &merged_src(src), &cpp_tb::EmitOpts::default())
+        .expect("inline wrapping ternaries emit");
+
+    let lazy = r#"const LazyWrap : bool = (false ? (1 / 0) : -1) < 0
+
+test T
+    let dut : Top
+    run
+        assert LazyWrap == true else fail("lazy wrap")
+    end run
+end test T"#;
+    lower_src(lazy).expect("unselected invalid arm remains lazy");
+
+    let selected = lazy.replace("false ?", "true ?");
+    let err = lower_src(&selected).expect_err("selected invalid arm must still fail");
+    assert!(assert_invalid(&err).contains("division by zero"));
+}
+
+#[test]
+fn const_logical_folds_only_the_reachable_rhs() {
+    let src = r#"const A : bool = false && (1 / 0 == 1)
+const B : bool = true || (1 % 0 == 1)
+const C : bool = false and (1 << 64 == 1)
+const D : bool = true or (1 / 0 == 1)
+
+test T
+    let dut : Top
+    run
+        assert A == false else fail("false &&")
+        assert B == true else fail("true ||")
+        assert C == false else fail("false and")
+        assert D == true else fail("true or")
+    end run
+end test T"#;
+    let program = lower_src(src).expect("unreachable logical RHS lowers");
+    verify::verify_program(&program).expect("unreachable logical RHS verifies");
+
+    for (bad, expected) in [
+        ("true && (1 / 0 == 1)", "division by zero"),
+        ("false || (1 % 0 == 1)", "modulo by zero"),
+        ("false && MISSING", "MISSING"),
+    ] {
+        let bad_src = format!("const Bad : bool = {bad}\n\ntest T\n    let dut : Top\nend test T");
+        let err = lower_src(&bad_src).expect_err("reachable or invalid logical RHS must fail");
+        assert!(err.to_string().contains(expected), "{bad}: {err}");
+    }
+}
+
 #[test]
 fn target_responder_wall_clock_wait_uses_the_test_scheduler() {
     let src = fixture("tlm_target_thread_test.harc").replace("wait 1 cycle", "wait 1ns");
@@ -53929,7 +54120,7 @@ end impl T
     // arithmetic shift.
     let v1_cpp = cpp_tb::emit(&merged_src(src)).expect("v1 emits");
     assert!(
-        v1_cpp.contains("(~(harc_rt::harc_read(dut->count_out) & 0x00)) >> 2"),
+        v1_cpp.contains("(~((harc_rt::harc_read(dut->count_out) & 0x00))) >> 2"),
         "v1 renders the same unmasked host bit-not, shifted logically:\n{v1_cpp}"
     );
 }
@@ -55746,6 +55937,188 @@ end impl ResultTest
             Ok(_) if !reject => {}
             Err(err) => panic!("{call}: expected acceptance, got {err:?}"),
             Ok(_) => panic!("{call}: expected rejection"),
+        }
+    }
+}
+
+
+#[test]
+fn blocking_randomize_captures_lexical_scalar_identity() {
+    let src = r#"
+transaction Req
+    x : sint<8>
+end transaction Req
+
+test CaptureTest
+    let dut : Top
+    run
+        let px : sint<64> = 1
+        for i in 0..1
+            let px : sint<64> = -2
+            let ctx : sint<64> = -3
+            let request : Req
+            blocking randomize(request) with
+                request.x == px
+                request.x > ctx
+            end randomize
+        end for
+    end run
+end test CaptureTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("lowers captures");
+    verify::verify_program(&prog).expect("verifies captures");
+    let site = &prog.constraint_sites[0];
+    let (_, px, _) = site.scalar_bindings.iter().find(|(name, _, _)| name == "px").unwrap();
+    let function = prog.functions.iter().find(|f| f.blocks.iter().any(|b|
+        matches!(b.terminator, ir::Terminator::Randomize { .. }))).unwrap();
+    assert_ne!(function.locals[px.index()].name, "px", "inner binding must be renamed");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits captures");
+    assert!(cpp.contains(&format!("(uint64_t)({})", function.locals[px.index()].name)), "{cpp}");
+    assert!(cpp.contains("(uint64_t)(_u_ctx)"), "reserved C++ name must use backend mapping: {cpp}");
+    assert!(!cpp.contains('\u{1e}'), "capture sentinel leaked");
+}
+
+#[test]
+fn blocking_randomize_does_not_capture_callers_scalar() {
+    let src = r#"
+transaction Req
+    x : uint<8>
+end transaction Req
+
+function solve(dut: Top)
+    let request : Req
+    blocking randomize(request) with
+        request.x == caller_only
+    end randomize
+end function solve
+
+test CaptureFenceTest
+    let dut : Top
+    run
+        let caller_only : uint<64> = 2
+        solve(dut)
+    end run
+end test CaptureFenceTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("constraint names checked at emission");
+    let error = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect_err("caller local is hidden");
+    assert!(error.0.contains("unknown name `caller_only`"), "{error}");
+}
+
+#[test]
+fn blocking_randomize_constant_precedence_matches_signedness() {
+    let src = r#"
+const LIMIT : uint<8> = 128
+transaction Req
+    x : sint<8>
+end transaction Req
+
+test CaptureConstTest
+    let dut : Top
+    run
+        let LIMIT : sint<64> = -1
+        let request : Req
+        blocking randomize(request) with
+            request.x < LIMIT
+        end randomize
+    end run
+end test CaptureConstTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("lowers");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
+    let plain = merged_src(&src.replace("        let LIMIT : sint<64> = -1\n", ""));
+    let plain_prog = lower::lower_program(&plain).unwrap();
+    let plain_cpp = tbir::emit(&plain_prog, &plain, &cpp_tb::EmitOpts::default()).unwrap();
+    let clauses = |text: &str| text.lines().filter(|line| line.contains("_s.add(") && !line.contains("_pref_")).map(str::trim).map(str::to_owned).collect::<Vec<_>>();
+    assert_eq!(clauses(&cpp), clauses(&plain_cpp), "local collision must not change constant value or comparison shape");
+    assert!(!cpp.contains("(uint64_t)(LIMIT)"), "constant wins over runtime capture: {cpp}");
+}
+
+
+#[test]
+fn blocking_randomize_scalar_width_controls_mixed_rank_comparison() {
+    for (field, binding, signed) in [("uint<32>", "sint<64>", true), ("sint<32>", "uint<8>", true), ("sint<8>", "uint<32>", false)] {
+        let src = format!(r#"
+transaction Req
+    x : {field}
+end transaction Req
+
+test RankTest
+    let dut : Top
+    run
+        let lim : {binding} = 1
+        let request : Req
+        blocking randomize(request) with
+            request.x < lim
+        end randomize
+    end run
+end test RankTest
+"#);
+        let merged = merged_src(&src);
+        let prog = lower::lower_program(&merged).unwrap();
+        let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).unwrap();
+        assert_eq!(cpp.lines().any(|line| line.contains("z3::ult(_z_x") && line.contains("(lim)")), !signed, "{field}/{binding}: {cpp}");
+    }
+}
+
+
+#[test]
+fn blocking_randomize_wide_scalar_capture_fails_closed() {
+    let src = r#"
+transaction Req
+    x : uint<8>
+end transaction Req
+
+test WideCaptureTest
+    let dut : Top
+    run
+        let lim : uint<128> = 1 << 64
+        let request : Req
+        blocking randomize(request) with
+            request.x == lim
+        end randomize
+    end run
+end test WideCaptureTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).unwrap();
+    let error = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect_err("wide captures must not truncate");
+    assert!(error.0.contains("wide runtime scalar captures are not supported"), "{error}");
+}
+
+
+#[test]
+fn blocking_randomize_scalar_condition_requires_flag() {
+    for (ty, succeeds) in [("bool", true), ("uint<1>", true), ("uint<8>", false), ("sint<1>", false)] {
+        let src = format!(r#"
+transaction Req
+    x : uint<8>
+end transaction Req
+
+test CaptureConditionTest
+    let dut : Top
+    run
+        let flag : {ty} = 1
+        let request : Req
+        blocking randomize(request) with
+            flag
+            !flag == (request.x == 0)
+        end randomize
+    end run
+end test CaptureConditionTest
+"#);
+        let merged = merged_src(&src);
+        let prog = lower::lower_program(&merged).unwrap();
+        let result = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default());
+        if succeeds {
+            let cpp = result.expect("flag capture emits Boolean solver expression");
+            assert!(cpp.contains("_ctx.bool_val((flag) != 0)"), "{cpp}");
+        } else {
+            let error = result.expect_err("numeric constraint must fail before Z3 sort error");
+            assert!(error.0.contains("value, not a condition"), "{error}");
         }
     }
 }

@@ -193,15 +193,15 @@ int run_CamValueBasicTest(int argc, char** argv) {
     struct _CamValueXactor_state {
         uint64_t _last_in_cycle = 0;
         uint64_t _last_out_cycle = 0;
-        std::vector<std::function<void(uint64_t, uint64_t, uint64_t, uint64_t)>> _harc_hook_write_pre;
-        std::vector<std::function<void(uint64_t, uint64_t, uint64_t, uint64_t)>> _harc_hook_write_post;
+        std::vector<std::function<void(uint64_t, uint64_t, uint64_t, bool)>> _harc_hook_write_pre;
+        std::vector<std::function<void(uint64_t, uint64_t, uint64_t, bool)>> _harc_hook_write_post;
         std::vector<std::function<void()>> _harc_hook_reset_dut_pre;
         std::vector<std::function<void()>> _harc_hook_reset_dut_post;
     };
     struct _CamValueXactor_state __harc_transactor_state_tb0_f0;
-    std::function<void(struct _CamValueXactor_state&, uint64_t, uint64_t, uint64_t, uint64_t)> CamValueXactor_write;
+    std::function<void(struct _CamValueXactor_state&, uint64_t, uint64_t, uint64_t, bool)> CamValueXactor_write;
     std::function<void(struct _CamValueXactor_state&)> CamValueXactor_reset_dut;
-    CamValueXactor_write = [&](struct _CamValueXactor_state& self_state, uint64_t idx, uint64_t key, uint64_t value, uint64_t set) -> void {
+    CamValueXactor_write = [&](struct _CamValueXactor_state& self_state, uint64_t idx, uint64_t key, uint64_t value, bool set) -> void {
         for (auto& _h : self_state._harc_hook_write_pre) _h(idx, key, value, set);
         int __bb = 0;
         while (true) {

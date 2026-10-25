@@ -1,0 +1,102 @@
+const YES : bool = true
+const NO : bool = false
+
+transaction PredicateEq
+    x : uint<8>
+    keep (x == 1) == YES
+end transaction PredicateEq
+
+transaction PredicateEqLiteral
+    x : uint<8>
+    keep (x == 1) == true
+end transaction PredicateEqLiteral
+
+transaction ReversedPredicate
+    x : uint<8>
+    keep true == (x == 1)
+end transaction ReversedPredicate
+
+transaction FlagValue
+    flag : uint<1>
+    keep true == flag
+end transaction FlagValue
+
+transaction PredicateEqFalse
+    x : uint<8>
+    keep (x == 1) == NO
+end transaction PredicateEqFalse
+
+transaction PredicateEqNumeric
+    x : uint<8>
+    keep (x == 1) == 1
+end transaction PredicateEqNumeric
+
+transaction PredicateEqNumericParen
+    x : uint<8>
+    keep (x == 1) == (1)
+end transaction PredicateEqNumericParen
+
+transaction NumericBoolValue
+    x : uint<8>
+    keep x == true
+end transaction NumericBoolValue
+
+transaction DirectPredicate
+    x : uint<8>
+    keep (x == 1)
+end transaction DirectPredicate
+
+transaction LogicalPredicate
+    x : uint<8>
+    keep (x == 1) && true
+end transaction LogicalPredicate
+
+transaction UnsatisfiablePredicate
+    x : uint<8>
+    keep (x == 1) == true
+    keep x == 2
+end transaction UnsatisfiablePredicate
+
+test Sat
+    let dut : Top
+    run
+        let a : PredicateEq
+        randomize(a)
+        assert a.x == 1
+        let b : PredicateEqLiteral
+        randomize(b)
+        assert b.x == 1
+        let i : ReversedPredicate
+        randomize(i)
+        assert i.x == 1
+        let j : FlagValue
+        randomize(j)
+        assert j.flag == 1
+        let e : PredicateEqFalse
+        randomize(e)
+        assert e.x != 1
+        let f : PredicateEqNumeric
+        randomize(f)
+        assert f.x == 1
+        let g : PredicateEqNumericParen
+        randomize(g)
+        assert g.x == 1
+        let h : NumericBoolValue
+        randomize(h)
+        assert h.x == 1
+        let c : DirectPredicate
+        randomize(c)
+        assert c.x == 1
+        let d : LogicalPredicate
+        randomize(d)
+        assert d.x == 1
+    end run
+end test Sat
+
+test Unsat
+    let dut : Top
+    run
+        let t : UnsatisfiablePredicate
+        randomize(t)
+    end run
+end test Unsat

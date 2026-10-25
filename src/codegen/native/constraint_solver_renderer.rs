@@ -2329,28 +2329,12 @@ impl Emitter {
     ) -> bool {
         let l = self.constraint_expr_signedness(lhs, field_info, target_root);
         let r = self.constraint_expr_signedness(rhs, field_info, target_root);
-        if l == ConstraintOperandSignedness::Unsigned || r == ConstraintOperandSignedness::Unsigned
-        {
-            let (signed_expr, unsigned_expr) = if l == ConstraintOperandSignedness::Signed
-                && r == ConstraintOperandSignedness::Unsigned
-            {
-                (lhs, rhs)
-            } else if r == ConstraintOperandSignedness::Signed
-                && l == ConstraintOperandSignedness::Unsigned
-            {
-                (rhs, lhs)
-            } else {
-                return false;
-            };
-            let signed_width = self
-                .constraint_expr_native_width(signed_expr, field_info, target_root)
-                .unwrap_or(0);
-            let unsigned_width = self
-                .constraint_expr_native_width(unsigned_expr, field_info, target_root)
-                .unwrap_or(u32::MAX);
-            return (signed_width < 32 && unsigned_width < 32) || signed_width > unsigned_width;
-        }
-        l == ConstraintOperandSignedness::Signed || r == ConstraintOperandSignedness::Signed
+        crate::numeric_semantics::solver_binary_is_signed(
+            l,
+            r,
+            self.constraint_expr_native_width(lhs, field_info, target_root),
+            self.constraint_expr_native_width(rhs, field_info, target_root),
+        )
     }
 
     fn constraint_expr_native_width(
@@ -2901,6 +2885,84 @@ impl Emitter {
             blocking,
             list_unroll_bounds,
         );
+    }
+
+    /// Equality normally compares bit-vectors, but a nested comparison (or a
+    /// Boolean literal/constant) is a Z3 Bool.  Keep that distinction local
+    /// to equality so ordinary numeric `0`/`1` comparisons retain their
+    /// bit-vector width and semantics.
+    fn constraint_expr_is_bool(&self, e: &Expr) -> bool {
+        match &*e.kind {
+            ExprKind::Bool(_) => false,
+            ExprKind::Ident(_) => false,
+            ExprKind::Paren(inner) => self.constraint_expr_is_bool(inner),
+            ExprKind::Unary {
+                op: UnaryOp::Not | UnaryOp::NotKw,
+                ..
+            } => true,
+            ExprKind::Binary { op, .. } => matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::AndAnd
+                    | BinaryOp::AndKw
+                    | BinaryOp::OrOr
+                    | BinaryOp::OrKw
+            ),
+            ExprKind::Membership { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn constraint_expr_numeric_bool_value(&self, e: &Expr) -> Option<bool> {
+        match &*e.kind {
+            ExprKind::Paren(inner) => self.constraint_expr_numeric_bool_value(inner),
+            ExprKind::Int(s) => match c_int_literal(s).as_str() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            },
+            ExprKind::Ident(id) => self.consts.get(&id.name).and_then(|c| {
+                if c.is_bool { None } else { (c.value == 0).then_some(false).or_else(|| (c.value == 1).then_some(true)) }
+            }),
+            _ => None,
+        }
+    }
+
+    fn emit_constraint_equality_operand(
+        &mut self,
+        e: &Expr,
+        bool_context: bool,
+        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        width: u32,
+        target_root: Option<&str>,
+        blocking: bool,
+        list_unroll_bounds: &std::collections::HashMap<String, usize>,
+    ) {
+        if bool_context {
+            write!(self.out, "(").ok();
+            if self.constraint_expr_is_bool(e) {
+                self.emit_constraint_bool_expr_w(
+                    e, field_info, width, target_root, blocking, list_unroll_bounds,
+                );
+            } else if let Some(value) = self.constraint_expr_numeric_bool_value(e) {
+                write!(self.out, "_ctx.bool_val({value})")
+                .ok();
+            } else {
+                self.emit_constraint_bool_expr_w(
+                    e, field_info, width, target_root, blocking, list_unroll_bounds,
+                );
+            }
+            write!(self.out, ")").ok();
+        } else {
+            self.emit_constraint_expr_w(
+                e, field_info, width, target_root, blocking, list_unroll_bounds,
+            );
+        }
     }
 
     fn emit_constraint_bit_slice_expr(
@@ -3469,21 +3531,16 @@ impl Emitter {
                     );
                     write!(self.out, ")").ok();
                 } else {
-                    self.emit_constraint_expr_w(
-                        lhs,
-                        field_info,
-                        width,
-                        target_root,
-                        blocking,
+                    let bool_context = matches!(op, Eq | Ne)
+                        && (self.constraint_expr_is_bool(lhs)
+                            || self.constraint_expr_is_bool(rhs));
+                    self.emit_constraint_equality_operand(
+                        lhs, bool_context, field_info, width, target_root, blocking,
                         list_unroll_bounds,
                     );
                     write!(self.out, "{sep}").ok();
-                    self.emit_constraint_expr_w(
-                        rhs,
-                        field_info,
-                        width,
-                        target_root,
-                        blocking,
+                    self.emit_constraint_equality_operand(
+                        rhs, bool_context, field_info, width, target_root, blocking,
                         list_unroll_bounds,
                     );
                 }

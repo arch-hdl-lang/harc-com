@@ -16,6 +16,10 @@ pub(crate) struct PerRunCell {
     pub init: Option<String>,
 }
 
+pub(crate) fn scalar_binding_sentinel(local: crate::ir::LocalId) -> String {
+    format!("\u{1e}harc-scalar-{}\u{1f}", local.0)
+}
+
 pub(crate) const TBIR_RANDOMIZE_TARGET_SENTINEL: &str = "\u{1e}harc-target\u{1f}";
 pub(crate) const TBIR_RANDOMIZE_CONTEXT_SENTINEL: &str = "\u{1e}harc-context\u{1f}";
 pub(crate) const TBIR_RANDOMIZE_STATE_SENTINEL: &str = "\u{1e}harc-state\u{1f}";

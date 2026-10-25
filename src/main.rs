@@ -2303,6 +2303,25 @@ fn absolutize_trace_path(path: &Path) -> Result<PathBuf> {
     Ok(std::env::current_dir().into_diagnostic()?.join(path))
 }
 
+fn prepare_trace_output_path(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).into_diagnostic()?;
+    }
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Err(miette::miette!(
+            "semantic trace output path is a directory: {}",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(miette::miette!(
+            "cannot access semantic trace output path {}: {}",
+            path.display(),
+            error
+        )),
+    }
+}
+
 fn prepare_native_build_directory(mdir: &Path, rebuild: bool, build_identity: &str) -> Result<()> {
     let identity_path = mdir.join(".harc_build_identity");
     let expected = format!("{build_identity}\n");
@@ -3628,6 +3647,9 @@ fn cmd_sim(
         .as_ref()
         .map(|p| absolutize_trace_path(p))
         .transpose()?;
+    if let Some(path) = &trace_abs {
+        prepare_trace_output_path(path)?;
+    }
     let coverage_json_abs = coverage_json
         .as_ref()
         .map(|p| absolutize_trace_path(p))

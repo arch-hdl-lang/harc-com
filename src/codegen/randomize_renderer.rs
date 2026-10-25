@@ -1374,6 +1374,7 @@ fn enum_width(variant_count: usize) -> u32 {
 #[derive(Clone, Copy, Debug)]
 struct LetWidth {
     signed: bool,
+    width: u32,
 }
 
 fn is_flag_field(f: &TxnFieldInfo) -> bool {
@@ -1799,6 +1800,7 @@ pub(crate) struct TbirRandomizeEmitter {
     relations: std::collections::HashMap<String, RelationDecl>,
     shadowed_lets: std::collections::HashSet<String>,
     let_widths: std::collections::HashMap<String, LetWidth>,
+    scalar_bindings: std::collections::HashMap<String, String>,
     enums: std::collections::HashMap<String, usize>,
     enum_variants: std::collections::HashMap<String, i64>,
     consts: std::collections::HashMap<String, crate::constraints::IntegerConstSchema>,
@@ -1967,6 +1969,7 @@ fn build_randomize_emitter(file: &SourceFile, _opts: &EmitOpts) -> TbirRandomize
         relations,
         shadowed_lets: std::collections::HashSet::new(),
         let_widths: std::collections::HashMap::new(),
+        scalar_bindings: std::collections::HashMap::new(),
         enums,
         enum_variants,
         consts,
@@ -1992,6 +1995,31 @@ impl TbirRandomizeEmitter {
         self.out.clear();
         self.errors.clear();
         self.current_source_id = site.source_id;
+        self.let_widths.clear();
+        self.scalar_bindings.clear();
+        for (name, local, ty) in &site.scalar_bindings {
+            // Constraint identifiers resolve fields, file constants and enum
+            // variants before runtime captures, matching the native renderer.
+            // Keep operand signedness aligned with that same value lookup.
+            if self.consts.contains_key(name) || self.enum_variants.contains_key(name) {
+                continue;
+            }
+            self.let_widths.insert(
+                name.clone(),
+                LetWidth {
+                    signed: matches!(ty, crate::ir::IrType::SInt(_)),
+                    width: match ty {
+                        crate::ir::IrType::UInt(width) | crate::ir::IrType::SInt(width) => width.unwrap_or(64),
+                        crate::ir::IrType::Bool => 1,
+                        _ => unreachable!("scalar binding type"),
+                    },
+                },
+            );
+            self.scalar_bindings.insert(
+                name.clone(),
+                crate::codegen::randomize::scalar_binding_sentinel(*local),
+            );
+        }
         let cell_start = self.per_run_cells.len();
         self.emit_randomize_for_site(site, depth);
         if let Some(error) = self.errors.first() {
@@ -2141,7 +2169,8 @@ impl TbirRandomizeEmitter {
                     self.out
                         .push_str(&global_enum_variant_cpp_name(&ident.name));
                 } else {
-                    self.out.push_str(&ident.name);
+                    self.out
+                        .push_str(self.scalar_bindings.get(&ident.name).unwrap_or(&ident.name));
                 }
             }
             ExprKind::ImplicitSelf => {}
@@ -2878,6 +2907,14 @@ impl TbirRandomizeEmitter {
                 );
             }
             ExprKind::Ident(id) => {
+                if !field_info.contains_key(&id.name)
+                    && self.let_widths.get(&id.name).is_some_and(|binding| binding.width > 64)
+                {
+                    self.errors.push(format!(
+                        "randomize({ty}) constraint references scalar `{}` wider than 64 bits; wide runtime scalar captures are not supported",
+                        id.name
+                    ));
+                }
                 if !blocking
                     && !field_info.contains_key(&id.name)
                     && !self.enum_variants.contains_key(&id.name)
@@ -5227,18 +5264,10 @@ impl TbirRandomizeEmitter {
     /// - Resolving *less* than the emitter turns a constraint the emitter
     ///   would have emitted into a hard build error.
     ///
-    /// The second is why this reads only state BOTH emitter constructors
-    /// populate: `field_info`, `const_widths`, `enum_variants`, and pure
-    /// syntax. **Do not add a fallback that reads `let_types`,
-    /// `let_widths` or `probe_widths` to close it.** Those are empty in
-    /// `build_randomize_emitter`, which emits per constraint site and
-    /// never walks statements, so such a fallback resolves on
-    /// `--codegen v1` alone and makes the two backends disagree about the
-    /// same source — a worse failure than the build error, and the reason
-    /// the `blocking` operand fallback added here was backed out again.
-    /// `let_types` is also unscoped (`emit_let` inserts with no block
-    /// restore), so a dead inner shadow supplies a wrong width. Both the
-    /// blocking gap and its scoping prerequisite are tracked in harc#566.
+    /// Runtime scalar widths come from this site's lexically scoped IR
+    /// bindings, populated by `emit_site`. Do not recover them by walking
+    /// source statements or consulting an unscoped name-to-type table: that
+    /// loses shadowing and helper scope boundaries (the historical #566 gap).
     ///
     /// `sum(...)` and `.len()` are deliberately absent for a different
     /// reason: the emitter turns them into solver-internal variables with
@@ -5265,7 +5294,7 @@ impl TbirRandomizeEmitter {
                 if let Some(idx) = self.enum_variants.get(&id.name) {
                     return u64::try_from(*idx).ok().map(value_bit_width);
                 }
-                None
+                self.let_widths.get(&id.name).map(|binding| binding.width)
             }
             ExprKind::Field { .. } => expr_field_path(e, target_root)
                 .and_then(|field| field_info.get(&field))
@@ -5429,28 +5458,12 @@ impl TbirRandomizeEmitter {
     ) -> bool {
         let l = self.constraint_expr_signedness(lhs, field_info, target_root);
         let r = self.constraint_expr_signedness(rhs, field_info, target_root);
-        if l == ConstraintOperandSignedness::Unsigned || r == ConstraintOperandSignedness::Unsigned
-        {
-            let (signed_expr, unsigned_expr) = if l == ConstraintOperandSignedness::Signed
-                && r == ConstraintOperandSignedness::Unsigned
-            {
-                (lhs, rhs)
-            } else if r == ConstraintOperandSignedness::Signed
-                && l == ConstraintOperandSignedness::Unsigned
-            {
-                (rhs, lhs)
-            } else {
-                return false;
-            };
-            let signed_width = self
-                .constraint_expr_native_width(signed_expr, field_info, target_root)
-                .unwrap_or(0);
-            let unsigned_width = self
-                .constraint_expr_native_width(unsigned_expr, field_info, target_root)
-                .unwrap_or(u32::MAX);
-            return (signed_width < 32 && unsigned_width < 32) || signed_width > unsigned_width;
-        }
-        l == ConstraintOperandSignedness::Signed || r == ConstraintOperandSignedness::Signed
+        crate::numeric_semantics::solver_binary_is_signed(
+            l,
+            r,
+            self.constraint_expr_native_width(lhs, field_info, target_root),
+            self.constraint_expr_native_width(rhs, field_info, target_root),
+        )
     }
 
     fn constraint_expr_native_width(
@@ -5750,6 +5763,21 @@ impl TbirRandomizeEmitter {
                     }
                     return;
                 }
+                if blocking {
+                    if let Some(binding) = self.let_widths.get(&id.name) {
+                        if binding.width == 1 && !binding.signed {
+                            let name = &self.scalar_bindings[&id.name];
+                            write!(self.out, "_ctx.bool_val(({}) != 0)", name).ok();
+                        } else {
+                            self.errors.push(format!(
+                                "the scalar `{}` is a value, not a condition, so it cannot be a constraint on its own",
+                                id.name
+                            ));
+                            write!(self.out, "_ctx.bool_val(true)").ok();
+                        }
+                        return;
+                    }
+                }
             }
             ExprKind::Field { .. } => {
                 if let Some(field) = expr_field_path(e, target_root) {
@@ -5960,6 +5988,70 @@ impl TbirRandomizeEmitter {
             blocking,
             list_unroll_bounds,
         );
+    }
+
+    fn constraint_expr_is_bool(&self, e: &Expr) -> bool {
+        match &*e.kind {
+            ExprKind::Bool(_) => false,
+            ExprKind::Ident(_) => false,
+            ExprKind::Paren(inner) => self.constraint_expr_is_bool(inner),
+            ExprKind::Unary { op: UnaryOp::Not | UnaryOp::NotKw, .. } => true,
+            ExprKind::Binary { op, .. } => matches!(
+                op,
+                BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le
+                    | BinaryOp::Gt | BinaryOp::Ge | BinaryOp::AndAnd | BinaryOp::AndKw
+                    | BinaryOp::OrOr | BinaryOp::OrKw
+            ),
+            ExprKind::Membership { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn constraint_expr_numeric_bool_value(&self, e: &Expr) -> Option<bool> {
+        match &*e.kind {
+            ExprKind::Paren(inner) => self.constraint_expr_numeric_bool_value(inner),
+            ExprKind::Int(s) => match c_int_literal(s).as_str() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            },
+            ExprKind::Ident(id) => self.consts.get(&id.name).and_then(|c| {
+                if c.is_bool { None } else { (c.value == 0).then_some(false).or_else(|| (c.value == 1).then_some(true)) }
+            }),
+            _ => None,
+        }
+    }
+
+    fn emit_constraint_equality_operand(
+        &mut self,
+        e: &Expr,
+        bool_context: bool,
+        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        width: u32,
+        target_root: Option<&str>,
+        blocking: bool,
+        list_unroll_bounds: &std::collections::HashMap<String, usize>,
+    ) {
+        if bool_context {
+            write!(self.out, "(").ok();
+            if self.constraint_expr_is_bool(e) {
+                self.emit_constraint_bool_expr_w(
+                    e, field_info, width, target_root, blocking, list_unroll_bounds,
+                );
+            } else if let Some(value) = self.constraint_expr_numeric_bool_value(e) {
+                write!(self.out, "_ctx.bool_val({value})")
+                .ok();
+            } else {
+                self.emit_constraint_bool_expr_w(
+                    e, field_info, width, target_root, blocking, list_unroll_bounds,
+                );
+            }
+            write!(self.out, ")").ok();
+        } else {
+            self.emit_constraint_expr_w(
+                e, field_info, width, target_root, blocking, list_unroll_bounds,
+            );
+        }
     }
 
     fn emit_constraint_bit_slice_expr(
@@ -6230,10 +6322,11 @@ impl TbirRandomizeEmitter {
                         .ok();
                     }
                 } else if blocking && self.let_widths.contains_key(&id.name) {
+                    let binding = self.scalar_bindings.get(&id.name).unwrap_or(&id.name);
                     if width <= 64 {
-                        write!(self.out, "_ctx.bv_val((uint64_t)({}), {})", id.name, width).ok();
+                        write!(self.out, "_ctx.bv_val((uint64_t)({}), {})", binding, width).ok();
                     } else {
-                        write!(self.out, "harc_z3_bv_value(_ctx, {}, {})", id.name, width).ok();
+                        write!(self.out, "harc_z3_bv_value(_ctx, {}, {})", binding, width).ok();
                     }
                 } else {
                     self.errors
@@ -6528,21 +6621,16 @@ impl TbirRandomizeEmitter {
                     );
                     write!(self.out, ")").ok();
                 } else {
-                    self.emit_constraint_expr_w(
-                        lhs,
-                        field_info,
-                        width,
-                        target_root,
-                        blocking,
+                    let bool_context = matches!(op, Eq | Ne)
+                        && (self.constraint_expr_is_bool(lhs)
+                            || self.constraint_expr_is_bool(rhs));
+                    self.emit_constraint_equality_operand(
+                        lhs, bool_context, field_info, width, target_root, blocking,
                         list_unroll_bounds,
                     );
                     write!(self.out, "{sep}").ok();
-                    self.emit_constraint_expr_w(
-                        rhs,
-                        field_info,
-                        width,
-                        target_root,
-                        blocking,
+                    self.emit_constraint_equality_operand(
+                        rhs, bool_context, field_info, width, target_root, blocking,
                         list_unroll_bounds,
                     );
                 }

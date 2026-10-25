@@ -376,7 +376,7 @@ backend can emit inconsistent SMT.
 |---|---|
 | `BvLit(n, w, _)` | `(_ bvN w)` |
 | `BoolLit(b)` | `true` / `false` |
-| `EnumLit { domain, idx }` | `(_ bvIDX W)` where `W = ceil_log2(\|domain\|)`. Plus an axiom on each enum-typed field: `bvult(field, |domain|)`. |
+| `EnumLit { domain, idx }` | `(_ bvIDX W)` where `W = max(1, ceil_log2(\|domain\|))`. For a non-full domain, each enum-typed field gets `bvult(field, \|domain\|)`; domains with at least two variants whose cardinality is a power of two already occupy every value of their minimum-width bit-vector, so no bound is emitted. |
 | `FieldRef(path)` | the declared Z3 variable for that field |
 | `Binary(Add, a, b)` | `(bvadd a b)` |
 | `Binary(Sub, a, b)` | `(bvsub a b)` |

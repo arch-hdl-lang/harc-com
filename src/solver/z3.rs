@@ -88,13 +88,19 @@ fn build_z3_problem(problem: &CTypedProblem) -> Result<Z3Problem, SolverBuildErr
                 return unsupported("enum domain", format!("missing enum domain #{}", domain.0));
             };
             let width = enum_width(enum_info.variants.len());
-            smt.push_str(&format!(
-                "(assert (bvult {} (_ bv{} {}))) ; enum {} domain\n",
-                z3_field_name(path),
-                enum_info.variants.len(),
-                width,
-                enum_info.name
-            ));
+            // A power-of-two enum occupies every value of its minimum-width
+            // bit-vector.  Its cardinality does not fit in that width, so
+            // rendering `bvult(field, cardinality)` would wrap the bound to
+            // zero and make the whole problem unsatisfiable.
+            if enum_info.variants.len() <= 1 || !enum_info.variants.len().is_power_of_two() {
+                smt.push_str(&format!(
+                    "(assert (bvult {} (_ bv{} {}))) ; enum {} domain\n",
+                    z3_field_name(path),
+                    enum_info.variants.len(),
+                    width,
+                    enum_info.name
+                ));
+            }
         }
     }
 
@@ -187,6 +193,9 @@ fn lower_expr(problem: &CTypedProblem, expr: &CTypedExpr) -> Result<String, Solv
             Ok(format!("({op_s} {inner_s})"))
         }
         CExprKind::Binary { op, lhs, rhs } => {
+            if matches!(op, CBinaryOp::Shl | CBinaryOp::Shr) {
+                return lower_shift_expr(problem, *op, lhs, rhs);
+            }
             let lhs_s = lower_expr(problem, lhs)?;
             let rhs_s = lower_expr(problem, rhs)?;
             let op_s = binary_op_smt(*op, &lhs.ty)?;
@@ -253,6 +262,51 @@ fn lower_expr(problem: &CTypedProblem, expr: &CTypedExpr) -> Result<String, Solv
             ))
         }
     }
+}
+
+fn lower_shift_expr(
+    problem: &CTypedProblem,
+    op: CBinaryOp,
+    lhs: &CTypedExpr,
+    rhs: &CTypedExpr,
+) -> Result<String, SolverBuildError> {
+    let lhs_width = bv_width(&lhs.ty).ok_or_else(|| SolverBuildError::Unsupported {
+        feature: "shift lhs",
+        detail: format!("shift lhs has type {}", lhs.ty),
+    })?;
+    let rhs_width = bv_width(&rhs.ty).ok_or_else(|| SolverBuildError::Unsupported {
+        feature: "shift rhs",
+        detail: format!("shift rhs has type {}", rhs.ty),
+    })?;
+    let width = lhs_width.max(rhs_width);
+    let lhs_s = lower_expr(problem, lhs)?;
+    let rhs_s = lower_expr(problem, rhs)?;
+
+    // SMT-LIB requires both shift operands to have the same width. Keep the
+    // full shift amount when it is wider than the value: truncating it would
+    // make (x << 256) look like (x << 0) for an 8-bit value.
+    let lhs_s = extend_bv(lhs_s, lhs_width, width, bv_sign(&lhs.ty));
+    let rhs_s = extend_bv(rhs_s, rhs_width, width, Some(Sign::Unsigned));
+    let op_s = binary_op_smt(op, &lhs.ty)?;
+    let shifted = format!("({op_s} {lhs_s} {rhs_s})");
+
+    if width == lhs_width {
+        Ok(shifted)
+    } else {
+        Ok(format!("((_ extract {} 0) {shifted})", lhs_width - 1))
+    }
+}
+
+fn extend_bv(value: String, from: u32, to: u32, sign: Option<Sign>) -> String {
+    if from == to {
+        return value;
+    }
+    let amount = to - from;
+    let extension = match sign {
+        Some(Sign::Signed) => "sign_extend",
+        Some(Sign::Unsigned) | None => "zero_extend",
+    };
+    format!("((_ {extension} {amount}) {value})")
 }
 
 fn lower_range_membership(
@@ -537,6 +591,76 @@ mod tests {
             .smt
             .contains("(assert (bvult f_op (_ bv3 2))) ; enum Op domain"));
         assert!(z3.smt.contains("(= f_op (_ bv1 2))"));
+    }
+
+    #[test]
+    fn enum_domain_axiom_does_not_wrap_power_of_two_bound() {
+        for variant_count in [2, 4, 8] {
+            let mut env = FieldEnv::new();
+            env.enums.push(EnumDomainEntry {
+                id: EnumDomainId(0),
+                name: "Op".to_string(),
+                variants: (0..variant_count)
+                    .map(|index| EnumVariantSchema {
+                        enum_name: "Op".to_string(),
+                        variant: format!("V{index}"),
+                        index,
+                    })
+                    .collect(),
+            });
+            env.fields.insert(
+                FieldPath::single("op"),
+                field_info(CType::Enum {
+                    domain: EnumDomainId(0),
+                }),
+            );
+
+            let z3 = Z3Backend
+                .build(&base_problem(
+                    env,
+                    CTypedExpr::new(CExprKind::BoolLit(true), CType::Bool, Span::default()),
+                ))
+                .expect("build");
+            assert!(
+                !z3.smt.contains("; enum Op domain"),
+                "full bit-vector enum domain {variant_count} must not emit a wrapping bound"
+            );
+        }
+    }
+
+    #[test]
+    fn enum_domain_axiom_retains_spare_value_exclusion() {
+        for variant_count in [1, 3] {
+            let mut env = FieldEnv::new();
+            env.enums.push(EnumDomainEntry {
+                id: EnumDomainId(0),
+                name: "Op".to_string(),
+                variants: (0..variant_count)
+                    .map(|index| EnumVariantSchema {
+                        enum_name: "Op".to_string(),
+                        variant: format!("V{index}"),
+                        index,
+                    })
+                    .collect(),
+            });
+            env.fields.insert(
+                FieldPath::single("op"),
+                field_info(CType::Enum {
+                    domain: EnumDomainId(0),
+                }),
+            );
+
+            let z3 = Z3Backend
+                .build(&base_problem(
+                    env,
+                    CTypedExpr::new(CExprKind::BoolLit(true), CType::Bool, Span::default()),
+                ))
+                .expect("build");
+            assert!(
+                z3.smt.contains("; enum Op domain"),
+                "non-full enum domain {variant_count} must retain its upper bound"
+            );
+        }
     }
 
     #[test]

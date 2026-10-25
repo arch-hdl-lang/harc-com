@@ -8,6 +8,7 @@
 use std::fs;
 use std::path::Path;
 
+use harc::constraints::typed::CType;
 use harc::constraints::typed_lower::LowerError;
 use harc::parser::parse_source;
 use harc::solver::problem_table::{
@@ -268,6 +269,34 @@ fn expected_lower_error_reason(
             }
         }
     }
+    if file == "predicate_equality_solver.harc" {
+        let transaction = match source {
+            TypedSolverProblemSource::TransactionTemplate { transaction, .. }
+            | TypedSolverProblemSource::RandomizeSite { transaction, .. } => transaction,
+        };
+        let expected = match transaction.as_str() {
+            "FlagValue" => "true == flag",
+            "PredicateEqNumeric" => "(x == 1) == 1",
+            "PredicateEqNumericParen" => "(x == 1) == (1)",
+            "NumericBoolValue" => "x == true",
+            _ => return None,
+        };
+        if errors.len() == 1 {
+            if let LowerError::NonBvBitwise {
+                op: "==",
+                found: CType::Bool,
+                span,
+            } = &errors[0]
+            {
+                let fixture_source = fs::read_to_string(path).ok()?;
+                if fixture_source.get(span.start_usize()..span.end_usize()) == Some(expected) {
+                    return Some(
+                        "C11 native solver regression fixture intentionally exercises mixed Bool/BV equality; staged typed-Z3 lowering does not yet normalize these operands",
+                    );
+                }
+            }
+        }
+    }
     None
 }
 
@@ -389,4 +418,47 @@ fn classifies_only_the_signed_minimum_magnitude_gap() {
         classified, 2,
         "template and randomize site should expose the gap"
     );
+}
+
+#[test]
+fn classifies_only_c11_fixture_mixed_equality_gaps() {
+    let path = Path::new("tests/fixtures/predicate_equality_solver.harc");
+    let parsed = parse_source(&fs::read_to_string(path).unwrap()).unwrap();
+    let table = build_typed_solver_problem_table(&parsed);
+    let mut classified = 0;
+    for entry in table.entries {
+        let transaction = match &entry.source {
+            TypedSolverProblemSource::TransactionTemplate { transaction, .. }
+            | TypedSolverProblemSource::RandomizeSite { transaction, .. } => transaction,
+        };
+        if !matches!(
+            transaction.as_str(),
+            "FlagValue" | "PredicateEqNumeric" | "PredicateEqNumericParen" | "NumericBoolValue"
+        ) {
+            continue;
+        }
+        let errors = match &entry.build {
+            TypedSolverProblemBuild::LowerError(errors) => errors,
+            build => panic!("expected typed lowering error, got {build:?}"),
+        };
+        assert!(expected_lower_error_reason(path, &entry.source, errors).is_some());
+        classified += 1;
+        let span = match &errors[0] {
+            LowerError::NonBvBitwise { span, .. } => *span,
+            error => panic!("expected C11 NonBvBitwise error, got {error:?}"),
+        };
+        let wrong_error = [LowerError::NonBvBitwise {
+            op: "!=",
+            found: CType::Bool,
+            span,
+        }];
+        assert!(expected_lower_error_reason(path, &entry.source, &wrong_error).is_none());
+        let wrong_transaction = TypedSolverProblemSource::TransactionTemplate {
+            transaction: "Other".into(),
+            source_id: Default::default(),
+            span: Default::default(),
+        };
+        assert!(expected_lower_error_reason(path, &wrong_transaction, errors).is_none());
+    }
+    assert!(classified >= 4, "expected all four C11 transaction gaps");
 }

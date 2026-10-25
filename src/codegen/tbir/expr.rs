@@ -1277,9 +1277,17 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             // v1 wraps the whole conditional in parens so it cannot
             // bind into a surrounding higher-precedence operator.
             let c = truthy_cpp(cx, c, expr_cpp(cx, c)?);
-            let t_cpp = expr_cpp(cx, t)?;
-            let e2_cpp = expr_cpp(cx, e2)?;
-            let (t_cpp, e2_cpp) = coerce_unsigned_wide_pair(cx, t, e2, t_cpp, e2_cpp);
+            let (t_cpp, e2_cpp) = if expr_is_signed(cx, t) && expr_is_signed(cx, e2) {
+                // A 65..=128-bit signed scalar is carried as `_harc_u128`,
+                // so C++ cannot recover its declared sign bit when the
+                // conditional promotes a narrower arm. Keep the extension
+                // in the selected arm to preserve conditional laziness.
+                coerce_signed_wide_pair(cx, t, e2)?
+            } else {
+                let t_cpp = expr_cpp(cx, t)?;
+                let e2_cpp = expr_cpp(cx, e2)?;
+                coerce_unsigned_wide_pair(cx, t, e2, t_cpp, e2_cpp)
+            };
             format!("({c} ? {t_cpp} : {e2_cpp})")
         }
         Expr::BitSlice { target, hi, lo } => {

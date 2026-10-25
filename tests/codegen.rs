@@ -43,6 +43,31 @@ fn v1_enum_symbol(cpp: &str, source_name: &str) -> String {
 }
 
 #[test]
+fn radix_literals_use_signed_rank_before_unary_negation() {
+    let source = parse_source(
+        r#"test T
+    let dut : Top
+    run
+        let hex : sint<32> = -0x80000000
+        let bin : sint<32> = -0b10000000000000000000000000000000
+        let sized : sint<32> = -32'h80000000
+        let unsigned : uint<64> = 0xffffffffffffffff
+        assert hex == -2147483648 else fail("hex")
+        assert bin == -2147483648 else fail("bin")
+        assert sized == -2147483648 else fail("sized")
+        assert unsigned == 18446744073709551615 else fail("unsigned")
+    end run
+end test T"#,
+    )
+    .expect("literal rank regression parses");
+    let cpp = cpp_tb::emit(&source).expect("literal rank regression emits");
+    assert!(cpp.contains("-(((int64_t)(0x80000000)))"), "{cpp}");
+    assert!(cpp.contains("-(((int64_t)(0b10000000000000000000000000000000)))"), "{cpp}");
+    assert!(cpp.contains("-(((int64_t)(0x80000000)))"), "{cpp}");
+    assert!(cpp.contains("((uint64_t)(0xffffffffffffffff))"), "{cpp}");
+}
+
+#[test]
 fn dut_interface_catalog_preserves_direction_signedness_and_lane_shape() {
     let dir =
         std::env::temp_dir().join(format!("harc_dut_interface_catalog_{}", std::process::id()));
@@ -3563,12 +3588,12 @@ end impl BareSiblingTestbenchCallTest"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
-        cpp.contains("Tb_write_reg(self, 0x1000, 0)")
-            && cpp.contains("Tb_write_reg(self, 0x1004, 1)"),
+        cpp.contains("Tb_write_reg(self, ((int64_t)(0x1000)), 0)")
+            && cpp.contains("Tb_write_reg(self, ((int64_t)(0x1004)), 1)"),
         "testbench sibling calls should dispatch through self; got:\n{cpp}"
     );
     assert!(
-        !cpp.contains("write_reg(0x1000, 0)") && !cpp.contains("write_reg(0x1004, 1)"),
+        !cpp.contains("write_reg(((int64_t)(0x1000)), 0)") && !cpp.contains("write_reg(((int64_t)(0x1004)), 1)"),
         "testbench sibling calls must not emit as bare C++ calls; got:\n{cpp}"
     );
 }
@@ -13217,34 +13242,34 @@ end test StableB"#,
     let expected = vec![
         (
             "stable__suite_api.hpp".to_string(),
-            "450bdb67181f050a".to_string(),
+            "4fd9c7674a02d7c3".to_string(),
         ),
         (
             "stable__runtime.cpp".to_string(),
-            "9fd33743b5d7f462".to_string(),
+            "376a413a731df2ab".to_string(),
         ),
         (
             "stable__test_StableA.cpp".to_string(),
-            "b85eaba9035b09af".to_string(),
+            "32e32104beec53c3".to_string(),
         ),
         (
             "stable__test_StableB.cpp".to_string(),
-            "a071ab01097939c5".to_string(),
+            "1f0f11bb0652b945".to_string(),
         ),
         (
             "stable__registry.cpp".to_string(),
-            "c7d7d898941958be".to_string(),
+            "d52062097b7e81e2".to_string(),
         ),
     ];
     assert_eq!(actual, expected);
-    assert_eq!(output.interface_abi, "2db2a7d982be6992");
+    assert_eq!(output.interface_abi, "b9a40407508ee6a4");
     assert_eq!(output.build_profile, "f11cada50936fa42");
     assert_eq!(
         output
             .artifact_plan
             .render_manifest(&output.interface_abi, &output.build_profile)
             .expect("render stable manifest"),
-        "{\"schema_version\":1,\"interface_abi\":\"2db2a7d982be6992\",\"build_profile\":\"f11cada50936fa42\",\"tests\":[\"StableA\",\"StableB\"],\"artifacts\":[\"stable__suite_api.hpp\",\"stable__runtime.cpp\",\"stable__test_StableA.cpp\",\"stable__test_StableB.cpp\",\"stable__registry.cpp\",\"harc_thread_rt.h\",\"harc_random_rt.h\",\"harc_queue_rt.h\",\"harc_trace_rt.h\",\"harc_log_rt.h\",\"harc_z3_rt.h\"]}\n"
+        "{\"schema_version\":1,\"interface_abi\":\"b9a40407508ee6a4\",\"build_profile\":\"f11cada50936fa42\",\"tests\":[\"StableA\",\"StableB\"],\"artifacts\":[\"stable__suite_api.hpp\",\"stable__runtime.cpp\",\"stable__test_StableA.cpp\",\"stable__test_StableB.cpp\",\"stable__registry.cpp\",\"harc_thread_rt.h\",\"harc_random_rt.h\",\"harc_queue_rt.h\",\"harc_trace_rt.h\",\"harc_log_rt.h\",\"harc_z3_rt.h\"]}\n"
     );
 }
 

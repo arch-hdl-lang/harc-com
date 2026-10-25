@@ -70,6 +70,65 @@ namespace harc_rt {
 // it for the value type so codegen can emit `_harc_u128` literals
 // without namespace qualification.
 
+// BEGIN FORMAL WORD KERNELS
+// Arithmetic kernels operate on distinct, valid arrays of `count` words.
+// Runtime wrappers supply std::array storage; proofs use the same bodies.
+inline void harc_word_mask(uint32_t* words, unsigned count, unsigned width) {
+    const unsigned total = count * 32;
+    if (width >= total) return;
+    const unsigned keep_words = width / 32;
+    const unsigned keep_bits = width % 32;
+    for (unsigned i = keep_words + (keep_bits ? 1 : 0); i < count; ++i) words[i] = 0;
+    if (keep_words < count) {
+        if (keep_bits == 0) {
+            for (unsigned i = keep_words; i < count; ++i) words[i] = 0;
+        } else {
+            words[keep_words] &= (static_cast<uint32_t>(1) << keep_bits) - 1u;
+        }
+    }
+}
+
+inline void harc_word_sext(uint32_t* words, unsigned count, unsigned source_width, unsigned dest_width) {
+    harc_word_mask(words, count, source_width);
+    if (source_width == 0 || dest_width == 0) {
+        for (unsigned i = 0; i < count; ++i) words[i] = 0;
+        return;
+    }
+    const unsigned sign_bit = source_width - 1;
+    const unsigned sign_word = sign_bit / 32;
+    const unsigned sign_off = sign_bit % 32;
+    const bool neg = sign_word < count && ((words[sign_word] >> sign_off) & 1u);
+    if (neg) {
+        for (unsigned i = 0; i < count; ++i) {
+            const unsigned low = i * 32;
+            if (source_width <= low) words[i] = ~static_cast<uint32_t>(0);
+            else if (source_width < low + 32)
+                words[i] |= ~static_cast<uint32_t>(0) << (source_width - low);
+        }
+    }
+    harc_word_mask(words, count, dest_width);
+}
+
+inline void harc_word_add(uint32_t* out, const uint32_t* lhs, const uint32_t* rhs, unsigned count) {
+    uint64_t carry = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        const uint64_t sum = static_cast<uint64_t>(lhs[i]) + rhs[i] + carry;
+        out[i] = static_cast<uint32_t>(sum);
+        carry = sum >> 32;
+    }
+}
+
+inline void harc_word_sub(uint32_t* out, const uint32_t* lhs, const uint32_t* rhs, unsigned count) {
+    uint64_t borrow = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        const uint64_t l = lhs[i];
+        const uint64_t r = static_cast<uint64_t>(rhs[i]) + borrow;
+        out[i] = static_cast<uint32_t>(l - r);
+        borrow = l < r ? 1 : 0;
+    }
+}
+// END FORMAL WORD KERNELS
+
 template<std::size_t N>
 struct HarcWide {
     std::array<uint32_t, N> words{};
@@ -222,18 +281,7 @@ inline bool operator!=(T lhs, const HarcWide<N>& rhs) {
 
 template<std::size_t N>
 inline HarcWide<N> harc_wide_mask_bits(HarcWide<N> value, unsigned width) {
-    const unsigned total = static_cast<unsigned>(N * 32);
-    if (width >= total) return value;
-    const unsigned keep_words = width / 32;
-    const unsigned keep_bits = width % 32;
-    for (std::size_t i = keep_words + (keep_bits ? 1 : 0); i < N; ++i) value.words[i] = 0;
-    if (keep_words < N) {
-        if (keep_bits == 0) {
-            for (std::size_t i = keep_words; i < N; ++i) value.words[i] = 0;
-        } else {
-            value.words[keep_words] &= (uint32_t{1} << keep_bits) - 1u;
-        }
-    }
+    harc_word_mask(value.words.data(), static_cast<unsigned>(N), width);
     return value;
 }
 
@@ -307,17 +355,8 @@ inline HarcWide<N> harc_wide_trunc(const HarcWide<M>& value, unsigned width) {
 template<std::size_t N, typename T>
 inline HarcWide<N> harc_wide_sext(T value, unsigned source_width, unsigned dest_width) {
     HarcWide<N> out = HarcWide<N>(value);
-    out = harc_wide_mask_bits(out, source_width);
-    if (source_width == 0 || dest_width == 0) return HarcWide<N>();
-    const unsigned sign_bit = source_width - 1;
-    const std::size_t sign_word = sign_bit / 32;
-    const unsigned sign_off = sign_bit % 32;
-    const bool neg = sign_word < N && ((out.words[sign_word] >> sign_off) & 1u);
-    if (!neg) return harc_wide_mask_bits(out, dest_width);
-    for (unsigned bit = source_width; bit < dest_width && bit < N * 32; ++bit) {
-        out.words[bit / 32] |= uint32_t{1} << (bit % 32);
-    }
-    return harc_wide_mask_bits(out, dest_width);
+    harc_word_sext(out.words.data(), static_cast<unsigned>(N), source_width, dest_width);
+    return out;
 }
 
 template<std::size_t N>
@@ -376,25 +415,14 @@ inline HarcWide<OutWords> harc_wide_extract_bits(
 template<std::size_t N>
 inline HarcWide<N> operator+(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
     HarcWide<N> out;
-    uint64_t carry = 0;
-    for (std::size_t i = 0; i < N; ++i) {
-        const uint64_t sum = static_cast<uint64_t>(lhs.words[i]) + rhs.words[i] + carry;
-        out.words[i] = static_cast<uint32_t>(sum);
-        carry = sum >> 32;
-    }
+    harc_word_add(out.words.data(), lhs.words.data(), rhs.words.data(), static_cast<unsigned>(N));
     return out;
 }
 
 template<std::size_t N>
 inline HarcWide<N> operator-(const HarcWide<N>& lhs, const HarcWide<N>& rhs) {
     HarcWide<N> out;
-    uint64_t borrow = 0;
-    for (std::size_t i = 0; i < N; ++i) {
-        const uint64_t l = lhs.words[i];
-        const uint64_t r = static_cast<uint64_t>(rhs.words[i]) + borrow;
-        out.words[i] = static_cast<uint32_t>(l - r);
-        borrow = l < r ? 1 : 0;
-    }
+    harc_word_sub(out.words.data(), lhs.words.data(), rhs.words.data(), static_cast<unsigned>(N));
     return out;
 }
 
@@ -770,6 +798,7 @@ inline uint64_t harc_bits(_harc_u128 value, uint32_t hi, uint32_t lo) {
     return static_cast<uint64_t>(shifted & mask);
 }
 
+// BEGIN FORMAL U128 KERNELS
 inline _harc_u128 harc_mask_u128(unsigned width) {
     if (width >= 128) return ~static_cast<_harc_u128>(0);
     if (width == 0) return 0;
@@ -834,13 +863,15 @@ inline _harc_u128 harc_ashr_u128(_harc_u128 value, uint64_t shift, unsigned widt
     value = harc_trunc_u128(value, width);
     if (width == 0) return 0;
     const bool negative = ((value >> (width - 1)) & 1u) != 0;
-    if (shift >= width) return negative ? harc_mask_u128(width) : 0;
+    if (shift >= width) return negative ? harc_mask_u128(width) : static_cast<_harc_u128>(0);
     _harc_u128 out = value >> shift;
     if (negative && shift != 0) {
         out |= harc_mask_u128(width) & ~harc_mask_u128(width - shift);
     }
     return harc_trunc_u128(out, width);
 }
+
+// END FORMAL U128 KERNELS
 
 template<std::size_t N>
 inline HarcWide<N> harc_wide_ashr(HarcWide<N> value, uint64_t shift, unsigned width) {

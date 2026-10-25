@@ -43,8 +43,8 @@ use crate::ir::scalar::{
     contextual_value_bits, scalar_value_evidence, signed_value_bits, ScalarValueEvidence,
 };
 use crate::ir::{
-    CallTarget, Expr, FunctionId, FunctionKind, IrType, RecordId, Stmt, TbFunction, Terminator,
-    TypedParam,
+    BinOp, CallTarget, Expr, FunctionId, FunctionKind, IrType, RecordId, Stmt, TbFunction,
+    Terminator, TypedParam,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -434,7 +434,27 @@ impl FuncBuilder<'_> {
                     });
                     let lowered = self.lower_expr(value);
                     self.inline_frames.pop();
-                    return lowered;
+                    let lowered = lowered?;
+                    let return_ty = inlined_helper_signature_type(
+                        name,
+                        "return type",
+                        decl.return_ty.as_ref(),
+                        &self.ctx.record_ids,
+                    )?;
+                    if matches!(return_ty, IrType::Bool) {
+                        // Preserve the expression-only fast path so DUT reads
+                        // remain live, while applying the declared bool
+                        // conversion at the expression's evaluation site.
+                        return Ok(Expr::Binary(
+                            BinOp::Ne,
+                            Box::new(lowered),
+                            Box::new(Expr::Literal {
+                                value: 0,
+                                ty: IrType::Unknown,
+                            }),
+                        ));
+                    }
+                    return Ok(lowered);
                 }
         }
         if self.in_fmt_args {
@@ -980,7 +1000,15 @@ impl FuncBuilder<'_> {
             let (dest, cont) = (frame.ret_dest, frame.ret_cont);
             if let Some(e) = value {
                 let expected = self.local_type(dest).clone();
-                if let Some(port) = self.as_port_ref(e)? {
+                if matches!(expected, IrType::Bool) {
+                    // Materialize a numeric port in its own carrier before
+                    // converting it; a Bool return slot cannot receive a
+                    // typed integer directly in verified IR.
+                    let ir = self.lower_expr_no_ports(e)?;
+                    self.check_slot_ir(&ir, &expected, "helper return")?;
+                    let ir = self.coerce_bool_return(ir, &expected);
+                    self.push(Stmt::Assign(dest, ir));
+                } else if let Some(port) = self.as_port_ref(e)? {
                     if matches!(
                         expected,
                         IrType::Record(_)
@@ -1073,12 +1101,33 @@ impl FuncBuilder<'_> {
                     self.record_error_span(e.span);
                     return Err(error);
                 }
+                let ir = self.coerce_bool_return(ir, &expected);
                 self.push(Stmt::Assign(ret, ir));
             }
             self.terminate(Terminator::Return);
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn coerce_bool_return(&self, value: Expr, expected: &IrType) -> Expr {
+        if matches!(expected, IrType::Bool)
+            && matches!(
+                self.expr_type(&value),
+                Some(IrType::UInt(_) | IrType::SInt(_) | IrType::Unknown) | None
+            )
+        {
+            Expr::Binary(
+                BinOp::Ne,
+                Box::new(value),
+                Box::new(Expr::Literal {
+                    value: 0,
+                    ty: IrType::Unknown,
+                }),
+            )
+        } else {
+            value
+        }
     }
 
     fn push_return_default(&mut self, dest: crate::ir::LocalId, ty: &IrType) {
