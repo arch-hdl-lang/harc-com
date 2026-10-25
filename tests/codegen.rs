@@ -43,6 +43,34 @@ fn v1_enum_symbol(cpp: &str, source_name: &str) -> String {
 }
 
 #[test]
+fn radix_literals_use_signed_rank_before_unary_negation() {
+    let source = parse_source(
+        r#"test T
+    let dut : Top
+    run
+        let hex : sint<32> = -0x80000000
+        let bin : sint<32> = -0b10000000000000000000000000000000
+        let sized : sint<32> = -32'h80000000
+        let unsigned : uint<64> = 0xffffffffffffffff
+        let wide : uint<128> = 65'h10000000000000000
+        assert hex == -2147483648 else fail("hex")
+        assert bin == -2147483648 else fail("bin")
+        assert sized == -2147483648 else fail("sized")
+        assert unsigned == 18446744073709551615 else fail("unsigned")
+        assert wide == 18446744073709551616 else fail("wide")
+    end run
+end test T"#,
+    )
+    .expect("literal rank regression parses");
+    let cpp = cpp_tb::emit(&source).expect("literal rank regression emits");
+    assert!(cpp.contains("-((int64_t)(0x80000000))"), "{cpp}");
+    assert!(cpp.contains("-((int64_t)(0b10000000000000000000000000000000))"), "{cpp}");
+    assert!(cpp.contains("-((int64_t)(0x80000000))"), "{cpp}");
+    assert!(cpp.contains("((uint64_t)(0xffffffffffffffff))"), "{cpp}");
+    assert!(cpp.contains("((_harc_u128)0x1ULL << 64)"), "{cpp}");
+}
+
+#[test]
 fn dut_interface_catalog_preserves_direction_signedness_and_lane_shape() {
     let dir =
         std::env::temp_dir().join(format!("harc_dut_interface_catalog_{}", std::process::id()));
@@ -3563,12 +3591,12 @@ end impl BareSiblingTestbenchCallTest"#,
     .unwrap();
     let cpp = cpp_tb::emit(&parsed).expect("emit");
     assert!(
-        cpp.contains("Tb_write_reg(self, 0x1000, 0)")
-            && cpp.contains("Tb_write_reg(self, 0x1004, 1)"),
+        cpp.contains("Tb_write_reg(self, ((int64_t)(0x1000)), 0)")
+            && cpp.contains("Tb_write_reg(self, ((int64_t)(0x1004)), 1)"),
         "testbench sibling calls should dispatch through self; got:\n{cpp}"
     );
     assert!(
-        !cpp.contains("write_reg(0x1000, 0)") && !cpp.contains("write_reg(0x1004, 1)"),
+        !cpp.contains("write_reg(((int64_t)(0x1000)), 0)") && !cpp.contains("write_reg(((int64_t)(0x1004)), 1)"),
         "testbench sibling calls must not emit as bare C++ calls; got:\n{cpp}"
     );
 }

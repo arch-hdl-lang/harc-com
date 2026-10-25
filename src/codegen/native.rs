@@ -6094,7 +6094,51 @@ fn c_value_literal(s: &str) -> String {
         out.push_str("})");
         return out;
     }
-    c_int_literal(s)
+    c_value_literal_with_rank(s)
+}
+
+/// Render radix literals with a carrier whose C++ rank matches HARC's
+/// 64-bit integer domain. In particular, an unadorned `0x80000000` is an
+/// unsigned 32-bit C++ literal; applying unary `-` to it wraps before the
+/// result reaches a signed HARC local.
+fn c_value_literal_with_rank(s: &str) -> String {
+    let normalized = normalized_int_literal(s);
+    let Some((radix, digits)) = radix_digits(&normalized) else {
+        return c_int_literal(s);
+    };
+    let Some(value) = u128::from_str_radix(digits, radix).ok() else {
+        return c_int_literal(s);
+    };
+    if value == 0 {
+        return normalized;
+    }
+    if value <= u64::MAX as u128 {
+        let carrier = if value <= i64::MAX as u128 {
+            "int64_t"
+        } else {
+            "uint64_t"
+        };
+        return format!("(({carrier})({normalized}))");
+    }
+    // Keep the established hex composite spelling (including source case)
+    // for values already handled by c_int_literal. Binary forms need the
+    // equivalent carrier here because c_int_literal only has a hex-wide
+    // path.
+    if radix == 16 {
+        return c_int_literal(s);
+    }
+    let lo = value as u64;
+    let hi = (value >> 64) as u64;
+    format!("(((_harc_u128)0x{hi:x}ULL << 64) | (_harc_u128)0x{lo:x}ULL)")
+}
+
+fn radix_digits(normalized: &str) -> Option<(u32, &str)> {
+    normalized
+        .strip_prefix("0x")
+        .map(|digits| (16, digits))
+        .or_else(|| normalized.strip_prefix("0X").map(|digits| (16, digits)))
+        .or_else(|| normalized.strip_prefix("0b").map(|digits| (2, digits)))
+        .or_else(|| normalized.strip_prefix("0B").map(|digits| (2, digits)))
 }
 
 /// If the integer literal `s` is hex with > 32 hex digits (i.e. >
