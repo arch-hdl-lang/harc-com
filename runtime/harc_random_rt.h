@@ -333,7 +333,15 @@ inline int64_t harc_prefer_dist(
 template <typename Next>
 inline int64_t harc_rng_range(Next next, int64_t lo, int64_t hi) {
     if (hi <= lo) return lo;
-    return lo + static_cast<int64_t>(next() % static_cast<uint64_t>(hi - lo + 1));
+    // Compute the inclusive cardinality in unsigned arithmetic.  A zero
+    // span is the intentional representation of the full int64_t domain.
+    const uint64_t span = static_cast<uint64_t>(hi) - static_cast<uint64_t>(lo) + 1;
+    const uint64_t offset = span == 0 ? next() : next() % span;
+    const uint64_t bits = static_cast<uint64_t>(lo) + offset;
+    // Reconstruct the signed value without an out-of-range conversion or a
+    // signed addition that could overflow at INT64_MIN/INT64_MAX.
+    return bits <= INT64_MAX ? static_cast<int64_t>(bits)
+        : -1 - static_cast<int64_t>(UINT64_MAX - bits);
 }
 
 template <typename Next>
