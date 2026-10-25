@@ -2893,8 +2893,8 @@ impl Emitter {
     /// bit-vector width and semantics.
     fn constraint_expr_is_bool(&self, e: &Expr) -> bool {
         match &*e.kind {
-            ExprKind::Bool(_) => true,
-            ExprKind::Ident(id) => self.consts.get(&id.name).is_some_and(|c| c.is_bool),
+            ExprKind::Bool(_) => false,
+            ExprKind::Ident(_) => false,
             ExprKind::Paren(inner) => self.constraint_expr_is_bool(inner),
             ExprKind::Unary {
                 op: UnaryOp::Not | UnaryOp::NotKw,
@@ -2918,6 +2918,21 @@ impl Emitter {
         }
     }
 
+    fn constraint_expr_numeric_bool_value(&self, e: &Expr) -> Option<bool> {
+        match &*e.kind {
+            ExprKind::Paren(inner) => self.constraint_expr_numeric_bool_value(inner),
+            ExprKind::Int(s) => match c_int_literal(s).as_str() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            },
+            ExprKind::Ident(id) => self.consts.get(&id.name).and_then(|c| {
+                if c.is_bool { None } else { (c.value == 0).then_some(false).or_else(|| (c.value == 1).then_some(true)) }
+            }),
+            _ => None,
+        }
+    }
+
     fn emit_constraint_equality_operand(
         &mut self,
         e: &Expr,
@@ -2929,31 +2944,20 @@ impl Emitter {
         list_unroll_bounds: &std::collections::HashMap<String, usize>,
     ) {
         if bool_context {
-            let numeric_bool = match &*e.kind {
-                ExprKind::Int(s) => matches!(c_int_literal(s).as_str(), "0" | "1"),
-                ExprKind::Ident(id) => self
-                    .consts
-                    .get(&id.name)
-                    .filter(|c| !c.is_bool)
-                    .is_some_and(|c| matches!(c.value, 0 | 1)),
-                _ => false,
-            };
+            write!(self.out, "(").ok();
             if self.constraint_expr_is_bool(e) {
                 self.emit_constraint_bool_expr_w(
                     e, field_info, width, target_root, blocking, list_unroll_bounds,
                 );
-            } else if numeric_bool {
-                write!(self.out, "_ctx.bool_val({})", match &*e.kind {
-                    ExprKind::Int(s) => c_int_literal(s) == "1",
-                    ExprKind::Ident(id) => self.consts[&id.name].value == 1,
-                    _ => false,
-                })
+            } else if let Some(value) = self.constraint_expr_numeric_bool_value(e) {
+                write!(self.out, "_ctx.bool_val({value})")
                 .ok();
             } else {
                 self.emit_constraint_bool_expr_w(
                     e, field_info, width, target_root, blocking, list_unroll_bounds,
                 );
             }
+            write!(self.out, ")").ok();
         } else {
             self.emit_constraint_expr_w(
                 e, field_info, width, target_root, blocking, list_unroll_bounds,

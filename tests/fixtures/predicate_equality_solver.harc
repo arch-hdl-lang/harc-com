@@ -11,6 +11,16 @@ transaction PredicateEqLiteral
     keep (x == 1) == true
 end transaction PredicateEqLiteral
 
+transaction ReversedPredicate
+    x : uint<8>
+    keep true == (x == 1)
+end transaction ReversedPredicate
+
+transaction FlagValue
+    flag : uint<1>
+    keep true == flag
+end transaction FlagValue
+
 transaction PredicateEqFalse
     x : uint<8>
     keep (x == 1) == NO
@@ -20,6 +30,16 @@ transaction PredicateEqNumeric
     x : uint<8>
     keep (x == 1) == 1
 end transaction PredicateEqNumeric
+
+transaction PredicateEqNumericParen
+    x : uint<8>
+    keep (x == 1) == (1)
+end transaction PredicateEqNumericParen
+
+transaction NumericBoolValue
+    x : uint<8>
+    keep x == true
+end transaction NumericBoolValue
 
 transaction DirectPredicate
     x : uint<8>
@@ -46,12 +66,24 @@ test Sat
         let b : PredicateEqLiteral
         randomize(b)
         assert b.x == 1
+        let i : ReversedPredicate
+        randomize(i)
+        assert i.x == 1
+        let j : FlagValue
+        randomize(j)
+        assert j.flag == 1
         let e : PredicateEqFalse
         randomize(e)
         assert e.x != 1
         let f : PredicateEqNumeric
         randomize(f)
         assert f.x == 1
+        let g : PredicateEqNumericParen
+        randomize(g)
+        assert g.x == 1
+        let h : NumericBoolValue
+        randomize(h)
+        assert h.x == 1
         let c : DirectPredicate
         randomize(c)
         assert c.x == 1
