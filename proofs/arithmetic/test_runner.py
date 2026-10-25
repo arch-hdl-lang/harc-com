@@ -81,6 +81,48 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("VERIFICATION:- FAILED", log)
             self.assertRegex(log, r"Failed Checks: assertion failed: a\.bits\s*==\s*b\.bits")
 
+    def test_rust_bitwise_recanonicalization_mutation_is_detected(self):
+        kani = shutil.which("kani")
+        self.assertIsNotNone(kani, "Kani required: mutation checks must execute")
+        source = (proof.ROOT / "src/numeric_semantics.rs").read_text()
+        original = """            Scalar {
+                bits,
+                // Preserve the existing integral-promotion signedness for
+                // Boolean-only operations, even when typed Boolean carriers
+                // enter the kernel with `signed: false`.
+                signed: if boolean { true } else { signed },
+                boolean,
+            }
+"""
+        mutated = """            Scalar {
+                bits: if a.boolean && b.boolean { (bits != 0) as u64 } else { bits },
+                // Preserve the existing integral-promotion signedness for
+                // Boolean-only operations, even when typed Boolean carriers
+                // enter the kernel with `signed: false`.
+                signed: if boolean { true } else { signed },
+                boolean,
+            }
+"""
+        self.assertEqual(source.count(original), 1)
+        out = proof.ROOT / "target/formal/mutations"
+        out.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="harc-formal-mutation-") as directory:
+            temp = Path(directory)
+            module = temp / "numeric_semantics.rs"
+            module.write_text(source.replace(original, mutated))
+            harness = (proof.ROOT / "proofs/arithmetic/kani.rs").read_text()
+            harness = harness.replace('../../src/numeric_semantics.rs', 'numeric_semantics.rs')
+            entry = temp / "harness.rs"
+            entry.write_text(harness)
+            code, log = proof.run([kani, str(entry), "--harness", "const_bit_logic", "--exact",
+                                   "--default-unwind", "5", "--output-format", "terse",
+                                   "--target-dir", str(temp / "build")], 90)
+            (out / "rust-bitwise-recanonicalization.log").write_text(log)
+            self.assertIsNotNone(code, log)
+            self.assertNotEqual(code, 0, log)
+            self.assertIn("VERIFICATION:- FAILED", log)
+            self.assertRegex(log, r"Failed Checks: assertion failed: a\.bits\s*==\s*b\.bits")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -384,6 +384,62 @@ end test T"#,
     }
 }
 
+/// Boolean-origin metadata is retained for dimension checks, while bitwise
+/// constant folding preserves the full 64-bit result of noncanonical Boolean
+/// operands such as `~true`.
+#[test]
+fn const_bitwise_boolean_origin_preserves_raw_bits() {
+    let src = r#"const A = (~true) & (~false)
+const B = (~true) | false
+const C = (true ? ~true : false) | false
+const D = (false ? ~false : ~true) & (~false)
+const E = ~true
+const F = ~false
+const G = true & false
+const H : bool = true
+const I = ~(H & H)
+
+test T
+    let dut : Top
+    run
+        assert A == -2 else fail("A")
+        assert B == -2 else fail("B")
+        assert C == -2 else fail("C")
+        assert D == -2 else fail("D")
+        assert E == -2 else fail("E")
+        assert F == -1 else fail("F")
+        assert G == 0 else fail("G")
+        assert I < 0 else fail("typed Boolean promotion")
+    end run
+end test T"#;
+    let program = lower_src(src).expect("bitwise Boolean constants lower");
+    verify::verify_program(&program).expect("bitwise Boolean constants verify");
+    let ir = format!("{program}");
+    assert!(
+        ir.matches("18446744073709551614").count() >= 4,
+        "all complement-derived constants must retain 0xfffffffffffffffe: {ir}"
+    );
+    assert!(
+        !ir.contains("(1 == -2)"),
+        "bitwise Boolean result must not be canonicalized to 1: {ir}"
+    );
+
+    let invalid = r#"scoreboard S
+    lanes : Vec<uint<8>, (~true) & (~false)>
+end scoreboard S
+
+test T
+    let dut : Top
+    run
+    end run
+end test T"#;
+    let err = lower_src(invalid).expect_err("Boolean-origin vector length must be rejected");
+    assert!(
+        err.to_string().contains("integer expression"),
+        "Boolean-origin metadata must remain visible to dimension checks: {err}"
+    );
+}
+
 /// #494 P2a / #521: a `const` initializer referencing an undefined name
 /// is rejected with a precise `Invalid` diagnostic naming both the
 /// const and the unknown reference — never silently accepted.

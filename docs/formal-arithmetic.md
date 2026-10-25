@@ -105,7 +105,7 @@ See the [CBMC documentation](https://diffblue.github.io/cbmc/) and
 [Kani installation guide](https://model-checking.github.io/kani/install-guide.html).
 
 `test_runner.py` checks fail-closed result classification and deliberately
-injects four defects into temporary copies: reversed signed comparison,
+injects five defects into temporary copies: reversed signed comparison,
 dropped word carry, missing sign extension and logical instead of arithmetic
 constant right shift. Each must produce a real assertion counterexample;
 compilation failure or timeout does not count as defect detection.

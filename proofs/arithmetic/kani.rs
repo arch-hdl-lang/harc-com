@@ -146,10 +146,10 @@ fn const_bit_logic() {
         (BitOr, a.bits | b.bits),
         (BitXor, a.bits ^ b.bits),
     ] {
-        let expected = if both {
-            boolean(bits != 0)
-        } else {
-            integer(bits, a.signed && b.signed)
+        let expected = Scalar {
+            bits,
+            signed: if both { true } else { a.signed && b.signed },
+            boolean: both,
         };
         check(fold_binary(op, a, b, None), Ok(expected));
     }

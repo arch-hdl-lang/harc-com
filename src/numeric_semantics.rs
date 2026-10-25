@@ -177,10 +177,19 @@ pub(crate) fn fold_binary(
                 BitOr => a.bits | b.bits,
                 _ => a.bits ^ b.bits,
             };
-            if a.boolean && b.boolean {
-                boolean(bits != 0)
-            } else {
-                arith(bits)
+            // Boolean provenance remains attached to the result for shape and
+            // dimension validation, but bitwise operators are still 64-bit
+            // arithmetic on the operand bit patterns. In particular, `~true`
+            // carries the noncanonical all-but-low-bit pattern and must not be
+            // collapsed back to the Boolean value 1 here.
+            let boolean = a.boolean && b.boolean;
+            Scalar {
+                bits,
+                // Preserve the existing integral-promotion signedness for
+                // Boolean-only operations, even when typed Boolean carriers
+                // enter the kernel with `signed: false`.
+                signed: if boolean { true } else { signed },
+                boolean,
             }
         }
         Eq => boolean(a.bits == b.bits),
