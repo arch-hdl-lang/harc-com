@@ -7,7 +7,7 @@ python3 proofs/arithmetic/test_runner.py
 python3 proofs/arithmetic/run.py
 ```
 
-The default suite runs 24 CBMC obligations and 10 Kani harnesses. Inputs are
+The default suite runs 28 CBMC obligations and 12 Kani harnesses. Inputs are
 symbolic: a passing obligation covers every input admitted by its assumptions,
 not a random sample. The separate `Formal arithmetic` workflow runs these
 checks on pushes and pull requests. Missing tools, failed assertions, incomplete
@@ -24,6 +24,8 @@ unwinding, unrecognized success output and timeouts fail the run.
 | `harc_word_add`, `harc_word_sub` | Addition/subtraction modulo storage capacity | All stored bits at word counts 1, 2, 4, 5, 8, 32 (32..1024 bits) |
 | `harc_word_mask`, `harc_word_sext` | Each output bit preserves an input bit, extends the declared sign bit, or clears padding | Same six capacities; all source/destination widths from zero through capacity, including narrowing |
 | `src/numeric_semantics.rs`: `fold_binary` | Constant arithmetic values, comparison/Boolean result kinds, signedness, wrapping masks, shift validation, division/error dispatch | All 64-bit operands and metadata flags; wrapping widths 0..64, plus rejection of absent/out-of-range widths |
+| `fold_binary`: algebraic cross-checks | Bitwise idempotence, self-XOR, absorption, De Morgan; wrapping addition/subtraction round-trip | Every 64-bit operand and metadata flag; every wrapping width 0..64 |
+| `runtime/harc_random_rt.h`: `harc_rng_range` | Mathematical inclusive modulo mapping, output bounds, exactly one draw for ordered ranges and none for degenerate ranges | Full signed int64 domain and either half-domain with every uint64 draw; all signed 8-bit bounds with all uint8 draws; every int64 degenerate/reversed pair |
 | `solver_binary_is_signed` | Existing declared-width promotion policy and operand symmetry | All three operand classifications and widths 1..1024; separate symmetry/conservative-fallback checks for arbitrary optional `u32` widths |
 
 Full C++ signed division/remainder equivalence at widths 32, 64 and 128 is
@@ -49,8 +51,9 @@ width. This is a contract for the existing decision function, **not a proof
 that every HARC expression or emitted C++ operation has matching semantics**.
 AST classification, width inference, literal typing, casts, ternary evaluation,
 SMT sort construction, and complete solver emission remain outside this proof.
-The previously observed hexadecimal-literal and named-Boolean-constant cases
-are therefore not resolved by these checks.
+Literal spelling, helper conversion and conditional widening are additionally
+checked through bounded executable compiler properties, independently of these
+kernel proofs. See [semantic properties](semantic-properties.md).
 
 Wide multiplication/division, arbitrary word counts, converting constructors,
 and coroutine scheduling are also outside this suite. Normal conformance and
@@ -72,6 +75,13 @@ output/input arrays for addition/subtraction, and arithmetic signed right shift
 on the supported target. Array/pointer checks and unwinding assertions remain
 enabled. A universally quantified bit index checks wide extension at every
 output position. The loops are bounded by the selected storage capacity.
+
+The RNG template is extracted verbatim from its unique signature through its
+unindented closing brace. Missing/duplicate signatures or missing terminators
+fail extraction; invalid extractions fail compilation. Its harness models the
+RNG callback with an arbitrary value and a checked draw counter. A signed
+128-bit mathematical reference represents cardinality 2^64 without overflow.
+The report hashes both runtime headers and all harnesses.
 
 The compiler and the standalone Kani harness import the same Rust numeric
 module. Both active native solver renderers call its promotion function;
@@ -105,7 +115,8 @@ See the [CBMC documentation](https://diffblue.github.io/cbmc/) and
 [Kani installation guide](https://model-checking.github.io/kani/install-guide.html).
 
 `test_runner.py` checks fail-closed result classification and deliberately
-injects five defects into temporary copies: reversed signed comparison,
+injects seven defects into temporary copies: reversed signed comparison,
 dropped word carry, missing sign extension, logical instead of arithmetic
-constant right shift, and Boolean bitwise recanonicalization. Each must produce a real assertion counterexample;
+constant right shift, Boolean bitwise recanonicalization, canonicalizing bitwise
+AND, and skipping the full-domain RNG draw. Each must produce a real assertion counterexample;
 compilation failure or timeout does not count as defect detection.

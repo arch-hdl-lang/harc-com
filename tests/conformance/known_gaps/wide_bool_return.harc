@@ -1,0 +1,15 @@
+// Known legacy v1 limitation: HarcWide has ambiguous implicit bool conversion.
+// TBIR must preserve the high bit and return true. See docs/semantic-properties.md.
+function wide_pred(d: Top) -> bool
+    let ignored = 0
+    return d.value
+end function wide_pred
+
+test WideBoolReturn
+    let dut : Top
+    run
+        dut.value = 0x10000000000000000000000000
+        let result = wide_pred(dut)
+        assert result else fail("high bit lost in Boolean return")
+    end run
+end test WideBoolReturn

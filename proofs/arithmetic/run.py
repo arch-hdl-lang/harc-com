@@ -17,9 +17,12 @@ PREFIX = """typedef unsigned __int128 _harc_u128;
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
 """
+RNG_PREFIX = PREFIX + ("typedef signed long long int64_t;\n"
+                       "#define INT64_MAX 9223372036854775807LL\n"
+                       "#define UINT64_MAX 18446744073709551615ULL\n")
 RUST_HARNESSES = (
     "const_add_sub", "const_mul", "const_wrap", "const_compare", "const_shift",
-    "const_bit_logic", "const_div_rem", "const_errors", "solver_promotion", "solver_unknown_widths",
+    "const_bit_logic", "const_bitwise_laws", "const_wrapping_roundtrip", "const_div_rem", "const_errors", "solver_promotion", "solver_unknown_widths",
 )
 
 
@@ -32,6 +35,18 @@ def slice_source(source, name):
     if source.count(begin) != 1 or source.count(end) != 1 or source.index(begin) >= source.index(end):
         raise ValueError(f"missing or ambiguous production slice: {name}")
     return source.split(begin)[1].split(end)[0]
+
+
+def rng_source(source):
+    # Extract the actual template, not a maintained model of its body. The
+    # unique signature and unindented terminator fail closed on source drift.
+    signature = "template <typename Next>\ninline int64_t harc_rng_range(Next next, int64_t lo, int64_t hi) {"
+    if source.count(signature) != 1:
+        raise ValueError("missing or ambiguous production RNG template")
+    body = source[source.index(signature):]
+    if "\n}" not in body:
+        raise ValueError("missing production RNG terminator")
+    return body.split("\n}", 1)[0] + "\n}\n"
 
 
 def run(command, timeout):
@@ -61,7 +76,7 @@ def cbmc_passed(code, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--group", choices=["u128", "wide", "rust", "all"], default="all")
+    parser.add_argument("--group", choices=["u128", "wide", "rng", "rust", "all"], default="all")
     parser.add_argument("--timeout", type=int, default=180, help="seconds per CBMC obligation or Kani batch")
     parser.add_argument("--out", type=Path, default=ROOT / "target/formal")
     parser.add_argument("--only", help="run one named C++ obligation or Rust harness")
@@ -82,6 +97,9 @@ def main():
             for operation in ("arith", "extend"):
                 cases.append((f"wide-{operation}-{words}", "wide", f"PROOF_WIDE_{operation.upper()}",
                               [f"-DWORDS={words}", f"-DPACK_BITS={words * 32}"], words + 1))
+    if args.group in ("rng", "all"):
+        for operation in ("full", "half", "small", "degenerate"):
+            cases.append((f"rng-{operation}", "rng", f"PROOF_RNG_{operation.upper()}", [], 1))
     rust = args.group in ("rust", "all")
     if args.only:
         cases = [case for case in cases if case[0] == args.only]
@@ -98,10 +116,10 @@ def main():
         parser.error("Z3 is required by these arithmetic harnesses")
     runtime = ROOT / "runtime/harc_thread_rt.h"
     source = runtime.read_text()
-    inputs = [runtime, ROOT / "src/numeric_semantics.rs", ROOT / "src/ast.rs",
+    inputs = [runtime, ROOT / "runtime/harc_random_rt.h", ROOT / "src/numeric_semantics.rs", ROOT / "src/ast.rs",
               ROOT / "src/ir/lower/mod.rs", ROOT / "src/codegen/native/constraint_solver_renderer.rs",
               ROOT / "src/codegen/randomize_renderer.rs", Path(__file__),
-              *(ROOT / f"proofs/arithmetic/{name}" for name in ("u128.cpp", "wide.cpp", "kani.rs"))]
+              *(ROOT / f"proofs/arithmetic/{name}" for name in ("u128.cpp", "wide.cpp", "rng.cpp", "kani.rs"))]
     report = {"scope": "See docs/formal-arithmetic.md for domains and exclusions",
               "inputs": {str(p.relative_to(ROOT)): digest(p) for p in inputs}, "tools": {}, "results": []}
     for tool in (cbmc if cases else None, kani if rust else None, shutil.which("z3") if needs_z3 else None):
@@ -123,9 +141,11 @@ def main():
         failed |= status != "passed"
 
     for name, group, macro, defines, unwind in cases:
-        body = slice_source(source, "U128" if group == "u128" else "WORD")
+        body = (rng_source((ROOT / "runtime/harc_random_rt.h").read_text()) if group == "rng"
+                else slice_source(source, "U128" if group == "u128" else "WORD"))
+        prefix = RNG_PREFIX if group == "rng" else PREFIX
         unit = args.out / f"{name}.cpp"
-        unit.write_text(PREFIX + body + (ROOT / f"proofs/arithmetic/{group}.cpp").read_text())
+        unit.write_text(prefix + body + (ROOT / f"proofs/arithmetic/{group}.cpp").read_text())
         command = [cbmc, str(unit), "--cpp11", f"-D{macro}", *defines, "--unwind", str(unwind),
                    "--unwinding-assertions", "--trace", "--json-ui"]
         if name == "wide-extend-32":

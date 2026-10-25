@@ -285,3 +285,35 @@ fn solver_unknown_widths() {
         assert!(!result);
     }
 }
+
+// Algebraic laws provide a second specification style: no expected-result
+// branch repeats the production operator dispatch or Boolean normalization.
+#[kani::proof]
+fn const_bitwise_laws() {
+    let (a, b) = (scalar(), scalar());
+    let aa = fold_binary(BitAnd, a, a, None).unwrap();
+    let oo = fold_binary(BitOr, a, a, None).unwrap();
+    let xx = fold_binary(BitXor, a, a, None).unwrap();
+    assert!(aa.bits == a.bits);
+    assert!(oo.bits == a.bits);
+    assert!(xx.bits == 0);
+    let union = fold_binary(BitOr, a, b, None).unwrap();
+    let absorbed = fold_binary(BitAnd, a, union, None).unwrap();
+    assert!(absorbed.bits == a.bits);
+    let complement = |v: Scalar| Scalar { bits: !v.bits, ..v };
+    let demorgan = fold_binary(BitAnd, complement(a), complement(b), None).unwrap();
+    assert!(demorgan.bits == !union.bits);
+}
+
+#[kani::proof]
+fn const_wrapping_roundtrip() {
+    let (a, b) = (scalar(), scalar());
+    let width: u32 = kani::any();
+    kani::assume(width <= 64);
+    let sum = fold_binary(AddWrap, a, b, Some(width)).unwrap();
+    let restored = fold_binary(SubWrap, sum, b, Some(width)).unwrap();
+    let modulus = 1u128 << width;
+    assert!(restored.bits as u128 == (a.bits as u128) % modulus);
+    assert!(!sum.signed && !sum.boolean);
+    assert!(!restored.signed && !restored.boolean);
+}
