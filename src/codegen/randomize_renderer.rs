@@ -5946,6 +5946,66 @@ impl TbirRandomizeEmitter {
         );
     }
 
+    fn constraint_expr_is_bool(&self, e: &Expr) -> bool {
+        match &*e.kind {
+            ExprKind::Bool(_) => true,
+            ExprKind::Ident(id) => self.consts.get(&id.name).is_some_and(|c| c.is_bool),
+            ExprKind::Paren(inner) => self.constraint_expr_is_bool(inner),
+            ExprKind::Unary { op: UnaryOp::Not | UnaryOp::NotKw, .. } => true,
+            ExprKind::Binary { op, .. } => matches!(
+                op,
+                BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le
+                    | BinaryOp::Gt | BinaryOp::Ge | BinaryOp::AndAnd | BinaryOp::AndKw
+                    | BinaryOp::OrOr | BinaryOp::OrKw
+            ),
+            ExprKind::Membership { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn emit_constraint_equality_operand(
+        &mut self,
+        e: &Expr,
+        bool_context: bool,
+        field_info: &std::collections::HashMap<String, TxnFieldInfo>,
+        width: u32,
+        target_root: Option<&str>,
+        blocking: bool,
+        list_unroll_bounds: &std::collections::HashMap<String, usize>,
+    ) {
+        if bool_context {
+            let numeric_bool = match &*e.kind {
+                ExprKind::Int(s) => matches!(c_int_literal(s).as_str(), "0" | "1"),
+                ExprKind::Ident(id) => self
+                    .consts
+                    .get(&id.name)
+                    .filter(|c| !c.is_bool)
+                    .is_some_and(|c| matches!(c.value, 0 | 1)),
+                _ => false,
+            };
+            if self.constraint_expr_is_bool(e) {
+                self.emit_constraint_bool_expr_w(
+                    e, field_info, width, target_root, blocking, list_unroll_bounds,
+                );
+            } else if numeric_bool {
+                write!(self.out, "_ctx.bool_val({})", match &*e.kind {
+                    ExprKind::Int(s) => c_int_literal(s) == "1",
+                    ExprKind::Ident(id) => self.consts[&id.name].value == 1,
+                    _ => false,
+                })
+                .ok();
+            } else {
+                self.emit_constraint_bool_expr_w(
+                    e, field_info, width, target_root, blocking, list_unroll_bounds,
+                );
+            }
+        } else {
+            self.emit_constraint_expr_w(
+                e, field_info, width, target_root, blocking, list_unroll_bounds,
+            );
+        }
+    }
+
     fn emit_constraint_bit_slice_expr(
         &mut self,
         target: &Expr,
@@ -6512,21 +6572,16 @@ impl TbirRandomizeEmitter {
                     );
                     write!(self.out, ")").ok();
                 } else {
-                    self.emit_constraint_expr_w(
-                        lhs,
-                        field_info,
-                        width,
-                        target_root,
-                        blocking,
+                    let bool_context = matches!(op, Eq | Ne)
+                        && (self.constraint_expr_is_bool(lhs)
+                            || self.constraint_expr_is_bool(rhs));
+                    self.emit_constraint_equality_operand(
+                        lhs, bool_context, field_info, width, target_root, blocking,
                         list_unroll_bounds,
                     );
                     write!(self.out, "{sep}").ok();
-                    self.emit_constraint_expr_w(
-                        rhs,
-                        field_info,
-                        width,
-                        target_root,
-                        blocking,
+                    self.emit_constraint_equality_operand(
+                        rhs, bool_context, field_info, width, target_root, blocking,
                         list_unroll_bounds,
                     );
                 }
