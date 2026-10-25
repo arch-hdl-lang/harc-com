@@ -60,3 +60,7 @@ v1 currently fails native compilation with ambiguous `HarcWide` to `bool`
 conversion. Selecting `--codegen tbir` passes. This reproducer is not a negative
 CI assertion that would require preserving the defect; after v1 supports this
 conversion, move the wide-port observations into the shared native matrix.
+
+The [expression and model properties](expression-model-properties.md) add
+whole-tree interpretation and exhaustive small-domain model-set equivalence
+through both native emitters and the actual typed SMT backend.

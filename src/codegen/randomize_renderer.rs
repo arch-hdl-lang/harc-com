@@ -1374,6 +1374,7 @@ fn enum_width(variant_count: usize) -> u32 {
 #[derive(Clone, Copy, Debug)]
 struct LetWidth {
     signed: bool,
+    width: u32,
 }
 
 fn is_flag_field(f: &TxnFieldInfo) -> bool {
@@ -1799,6 +1800,7 @@ pub(crate) struct TbirRandomizeEmitter {
     relations: std::collections::HashMap<String, RelationDecl>,
     shadowed_lets: std::collections::HashSet<String>,
     let_widths: std::collections::HashMap<String, LetWidth>,
+    scalar_bindings: std::collections::HashMap<String, String>,
     enums: std::collections::HashMap<String, usize>,
     enum_variants: std::collections::HashMap<String, i64>,
     consts: std::collections::HashMap<String, crate::constraints::IntegerConstSchema>,
@@ -1967,6 +1969,7 @@ fn build_randomize_emitter(file: &SourceFile, _opts: &EmitOpts) -> TbirRandomize
         relations,
         shadowed_lets: std::collections::HashSet::new(),
         let_widths: std::collections::HashMap::new(),
+        scalar_bindings: std::collections::HashMap::new(),
         enums,
         enum_variants,
         consts,
@@ -1992,6 +1995,31 @@ impl TbirRandomizeEmitter {
         self.out.clear();
         self.errors.clear();
         self.current_source_id = site.source_id;
+        self.let_widths.clear();
+        self.scalar_bindings.clear();
+        for (name, local, ty) in &site.scalar_bindings {
+            // Constraint identifiers resolve fields, file constants and enum
+            // variants before runtime captures, matching the native renderer.
+            // Keep operand signedness aligned with that same value lookup.
+            if self.consts.contains_key(name) || self.enum_variants.contains_key(name) {
+                continue;
+            }
+            self.let_widths.insert(
+                name.clone(),
+                LetWidth {
+                    signed: matches!(ty, crate::ir::IrType::SInt(_)),
+                    width: match ty {
+                        crate::ir::IrType::UInt(width) | crate::ir::IrType::SInt(width) => width.unwrap_or(64),
+                        crate::ir::IrType::Bool => 1,
+                        _ => unreachable!("scalar binding type"),
+                    },
+                },
+            );
+            self.scalar_bindings.insert(
+                name.clone(),
+                crate::codegen::randomize::scalar_binding_sentinel(*local),
+            );
+        }
         let cell_start = self.per_run_cells.len();
         self.emit_randomize_for_site(site, depth);
         if let Some(error) = self.errors.first() {
@@ -2141,7 +2169,8 @@ impl TbirRandomizeEmitter {
                     self.out
                         .push_str(&global_enum_variant_cpp_name(&ident.name));
                 } else {
-                    self.out.push_str(&ident.name);
+                    self.out
+                        .push_str(self.scalar_bindings.get(&ident.name).unwrap_or(&ident.name));
                 }
             }
             ExprKind::ImplicitSelf => {}
@@ -2878,6 +2907,14 @@ impl TbirRandomizeEmitter {
                 );
             }
             ExprKind::Ident(id) => {
+                if !field_info.contains_key(&id.name)
+                    && self.let_widths.get(&id.name).is_some_and(|binding| binding.width > 64)
+                {
+                    self.errors.push(format!(
+                        "randomize({ty}) constraint references scalar `{}` wider than 64 bits; wide runtime scalar captures are not supported",
+                        id.name
+                    ));
+                }
                 if !blocking
                     && !field_info.contains_key(&id.name)
                     && !self.enum_variants.contains_key(&id.name)
@@ -5227,18 +5264,10 @@ impl TbirRandomizeEmitter {
     /// - Resolving *less* than the emitter turns a constraint the emitter
     ///   would have emitted into a hard build error.
     ///
-    /// The second is why this reads only state BOTH emitter constructors
-    /// populate: `field_info`, `const_widths`, `enum_variants`, and pure
-    /// syntax. **Do not add a fallback that reads `let_types`,
-    /// `let_widths` or `probe_widths` to close it.** Those are empty in
-    /// `build_randomize_emitter`, which emits per constraint site and
-    /// never walks statements, so such a fallback resolves on
-    /// `--codegen v1` alone and makes the two backends disagree about the
-    /// same source — a worse failure than the build error, and the reason
-    /// the `blocking` operand fallback added here was backed out again.
-    /// `let_types` is also unscoped (`emit_let` inserts with no block
-    /// restore), so a dead inner shadow supplies a wrong width. Both the
-    /// blocking gap and its scoping prerequisite are tracked in harc#566.
+    /// Runtime scalar widths come from this site's lexically scoped IR
+    /// bindings, populated by `emit_site`. Do not recover them by walking
+    /// source statements or consulting an unscoped name-to-type table: that
+    /// loses shadowing and helper scope boundaries (the historical #566 gap).
     ///
     /// `sum(...)` and `.len()` are deliberately absent for a different
     /// reason: the emitter turns them into solver-internal variables with
@@ -5265,7 +5294,7 @@ impl TbirRandomizeEmitter {
                 if let Some(idx) = self.enum_variants.get(&id.name) {
                     return u64::try_from(*idx).ok().map(value_bit_width);
                 }
-                None
+                self.let_widths.get(&id.name).map(|binding| binding.width)
             }
             ExprKind::Field { .. } => expr_field_path(e, target_root)
                 .and_then(|field| field_info.get(&field))
@@ -5733,6 +5762,21 @@ impl TbirRandomizeEmitter {
                         write!(self.out, "_ctx.bool_val(true)").ok();
                     }
                     return;
+                }
+                if blocking {
+                    if let Some(binding) = self.let_widths.get(&id.name) {
+                        if binding.width == 1 && !binding.signed {
+                            let name = &self.scalar_bindings[&id.name];
+                            write!(self.out, "_ctx.bool_val(({}) != 0)", name).ok();
+                        } else {
+                            self.errors.push(format!(
+                                "the scalar `{}` is a value, not a condition, so it cannot be a constraint on its own",
+                                id.name
+                            ));
+                            write!(self.out, "_ctx.bool_val(true)").ok();
+                        }
+                        return;
+                    }
                 }
             }
             ExprKind::Field { .. } => {
@@ -6278,10 +6322,11 @@ impl TbirRandomizeEmitter {
                         .ok();
                     }
                 } else if blocking && self.let_widths.contains_key(&id.name) {
+                    let binding = self.scalar_bindings.get(&id.name).unwrap_or(&id.name);
                     if width <= 64 {
-                        write!(self.out, "_ctx.bv_val((uint64_t)({}), {})", id.name, width).ok();
+                        write!(self.out, "_ctx.bv_val((uint64_t)({}), {})", binding, width).ok();
                     } else {
-                        write!(self.out, "harc_z3_bv_value(_ctx, {}, {})", id.name, width).ok();
+                        write!(self.out, "harc_z3_bv_value(_ctx, {}, {})", binding, width).ok();
                     }
                 } else {
                     self.errors

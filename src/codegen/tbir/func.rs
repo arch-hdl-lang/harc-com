@@ -259,6 +259,19 @@ fn randomize_snippet_for(
         }
         _ => String::new(),
     };
+    let mut snippet = snippet.clone();
+    for (_, local, _) in &site.scalar_bindings {
+        let name = names.get(local.index()).ok_or_else(|| {
+            EmitError(format!(
+                "tbir randomize scalar binding references missing local {}",
+                local.0
+            ))
+        })?;
+        snippet = snippet.replace(
+            &crate::codegen::randomize::scalar_binding_sentinel(*local),
+            name,
+        );
+    }
     Ok(Some(
         snippet
             .replace(TBIR_RANDOMIZE_TARGET_SENTINEL, dst)

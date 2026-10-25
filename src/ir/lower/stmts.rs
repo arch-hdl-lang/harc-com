@@ -5200,12 +5200,30 @@ impl FuncBuilder<'_> {
             ))
             .copied();
 
+        let mut visible = std::collections::BTreeMap::new();
+        let floor = self.inline_frames.last()
+            .map_or(0, |frame| frame.scope_floor.min(self.scopes.len()));
+        for scope in &self.scopes[floor..] {
+            for (name, local) in scope {
+                visible.insert(name.clone(), *local);
+            }
+        }
+        let scalar_bindings = visible
+            .into_iter()
+            .filter_map(|(name, local)| {
+                let ty = &self.locals[local.index()].ty;
+                matches!(ty, IrType::UInt(_) | IrType::SInt(_) | IrType::Bool)
+                    .then(|| (name, local, ty.clone()))
+            })
+            .collect();
+
         let constraints_ref = self.push_constraint_site(crate::ir::ConstraintSite {
             record,
             target: target.clone(),
             source_id: self.current_source_id,
             constraints,
             blocking,
+            scalar_bindings,
             problem_id,
         });
 

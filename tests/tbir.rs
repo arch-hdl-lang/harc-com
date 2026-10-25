@@ -55940,3 +55940,185 @@ end impl ResultTest
         }
     }
 }
+
+
+#[test]
+fn blocking_randomize_captures_lexical_scalar_identity() {
+    let src = r#"
+transaction Req
+    x : sint<8>
+end transaction Req
+
+test CaptureTest
+    let dut : Top
+    run
+        let px : sint<64> = 1
+        for i in 0..1
+            let px : sint<64> = -2
+            let ctx : sint<64> = -3
+            let request : Req
+            blocking randomize(request) with
+                request.x == px
+                request.x > ctx
+            end randomize
+        end for
+    end run
+end test CaptureTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("lowers captures");
+    verify::verify_program(&prog).expect("verifies captures");
+    let site = &prog.constraint_sites[0];
+    let (_, px, _) = site.scalar_bindings.iter().find(|(name, _, _)| name == "px").unwrap();
+    let function = prog.functions.iter().find(|f| f.blocks.iter().any(|b|
+        matches!(b.terminator, ir::Terminator::Randomize { .. }))).unwrap();
+    assert_ne!(function.locals[px.index()].name, "px", "inner binding must be renamed");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits captures");
+    assert!(cpp.contains(&format!("(uint64_t)({})", function.locals[px.index()].name)), "{cpp}");
+    assert!(cpp.contains("(uint64_t)(_u_ctx)"), "reserved C++ name must use backend mapping: {cpp}");
+    assert!(!cpp.contains('\u{1e}'), "capture sentinel leaked");
+}
+
+#[test]
+fn blocking_randomize_does_not_capture_callers_scalar() {
+    let src = r#"
+transaction Req
+    x : uint<8>
+end transaction Req
+
+function solve(dut: Top)
+    let request : Req
+    blocking randomize(request) with
+        request.x == caller_only
+    end randomize
+end function solve
+
+test CaptureFenceTest
+    let dut : Top
+    run
+        let caller_only : uint<64> = 2
+        solve(dut)
+    end run
+end test CaptureFenceTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("constraint names checked at emission");
+    let error = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect_err("caller local is hidden");
+    assert!(error.0.contains("unknown name `caller_only`"), "{error}");
+}
+
+#[test]
+fn blocking_randomize_constant_precedence_matches_signedness() {
+    let src = r#"
+const LIMIT : uint<8> = 128
+transaction Req
+    x : sint<8>
+end transaction Req
+
+test CaptureConstTest
+    let dut : Top
+    run
+        let LIMIT : sint<64> = -1
+        let request : Req
+        blocking randomize(request) with
+            request.x < LIMIT
+        end randomize
+    end run
+end test CaptureConstTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).expect("lowers");
+    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
+    let plain = merged_src(&src.replace("        let LIMIT : sint<64> = -1\n", ""));
+    let plain_prog = lower::lower_program(&plain).unwrap();
+    let plain_cpp = tbir::emit(&plain_prog, &plain, &cpp_tb::EmitOpts::default()).unwrap();
+    let clauses = |text: &str| text.lines().filter(|line| line.contains("_s.add(") && !line.contains("_pref_")).map(str::trim).map(str::to_owned).collect::<Vec<_>>();
+    assert_eq!(clauses(&cpp), clauses(&plain_cpp), "local collision must not change constant value or comparison shape");
+    assert!(!cpp.contains("(uint64_t)(LIMIT)"), "constant wins over runtime capture: {cpp}");
+}
+
+
+#[test]
+fn blocking_randomize_scalar_width_controls_mixed_rank_comparison() {
+    for (field, binding, signed) in [("uint<32>", "sint<64>", true), ("sint<32>", "uint<8>", true), ("sint<8>", "uint<32>", false)] {
+        let src = format!(r#"
+transaction Req
+    x : {field}
+end transaction Req
+
+test RankTest
+    let dut : Top
+    run
+        let lim : {binding} = 1
+        let request : Req
+        blocking randomize(request) with
+            request.x < lim
+        end randomize
+    end run
+end test RankTest
+"#);
+        let merged = merged_src(&src);
+        let prog = lower::lower_program(&merged).unwrap();
+        let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).unwrap();
+        assert_eq!(cpp.lines().any(|line| line.contains("z3::ult(_z_x") && line.contains("(lim)")), !signed, "{field}/{binding}: {cpp}");
+    }
+}
+
+
+#[test]
+fn blocking_randomize_wide_scalar_capture_fails_closed() {
+    let src = r#"
+transaction Req
+    x : uint<8>
+end transaction Req
+
+test WideCaptureTest
+    let dut : Top
+    run
+        let lim : uint<128> = 1 << 64
+        let request : Req
+        blocking randomize(request) with
+            request.x == lim
+        end randomize
+    end run
+end test WideCaptureTest
+"#;
+    let merged = merged_src(src);
+    let prog = lower::lower_program(&merged).unwrap();
+    let error = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect_err("wide captures must not truncate");
+    assert!(error.0.contains("wide runtime scalar captures are not supported"), "{error}");
+}
+
+
+#[test]
+fn blocking_randomize_scalar_condition_requires_flag() {
+    for (ty, succeeds) in [("bool", true), ("uint<1>", true), ("uint<8>", false), ("sint<1>", false)] {
+        let src = format!(r#"
+transaction Req
+    x : uint<8>
+end transaction Req
+
+test CaptureConditionTest
+    let dut : Top
+    run
+        let flag : {ty} = 1
+        let request : Req
+        blocking randomize(request) with
+            flag
+            !flag == (request.x == 0)
+        end randomize
+    end run
+end test CaptureConditionTest
+"#);
+        let merged = merged_src(&src);
+        let prog = lower::lower_program(&merged).unwrap();
+        let result = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default());
+        if succeeds {
+            let cpp = result.expect("flag capture emits Boolean solver expression");
+            assert!(cpp.contains("_ctx.bool_val((flag) != 0)"), "{cpp}");
+        } else {
+            let error = result.expect_err("numeric constraint must fail before Z3 sort error");
+            assert!(error.0.contains("value, not a condition"), "{error}");
+        }
+    }
+}
