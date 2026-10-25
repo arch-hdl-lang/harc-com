@@ -1598,7 +1598,7 @@ fn callable_value_cty(prog: &TbProgram, ty: &IrType) -> Result<String, EmitError
 
 #[cfg(test)]
 mod value_abi_type_tests {
-    use super::super::field_scalar_cty;
+    use super::super::{field_scalar_cty, local_scalar_cty};
     use crate::codegen::render_support::ir_vec_elem_class;
     use crate::ir::{sequence_element_compatible, value_abi_class, IrType, ValueAbiClass};
 
@@ -1629,6 +1629,7 @@ mod value_abi_type_tests {
             assert_eq!(value_abi_class(&ty), Some(class));
             assert_eq!(ir_vec_elem_class(&ty).as_deref(), Some(cpp));
             assert_eq!(field_scalar_cty(&ty), cpp);
+            assert_eq!(local_scalar_cty(&ty), cpp);
         }
     }
 

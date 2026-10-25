@@ -1606,6 +1606,7 @@ pub(super) fn local_scalar_cty(ty: &ir::IrType) -> String {
         ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) if *w > 64 => {
             "_harc_u128".to_string()
         }
+        ir::IrType::Bool => "bool".to_string(),
         ir::IrType::SInt(_) => "int64_t".to_string(),
         ir::IrType::String => "const char*".to_string(),
         _ => "uint64_t".to_string(),
