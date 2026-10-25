@@ -52979,6 +52979,66 @@ end function Pick
     }
 }
 
+/// Wrapping arithmetic has an unsigned result even when its operands are
+/// signed literals. The shape pass must carry that result through a constant
+/// ternary, including when the wrapping arm is unselected.
+#[test]
+fn const_ternary_inline_wraps_are_unsigned_in_both_arm_orders() {
+    let src = r#"
+const AddThen : bool = (false ? (7 +% 1) : -1) < 0
+const AddElse : bool = (false ? -1 : (7 +% 1)) < 0
+const SubThen : bool = (false ? (7 -% 1) : -1) < 0
+const SubElse : bool = (false ? -1 : (7 -% 1)) < 0
+const MulThen : bool = (false ? (7 *% 1) : -1) < 0
+const MulElse : bool = (false ? -1 : (7 *% 1)) < 0
+const Nested : bool = (false ? ((7 +% (1 + 0))) : -1) < 0
+const Ordinary : bool = (false ? (7 + 1) : -1) < 0
+
+test T
+    let dut : Top
+    run
+        assert AddThen == false else fail("add then")
+        assert AddElse == false else fail("add else")
+        assert SubThen == false else fail("sub then")
+        assert SubElse == false else fail("sub else")
+        assert MulThen == false else fail("mul then")
+        assert MulElse == false else fail("mul else")
+        assert Nested == false else fail("nested")
+        assert Ordinary == true else fail("ordinary control")
+    end run
+end test T
+"#;
+    let program = lower_src(src).expect("inline wrapping ternaries lower");
+    verify::verify_program(&program).expect("inline wrapping ternaries verify");
+    let text = format!("{program}");
+    assert_eq!(
+        text.matches("(0 == 0)").count(),
+        7,
+        "wrap ternaries must fold false: {text}"
+    );
+    assert_eq!(
+        text.matches("(1 == 1)").count(),
+        1,
+        "ordinary signed control must stay true: {text}"
+    );
+    tbir::emit(&program, &merged_src(src), &cpp_tb::EmitOpts::default())
+        .expect("inline wrapping ternaries emit");
+
+    let lazy = r#"const LazyWrap : bool = (false ? (1 / 0) : -1) < 0
+
+test T
+    let dut : Top
+    run
+        assert LazyWrap == true else fail("lazy wrap")
+    end run
+end test T"#;
+    lower_src(lazy).expect("unselected invalid arm remains lazy");
+
+    let selected = lazy.replace("false ?", "true ?");
+    let err = lower_src(&selected).expect_err("selected invalid arm must still fail");
+    assert!(assert_invalid(&err).contains("division by zero"));
+}
+
 #[test]
 fn const_logical_folds_only_the_reachable_rhs() {
     let src = r#"const A : bool = false && (1 / 0 == 1)

@@ -742,6 +742,15 @@ fn const_expr_scalar_shape(
                 })
             } else if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
                 Ok(lhs)
+            } else if matches!(op, BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap) {
+                // Wrapping arithmetic is an unsigned low-width residue even
+                // when both operands originate as signed literals. Keep this
+                // in the shape pass so a surrounding constant ternary uses
+                // the same common type as numeric folding.
+                Ok(ConstScalarShape {
+                    signed: false,
+                    boolean: false,
+                })
             } else {
                 Ok(common(lhs, rhs))
             }
