@@ -193,6 +193,9 @@ fn lower_expr(problem: &CTypedProblem, expr: &CTypedExpr) -> Result<String, Solv
             Ok(format!("({op_s} {inner_s})"))
         }
         CExprKind::Binary { op, lhs, rhs } => {
+            if matches!(op, CBinaryOp::Shl | CBinaryOp::Shr) {
+                return lower_shift_expr(problem, *op, lhs, rhs);
+            }
             let lhs_s = lower_expr(problem, lhs)?;
             let rhs_s = lower_expr(problem, rhs)?;
             let op_s = binary_op_smt(*op, &lhs.ty)?;
@@ -259,6 +262,51 @@ fn lower_expr(problem: &CTypedProblem, expr: &CTypedExpr) -> Result<String, Solv
             ))
         }
     }
+}
+
+fn lower_shift_expr(
+    problem: &CTypedProblem,
+    op: CBinaryOp,
+    lhs: &CTypedExpr,
+    rhs: &CTypedExpr,
+) -> Result<String, SolverBuildError> {
+    let lhs_width = bv_width(&lhs.ty).ok_or_else(|| SolverBuildError::Unsupported {
+        feature: "shift lhs",
+        detail: format!("shift lhs has type {}", lhs.ty),
+    })?;
+    let rhs_width = bv_width(&rhs.ty).ok_or_else(|| SolverBuildError::Unsupported {
+        feature: "shift rhs",
+        detail: format!("shift rhs has type {}", rhs.ty),
+    })?;
+    let width = lhs_width.max(rhs_width);
+    let lhs_s = lower_expr(problem, lhs)?;
+    let rhs_s = lower_expr(problem, rhs)?;
+
+    // SMT-LIB requires both shift operands to have the same width. Keep the
+    // full shift amount when it is wider than the value: truncating it would
+    // make (x << 256) look like (x << 0) for an 8-bit value.
+    let lhs_s = extend_bv(lhs_s, lhs_width, width, bv_sign(&lhs.ty));
+    let rhs_s = extend_bv(rhs_s, rhs_width, width, Some(Sign::Unsigned));
+    let op_s = binary_op_smt(op, &lhs.ty)?;
+    let shifted = format!("({op_s} {lhs_s} {rhs_s})");
+
+    if width == lhs_width {
+        Ok(shifted)
+    } else {
+        Ok(format!("((_ extract {} 0) {shifted})", lhs_width - 1))
+    }
+}
+
+fn extend_bv(value: String, from: u32, to: u32, sign: Option<Sign>) -> String {
+    if from == to {
+        return value;
+    }
+    let amount = to - from;
+    let extension = match sign {
+        Some(Sign::Signed) => "sign_extend",
+        Some(Sign::Unsigned) | None => "zero_extend",
+    };
+    format!("((_ {extension} {amount}) {value})")
 }
 
 fn lower_range_membership(
