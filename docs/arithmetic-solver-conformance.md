@@ -121,3 +121,7 @@ specific sensitivity checks, not a claim of complete mutation coverage.
 For a shorter native debugging replay, the standalone script accepts
 `--only solver --backend tbir` (or `--only arithmetic --backend v1`). The normal
 Cargo target always runs both suites and both backends.
+
+For symbolic checks over explicitly bounded domains, see
+[Formal arithmetic contracts](formal-arithmetic.md). The conformance suite
+continues to exercise complete native and typed-SMT execution paths.

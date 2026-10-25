@@ -5470,14 +5470,7 @@ struct LetWidth {
     signed: bool,
 }
 
-/// Signedness used by native solver operators. Untyped literals participate
-/// in the usual arithmetic conversion of their other operand.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ConstraintOperandSignedness {
-    Signed,
-    Unsigned,
-    UntypedLiteral,
-}
+pub(crate) use crate::numeric_semantics::ConstraintOperandSignedness;
 
 fn scalar_let_width(ty: &TypeExpr) -> Option<LetWidth> {
     let TypeExpr::Builtin { name, args, .. } = ty else {

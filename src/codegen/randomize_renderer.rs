@@ -5429,28 +5429,12 @@ impl TbirRandomizeEmitter {
     ) -> bool {
         let l = self.constraint_expr_signedness(lhs, field_info, target_root);
         let r = self.constraint_expr_signedness(rhs, field_info, target_root);
-        if l == ConstraintOperandSignedness::Unsigned || r == ConstraintOperandSignedness::Unsigned
-        {
-            let (signed_expr, unsigned_expr) = if l == ConstraintOperandSignedness::Signed
-                && r == ConstraintOperandSignedness::Unsigned
-            {
-                (lhs, rhs)
-            } else if r == ConstraintOperandSignedness::Signed
-                && l == ConstraintOperandSignedness::Unsigned
-            {
-                (rhs, lhs)
-            } else {
-                return false;
-            };
-            let signed_width = self
-                .constraint_expr_native_width(signed_expr, field_info, target_root)
-                .unwrap_or(0);
-            let unsigned_width = self
-                .constraint_expr_native_width(unsigned_expr, field_info, target_root)
-                .unwrap_or(u32::MAX);
-            return (signed_width < 32 && unsigned_width < 32) || signed_width > unsigned_width;
-        }
-        l == ConstraintOperandSignedness::Signed || r == ConstraintOperandSignedness::Signed
+        crate::numeric_semantics::solver_binary_is_signed(
+            l,
+            r,
+            self.constraint_expr_native_width(lhs, field_info, target_root),
+            self.constraint_expr_native_width(rhs, field_info, target_root),
+        )
     }
 
     fn constraint_expr_native_width(

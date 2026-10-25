@@ -1334,45 +1334,7 @@ pub enum UnaryOp {
     BitNot, // ~
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinaryOp {
-    // arithmetic
-    Add,
-    AddWrap,
-    Sub,
-    SubWrap,
-    Mul,
-    MulWrap,
-    Div,
-    Mod,
-    // comparison
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    // logical
-    AndAnd,
-    OrOr,
-    AndKw,
-    OrKw,
-    // bitwise
-    BitAnd,
-    BitOr,
-    BitXor,
-    Shl,
-    Shr,
-    // temporal SVA
-    PipeImplies,     // |->
-    PipeImpliesNext, // |=>
-    Throughout,
-    Within,
-    Intersect,
-    // membership
-    In,
-    Inside,
-}
+pub use crate::numeric_semantics::BinaryOp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemFn {
