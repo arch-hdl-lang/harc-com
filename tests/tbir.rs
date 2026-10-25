@@ -30582,7 +30582,8 @@ fn regblock_addrmap_corpus_lowers() {
     let dump = format!("{prog}");
     // Two distinct per-instance mirror locals (mangled), not one.
     assert!(
-        dump.contains("__addrmap_chip_mm2s") && dump.contains("__addrmap_chip_s2mm"),
+        dump.contains("__addrmap_4_chip_4_mm2s")
+            && dump.contains("__addrmap_4_chip_4_s2mm"),
         "expected two per-instance addrmap mirror locals: {dump}"
     );
 }
@@ -30597,13 +30598,13 @@ fn regblock_alias_corpus_lowers() {
         lower_with_stdlib_bus("regblock_alias_test.harc", "BusAxiLite.arch").expect("lowers");
     let dump = format!("{prog}");
     // The alias instance shares the primary's mirror — only ONE mirror
-    // local is declared (no `__addrmap_chip_mm2s_view`).
+    // local is declared (no `__addrmap_4_chip_9_mm2s_view`).
     assert!(
-        dump.contains("__addrmap_chip_mm2s"),
+        dump.contains("__addrmap_4_chip_4_mm2s"),
         "expected the primary mirror local: {dump}"
     );
     assert!(
-        !dump.contains("__addrmap_chip_mm2s_view"),
+        !dump.contains("__addrmap_4_chip_9_mm2s_view"),
         "alias must NOT get its own mirror local (shares the target's cell): {dump}"
     );
 }

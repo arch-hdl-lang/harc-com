@@ -70,10 +70,26 @@ pub(crate) struct AddrmapBindingCtx {
 }
 
 /// Mangle a `chip.inst` pair into a dotless local name usable as a C++
-/// identifier. The binding name and instance name are both source-level
-/// identifiers, so the join is unambiguous.
+/// identifier. Length-prefixing each source-level identifier keeps the
+/// representation injective: `a_b.c` and `a.b_c` must resolve to distinct
+/// mirror locals even though both contain underscores.
 pub(crate) fn instance_mirror_key(chip: &str, inst: &str) -> String {
-    format!("__addrmap_{chip}_{inst}")
+    format!("__addrmap_{}_{}_{}_{}", chip.len(), chip, inst.len(), inst)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::instance_mirror_key;
+
+    #[test]
+    fn mirror_key_is_injective_across_underscore_boundaries() {
+        assert_ne!(
+            instance_mirror_key("a_b", "c"),
+            instance_mirror_key("a", "b_c")
+        );
+        assert_eq!(instance_mirror_key("a_b", "c"), "__addrmap_3_a_b_1_c");
+        assert_eq!(instance_mirror_key("a", "b_c"), "__addrmap_1_a_3_b_c");
+    }
 }
 
 /// Build the per-binding context for `let chip : A = bind <helper>`.

@@ -8739,7 +8739,8 @@ fn lower_function<'a>(
         // Addrmap per-instance mirror locals: one default-constructed
         // record local per non-aliased instance (alias instances share
         // their target's cell). Declared with the mangled
-        // `__addrmap_<chip>_<inst>` name the access resolution computes.
+        // Length-prefixed `__addrmap_<chip-len>_<chip>_<inst-len>_<inst>`
+        // names match the access resolution's collision-free keys.
         for (key, rec) in &ctx.addrmap_init_order {
             let id = b.declare(key);
             b.set_local_type(id, IrType::Record(*rec));
