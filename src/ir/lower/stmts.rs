@@ -292,7 +292,10 @@ impl FuncBuilder<'_> {
             // v1's `after` emit never special-cased a time literal).
             StmtKind::After { duration, body, .. } => {
                 self.lower_wait_cycles(duration, None)?;
-                self.lower_block_stmts(body)
+                self.push_scope();
+                let result = self.lower_block_stmts(body);
+                self.pop_scope();
+                result
             }
             // ── Explicit unsupported stubs (MVP) ────────────────────
             StmtKind::Randomize {
