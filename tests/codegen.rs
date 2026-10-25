@@ -63,9 +63,9 @@ end test T"#,
     )
     .expect("literal rank regression parses");
     let cpp = cpp_tb::emit(&source).expect("literal rank regression emits");
-    assert!(cpp.contains("-((int64_t)(0x80000000))"), "{cpp}");
-    assert!(cpp.contains("-((int64_t)(0b10000000000000000000000000000000))"), "{cpp}");
-    assert!(cpp.contains("-((int64_t)(0x80000000))"), "{cpp}");
+    assert!(cpp.contains("-(((int64_t)(0x80000000)))"), "{cpp}");
+    assert!(cpp.contains("-(((int64_t)(0b10000000000000000000000000000000)))"), "{cpp}");
+    assert!(cpp.contains("-(((int64_t)(0x80000000)))"), "{cpp}");
     assert!(cpp.contains("((uint64_t)(0xffffffffffffffff))"), "{cpp}");
     assert!(cpp.contains("((_harc_u128)0x1ULL << 64)"), "{cpp}");
 }

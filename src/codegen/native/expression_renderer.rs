@@ -590,8 +590,13 @@ impl Emitter {
                     UnaryOp::NotKw => "!",
                     UnaryOp::BitNot => "~",
                 };
-                write!(self.out, "{s}").ok();
+                // Group the operand so adjacent prefix operators cannot be
+                // tokenized as a different C++ operator. In particular,
+                // `- -x` must remain a pure double negation rather than
+                // becoming the pre-decrement `--x`.
+                write!(self.out, "{s}(").ok();
                 self.emit_expr(expr);
+                write!(self.out, ")").ok();
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 // Wrapping arithmetic (`+% / -% / *%`, harc#473) masks the
