@@ -1263,10 +1263,10 @@ end test T"#,
         cpp.contains("static int64_t harc_helper_halve_twice(int64_t x)"),
         "sint helper with internal sint local must declare int64_t; got:\n{cpp}"
     );
-    // A `bool` return keeps uint64_t; only the sint param flips.
+    // A `bool` return uses its canonical Boolean carrier; the sint param stays signed.
     assert!(
-        cpp.contains("static uint64_t harc_helper_isneg(int64_t x)"),
-        "bool-returning helper keeps uint64_t return, int64_t sint param; got:\n{cpp}"
+        cpp.contains("static bool harc_helper_isneg(int64_t x)"),
+        "bool-returning helper uses bool return and int64_t sint param; got:\n{cpp}"
     );
 }
 
@@ -18624,7 +18624,7 @@ fn fixed_vector_pure_helper_signatures_are_typed_end_to_end() {
     let cpp = emit_cpp_src(&src);
     assert!(
         cpp.contains("static std::array<uint64_t, 2> harc_helper_echo_vec(std::array<uint64_t, 2> values);")
-            && cpp.contains("static uint64_t harc_helper_vec_matches(std::array<uint64_t, 2> values, std::array<uint64_t, 2> expected);")
+            && cpp.contains("static bool harc_helper_vec_matches(std::array<uint64_t, 2> values, std::array<uint64_t, 2> expected);")
             && cpp.contains("std::array<uint64_t, 2> __ret{};")
             && cpp.contains("default: return {};"),
         "{cpp}"
@@ -41279,7 +41279,7 @@ fn v1_working_coverpoint_value_forms_lower_and_verify() {
             "sized literal",
             "32'h7",
             "uint64_t _v = (uint64_t)(7)",
-            "(uint64_t)(0x7)",
+            "(uint64_t)(((int64_t)(0x7)))",
         ),
         (
             "sized slice bounds",
@@ -54120,7 +54120,7 @@ end impl T
     // arithmetic shift.
     let v1_cpp = cpp_tb::emit(&merged_src(src)).expect("v1 emits");
     assert!(
-        v1_cpp.contains("(~(harc_rt::harc_read(dut->count_out) & 0x00)) >> 2"),
+        v1_cpp.contains("(~((harc_rt::harc_read(dut->count_out) & 0x00))) >> 2"),
         "v1 renders the same unmasked host bit-not, shifted logically:\n{v1_cpp}"
     );
 }
