@@ -2922,26 +2922,35 @@ impl Parser {
         Ok(args)
     }
 
-    /// True if the next token closes a generic — either a plain `>` or the
-    /// first half of a `>>` (lexed as a single `Shr` token from nested
-    /// generics like `queue<uint<32>>`).
+    /// True if the next token closes a generic — either a plain `>`, the
+    /// first half of `>>` (lexed as a single `Shr` token from nested
+    /// generics like `queue<uint<32>>`), or the first half of `>=` at a
+    /// declaration boundary such as `uint<8>=1`.
     fn is_close_angle(&self) -> bool {
-        matches!(self.peek_kind(), Some(TokenKind::Gt) | Some(TokenKind::Shr))
+        matches!(
+            self.peek_kind(),
+            Some(TokenKind::Gt) | Some(TokenKind::Shr) | Some(TokenKind::GtEq)
+        )
     }
 
     /// Consume a closing `>`. If the next token is `>>` (Shr — produced by
-    /// the lexer when two `>`s sit adjacent), split it: take the first
-    /// `>` and rewrite the remaining position to a fresh `Gt` so the
-    /// outer generic can consume it next.
+    /// the lexer when two `>`s sit adjacent), or `>=` (GtEq — produced by
+    /// the lexer when a generic close is adjacent to an initializer), split
+    /// it: take the first `>` and rewrite the remaining position to the
+    /// token for the second character so the outer parser can consume it.
     fn expect_close_angle(&mut self) -> Result<Span, CompileError> {
         match self.peek_kind() {
             Some(TokenKind::Gt) => Ok(self.advance().unwrap().span),
-            Some(TokenKind::Shr) => {
+            Some(kind @ (TokenKind::Shr | TokenKind::GtEq)) => {
                 let span = self.peek_span();
                 let half = Span::new(span.start_usize(), span.start_usize() + 1);
-                // Rewrite this token in place to be a single `>` whose span
-                // covers the second char; do NOT advance past it.
-                self.tokens[self.pos].kind = TokenKind::Gt;
+                // Rewrite this token in place to be the second character's
+                // token (`>` for `>>`, `=` for `>=`); do NOT advance past it.
+                self.tokens[self.pos].kind = if *kind == TokenKind::Shr {
+                    TokenKind::Gt
+                } else {
+                    TokenKind::Eq
+                };
                 self.tokens[self.pos].span = Span::new(span.start_usize() + 1, span.end_usize());
                 Ok(half)
             }
@@ -5085,6 +5094,33 @@ mod tests {
     fn empty_file() {
         let f = parse("").unwrap();
         assert!(f.items.is_empty());
+    }
+
+    #[test]
+    fn generic_close_splits_adjacent_assignment() {
+        let src = "const X: uint<8>=1\n";
+        let f = parse(src).expect("compact typed const should parse");
+        let Item::Const(c) = &f.items[0] else {
+            panic!("expected const");
+        };
+        assert_eq!(c.ty.as_ref().unwrap().span(), Span::new(9, 15));
+        assert_eq!(c.value.span, Span::new(17, 18));
+
+        let f = parse(
+            "function make() -> uint<8>\n    let x: uint<8>=1\n    return x\nend function make",
+        )
+        .expect("compact typed let should parse");
+        let Item::Function(function) = &f.items[0] else {
+            panic!("expected function");
+        };
+        let StmtKind::Let(stmt) = &function.body.stmts[0].kind else {
+            panic!("expected let");
+        };
+        assert_eq!(stmt.ty.as_ref().unwrap().span(), Span::new(38, 44));
+        assert_eq!(stmt.value.as_ref().unwrap().span, Span::new(46, 47));
+
+        assert!(parse("const C: bool = 8>=1").is_ok());
+        assert!(parse_type_expr_fragment("queue<uint<32>>").is_ok());
     }
 
     #[test]
