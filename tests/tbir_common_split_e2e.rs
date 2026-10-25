@@ -5368,8 +5368,8 @@ fn tbir_common_testbench_methods_compile_once_and_match_self_contained() {
         "uint64_t MethodTb_ordered(",
         "Beat MethodTb_mirror(",
         "uint64_t MethodTb_save(",
-        "uint64_t MethodTb_lazy_take(",
-        "uint64_t MethodTb_lazy_skip_or(",
+        "bool MethodTb_lazy_take(",
+        "bool MethodTb_lazy_skip_or(",
         "uint64_t MethodTb_lazy_choose(",
     ] {
         assert_eq!(
