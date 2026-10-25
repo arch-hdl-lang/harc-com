@@ -932,6 +932,25 @@ fn fold_const_inner(
         }
         ExprKind::Binary { op, lhs, rhs } => {
             let a = fold_const_inner(lhs, consts, self_name, helpers, call_stack)?;
+            // Logical operators are short-circuiting expressions. Validate the
+            // RHS shape before deciding whether to evaluate it, so unresolved
+            // names and unsupported forms still produce diagnostics while
+            // arithmetic errors in an unreachable arm remain unobservable.
+            if matches!(
+                op,
+                BinaryOp::AndAnd | BinaryOp::AndKw | BinaryOp::OrOr | BinaryOp::OrKw
+            ) {
+                const_expr_scalar_shape(rhs, consts, helpers)?;
+                let lhs_true = a.bits != 0;
+                let short_circuits = match op {
+                    BinaryOp::AndAnd | BinaryOp::AndKw => !lhs_true,
+                    BinaryOp::OrOr | BinaryOp::OrKw => lhs_true,
+                    _ => unreachable!(),
+                };
+                if short_circuits {
+                    return boolean(matches!(op, BinaryOp::OrOr | BinaryOp::OrKw));
+                }
+            }
             let b = fold_const_inner(rhs, consts, self_name, helpers, call_stack)?;
             use crate::numeric_semantics::{self, NumericError, Scalar};
             let wrap_width = if matches!(

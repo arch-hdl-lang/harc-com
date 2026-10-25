@@ -52924,6 +52924,36 @@ end function Pick
 }
 
 #[test]
+fn const_logical_folds_only_the_reachable_rhs() {
+    let src = r#"const A : bool = false && (1 / 0 == 1)
+const B : bool = true || (1 % 0 == 1)
+const C : bool = false and (1 << 64 == 1)
+const D : bool = true or (1 / 0 == 1)
+
+test T
+    let dut : Top
+    run
+        assert A == false else fail("false &&")
+        assert B == true else fail("true ||")
+        assert C == false else fail("false and")
+        assert D == true else fail("true or")
+    end run
+end test T"#;
+    let program = lower_src(src).expect("unreachable logical RHS lowers");
+    verify::verify_program(&program).expect("unreachable logical RHS verifies");
+
+    for (bad, expected) in [
+        ("true && (1 / 0 == 1)", "division by zero"),
+        ("false || (1 % 0 == 1)", "modulo by zero"),
+        ("false && MISSING", "MISSING"),
+    ] {
+        let bad_src = format!("const Bad : bool = {bad}\n\ntest T\n    let dut : Top\nend test T");
+        let err = lower_src(&bad_src).expect_err("reachable or invalid logical RHS must fail");
+        assert!(err.to_string().contains(expected), "{bad}: {err}");
+    }
+}
+
+#[test]
 fn target_responder_wall_clock_wait_uses_the_test_scheduler() {
     let src = fixture("tlm_target_thread_test.harc").replace("wait 1 cycle", "wait 1ns");
     let program = lower_src(&src).expect("target responder wall-clock wait lowers");
