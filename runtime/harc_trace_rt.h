@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <cerrno>
 #include <string>
 
 namespace harc_rt {
@@ -60,12 +61,22 @@ struct HarcTraceWriter {
     uint64_t clock_cycle = 0;
     std::string clock;
     bool enabled = false;
+    bool open_failed = false;
 
     void open_env() {
         const char* p = std::getenv("HARC_TRACE");
         if (p && *p) {
             out = std::fopen(p, "w");
             enabled = (out != nullptr);
+            if (!enabled) {
+                open_failed = true;
+                const int error = errno;
+                std::fprintf(
+                    stderr,
+                    "harc: failed to open semantic trace '%s': %s\n",
+                    p,
+                    std::strerror(error));
+            }
         }
     }
 
