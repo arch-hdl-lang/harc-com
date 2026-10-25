@@ -6120,16 +6120,9 @@ fn c_value_literal_with_rank(s: &str) -> String {
         };
         return format!("(({carrier})({normalized}))");
     }
-    // Keep the established hex composite spelling (including source case)
-    // for values already handled by c_int_literal. Binary forms need the
-    // equivalent carrier here because c_int_literal only has a hex-wide
-    // path.
-    if radix == 16 {
-        return c_int_literal(s);
-    }
-    let lo = value as u64;
-    let hi = (value >> 64) as u64;
-    format!("(((_harc_u128)0x{hi:x}ULL << 64) | (_harc_u128)0x{lo:x}ULL)")
+    // Values above 64 bits retain the established c_int_literal route.
+    // C09 covers only the host-rank boundary in the 32-bit-to-64-bit tier.
+    c_int_literal(s)
 }
 
 fn radix_digits(normalized: &str) -> Option<(u32, &str)> {

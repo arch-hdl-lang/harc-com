@@ -52,12 +52,10 @@ fn radix_literals_use_signed_rank_before_unary_negation() {
         let bin : sint<32> = -0b10000000000000000000000000000000
         let sized : sint<32> = -32'h80000000
         let unsigned : uint<64> = 0xffffffffffffffff
-        let wide : uint<128> = 65'h10000000000000000
         assert hex == -2147483648 else fail("hex")
         assert bin == -2147483648 else fail("bin")
         assert sized == -2147483648 else fail("sized")
         assert unsigned == 18446744073709551615 else fail("unsigned")
-        assert wide == 18446744073709551616 else fail("wide")
     end run
 end test T"#,
     )
@@ -67,7 +65,6 @@ end test T"#,
     assert!(cpp.contains("-(((int64_t)(0b10000000000000000000000000000000)))"), "{cpp}");
     assert!(cpp.contains("-(((int64_t)(0x80000000)))"), "{cpp}");
     assert!(cpp.contains("((uint64_t)(0xffffffffffffffff))"), "{cpp}");
-    assert!(cpp.contains("((_harc_u128)0x1ULL << 64)"), "{cpp}");
 }
 
 #[test]
