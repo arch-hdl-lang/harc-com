@@ -6,6 +6,7 @@ const DUT: &str = r#"module Top(input logic clk); endmodule"#;
 
 const TEST: &str = r#"
 const NEG8 : sint<8> = -1
+const MIN64 : sint<64> = -9223372036854775808
 const UMAX8 : uint<8> = 255
 
 scoreboard Sink
@@ -21,6 +22,7 @@ covergroup Cov @(sink.accept(value, lo, hi, uvalue) post)
     signed_cp : cover value
         bins
             cross_zero = [NEG8..1]
+            from_min = [MIN64..1]
             negative_only = [NEG8..NEG8]
             positive_only = [1..1]
             runtime_equivalent = [lo..hi]
@@ -47,6 +49,7 @@ impl Test for Tb
     check
         assert sink.calls == 3 else fail("delivery")
         assert cov.signed_cp.cross_zero == 3 else fail("cross zero")
+        assert cov.signed_cp.from_min == 3 else fail("minimum signed bound")
         assert cov.signed_cp.negative_only == 1 else fail("negative only")
         assert cov.signed_cp.positive_only == 1 else fail("positive only")
         assert cov.signed_cp.runtime_equivalent == 3 else fail("runtime equivalent")
@@ -57,7 +60,15 @@ end impl Test
 
 #[test]
 fn static_signed_cover_bins_native_regression() {
-    if Command::new("verilator").arg("--version").output().is_err() {
+    let verilator_present = Command::new("verilator")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    assert!(
+        verilator_present || std::env::var_os("HARC_REQUIRE_VERILATOR").is_none(),
+        "HARC_REQUIRE_VERILATOR is set but `verilator` is not on PATH"
+    );
+    if !verilator_present {
         eprintln!("skipping static cover bins regression: verilator not found");
         return;
     }

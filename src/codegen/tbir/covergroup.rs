@@ -913,6 +913,12 @@ fn bin_membership(values: &[CovBinValue], widths: &CoverWidths<'_>) -> Result<St
     let bound = |b: &CovBinBound| -> Result<String, EmitError> {
         match b {
             CovBinBound::Const(x) => Ok(x.to_string()),
+            CovBinBound::ConstSigned(x) if *x == i64::MIN => {
+                // A decimal i64::MIN literal is lexed as an unsigned C++
+                // literal before unary minus is applied. Keep the operand
+                // signed so comparisons against a signed sample stay signed.
+                Ok("(-9223372036854775807LL - 1)".to_string())
+            }
             CovBinBound::ConstSigned(x) => Ok(x.to_string()),
             CovBinBound::Runtime(e) => cover_expr_cpp(e, widths),
         }

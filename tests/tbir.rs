@@ -22086,6 +22086,37 @@ end impl T
 }
 
 #[test]
+fn covergroup_static_i64_min_bound_uses_signed_cpp_spelling() {
+    let src = r#"
+const MIN64 : sint<64> = -9223372036854775808
+
+covergroup Cov @(posedge dut.clk)
+    cp : cover dut.count_out
+        bins
+            from_min = [MIN64..1]
+        end bins
+end covergroup Cov
+
+testbench Tb
+    dut : Top
+    cov : Cov
+end testbench Tb
+
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T
+"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("_v >= (-9223372036854775807LL - 1) && _v <= 1"),
+        "{cpp}"
+    );
+    assert!(!cpp.contains("_v >= -9223372036854775808 &&"), "{cpp}");
+}
+
+#[test]
 fn covergroup_width_methods_lower_with_source_width() {
     let src = r#"
 covergroup Cov @(posedge dut.clk)
