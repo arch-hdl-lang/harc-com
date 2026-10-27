@@ -23,7 +23,11 @@ jobs:
           curl --fail --location --retry 3 -o /tmp/cbmc.deb https://github.com/diffblue/cbmc/releases/download/cbmc-6.11.0/ubuntu-24.04-cbmc-6.11.0-Linux.deb
           echo 'b3721aa541038384d7801ea3aeabbcddc3e8845ac8f1cbff637cf8dec7481ac8  /tmp/cbmc.deb' | sha256sum --check
           sudo apt-get update
-          sudo apt-get install -y /tmp/cbmc.deb z3
+          sudo apt-get install -y /tmp/cbmc.deb
+          python3 -m venv "$RUNNER_TEMP/formal-solver"
+          "$RUNNER_TEMP/formal-solver/bin/python" -m pip install z3-solver==4.15.4.0
+          echo "$RUNNER_TEMP/formal-solver/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/formal-solver/bin/z3" --version
           cargo install --locked kani-verifier --version 0.67.0
           cargo kani setup
 

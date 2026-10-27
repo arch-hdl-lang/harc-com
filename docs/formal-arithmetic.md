@@ -99,7 +99,10 @@ part of the trusted toolchain.
 
 ## Toolchain and sensitivity checks
 
-CI pins CBMC 6.11.0 (the Ubuntu package is checksum-verified) and Kani 0.67.0.
+CI pins CBMC 6.11.0 (the Ubuntu package is checksum-verified), Kani 0.67.0,
+and Z3 4.15.4 through the `z3-solver==4.15.4.0` wheel in an isolated Python
+environment. Ubuntu 24.04's Z3 4.8.12 timed out on the 1024-bit extension
+obligation at 300 seconds; the proof and timeout remain unchanged.
 Kani supplies its own CBMC 6.8.0 and Rust nightly; the C++ runner uses the
 separately installed CBMC. Z3 is required for the wide 1024-bit extension
 obligation and selected successful Rust arithmetic paths. Error-path harnesses
