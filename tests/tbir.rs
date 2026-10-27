@@ -30799,6 +30799,51 @@ fn regblock_field_resets_compose_into_mirror_default() {
     );
 }
 
+/// `UInt<N>`/`SInt<N>` are exactly `N` bits, like `uint<N>`/`sint<N>`
+/// (spec §2). A capitalized field type must lower identically to its
+/// lowercase spelling — width, reset fit, overlay mask and overflow check
+/// all come from the same field width.
+#[test]
+fn regblock_capitalized_field_types_lower_like_lowercase() {
+    let fixture = fixture("regblock_fields_test.harc");
+    let field = "field MODE : uint<3> @ 4  reset 0";
+    assert!(fixture.contains(field), "fixture field line moved");
+    let lower = |ty: &str, reset: &str| {
+        lower_with_stdlib_bus_src(
+            &fixture.replace(field, &format!("field MODE : {ty} @ 4  reset {reset}")),
+        )
+    };
+    for (lowercase, capitalized) in [("uint<3>", "UInt<3>"), ("sint<3>", "SInt<3>")] {
+        let expected = format!("{}", lower(lowercase, "3").expect("lowercase field lowers"));
+        let actual = format!(
+            "{}",
+            lower(capitalized, "3").expect("capitalized field lowers")
+        );
+        assert_eq!(
+            actual, expected,
+            "{capitalized} must lower like {lowercase}"
+        );
+    }
+    let reset = lower("UInt<3>", "5").expect("a 3-bit reset fits UInt<3>");
+    let record = reset
+        .records
+        .iter()
+        .find(|record| record.name == "DmaRegs")
+        .expect("regblock mirror record");
+    assert_eq!(
+        record.field("DMACR").and_then(|field| field.default),
+        Some(0x50)
+    );
+
+    let overflow = fixture.replace(field, "field MODE : UInt<32> @ 4  reset 0");
+    let error = lower_with_stdlib_bus_src(&overflow)
+        .expect_err("a capitalized field wider than its register must be rejected");
+    assert!(
+        error.to_string().contains("exceeds the register width"),
+        "unexpected field overflow diagnostic: {error}"
+    );
+}
+
 /// The corpus `regblock_addrmap_test` fixture — two `DmaChan` instances
 /// at distinct bases composed by an `addrmap`, accessed 3-level
 /// (`chip.inst.REG`) and 4-level (`chip.inst.REG.FIELD`) — FULLY lowers.
