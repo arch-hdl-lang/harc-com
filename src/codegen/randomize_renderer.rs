@@ -5798,6 +5798,29 @@ impl TbirRandomizeEmitter {
                             self.reject_non_flag_field(&field);
                         }
                         return;
+                    } else if blocking
+                        && target_root
+                            .zip(expr_field_root(e).as_deref())
+                            .is_some_and(|(target, root)| root != target)
+                    {
+                        if let Some(info) = self.captured_scalar_field_info(e, target_root) {
+                            if is_flag_field(info) {
+                                // Captured runtime flags are host-language
+                                // booleans, while captured numeric fields
+                                // remain values and must use comparisons.
+                                write!(self.out, "_ctx.bool_val((bool)(").ok();
+                                self.emit_expr(e);
+                                write!(self.out, "))").ok();
+                            } else {
+                                self.reject_non_flag_field(&field);
+                            }
+                        } else {
+                            self.errors.push(format!(
+                                "constraint references unknown captured field `{field}`"
+                            ));
+                            write!(self.out, "_ctx.bool_val(true)").ok();
+                        }
+                        return;
                     }
                 }
             }
@@ -6267,7 +6290,13 @@ impl TbirRandomizeEmitter {
                                 write!(self.out, ", {}, {})", captured_width, width).ok();
                             } else {
                                 write!(self.out, "harc_z3_bv_value(_ctx, ").ok();
-                                self.emit_expr(e);
+                                if captured_width <= 64 {
+                                    write!(self.out, "(uint64_t)(").ok();
+                                    self.emit_expr(e);
+                                    write!(self.out, ")").ok();
+                                } else {
+                                    self.emit_expr(e);
+                                }
                                 write!(self.out, ", {})", width).ok();
                             }
                         } else if width <= 64 {

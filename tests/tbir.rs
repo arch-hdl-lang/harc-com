@@ -56350,3 +56350,41 @@ end test CaptureConditionTest
         }
     }
 }
+
+#[test]
+fn blocking_randomize_captured_field_condition_uses_record_metadata() {
+    let source = r#"
+transaction Capture
+    flag : bool
+    value : uint<8>
+end transaction Capture
+
+transaction Req
+    x : uint<8>
+end transaction Req
+
+test CapturedFieldConditionTest
+    let dut : Top
+    run
+        let c : Capture
+        let request : Req
+        blocking randomize(request) with
+            c.flag
+            request.x == 3
+        end randomize
+    end run
+end test CapturedFieldConditionTest
+"#;
+    let merged = merged_src(source);
+    let program = lower::lower_program(&merged).unwrap();
+    let cpp = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default()).unwrap();
+    assert!(cpp.contains("_ctx.bool_val((bool)(c.flag))"), "{cpp}");
+    assert!(cpp.contains("_z_x == _ctx.bv_val"), "{cpp}");
+
+    let numeric = source.replace("c.flag\n            request.x", "c.value\n            request.x");
+    let merged = merged_src(&numeric);
+    let program = lower::lower_program(&merged).unwrap();
+    let error = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default())
+        .expect_err("captured numeric fields cannot be bare conditions");
+    assert!(error.0.contains("value, not a condition"), "{error}");
+}
