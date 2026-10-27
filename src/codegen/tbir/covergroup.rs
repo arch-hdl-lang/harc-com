@@ -936,42 +936,53 @@ fn bin_membership(
     let signed_common_width = |b: &CovBinBound| {
         let target_width = cover_expr_width(target, widths).unwrap_or(64);
         let target_signed = cover_expr_signed(target, widths);
-        let CovBinBound::Runtime(expr) = b else {
+        if !target_signed {
             return None;
-        };
-        if target_signed && cover_expr_signed(expr, widths) {
-            Some(target_width.max(cover_expr_width(expr, widths).unwrap_or(64)))
-        } else {
-            None
+        }
+        match b {
+            CovBinBound::ConstSigned(_) => Some(target_width.max(64)),
+            // Ordinary positive literals that fit the signed host carrier
+            // participate in a signed comparison with a signed sample. Keep
+            // larger unsigned constants on the unsigned path.
+            CovBinBound::Const(value) if *value <= i64::MAX as u64 => Some(target_width.max(64)),
+            CovBinBound::Runtime(expr) if cover_expr_signed(expr, widths) => {
+                Some(target_width.max(cover_expr_width(expr, widths).unwrap_or(64)))
+            }
+            _ => None,
         }
     };
-    let signed_operand = |rendered: String, expr: Option<&Expr>, width: u32| {
-        cover_coerce_cpp(
-            rendered,
-            expr.and_then(|e| cover_expr_width(e, widths)),
-            width,
-            true,
-        )
-    };
-    let compare =
-        |lhs: String, rhs: String, rhs_expr: Option<&Expr>, op: BinOp, width: Option<u32>| {
-            if let Some(width) = width.filter(|w| *w <= 128) {
-                let lhs = signed_operand(lhs, Some(target), width);
-                let rhs = signed_operand(rhs, rhs_expr, width);
-                let less = |a: &str, b: &str| {
-                    format!("harc_rt::harc_slt_u128((_harc_u128)({a}), (_harc_u128)({b}), {width})")
-                };
-                return match op {
-                    BinOp::Lt => less(&lhs, &rhs),
-                    BinOp::Le => format!("(!{})", less(&rhs, &lhs)),
-                    BinOp::Gt => less(&rhs, &lhs),
-                    BinOp::Ge => format!("(!{})", less(&lhs, &rhs)),
-                    BinOp::Eq => format!("(({lhs}) == ({rhs}))"),
-                    _ => format!("({lhs} {} {rhs})", cover_bin_op_cpp(op)),
-                };
-            }
-            format!("({lhs} {} {rhs})", cover_bin_op_cpp(op))
+    let signed_operand =
+        |rendered: String, expr: Option<&Expr>, source_width: Option<u32>, width: u32| {
+            cover_coerce_cpp(
+                rendered,
+                source_width.or_else(|| expr.and_then(|e| cover_expr_width(e, widths))),
+                width,
+                true,
+            )
         };
+    let compare = |lhs: String,
+                   rhs: String,
+                   rhs_expr: Option<&Expr>,
+                   rhs_source_width: Option<u32>,
+                   op: BinOp,
+                   width: Option<u32>| {
+        if let Some(width) = width.filter(|w| *w <= 128) {
+            let lhs = signed_operand(lhs, Some(target), None, width);
+            let rhs = signed_operand(rhs, rhs_expr, rhs_source_width, width);
+            let less = |a: &str, b: &str| {
+                format!("harc_rt::harc_slt_u128((_harc_u128)({a}), (_harc_u128)({b}), {width})")
+            };
+            return match op {
+                BinOp::Lt => less(&lhs, &rhs),
+                BinOp::Le => format!("(!{})", less(&rhs, &lhs)),
+                BinOp::Gt => less(&rhs, &lhs),
+                BinOp::Ge => format!("(!{})", less(&lhs, &rhs)),
+                BinOp::Eq => format!("(({lhs}) == ({rhs}))"),
+                _ => format!("({lhs} {} {rhs})", cover_bin_op_cpp(op)),
+            };
+        }
+        format!("({lhs} {} {rhs})", cover_bin_op_cpp(op))
+    };
     let mut parts = Vec::with_capacity(values.len());
     for v in values {
         let part = match v {
@@ -985,7 +996,12 @@ fn bin_membership(
                         x_rendered,
                         match x {
                             CovBinBound::Runtime(expr) => Some(expr),
-                            CovBinBound::Const(_) => None,
+                            CovBinBound::Const(_) | CovBinBound::ConstSigned(_) => None,
+                        },
+                        match x {
+                            CovBinBound::ConstSigned(_) => Some(64),
+                            CovBinBound::Const(value) if *value <= i64::MAX as u64 => Some(64),
+                            _ => None,
                         },
                         BinOp::Eq,
                         width,
@@ -1003,7 +1019,12 @@ fn bin_membership(
                             lo,
                             match l {
                                 CovBinBound::Runtime(expr) => Some(expr),
-                                CovBinBound::Const(_) => None,
+                                CovBinBound::Const(_) | CovBinBound::ConstSigned(_) => None,
+                            },
+                            match l {
+                                CovBinBound::ConstSigned(_) => Some(64),
+                                CovBinBound::Const(value) if *value <= i64::MAX as u64 => Some(64),
+                                _ => None,
                             },
                             BinOp::Ge,
                             signed_common_width(l),
@@ -1013,7 +1034,12 @@ fn bin_membership(
                             hi,
                             match h {
                                 CovBinBound::Runtime(expr) => Some(expr),
-                                CovBinBound::Const(_) => None,
+                                CovBinBound::Const(_) | CovBinBound::ConstSigned(_) => None,
+                            },
+                            match h {
+                                CovBinBound::ConstSigned(_) => Some(64),
+                                CovBinBound::Const(value) if *value <= i64::MAX as u64 => Some(64),
+                                _ => None,
                             },
                             BinOp::Le,
                             signed_common_width(h),
@@ -1027,7 +1053,12 @@ fn bin_membership(
                         bound(l)?,
                         match l {
                             CovBinBound::Runtime(expr) => Some(expr),
-                            CovBinBound::Const(_) => None,
+                            CovBinBound::Const(_) | CovBinBound::ConstSigned(_) => None,
+                        },
+                        match l {
+                            CovBinBound::ConstSigned(_) => Some(64),
+                            CovBinBound::Const(value) if *value <= i64::MAX as u64 => Some(64),
+                            _ => None,
                         },
                         BinOp::Ge,
                         signed_common_width(l),
@@ -1040,7 +1071,12 @@ fn bin_membership(
                         bound(h)?,
                         match h {
                             CovBinBound::Runtime(expr) => Some(expr),
-                            CovBinBound::Const(_) => None,
+                            CovBinBound::Const(_) | CovBinBound::ConstSigned(_) => None,
+                        },
+                        match h {
+                            CovBinBound::ConstSigned(_) => Some(64),
+                            CovBinBound::Const(value) if *value <= i64::MAX as u64 => Some(64),
+                            _ => None,
                         },
                         BinOp::Le,
                         signed_common_width(h),

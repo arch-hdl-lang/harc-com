@@ -96,8 +96,8 @@ fn static_signed_cover_bins_native_regression() {
     let cpp =
         std::fs::read_to_string(outdir.join("static_cover_bins.cpp")).expect("read generated C++");
     assert!(
-        cpp.contains("_v >= -1 && _v <= 1"),
-        "signed bounds were not emitted: {cpp}"
+        cpp.contains("harc_rt::harc_slt_u128"),
+        "signed bounds were not emitted through the signed comparison helper: {cpp}"
     );
     assert!(
         !cpp.contains("18446744073709551615 && _v <= 1"),

@@ -44,7 +44,11 @@ end covergroup WideNarrowCov
 
 covergroup Signed65Cov @(signed_sb.accept(value, lo, hi) post)
     interval : cover value
-        bins hit = [lo..hi]
+        bins
+            hit = [lo..hi]
+            static_cross = [-1..1]
+            static_negative = [-3..-1]
+            static_positive = [1..3]
     end bins
 end covergroup Signed65Cov
 
@@ -79,9 +83,13 @@ impl CovRuntimeSignedBoundsTest for RuntimeSignedBoundsTb
         signed_sb.accept(-3, -3, -1)
         signed_sb.accept(-2, -3, -1)
         signed_sb.accept(-1, -3, -1)
+        signed_sb.accept(0, -1, 1)
         signed_sb.accept(1, 1, 3)
         signed_sb.accept(2, 1, 3)
         signed_sb.accept(3, 1, 3)
+        let one65 : sint<65> = 1
+        let signbit65 : sint<65> = one65 << 64
+        signed_sb.accept(signbit65, signbit65, signbit65)
 
         unsigned_sb.accept(0, 0, 2)
         unsigned_sb.accept(1, 0, 2)
@@ -96,11 +104,14 @@ impl CovRuntimeSignedBoundsTest for RuntimeSignedBoundsTb
         unsigned_cov.report()
         assert narrow.calls == 3 else fail("narrow-wide delivery")
         assert wide.calls == 3 else fail("wide-narrow delivery")
-        assert signed_sb.calls == 6 else fail("signed delivery")
+        assert signed_sb.calls == 8 else fail("signed delivery")
         assert unsigned_sb.calls == 3 else fail("unsigned delivery")
         assert narrow_cov.interval.hit == 3 else fail("narrow-wide signed interval")
         assert wide_cov.interval.hit == 3 else fail("wide-narrow signed interval")
-        assert signed_cov.interval.hit == 6 else fail("signed all-negative/all-positive intervals")
+        assert signed_cov.interval.hit == 8 else fail("signed all-negative/all-positive intervals")
+        assert signed_cov.interval.static_cross == 3 else fail("signed static cross-zero interval")
+        assert signed_cov.interval.static_negative == 3 else fail("signed static negative interval")
+        assert signed_cov.interval.static_positive == 3 else fail("signed static positive interval")
         assert unsigned_cov.interval.hit == 3 else fail("unsigned control interval")
         log(info, "ALL TESTS PASSED")
     end check

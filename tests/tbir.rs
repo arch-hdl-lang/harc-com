@@ -22077,7 +22077,11 @@ end impl T
     let prog = lower_src(src).expect("signed static bounds lower");
     verify::verify_program(&prog).expect("signed static bounds verify");
     let cpp = emit_cpp_src(src);
-    assert!(cpp.contains("_v >= -1 && _v <= 1"), "{cpp}");
+    assert!(
+        (cpp.contains("_v >= -1") && cpp.contains("_v <= 1"))
+            || cpp.contains("harc_rt::harc_slt_u128"),
+        "signed bounds were not emitted through a signed comparison: {cpp}"
+    );
     assert!(!cpp.contains("18446744073709551615 && _v <= 1"), "{cpp}");
     match &prog.covgroups[0].points[0].bins[0].values[0] {
         ir::CovBinValue::Range { lo: Some(ir::CovBinBound::ConstSigned(-1)), hi: Some(ir::CovBinBound::Const(1)) } => {}
