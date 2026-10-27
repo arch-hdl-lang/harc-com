@@ -5217,11 +5217,20 @@ impl FuncBuilder<'_> {
             }
         }
         let scalar_bindings = visible
-            .into_iter()
+            .iter()
+            .map(|(name, local)| (name.clone(), *local))
             .filter_map(|(name, local)| {
                 let ty = &self.locals[local.index()].ty;
                 matches!(ty, IrType::UInt(_) | IrType::SInt(_) | IrType::Bool)
                     .then(|| (name, local, ty.clone()))
+            })
+            .collect();
+        let record_bindings = visible
+            .into_iter()
+            .filter_map(|(name, local)| {
+                self.record_of_local(local).map(|record_id| {
+                    (name, self.ctx.records[record_id.index()].name.clone())
+                })
             })
             .collect();
 
@@ -5232,6 +5241,7 @@ impl FuncBuilder<'_> {
             constraints,
             blocking,
             scalar_bindings,
+            record_bindings,
             problem_id,
         });
 

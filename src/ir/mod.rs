@@ -440,6 +440,9 @@ pub struct ConstraintSite {
     /// Lexically visible scalar bindings at this site. Preserve local identity
     /// across shadowing and backend-specific C++ name assignment.
     pub scalar_bindings: Vec<(String, LocalId, IrType)>,
+    /// Lexically visible record bindings used to type captured record fields
+    /// in constraints (including their declared signedness and width).
+    pub record_bindings: Vec<(String, String)>,
     /// Stable problem-table identity (`ConstraintProblemId.0`) when the typed
     /// constraint IR built a Z3-ready problem for this site; `None` when
     /// the site has no solver problem (lower/backend error — v1 then
