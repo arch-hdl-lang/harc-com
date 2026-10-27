@@ -61,14 +61,24 @@ impl SignedWideOpsTest for SignedWideTb
         let zero65 : sint<65> = 0
         let direct65 : sint<129> = source65.sext<129>()
         let compound65 : sint<129> = (source65 + zero65).sext<129>()
+        let compound65_100 : sint<100> = (source65 + zero65).sext<100>()
         let inferred65 = source65 + zero65
         let inferred65_sext : sint<129> = inferred65.sext<129>()
+        let cast65 : sint<129> = ((source65 + zero65) as sint<65>).sext<129>()
         let nested65 : uint<65> = ((source65 + zero65).sext<129>()).trunc<65>()
         assert direct65 == -2 else fail("direct sext<129> lost signed65 source")
         assert compound65 == -2 else fail("compound sext<129> lost signed65 source")
+        assert compound65_100 == -2 else fail("compound sext<100> lost signed65 source")
         assert inferred65_sext == -2 else fail("inferred sext<129> lost signed65 source")
+        assert cast65 == -2 else fail("explicit cast sext<129> changed")
         assert nested65 == 0x1FFFFFFFFFFFFFFFE
             else fail("nested sext/trunc lost signed65 source")
+
+        let source129 : sint<129> = -2
+        let zero129 : sint<129> = 0
+        let compound129_256 : sint<256> = (source129 + zero129).sext<256>()
+        assert compound129_256 == -2
+            else fail("compound sext<256> lost signed129 source")
 
         let source8 : sint<8> = -1
         let zero8 : sint<8> = 0

@@ -29166,9 +29166,31 @@ end test T"#;
             }
         }
     }
-    assert!(casts.contains(&(ir::WidthCastKind::Sext, 129, Some(65))), "{casts:?}");
-    assert!(casts.contains(&(ir::WidthCastKind::Trunc, 65, Some(129))), "{casts:?}");
-    assert!(casts.contains(&(ir::WidthCastKind::Zext, 16, Some(8))), "{casts:?}");
+    assert_eq!(
+        casts
+            .iter()
+            .filter(|cast| **cast == (ir::WidthCastKind::Sext, 129, Some(65)))
+            .count(),
+        4,
+        "direct, compound, inferred, and nested sext receivers must retain 65-bit metadata: {casts:?}"
+    );
+    assert_eq!(
+        casts
+            .iter()
+            .filter(|cast| **cast == (ir::WidthCastKind::Trunc, 65, Some(129)))
+            .count(),
+        1,
+        "nested trunc receiver must retain 129-bit metadata: {casts:?}"
+    );
+    assert_eq!(
+        casts
+            .iter()
+            .filter(|cast| **cast == (ir::WidthCastKind::Zext, 16, Some(8)))
+            .count(),
+        1,
+        "compound zext receiver must retain 8-bit metadata: {casts:?}"
+    );
+    assert!(casts.iter().all(|(_, _, src_width)| src_width.is_some()));
 }
 
 #[test]
