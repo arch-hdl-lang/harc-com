@@ -23,6 +23,77 @@ fn dump_ir(paths: &[&PathBuf]) -> Output {
     command.output().expect("run harc dump-ir")
 }
 
+#[cfg(unix)]
+#[test]
+fn sim_uses_path_arch_launcher_and_forwards_arguments() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = std::env::temp_dir().join(format!(
+        "harc_arch_path_cli_{}",
+        std::process::id()
+    ));
+    let bin_dir = base.join("bin");
+    let run_dir = base.join("run");
+    let out_dir = base.join("out");
+    fs::create_dir_all(&bin_dir).expect("create mock ARCH bin dir");
+    fs::create_dir_all(&run_dir).expect("create mock ARCH run dir");
+    let record = base.join("invocation.txt");
+    let mock = bin_dir.join("arch");
+    fs::write(
+        &mock,
+        format!(
+            "#!/bin/sh\nprintf 'cwd=%s\\n' \"$PWD\" > '{}'\nprintf 'argv=%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            record.display(),
+            record.display()
+        ),
+    )
+    .expect("write mock ARCH launcher");
+    fs::set_permissions(&mock, fs::Permissions::from_mode(0o755))
+        .expect("make mock ARCH launcher executable");
+    let smoke = base.join("smoke.harc");
+    fs::write(
+        &smoke,
+        "test Smoke\n    let dut : Top\n    run\n        log(info, \"SMOKE\")\n    end run\nend test Smoke\n",
+    )
+    .expect("write smoke test");
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(bin_dir.clone()).chain(std::env::split_paths(&old_path)),
+    )
+    .expect("construct PATH");
+    let output = Command::new(harc_bin())
+        .current_dir(&run_dir)
+        .env("PATH", path)
+        .env("HARC_NO_LEARN", "1")
+        .env("ARCH_NO_LEARN", "1")
+        .args([
+            "sim",
+            "--dut",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/dut/top_counter.arch"),
+            "--outdir",
+            out_dir.to_str().unwrap(),
+            smoke.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run harc sim with mock ARCH launcher");
+    assert!(
+        output.status.success(),
+        "PATH ARCH launcher should be invoked successfully\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let capture = fs::read_to_string(&record).expect("mock ARCH invocation record");
+    let run_dir = fs::canonicalize(&run_dir).expect("canonicalize mock ARCH run dir");
+    assert!(
+        capture.contains(&format!("cwd={}\n", run_dir.display())),
+        "mock launcher record:\n{capture}"
+    );
+    assert!(capture.contains("argv=sim "));
+    assert!(capture.contains("--tb "));
+    assert!(capture.contains("--outdir "));
+    let _ = fs::remove_dir_all(base);
+}
+
 fn assert_source_diagnostic(
     output: &Output,
     file: &PathBuf,

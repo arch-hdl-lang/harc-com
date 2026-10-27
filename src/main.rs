@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, NamedSource, Report, Result};
 use std::collections::HashMap;
 use std::fs;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -3735,34 +3736,12 @@ fn cmd_sim(
         dut_abs.push(fs::canonicalize(d).into_diagnostic()?);
     }
 
-    let (program, mut prefix_args, working_dir) = match &arch_bin {
-        Some(p) => (
-            p.clone(),
-            Vec::<String>::new(),
-            std::env::current_dir().into_diagnostic()?,
-        ),
-        None => {
-            // Default: invoke arch via cargo against the sibling arch-com checkout.
-            // Working dir = the arch-com root so its relative paths (runtime/, etc.) resolve.
-            let arch_root = std::env::current_dir()
-                .into_diagnostic()?
-                .join("..")
-                .join("arch-com");
-            (
-                PathBuf::from("cargo"),
-                vec![
-                    "run".into(),
-                    "--quiet".into(),
-                    "--manifest-path".into(),
-                    arch_root.join("Cargo.toml").display().to_string(),
-                    "--bin".into(),
-                    "arch".into(),
-                    "--".into(),
-                ],
-                arch_root,
-            )
-        }
-    };
+    let current_dir = std::env::current_dir().into_diagnostic()?;
+    let (program, mut prefix_args, working_dir) = resolve_arch_invocation(
+        arch_bin.as_deref(),
+        &current_dir,
+        std::env::var_os("PATH").as_deref(),
+    );
     prefix_args.push("sim".into());
     for d in &dut_abs {
         prefix_args.push(d.display().to_string());
@@ -4016,6 +3995,70 @@ fn effective_codegen(codegen: Option<CodegenKind>) -> CodegenKind {
     codegen.unwrap_or_default()
 }
 
+/// Resolve the ARCH launcher for an `--dut` simulation.
+///
+/// An explicit `--arch-bin` is always honored. Otherwise prefer an ARCH
+/// executable on PATH, while skipping the macOS/Linux `arch` architecture
+/// selection utility. The sibling checkout remains the last-resort fallback.
+fn resolve_arch_invocation(
+    arch_bin: Option<&Path>,
+    current_dir: &Path,
+    path_var: Option<&OsStr>,
+) -> (PathBuf, Vec<String>, PathBuf) {
+    if let Some(path) = arch_bin {
+        return (path.to_path_buf(), Vec::new(), current_dir.to_path_buf());
+    }
+
+    if let Some(path_var) = path_var {
+        for directory in std::env::split_paths(path_var) {
+            let candidate = directory.join("arch");
+            if !is_executable_file(&candidate) || is_system_arch_utility(&candidate) {
+                continue;
+            }
+            let candidate = fs::canonicalize(&candidate).unwrap_or(candidate);
+            return (candidate, Vec::new(), current_dir.to_path_buf());
+        }
+    }
+
+    let arch_root = current_dir.join("..").join("arch-com");
+    (
+        PathBuf::from("cargo"),
+        vec![
+            "run".into(),
+            "--quiet".into(),
+            "--manifest-path".into(),
+            arch_root.join("Cargo.toml").display().to_string(),
+            "--bin".into(),
+            "arch".into(),
+            "--".into(),
+        ],
+        arch_root,
+    )
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn is_system_arch_utility(path: &Path) -> bool {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical == Path::new("/usr/bin/arch") || canonical == Path::new("/bin/arch")
+}
+
 fn arch_opt_with_solver_z3(base: &str, inc: &Path, lib: &Path, force_no_as_needed: bool) -> String {
     let z3_link = if force_no_as_needed {
         "-Wl,--no-as-needed -lz3 -Wl,--as-needed"
@@ -4033,6 +4076,8 @@ fn arch_opt_with_solver_z3(base: &str, inc: &Path, lib: &Path, force_no_as_neede
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     /// Regression guard for the `--check-backends` self-poisoning bug:
     /// both backends used to share one outdir, so the ARCH-sim stub
@@ -4594,6 +4639,72 @@ mod tests {
             panic!("expected sim command");
         };
         assert_eq!(effective_codegen(codegen), CodegenKind::Tbir);
+    }
+
+    #[test]
+    fn arch_invocation_prefers_arch_on_path_and_preserves_cwd() {
+        let base = temp_dir("arch-path-selection");
+        let bin_dir = base.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let arch = bin_dir.join("arch");
+        fs::write(&arch, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&arch, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([&bin_dir]).unwrap();
+        let cwd = base.join("caller");
+        fs::create_dir_all(&cwd).unwrap();
+
+        let (program, args, working_dir) = resolve_arch_invocation(None, &cwd, Some(&path));
+        assert_eq!(program, fs::canonicalize(&arch).unwrap());
+        assert!(args.is_empty());
+        assert_eq!(working_dir, cwd);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn arch_invocation_explicit_override_wins_over_path() {
+        let base = temp_dir("arch-explicit-selection");
+        let explicit = base.join("custom-arch");
+        fs::write(&explicit, "mock").unwrap();
+        let path = std::env::join_paths([base.as_path()]).unwrap();
+        let (program, args, working_dir) = resolve_arch_invocation(
+            Some(&explicit),
+            &base,
+            Some(&path),
+        );
+        assert_eq!(program, explicit);
+        assert!(args.is_empty());
+        assert_eq!(working_dir, base);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn arch_invocation_falls_back_to_sibling_when_path_has_no_arch() {
+        let base = temp_dir("arch-sibling-fallback");
+        let empty = base.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let path = std::env::join_paths([empty.as_path()]).unwrap();
+        let (program, args, working_dir) = resolve_arch_invocation(None, &base, Some(&path));
+        assert_eq!(program, PathBuf::from("cargo"));
+        assert_eq!(working_dir, base.join("..").join("arch-com"));
+        assert_eq!(args.last().map(String::as_str), Some("--"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn arch_invocation_skips_system_arch_utility() {
+        let base = temp_dir("arch-system-utility");
+        let bin_dir = base.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/usr/bin/arch", bin_dir.join("arch")).unwrap();
+        #[cfg(not(unix))]
+        fs::write(bin_dir.join("arch"), "system utility").unwrap();
+        let path = std::env::join_paths([bin_dir.as_path()]).unwrap();
+        let (program, args, _) = resolve_arch_invocation(None, &base, Some(&path));
+        assert_eq!(program, PathBuf::from("cargo"));
+        assert_eq!(args.last().map(String::as_str), Some("--"));
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
