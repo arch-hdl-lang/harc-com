@@ -19216,6 +19216,48 @@ end test PureVoidHelperCalls
     }));
 }
 
+#[test]
+fn pure_void_helper_statement_call_rejects_bad_argument_type() {
+    let src = r#"
+function consume(value: Vec<uint<8>, 2>)
+end function consume
+
+test PureVoidHelperBadArg
+    let dut : Top
+    let sample : Vec<uint<8>, 2>
+    run
+        consume(sample)
+    end run
+end test PureVoidHelperBadArg
+"#;
+    let mut prog = lower_src(src).expect("pure void helper call lowers");
+    let run_id = prog.tests[0].run;
+    let run = &mut prog.functions[run_id.index()];
+    let call = run
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::HelperCall { call } => Some(call),
+            _ => None,
+        })
+        .expect("void helper call is represented as a statement");
+    let ir::Expr::Call(_, args) = call else {
+        panic!("expected helper call expression")
+    };
+    args[0] = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(Some(16)),
+    };
+    let errors = verify::verify_program(&prog).expect_err("bad void helper argument type rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.to_string().contains("argument 1")),
+        "{errors:?}"
+    );
+}
+
 /// CFG-inlined free helpers and direct testbench-method calls are value
 /// preludes. Lazy operators must therefore place each effect in the selected
 /// branch, including when impurity is reached through a nested call.
