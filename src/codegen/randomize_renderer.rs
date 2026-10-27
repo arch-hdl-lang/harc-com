@@ -3752,11 +3752,27 @@ impl TbirRandomizeEmitter {
                 ));
             }
         }
+        let captured_fields = self.captured_field_infos();
+        let mut captured_refs = std::collections::HashSet::new();
+        for constraint in with_body {
+            collect_randomize_target_field_refs(
+                constraint,
+                &captured_fields,
+                None,
+                &mut captured_refs,
+            );
+        }
+        let capture_width = captured_refs
+            .iter()
+            .filter_map(|field| captured_fields.get(field).map(|info| info.width))
+            .max()
+            .unwrap_or(0);
         let solver_width = fields
             .iter()
             .map(txn_field_solver_width)
             .max()
             .unwrap_or(64)
+            .max(capture_width)
             .max(64);
         if solver_width > 1024 {
             self.errors.push(format!(
@@ -6079,6 +6095,21 @@ impl TbirRandomizeEmitter {
                 e, field_info, width, target_root, blocking, list_unroll_bounds,
             );
         }
+    }
+
+    fn captured_field_infos(&self) -> std::collections::HashMap<String, TxnFieldInfo> {
+        let mut out = std::collections::HashMap::new();
+        for (root, record) in &self.record_bindings {
+            let Some(fields) = self.txn_fields.get(record) else {
+                continue;
+            };
+            for info in fields {
+                let mut captured = info.clone();
+                captured.name = format!("{root}.{}", info.name);
+                out.insert(captured.name.clone(), captured);
+            }
+        }
+        out
     }
 
     fn emit_constraint_bit_slice_expr(
