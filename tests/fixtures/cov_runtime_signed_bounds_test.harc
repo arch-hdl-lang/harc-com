@@ -1,0 +1,107 @@
+// Runtime interval bounds exercise signed common-width ordering at the
+// native covergroup sampler boundary.  The unsigned case is a control: its
+// ordering must remain unsigned.
+
+scoreboard NarrowWide
+    calls : uint<32> default 0
+    hookable accept(value: sint<8>, lo: sint<65>, hi: sint<65>)
+        calls = calls + 1
+    end accept
+end scoreboard NarrowWide
+
+scoreboard WideNarrow
+    calls : uint<32> default 0
+    hookable accept(value: sint<65>, lo: sint<8>, hi: sint<8>)
+        calls = calls + 1
+    end accept
+end scoreboard WideNarrow
+
+scoreboard Signed65
+    calls : uint<32> default 0
+    hookable accept(value: sint<65>, lo: sint<65>, hi: sint<65>)
+        calls = calls + 1
+    end accept
+end scoreboard Signed65
+
+scoreboard Unsigned65
+    calls : uint<32> default 0
+    hookable accept(value: uint<65>, lo: uint<65>, hi: uint<65>)
+        calls = calls + 1
+    end accept
+end scoreboard Unsigned65
+
+covergroup NarrowWideCov @(narrow.accept(value, lo, hi) post)
+    interval : cover value
+        bins hit = [lo..hi]
+    end bins
+end covergroup NarrowWideCov
+
+covergroup WideNarrowCov @(wide.accept(value, lo, hi) post)
+    interval : cover value
+        bins hit = [lo..hi]
+    end bins
+end covergroup WideNarrowCov
+
+covergroup Signed65Cov @(signed_sb.accept(value, lo, hi) post)
+    interval : cover value
+        bins hit = [lo..hi]
+    end bins
+end covergroup Signed65Cov
+
+covergroup Unsigned65Cov @(unsigned_sb.accept(value, lo, hi) post)
+    interval : cover value
+        bins hit = [lo..hi]
+    end bins
+end covergroup Unsigned65Cov
+
+testbench RuntimeSignedBoundsTb
+    dut : Top
+    narrow : NarrowWide
+    wide : WideNarrow
+    signed_sb : Signed65
+    unsigned_sb : Unsigned65
+    narrow_cov : NarrowWideCov
+    wide_cov : WideNarrowCov
+    signed_cov : Signed65Cov
+    unsigned_cov : Unsigned65Cov
+end testbench RuntimeSignedBoundsTb
+
+impl CovRuntimeSignedBoundsTest for RuntimeSignedBoundsTb
+    run
+        narrow.accept(-1, -1, 1)
+        narrow.accept(0, -1, 1)
+        narrow.accept(1, -1, 1)
+
+        wide.accept(-1, -1, 1)
+        wide.accept(0, -1, 1)
+        wide.accept(1, -1, 1)
+
+        signed_sb.accept(-3, -3, -1)
+        signed_sb.accept(-2, -3, -1)
+        signed_sb.accept(-1, -3, -1)
+        signed_sb.accept(1, 1, 3)
+        signed_sb.accept(2, 1, 3)
+        signed_sb.accept(3, 1, 3)
+
+        unsigned_sb.accept(0, 0, 2)
+        unsigned_sb.accept(1, 0, 2)
+        unsigned_sb.accept(2, 0, 2)
+        wait 1 cycle
+    end run
+
+    check
+        narrow_cov.report()
+        wide_cov.report()
+        signed_cov.report()
+        unsigned_cov.report()
+        assert narrow.calls == 3 else fail("narrow-wide delivery")
+        assert wide.calls == 3 else fail("wide-narrow delivery")
+        assert signed_sb.calls == 6 else fail("signed delivery")
+        assert unsigned_sb.calls == 3 else fail("unsigned delivery")
+        assert narrow_cov.interval.hit == 3 else fail("narrow-wide signed interval")
+        assert wide_cov.interval.hit == 3 else fail("wide-narrow signed interval")
+        assert signed_cov.interval.hit == 6 else fail("signed all-negative/all-positive intervals")
+        assert unsigned_cov.interval.hit == 3 else fail("unsigned control interval")
+        log(info, "ALL TESTS PASSED")
+    end check
+end impl CovRuntimeSignedBoundsTest

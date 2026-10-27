@@ -886,7 +886,11 @@ fn cover_width_cast_cpp(
     })
 }
 
-fn bin_membership(values: &[CovBinValue], widths: &CoverWidths<'_>) -> Result<String, EmitError> {
+fn bin_membership(
+    values: &[CovBinValue],
+    target: &Expr,
+    widths: &CoverWidths<'_>,
+) -> Result<String, EmitError> {
     if values.is_empty() {
         return Ok("(false)".to_string());
     }
@@ -923,14 +927,125 @@ fn bin_membership(values: &[CovBinValue], widths: &CoverWidths<'_>) -> Result<St
             CovBinBound::Runtime(e) => cover_expr_cpp(e, widths),
         }
     };
+    // Runtime bounds are emitted as their native carriers (wide values use
+    // `_harc_u128`).  C++ would then apply the usual unsigned promotion when
+    // comparing them with `_v`, which reverses signed intervals such as
+    // `[-1..1]` for a signed 65-bit target.  Preserve HARC's common numeric
+    // type: when the sampled target and a runtime bound are both signed,
+    // sign-extend both to the widest operand before ordering them.
+    let signed_common_width = |b: &CovBinBound| {
+        let target_width = cover_expr_width(target, widths).unwrap_or(64);
+        let target_signed = cover_expr_signed(target, widths);
+        let CovBinBound::Runtime(expr) = b else {
+            return None;
+        };
+        if target_signed && cover_expr_signed(expr, widths) {
+            Some(target_width.max(cover_expr_width(expr, widths).unwrap_or(64)))
+        } else {
+            None
+        }
+    };
+    let signed_operand = |rendered: String, expr: Option<&Expr>, width: u32| {
+        cover_coerce_cpp(
+            rendered,
+            expr.and_then(|e| cover_expr_width(e, widths)),
+            width,
+            true,
+        )
+    };
+    let compare =
+        |lhs: String, rhs: String, rhs_expr: Option<&Expr>, op: BinOp, width: Option<u32>| {
+            if let Some(width) = width.filter(|w| *w <= 128) {
+                let lhs = signed_operand(lhs, Some(target), width);
+                let rhs = signed_operand(rhs, rhs_expr, width);
+                let less = |a: &str, b: &str| {
+                    format!("harc_rt::harc_slt_u128((_harc_u128)({a}), (_harc_u128)({b}), {width})")
+                };
+                return match op {
+                    BinOp::Lt => less(&lhs, &rhs),
+                    BinOp::Le => format!("(!{})", less(&rhs, &lhs)),
+                    BinOp::Gt => less(&rhs, &lhs),
+                    BinOp::Ge => format!("(!{})", less(&lhs, &rhs)),
+                    BinOp::Eq => format!("(({lhs}) == ({rhs}))"),
+                    _ => format!("({lhs} {} {rhs})", cover_bin_op_cpp(op)),
+                };
+            }
+            format!("({lhs} {} {rhs})", cover_bin_op_cpp(op))
+        };
     let mut parts = Vec::with_capacity(values.len());
     for v in values {
         let part = match v {
-            CovBinValue::Eq(x) => format!("(_v == {})", bound(x)?),
+            CovBinValue::Eq(x) => {
+                let x_rendered = bound(x)?;
+                let width = signed_common_width(x);
+                format!(
+                    "{}",
+                    compare(
+                        "_v".to_string(),
+                        x_rendered,
+                        match x {
+                            CovBinBound::Runtime(expr) => Some(expr),
+                            CovBinBound::Const(_) => None,
+                        },
+                        BinOp::Eq,
+                        width,
+                    )
+                )
+            }
             CovBinValue::Range { lo, hi } => match (lo, hi) {
-                (Some(l), Some(h)) => format!("(_v >= {} && _v <= {})", bound(l)?, bound(h)?),
-                (Some(l), None) => format!("(_v >= {})", bound(l)?),
-                (None, Some(h)) => format!("(_v <= {})", bound(h)?),
+                (Some(l), Some(h)) => {
+                    let lo = bound(l)?;
+                    let hi = bound(h)?;
+                    format!(
+                        "({} && {})",
+                        compare(
+                            "_v".to_string(),
+                            lo,
+                            match l {
+                                CovBinBound::Runtime(expr) => Some(expr),
+                                CovBinBound::Const(_) => None,
+                            },
+                            BinOp::Ge,
+                            signed_common_width(l),
+                        ),
+                        compare(
+                            "_v".to_string(),
+                            hi,
+                            match h {
+                                CovBinBound::Runtime(expr) => Some(expr),
+                                CovBinBound::Const(_) => None,
+                            },
+                            BinOp::Le,
+                            signed_common_width(h),
+                        )
+                    )
+                }
+                (Some(l), None) => format!(
+                    "{}",
+                    compare(
+                        "_v".to_string(),
+                        bound(l)?,
+                        match l {
+                            CovBinBound::Runtime(expr) => Some(expr),
+                            CovBinBound::Const(_) => None,
+                        },
+                        BinOp::Ge,
+                        signed_common_width(l),
+                    )
+                ),
+                (None, Some(h)) => format!(
+                    "{}",
+                    compare(
+                        "_v".to_string(),
+                        bound(h)?,
+                        match h {
+                            CovBinBound::Runtime(expr) => Some(expr),
+                            CovBinBound::Const(_) => None,
+                        },
+                        BinOp::Le,
+                        signed_common_width(h),
+                    )
+                ),
                 (None, None) => "(true)".to_string(),
             },
         };
@@ -1221,14 +1336,18 @@ fn sample_body(
     for p in &schema.points {
         writeln!(out, "{pad2}{{").ok();
         let target = cover_expr_cpp(&p.target, widths)?;
-        let sample_type = if cover_expr_signed(&p.target, widths) {
-            "int64_t"
-        } else {
-            "uint64_t"
+        let sample_type = match (
+            cover_expr_signed(&p.target, widths),
+            cover_expr_width(&p.target, widths),
+        ) {
+            (true, Some(width)) if width > 64 && width <= 128 => "_harc_u128",
+            (true, _) => "int64_t",
+            (false, Some(width)) if width > 64 && width <= 128 => "_harc_u128",
+            (false, _) => "uint64_t",
         };
         writeln!(out, "{pad3}{sample_type} _v = ({sample_type})({target});").ok();
         for (bin_idx, b) in p.bins.iter().enumerate() {
-            let membership = bin_membership(&b.values, widths)?;
+            let membership = bin_membership(&b.values, &p.target, widths)?;
             if !any_cross {
                 writeln!(
                     out,
