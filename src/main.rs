@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, NamedSource, Report, Result};
 use std::collections::HashMap;
-use std::fs;
 use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -4011,6 +4011,13 @@ fn resolve_arch_invocation(
 
     if let Some(path_var) = path_var {
         for directory in std::env::split_paths(path_var) {
+            let directory = if directory.as_os_str().is_empty() {
+                current_dir.to_path_buf()
+            } else if directory.is_relative() {
+                current_dir.join(directory)
+            } else {
+                directory
+            };
             let candidate = directory.join("arch");
             if !is_executable_file(&candidate) || is_system_arch_utility(&candidate) {
                 continue;
@@ -4662,6 +4669,33 @@ mod tests {
     }
 
     #[test]
+    fn arch_invocation_resolves_relative_and_empty_path_entries_against_cwd() {
+        let base = temp_dir("arch-relative-path-selection");
+        let cwd = base.join("caller");
+        let relative_bin = cwd.join("bin");
+        fs::create_dir_all(&relative_bin).unwrap();
+        let relative_arch = relative_bin.join("arch");
+        fs::write(&relative_arch, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&relative_arch, fs::Permissions::from_mode(0o755)).unwrap();
+        let relative_path = std::ffi::OsString::from("bin");
+        let (program, _, _) = resolve_arch_invocation(None, &cwd, Some(&relative_path));
+        assert_eq!(program, fs::canonicalize(&relative_arch).unwrap());
+
+        let empty_arch = cwd.join("arch");
+        fs::write(&empty_arch, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&empty_arch, fs::Permissions::from_mode(0o755)).unwrap();
+        let (program, _, _) = resolve_arch_invocation(
+            None,
+            &cwd,
+            Some(std::ffi::OsStr::new("")),
+        );
+        assert_eq!(program, fs::canonicalize(&empty_arch).unwrap());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn arch_invocation_explicit_override_wins_over_path() {
         let base = temp_dir("arch-explicit-selection");
         let explicit = base.join("custom-arch");
@@ -4691,15 +4725,13 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
+    #[cfg(unix)]
     #[test]
     fn arch_invocation_skips_system_arch_utility() {
         let base = temp_dir("arch-system-utility");
         let bin_dir = base.join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        #[cfg(unix)]
         std::os::unix::fs::symlink("/usr/bin/arch", bin_dir.join("arch")).unwrap();
-        #[cfg(not(unix))]
-        fs::write(bin_dir.join("arch"), "system utility").unwrap();
         let path = std::env::join_paths([bin_dir.as_path()]).unwrap();
         let (program, args, _) = resolve_arch_invocation(None, &base, Some(&path));
         assert_eq!(program, PathBuf::from("cargo"));
