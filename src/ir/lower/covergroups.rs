@@ -2355,7 +2355,11 @@ fn lower_bin_bound(
         // literal spelling lowers. A hook param anywhere inside keeps
         // its precedence, so the fold is skipped when one appears.
         _ if !mentions_hook_param(e, hook_params) => match fold_const(e, consts, "") {
-            Ok(v) => Ok(CovBinBound::Const(v.bits)),
+            Ok(v) => Ok(if v.signed && (v.bits as i64) < 0 {
+                CovBinBound::ConstSigned(v.bits as i64)
+            } else {
+                CovBinBound::Const(v.bits)
+            }),
             Err(_) => bin_bound_fallback(group, bin, e, consts, hook_params, helpers, extern_fns),
         },
         _ => {

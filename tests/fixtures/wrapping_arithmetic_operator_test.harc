@@ -51,8 +51,10 @@ test WrappingArithmeticOperatorTest
         assert plain == 256 else fail("`+` must not wrap, got ${plain}")
 
         // Explicit `.trunc<N>()` still gives a genuine N-bit wrap and now
-        // agrees with `+%` at the same width.
-        let trunc8 : uint<8> = (a + 1).trunc<8>()
+        // agrees with `+%` at the same width. Give the plain sum a 9-bit
+        // static type before narrowing; plain `+` preserves the carry value
+        // but does not infer a wider static type for `a + 1`.
+        let trunc8 : uint<8> = ((a as uint<9>) + 1).trunc<8>()
         assert trunc8 == sum else fail(".trunc<8>() and +% must agree, got ${trunc8} vs ${sum}")
 
         log(info, "PASS: wrapping operators mask to the wider operand width")

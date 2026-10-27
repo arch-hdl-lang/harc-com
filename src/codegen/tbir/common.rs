@@ -4020,6 +4020,7 @@ fn validate_stmt(
             validate_local(function, *local)?;
             validate_expr(opts, test, function, block, value)
         }
+        Stmt::HelperCall { call } => validate_expr(opts, test, function, block, call),
         Stmt::DutWrite(port, value) => {
             validate_port(opts, test, function, block, port)?;
             validate_expr(opts, test, function, block, value)
@@ -5335,6 +5336,7 @@ fn function_kind_ticket(kind: &FunctionKind) -> &'static str {
 fn stmt_kind(stmt: &Stmt) -> &'static str {
     match stmt {
         Stmt::Assign(_, _) => "scalar assignment",
+        Stmt::HelperCall { .. } => "pure helper call",
         Stmt::DutWrite(_, _) => "direct DUT write",
         Stmt::DutRead(_, _) => "direct DUT read",
         Stmt::ProbeRelease(_) => "probe release",
@@ -5423,6 +5425,7 @@ fn stmt_ticket(stmt: &Stmt) -> &'static str {
         | Stmt::ComponentAssign { .. } => "ticket 05",
         Stmt::TestbenchCall { .. } => "ticket 05",
         Stmt::Assign(_, _)
+        | Stmt::HelperCall { .. }
         | Stmt::DutWrite(_, _)
         | Stmt::DutRead(_, _)
         | Stmt::Log { .. }

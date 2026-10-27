@@ -1049,6 +1049,7 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             format!("TlmJoinAll([{}])", descs.join(", "))
         }
         Stmt::ErrorIncrement => "ErrorIncrement".to_string(),
+        Stmt::HelperCall { call } => format!("HelperCall({call:?})"),
     }
 }
 
@@ -1179,6 +1180,7 @@ fn bin_value_str(v: &CovBinValue) -> String {
     fn bound_str(b: &CovBinBound) -> String {
         match b {
             CovBinBound::Const(x) => x.to_string(),
+            CovBinBound::ConstSigned(x) => x.to_string(),
             CovBinBound::Runtime(e) => cover_expr_str(e),
         }
     }

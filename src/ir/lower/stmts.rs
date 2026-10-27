@@ -862,7 +862,15 @@ impl FuncBuilder<'_> {
                                 // (already evaluated); pure calls keep
                                 // the `Expr::Call` in a discard temp so
                                 // the C++ call survives, mirroring v1.
+                                let void_pure = self
+                                    .helpers
+                                    .get(&id.name)
+                                    .is_some_and(|entry| entry.pure && entry.decl.return_ty.is_none());
                                 let val = self.lower_helper_call(&id.name, args)?;
+                                if void_pure {
+                                    self.push(Stmt::HelperCall { call: val });
+                                    return Ok(());
+                                }
                                 if !matches!(val, crate::ir::Expr::Local(_)) {
                                     let val = self.hoist_ports(val);
                                     let t = self.fresh_temp();
@@ -5209,11 +5217,20 @@ impl FuncBuilder<'_> {
             }
         }
         let scalar_bindings = visible
-            .into_iter()
+            .iter()
+            .map(|(name, local)| (name.clone(), *local))
             .filter_map(|(name, local)| {
                 let ty = &self.locals[local.index()].ty;
                 matches!(ty, IrType::UInt(_) | IrType::SInt(_) | IrType::Bool)
                     .then(|| (name, local, ty.clone()))
+            })
+            .collect();
+        let record_bindings = visible
+            .into_iter()
+            .filter_map(|(name, local)| {
+                self.record_of_local(local).map(|record_id| {
+                    (name, self.ctx.records[record_id.index()].name.clone())
+                })
             })
             .collect();
 
@@ -5224,6 +5241,7 @@ impl FuncBuilder<'_> {
             constraints,
             blocking,
             scalar_bindings,
+            record_bindings,
             problem_id,
         });
 

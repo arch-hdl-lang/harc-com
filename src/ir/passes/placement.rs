@@ -275,6 +275,10 @@ fn block_features(prog: &TbProgram, block: &super::super::BasicBlock) -> BlockFe
                 host_service_only = false;
                 visit_expr(e, &mut accesses, &mut transactor);
             }
+            Stmt::HelperCall { call } => {
+                host_service_only = false;
+                visit_expr(call, &mut accesses, &mut transactor);
+            }
             Stmt::AssertCheck { cond, on_fail } | Stmt::AssumeCheck { cond, on_fail } => {
                 host_service_only = false;
                 visit_expr(cond, &mut accesses, &mut transactor);

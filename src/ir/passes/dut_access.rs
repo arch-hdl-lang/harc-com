@@ -87,7 +87,7 @@ fn record_covergroup_reads_at(
                             }
                         }
                     }
-                    crate::ir::CovBinValue::Eq(crate::ir::CovBinBound::Const(_)) => {}
+                    crate::ir::CovBinValue::Eq(crate::ir::CovBinBound::Const(_) | crate::ir::CovBinBound::ConstSigned(_)) => {}
                 }
             }
         }
@@ -1107,7 +1107,7 @@ fn analyze_impl(
                                 }
                             }
                         }
-                        crate::ir::CovBinValue::Eq(crate::ir::CovBinBound::Const(_)) => {}
+                        crate::ir::CovBinValue::Eq(crate::ir::CovBinBound::Const(_) | crate::ir::CovBinBound::ConstSigned(_)) => {}
                     }
                 }
             }

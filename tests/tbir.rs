@@ -247,6 +247,7 @@ fn bin_repr(v: &ir::CovBinValue) -> (&'static str, Option<u64>, Option<u64>) {
     fn bound(b: &ir::CovBinBound) -> Option<u64> {
         match b {
             ir::CovBinBound::Const(x) => Some(*x),
+            ir::CovBinBound::ConstSigned(x) => Some(*x as u64),
             ir::CovBinBound::Runtime(_) => Some(u64::MAX),
         }
     }
@@ -19172,6 +19173,92 @@ fn helper_categorization_pure_vs_impure() {
     assert!(calls_double_it, "pure call survives as Expr::Call:\n{run}");
 }
 
+#[test]
+fn pure_void_helper_statement_calls_lower_and_verify() {
+    let src = r#"
+function empty()
+end function empty
+
+function local_only()
+    let x: uint<8> = 7
+end function local_only
+
+function bare_return()
+    return
+end function bare_return
+
+function typed() -> uint<8>
+    return 7
+end function typed
+
+test PureVoidHelperCalls
+    let dut : Top
+    run
+        empty()
+        local_only()
+        bare_return()
+        let value = typed()
+        assert value == 7 else fail("typed helper")
+    end run
+end test PureVoidHelperCalls
+"#;
+    let prog = lower_src(src).expect("pure void helper calls lower");
+    verify::verify_program(&prog).expect("pure void helper calls verify");
+    let run = prog.function(prog.tests[0].run);
+    let void_calls = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .filter(|stmt| matches!(stmt, ir::Stmt::HelperCall { .. }))
+        .count();
+    assert_eq!(void_calls, 3, "void helpers use statement calls:\n{run}");
+    assert!(run.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+        matches!(stmt, ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::Helper { name, ret, .. }, _)) if name == "typed" && matches!(ret, ir::IrType::UInt(Some(8))))
+    }));
+}
+
+#[test]
+fn pure_void_helper_statement_call_rejects_bad_argument_type() {
+    let src = r#"
+function consume(value: Vec<uint<8>, 2>)
+end function consume
+
+test PureVoidHelperBadArg
+    let dut : Top
+    let sample : Vec<uint<8>, 2>
+    run
+        consume(sample)
+    end run
+end test PureVoidHelperBadArg
+"#;
+    let mut prog = lower_src(src).expect("pure void helper call lowers");
+    let run_id = prog.tests[0].run;
+    let run = &mut prog.functions[run_id.index()];
+    let call = run
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.stmts)
+        .find_map(|stmt| match stmt {
+            ir::Stmt::HelperCall { call } => Some(call),
+            _ => None,
+        })
+        .expect("void helper call is represented as a statement");
+    let ir::Expr::Call(_, args) = call else {
+        panic!("expected helper call expression")
+    };
+    args[0] = ir::Expr::Literal {
+        value: 1,
+        ty: ir::IrType::UInt(Some(16)),
+    };
+    let errors = verify::verify_program(&prog).expect_err("bad void helper argument type rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.to_string().contains("argument 1")),
+        "{errors:?}"
+    );
+}
+
 /// CFG-inlined free helpers and direct testbench-method calls are value
 /// preludes. Lazy operators must therefore place each effect in the selected
 /// branch, including when impurity is reached through a nested call.
@@ -21962,6 +22049,77 @@ fn covergroup_runtime_range_bounds_lower_and_emit() {
 /// Width-method coverpoint targets carry source widths when they can be
 /// inferred, so signed extension samples the same values as ordinary
 /// TBIR expressions.
+#[test]
+fn covergroup_static_signed_bounds_preserve_signedness() {
+    let src = r#"
+const NEG8 : sint<8> = -1
+
+covergroup Cov @(posedge dut.clk)
+    cp : cover dut.count_out
+        bins
+            cross_zero = [NEG8..1]
+            negative = [NEG8..NEG8]
+            positive = [1..1]
+        end bins
+end covergroup Cov
+
+testbench Tb
+    dut : Top
+    cov : Cov
+end testbench Tb
+
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T
+"#;
+    let prog = lower_src(src).expect("signed static bounds lower");
+    verify::verify_program(&prog).expect("signed static bounds verify");
+    let cpp = emit_cpp_src(src);
+    assert!(
+        (cpp.contains("_v >= -1") && cpp.contains("_v <= 1"))
+            || cpp.contains("harc_rt::harc_slt_u128"),
+        "signed bounds were not emitted through a signed comparison: {cpp}"
+    );
+    assert!(!cpp.contains("18446744073709551615 && _v <= 1"), "{cpp}");
+    match &prog.covgroups[0].points[0].bins[0].values[0] {
+        ir::CovBinValue::Range { lo: Some(ir::CovBinBound::ConstSigned(-1)), hi: Some(ir::CovBinBound::Const(1)) } => {}
+        other => panic!("cross-zero bound lost signedness: {other:?}"),
+    }
+}
+
+#[test]
+fn covergroup_static_i64_min_bound_uses_signed_cpp_spelling() {
+    let src = r#"
+const MIN64 : sint<64> = -9223372036854775808
+
+covergroup Cov @(posedge dut.clk)
+    cp : cover dut.count_out
+        bins
+            from_min = [MIN64..1]
+        end bins
+end covergroup Cov
+
+testbench Tb
+    dut : Top
+    cov : Cov
+end testbench Tb
+
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T
+"#;
+    let cpp = emit_cpp_src(src);
+    assert!(
+        cpp.contains("_v >= (-9223372036854775807LL - 1) && _v <= 1"),
+        "{cpp}"
+    );
+    assert!(!cpp.contains("_v >= -9223372036854775808 &&"), "{cpp}");
+}
+
 #[test]
 fn covergroup_width_methods_lower_with_source_width() {
     let src = r#"
@@ -29125,6 +29283,76 @@ fn width_methods_dump_ir_snapshot() {
     let prog = lower_src(&fixture("width_methods_test.harc")).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
     insta::assert_snapshot!("width_methods_dump_ir", format!("{prog}"));
+}
+
+#[test]
+fn width_methods_preserve_lowered_receiver_width_metadata() {
+    let source = r#"test T
+    let dut : Top
+    run
+        let n : sint<65> = -8 / 3
+        let z : sint<65> = 0
+        let direct : sint<129> = n.sext<129>()
+        let compound : sint<129> = (n + z).sext<129>()
+        let inferred = n + z
+        let inferred_cast : sint<129> = inferred.sext<129>()
+        let nested : uint<65> = ((n + z).sext<129>()).trunc<65>()
+        let n8 : sint<8> = -1
+        let compound_zext : uint<16> = (n8 + (0 as sint<8>)).zext<16>()
+        let masked_sext : sint<129> = (n & 0xFF).sext<129>()
+        let masked_trunc : uint<16> = (n & 0xFF).trunc<16>()
+    end run
+end test T"#;
+    let prog = lower_src(source).expect("lowers");
+    let mut casts = Vec::new();
+    fn collect(e: &ir::Expr, out: &mut Vec<(ir::WidthCastKind, u32, Option<u32>)>) {
+        if let ir::Expr::WidthCast {
+            kind,
+            width,
+            src_width,
+            inner,
+        } = e
+        {
+            out.push((*kind, *width, *src_width));
+            collect(inner, out);
+        }
+    }
+    for function in &prog.functions {
+        for block in &function.blocks {
+            for stmt in &block.stmts {
+                if let ir::Stmt::Assign(_, value) = stmt {
+                    collect(value, &mut casts);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        casts
+            .iter()
+            .filter(|cast| **cast == (ir::WidthCastKind::Sext, 129, Some(65)))
+            .count(),
+        5,
+        "direct, compound, inferred, nested, and masked sext receivers must retain 65-bit metadata: {casts:?}"
+    );
+    assert_eq!(
+        casts
+            .iter()
+            .filter(|cast| **cast == (ir::WidthCastKind::Trunc, 65, Some(129)))
+            .count(),
+        1,
+        "nested trunc receiver must retain 129-bit metadata: {casts:?}"
+    );
+    assert_eq!(
+        casts
+            .iter()
+            .filter(|cast| **cast == (ir::WidthCastKind::Zext, 16, Some(8)))
+            .count(),
+        1,
+        "compound zext receiver must retain 8-bit metadata: {casts:?}"
+    );
+    assert!(casts.contains(&(ir::WidthCastKind::Sext, 129, Some(65))), "{casts:?}");
+    assert!(casts.contains(&(ir::WidthCastKind::Trunc, 16, Some(65))), "{casts:?}");
+    assert!(casts.iter().all(|(_, _, src_width)| src_width.is_some()));
 }
 
 #[test]
@@ -56121,4 +56349,42 @@ end test CaptureConditionTest
             assert!(error.0.contains("value, not a condition"), "{error}");
         }
     }
+}
+
+#[test]
+fn blocking_randomize_captured_field_condition_uses_record_metadata() {
+    let source = r#"
+transaction Capture
+    flag : bool
+    value : uint<8>
+end transaction Capture
+
+transaction Req
+    x : uint<8>
+end transaction Req
+
+test CapturedFieldConditionTest
+    let dut : Top
+    run
+        let c : Capture
+        let request : Req
+        blocking randomize(request) with
+            c.flag
+            request.x == 3
+        end randomize
+    end run
+end test CapturedFieldConditionTest
+"#;
+    let merged = merged_src(source);
+    let program = lower::lower_program(&merged).unwrap();
+    let cpp = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default()).unwrap();
+    assert!(cpp.contains("_ctx.bool_val((bool)(c.flag))"), "{cpp}");
+    assert!(cpp.contains("_z_x == _ctx.bv_val"), "{cpp}");
+
+    let numeric = source.replace("c.flag\n            request.x", "c.value\n            request.x");
+    let merged = merged_src(&numeric);
+    let program = lower::lower_program(&merged).unwrap();
+    let error = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default())
+        .expect_err("captured numeric fields cannot be bare conditions");
+    assert!(error.0.contains("value, not a condition"), "{error}");
 }

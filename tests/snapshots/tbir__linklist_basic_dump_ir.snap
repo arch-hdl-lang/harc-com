@@ -269,7 +269,7 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
     Assign(%__t5, 0)
     Assign(%handle, %h_2)
     DutWrite(dut.free_req_valid, 1)
-    DutWrite(dut.free_req_handle, %handle.trunc<3>())
+    DutWrite(dut.free_req_handle, %handle.trunc<3 from 32>())
     -> WaitCyclesSync(1, b9)
 
   b6:
@@ -687,7 +687,7 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
     Assign(%__t49, 0)
     Assign(%handle_2, %h6)
     DutWrite(dut.read_data_req_valid, 1)
-    DutWrite(dut.read_data_req_handle, %handle_2.trunc<3>())
+    DutWrite(dut.read_data_req_handle, %handle_2.trunc<3 from 32>())
     -> WaitCyclesSync(1, b82)
 
   b78:
@@ -712,7 +712,7 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
     Assign(%handle_3, %h6)
     Assign(%data_9, 3405691582)
     DutWrite(dut.write_data_req_valid, 1)
-    DutWrite(dut.write_data_req_handle, %handle_3.trunc<3>())
+    DutWrite(dut.write_data_req_handle, %handle_3.trunc<3 from 32>())
     DutWrite(dut.write_data_req_data, %data_9)
     -> WaitCyclesSync(1, b85)
 
@@ -732,7 +732,7 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
     Assign(%__t53, 0)
     Assign(%handle_4, %h6)
     DutWrite(dut.read_data_req_valid, 1)
-    DutWrite(dut.read_data_req_handle, %handle_4.trunc<3>())
+    DutWrite(dut.read_data_req_handle, %handle_4.trunc<3 from 32>())
     -> WaitCyclesSync(1, b88)
 
   b85:
@@ -929,7 +929,7 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
     Assign(%__t84, 0)
     Assign(%handle_5, %a0)
     DutWrite(dut.free_req_valid, 1)
-    DutWrite(dut.free_req_handle, %handle_5.trunc<3>())
+    DutWrite(dut.free_req_handle, %handle_5.trunc<3 from 32>())
     -> WaitCyclesSync(1, b121)
 
   b118:
@@ -947,7 +947,7 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
     Assign(%__t85, 0)
     Assign(%handle_6, %a1)
     DutWrite(dut.free_req_valid, 1)
-    DutWrite(dut.free_req_handle, %handle_6.trunc<3>())
+    DutWrite(dut.free_req_handle, %handle_6.trunc<3 from 32>())
     -> WaitCyclesSync(1, b124)
 
   b121:
@@ -962,7 +962,7 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
     Assign(%__t86, 0)
     Assign(%handle_7, %a2)
     DutWrite(dut.free_req_valid, 1)
-    DutWrite(dut.free_req_handle, %handle_7.trunc<3>())
+    DutWrite(dut.free_req_handle, %handle_7.trunc<3 from 32>())
     -> WaitCyclesSync(1, b127)
 
   b124:
@@ -977,7 +977,7 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
     Assign(%__t87, 0)
     Assign(%handle_8, %a3)
     DutWrite(dut.free_req_valid, 1)
-    DutWrite(dut.free_req_handle, %handle_8.trunc<3>())
+    DutWrite(dut.free_req_handle, %handle_8.trunc<3 from 32>())
     -> WaitCyclesSync(1, b130)
 
   b127:
@@ -992,7 +992,7 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
     Assign(%__t88, 0)
     Assign(%handle_9, %a4)
     DutWrite(dut.free_req_valid, 1)
-    DutWrite(dut.free_req_handle, %handle_9.trunc<3>())
+    DutWrite(dut.free_req_handle, %handle_9.trunc<3 from 32>())
     -> WaitCyclesSync(1, b133)
 
   b130:
@@ -1007,7 +1007,7 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
     Assign(%__t89, 0)
     Assign(%handle_10, %a5)
     DutWrite(dut.free_req_valid, 1)
-    DutWrite(dut.free_req_handle, %handle_10.trunc<3>())
+    DutWrite(dut.free_req_handle, %handle_10.trunc<3 from 32>())
     -> WaitCyclesSync(1, b136)
 
   b133:
@@ -1022,7 +1022,7 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
     Assign(%__t90, 0)
     Assign(%handle_11, %a6)
     DutWrite(dut.free_req_valid, 1)
-    DutWrite(dut.free_req_handle, %handle_11.trunc<3>())
+    DutWrite(dut.free_req_handle, %handle_11.trunc<3 from 32>())
     -> WaitCyclesSync(1, b139)
 
   b136:
@@ -1037,7 +1037,7 @@ fn fn0 run_LinklistBasicTest [kind=Run, owner=tb0]
     Assign(%__t91, 0)
     Assign(%handle_12, %a7)
     DutWrite(dut.free_req_valid, 1)
-    DutWrite(dut.free_req_handle, %handle_12.trunc<3>())
+    DutWrite(dut.free_req_handle, %handle_12.trunc<3 from 32>())
     -> WaitCyclesSync(1, b142)
 
   b139:
