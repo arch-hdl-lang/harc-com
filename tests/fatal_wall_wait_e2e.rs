@@ -10,6 +10,10 @@ fn root() -> PathBuf {
 }
 
 fn run_case(root_dir: &Path, name: &str, source: &str) -> Output {
+    run_case_with(root_dir, name, source, &[])
+}
+
+fn run_case_with(root_dir: &Path, name: &str, source: &str, extra: &[&str]) -> Output {
     let fixture = root_dir.join(format!("{name}.harc"));
     let outdir = root_dir.join(format!("{name}-out"));
     std::fs::write(&fixture, source).expect("write HARC fixture");
@@ -20,6 +24,7 @@ fn run_case(root_dir: &Path, name: &str, source: &str) -> Output {
         .args(["--top", "Top", "--outdir"])
         .arg(outdir)
         .args(["--rebuild", "--jobs", "2"])
+        .args(extra)
         .env("HARC_NO_LEARN", "1")
         .env("ARCH_NO_LEARN", "1")
         .env("HARC_REQUIRE_VERILATOR", "1")
@@ -205,5 +210,129 @@ fn fatal_wall_wait_stops_current_run_and_preserves_zero_wait_boundary() {
         !typed_log.contains("HELPER_AFTER") && !typed_log.contains("CALLER_AFTER"),
         "value-returning helper continued after fatal:\n{typed_log}"
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `wait N cycles on <clock>` interrupted by a fatal from a post-eval
+/// service. `run_body` is the run block after reset/enable; the helper
+/// waits on the named clock too, so helper calls cover the callable path.
+fn qualified_fixture(severity: &str, run_body: &str) -> String {
+    format!(
+        r#"domain D
+    freq_mhz: 100
+end domain D
+testbench Tb
+    dut : Top
+    on 1 cycles phase post_eval
+        if cycle_count == 1
+            log({severity}, "MIDWAIT_FATAL")
+        end if
+        log(info, "SERVICE=${{cycle_count}}")
+    end on
+    function clock_helper()
+        wait 10 cycles on clk
+        log(info, "HELPER_AFTER")
+    end function clock_helper
+    function typed_clock_helper() -> uint<8>
+        wait 10 cycles on clk
+        log(info, "HELPER_AFTER")
+        return 7
+    end function typed_clock_helper
+end testbench Tb
+impl T for Tb
+    clock clk = D
+    run
+        dut.rst = 0
+        dut.en = 1
+{run_body}
+    end run
+end impl T
+"#
+    )
+}
+
+#[test]
+fn fatal_named_clock_wait_stops_current_run_in_both_layouts() {
+    if Command::new("verilator")
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        if std::env::var_os("HARC_REQUIRE_VERILATOR").is_some() {
+            panic!("verilator required");
+        }
+        eprintln!("SKIP fatal_named_clock_wait: verilator not found");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "harc_fatal_named_clock_wait_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create test directory");
+
+    let positive = "        wait 10 cycles on clk\n        log(info, \"SUCCESSOR=${cycle_count}\")";
+    let helper = "        clock_helper()\n        log(info, \"CALLER_AFTER\")";
+    let typed =
+        "        let result = typed_clock_helper()\n        log(info, \"CALLER_AFTER=${result}\")";
+    let same_cycle =
+        "        wait 1 cycles on clk\n        log(info, \"SUCCESSOR=${cycle_count}\")";
+    let zero = "        log(fatal, \"BEFORE_ZERO\")\n        wait 0 cycles on clk\n        log(info, \"ZERO_SUCCESSOR\")";
+    let layouts: [(&str, &[&str]); 2] = [
+        ("default", &[]),
+        (
+            "common",
+            &["--cpp-split", "tests", "--cpp-split-layout", "common"],
+        ),
+    ];
+    for (layout, extra) in layouts {
+        let run = |name: &str, severity: &str, body: &str| {
+            let output = run_case_with(
+                &dir,
+                &format!("{layout}_{name}"),
+                &qualified_fixture(severity, body),
+                extra,
+            );
+            (output.status.success(), text(&output))
+        };
+
+        for (name, body) in [("positive", positive), ("helper", helper), ("typed", typed)] {
+            let (ok, log) = run(name, "fatal", body);
+            assert!(!ok, "{layout} {name}: fatal run passed:\n{log}");
+            assert!(
+                log.contains("SERVICE=1") && !log.contains("SERVICE=2"),
+                "{layout} {name}: missing current edge or ran a future edge:\n{log}"
+            );
+            assert!(
+                !log.contains("SUCCESSOR")
+                    && !log.contains("HELPER_AFTER")
+                    && !log.contains("CALLER_AFTER"),
+                "{layout} {name}: code after the interrupted wait ran:\n{log}"
+            );
+        }
+
+        // A wait whose last owed edge is the fatal edge completes, like
+        // the unqualified `wait 1 cycles`; so does a zero wait.
+        let (ok, log) = run("same_cycle", "fatal", same_cycle);
+        assert!(!ok, "{layout} same_cycle: fatal run passed:\n{log}");
+        assert!(
+            log.contains("SUCCESSOR=1"),
+            "{layout} same_cycle: completed wait lost its successor:\n{log}"
+        );
+        let (ok, log) = run("zero", "info", zero);
+        assert!(!ok, "{layout} zero: fatal run passed:\n{log}");
+        assert!(
+            log.contains("ZERO_SUCCESSOR"),
+            "{layout} zero: zero wait lost its successor:\n{log}"
+        );
+
+        let (ok, log) = run("info", "info", positive);
+        assert!(ok, "{layout} info: nonfatal run failed:\n{log}");
+        assert!(
+            log.contains("SERVICE=10") && log.contains("SUCCESSOR=10"),
+            "{layout} info: wait did not reach its target:\n{log}"
+        );
+    }
     let _ = std::fs::remove_dir_all(dir);
 }

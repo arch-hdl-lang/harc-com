@@ -21369,7 +21369,8 @@ fn verifier_catches_bad_wait_clock() {
 /// eval_clocks_until loop: advance to whichever clock's next edge is
 /// sooner until the named clock has seen N more rising edges, service
 /// actor schedulers on each primary edge without re-entering the active
-/// run slot, then run the checkers.
+/// run slot, then run the checkers. A fatal that ended the loop with edges
+/// still owed aborts the run after that checker pass.
 #[test]
 fn tbir_emit_wait_on_clock_inline_loop() {
     let merged = merged_src(WAIT_ON_CLOCK_SRC);
@@ -21387,7 +21388,8 @@ fn tbir_emit_wait_on_clock_inline_loop() {
         "uint64_t _advanced = clocks_[1].rising_count - _before_rising;",
         "if (_advanced > 0) _remaining = _advanced >= _remaining ? 0 : _remaining - _advanced;",
         "if (cycle_count != _before_cycle) _harc_advance_actors();",
-        "} for (auto& _c : _checkers) _c(); }",
+        "} for (auto& _c : _checkers) _c(); \
+         if (_remaining > 0) throw harc_rt::HarcFatalAbort{}; }",
     ] {
         assert!(
             cpp.contains(marker),

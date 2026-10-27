@@ -534,7 +534,7 @@ fn emit_function_with_tseq_calls(
                         if let Some(context) = cx.bindings.run_context {
                             writeln!(
                                 out,
-                                "{pad3}harc_wait_clock_cycles({context}, \"{}\", (long long)({n}));",
+                                "{pad3}if (!harc_wait_clock_cycles({context}, \"{}\", (long long)({n}))) throw harc_rt::HarcFatalAbort{{}};",
                                 super::expr::escape_c(&c.name)
                             )
                             .ok();
@@ -545,7 +545,7 @@ fn emit_function_with_tseq_calls(
                             // simulated time edge-by-edge until the named
                             // clock has seen N more rising edges, then run
                             // the checkers.
-                            emit_local_qualified_clock_wait(out, &pad3, c.index, &n);
+                            emit_local_qualified_clock_wait(out, &pad3, c.index, &n, true);
                         }
                     }
                 }
@@ -2506,7 +2506,20 @@ fn scalar_sink_expr_cpp(
     }
 }
 
-fn emit_local_qualified_clock_wait(out: &mut String, pad: &str, clock_index: usize, cycles: &str) {
+/// `abort_on_fatal`: a fatal ends the wait loop early; with edges still
+/// owed, the caller's successor must not run (spec §7.7 aborts the test
+/// at end of the current cycle), so after the usual checker pass the wait
+/// throws `HarcFatalAbort` like a positive wall-clock wait. Zero waits and
+/// waits whose last edge lands in the fatal cycle still reach their
+/// successor. Test hooks pass `false`: they fire in synchronous callback
+/// dispatch, outside the coroutine that catches the abort.
+fn emit_local_qualified_clock_wait(
+    out: &mut String,
+    pad: &str,
+    clock_index: usize,
+    cycles: &str,
+    abort_on_fatal: bool,
+) {
     writeln!(
         out,
         "{pad}{{ if (_harc_actor_tick_due) {{ _harc_advance_actors(); _harc_actor_tick_due = false; }} uint64_t _remaining = (uint64_t)({cycles}); while (_remaining > 0 && !_fatal) {{"
@@ -2528,7 +2541,12 @@ fn emit_local_qualified_clock_wait(out: &mut String, pad: &str, clock_index: usi
         "{pad}{INDENT}if (cycle_count != _before_cycle) _harc_advance_actors();"
     )
     .ok();
-    writeln!(out, "{pad}}} for (auto& _c : _checkers) _c(); }}").ok();
+    let abort = if abort_on_fatal {
+        " if (_remaining > 0) throw harc_rt::HarcFatalAbort{};"
+    } else {
+        ""
+    };
+    writeln!(out, "{pad}}} for (auto& _c : _checkers) _c();{abort} }}").ok();
 }
 
 fn event_payload_ir_type(payload: crate::ir::EventPayload) -> IrType {
@@ -7388,7 +7406,7 @@ fn emit_component_fn_lambda(
                     let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
                     writeln!(
                         out,
-                        "{pad3}harc_wait_clock_cycles(ctx, \"{}\", (long long)({n}));",
+                        "{pad3}if (!harc_wait_clock_cycles(ctx, \"{}\", (long long)({n}))) throw harc_rt::HarcFatalAbort{{}};",
                         super::expr::escape_c(&clock.name)
                     )
                     .ok();
@@ -7409,7 +7427,7 @@ fn emit_component_fn_lambda(
                             ))
                         })?;
                     let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
-                    emit_local_qualified_clock_wait(out, &pad3, index, &n);
+                    emit_local_qualified_clock_wait(out, &pad3, index, &n, true);
                 }
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
@@ -8784,7 +8802,7 @@ pub(super) fn emit_test_hook(
                             ))
                         })?;
                     let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
-                    emit_local_qualified_clock_wait(out, &pad3, index, &n);
+                    emit_local_qualified_clock_wait(out, &pad3, index, &n, false);
                 }
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
