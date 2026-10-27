@@ -80,6 +80,20 @@ impl SignedWideOpsTest for SignedWideTb
         assert compound129_256 == -2
             else fail("compound sext<256> lost signed129 source")
 
+        // A direct masked expression retains its semantic operand width for
+        // width methods; an inferred local may use its narrowed assignment
+        // type, which is a separate and intentional case.
+        let masked_sext : sint<129> = (source65 & 0xFF).sext<129>()
+        let masked_trunc : uint<16> = (source65 & 0xFF).trunc<16>()
+        let inferred_mask : uint<8> = source65 & 0xFF
+        let inferred_mask_sext : sint<129> = inferred_mask.sext<129>()
+        assert masked_sext == 0xFE
+            else fail("masked direct sext changed semantic width")
+        assert masked_trunc == 0xFE
+            else fail("masked direct trunc changed semantic width")
+        assert inferred_mask_sext == -2
+            else fail("inferred masked local changed narrowed width")
+
         let source8 : sint<8> = -1
         let zero8 : sint<8> = 0
         let direct8 : uint<16> = source8.zext<16>()

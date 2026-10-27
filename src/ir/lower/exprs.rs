@@ -5684,8 +5684,12 @@ impl FuncBuilder<'_> {
         let ast_src_width = self.infer_expr_width(target);
         let inner = self.lower_expr(target)?;
         let src_width = self
-            .scalar_assignment_type(&inner)
+            .expr_type(&inner)
             .and_then(|ty| scalar_ir_width(&ty))
+            .or_else(|| {
+                self.scalar_assignment_type(&inner)
+                    .and_then(|ty| scalar_ir_width(&ty))
+            })
             .or(ast_src_width);
         if let Some(why) = width_method_violation(kind_name, width, src_width) {
             return Err(LowerError::Invalid(why));

@@ -29227,6 +29227,8 @@ fn width_methods_preserve_lowered_receiver_width_metadata() {
         let nested : uint<65> = ((n + z).sext<129>()).trunc<65>()
         let n8 : sint<8> = -1
         let compound_zext : uint<16> = (n8 + (0 as sint<8>)).zext<16>()
+        let masked_sext : sint<129> = (n & 0xFF).sext<129>()
+        let masked_trunc : uint<16> = (n & 0xFF).trunc<16>()
     end run
 end test T"#;
     let prog = lower_src(source).expect("lowers");
@@ -29257,8 +29259,8 @@ end test T"#;
             .iter()
             .filter(|cast| **cast == (ir::WidthCastKind::Sext, 129, Some(65)))
             .count(),
-        4,
-        "direct, compound, inferred, and nested sext receivers must retain 65-bit metadata: {casts:?}"
+        5,
+        "direct, compound, inferred, nested, and masked sext receivers must retain 65-bit metadata: {casts:?}"
     );
     assert_eq!(
         casts
@@ -29276,6 +29278,8 @@ end test T"#;
         1,
         "compound zext receiver must retain 8-bit metadata: {casts:?}"
     );
+    assert!(casts.contains(&(ir::WidthCastKind::Sext, 129, Some(65))), "{casts:?}");
+    assert!(casts.contains(&(ir::WidthCastKind::Trunc, 16, Some(65))), "{casts:?}");
     assert!(casts.iter().all(|(_, _, src_width)| src_width.is_some()));
 }
 
