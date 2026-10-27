@@ -3796,6 +3796,7 @@ fn cmd_sim(
     if let Some(s) = seed {
         cmd.env("HARC_SEED", s.to_string());
     }
+    forward_arch_test_selection(&mut cmd, test.as_deref());
     // `arch sim` compiles the generated C++ testbench itself. When the TB
     // uses the runtime constraint solver it `#include`s `harc_z3_rt.h`
     // (→ `<z3++.h>`) and must link libz3 — but `arch sim` has no -I/-L
@@ -4064,6 +4065,15 @@ fn is_executable_file(path: &Path) -> bool {
 fn is_system_arch_utility(path: &Path) -> bool {
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     canonical == Path::new("/usr/bin/arch") || canonical == Path::new("/bin/arch")
+}
+
+/// `arch sim` owns the binary's argv, so the suite dispatcher learns the
+/// selected test from `HARC_TEST` (as on the co-sim path). Without it a
+/// suite-scope build silently runs the alphabetically-first test.
+fn forward_arch_test_selection(cmd: &mut Command, test: Option<&str>) {
+    if let Some(t) = test {
+        cmd.env("HARC_TEST", t);
+    }
 }
 
 fn arch_opt_with_solver_z3(base: &str, inc: &Path, lib: &Path, force_no_as_needed: bool) -> String {
@@ -4757,5 +4767,22 @@ mod tests {
         let flags = arch_opt_with_solver_z3("-O2 -flto", inc, lib, false);
         assert!(flags.ends_with(" -lz3"));
         assert!(!flags.contains("--no-as-needed"));
+    }
+
+    #[test]
+    fn arch_sim_forwards_the_selected_test() {
+        let harc_test = |cmd: &Command| {
+            cmd.get_envs()
+                .find(|(key, _)| *key == "HARC_TEST")
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        let mut selected = Command::new("arch");
+        forward_arch_test_selection(&mut selected, Some("B_second"));
+        assert_eq!(harc_test(&selected).as_deref(), Some("B_second"));
+
+        let mut unselected = Command::new("arch");
+        forward_arch_test_selection(&mut unselected, None);
+        assert_eq!(harc_test(&unselected), None);
     }
 }
