@@ -9762,6 +9762,7 @@ fn existing_state_instance(func: &TbFunction) -> Option<String> {
                 }
                 ir::Stmt::TransactorCall { call, .. }
                 | ir::Stmt::TransactorSelfCall { call, .. } => in_expr(call),
+                ir::Stmt::HelperCall { call } => in_expr(call),
                 ir::Stmt::TestbenchCall { args, .. } => args.iter().find_map(in_expr),
                 ir::Stmt::ScoreboardOp { op, .. } => match op {
                     ir::ScoreboardOp::QueuePush { value, .. }
@@ -10054,6 +10055,7 @@ fn fill_transactor_state_instance_unchecked(func: &mut TbFunction, instance: &st
                 }
                 ir::Stmt::TransactorCall { call, .. }
                 | ir::Stmt::TransactorSelfCall { call, .. } => fill_expr(call, instance),
+                ir::Stmt::HelperCall { call } => fill_expr(call, instance),
                 ir::Stmt::TestbenchCall { args, .. } => {
                     for arg in args {
                         fill_expr(arg, instance);
@@ -10689,6 +10691,9 @@ fn fill_initiator_bus_prefix(
                         }
                     }
                     Stmt::TransactorCall { call, .. } | Stmt::TransactorSelfCall { call, .. } => {
+                        visit_expr(call, placeholder, binding, remap, rewrite, &mut conflict)
+                    }
+                    Stmt::HelperCall { call } => {
                         visit_expr(call, placeholder, binding, remap, rewrite, &mut conflict)
                     }
                     Stmt::TestbenchCall { args, .. } => {

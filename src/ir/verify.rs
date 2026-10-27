@@ -5888,6 +5888,38 @@ impl Checker<'_> {
     fn check_block(&mut self, b: &BasicBlock) {
         for s in &b.stmts {
             match s {
+                Stmt::HelperCall { call } => {
+                    let Expr::Call(CallTarget::Helper { function, name, ret }, args) = call else {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!("fn{} b{} malformed pure helper call", self.fid.0, self.bid.0),
+                        });
+                        continue;
+                    };
+                    let helper = self.prog.functions.get(function.index()).filter(|candidate| {
+                        candidate.id == *function
+                            && candidate.kind == FunctionKind::Helper
+                            && candidate.name == *name
+                    });
+                    let Some(helper) = helper else {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!("fn{} b{} references missing helper `{name}`", self.fid.0, self.bid.0),
+                        });
+                        continue;
+                    };
+                    if helper.ret.is_some() || !matches!(ret, IrType::Unknown) {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!("fn{} b{} non-void helper in statement call", self.fid.0, self.bid.0),
+                        });
+                    }
+                    if helper.params.len() != args.len() {
+                        self.errs.push(VerifyError::BadProgramRef {
+                            what: format!("fn{} b{} helper `{name}` arity mismatch", self.fid.0, self.bid.0),
+                        });
+                    }
+                    for arg in args {
+                        self.check_expr_inner(arg, false, "pure helper argument", false);
+                    }
+                }
                 Stmt::Assign(l, e) => {
                     self.check_local(*l);
                     // Transactor-call seam rule: the one sanctioned
@@ -11001,6 +11033,7 @@ fn check_def_before_use(
         };
         for s in &b.stmts {
             match s {
+                Stmt::HelperCall { call } => check_e(call, &defined, errs),
                 Stmt::Assign(l, e) => {
                     check_e(e, &defined, errs);
                     bit_set(&mut defined, l.index());

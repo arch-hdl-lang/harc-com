@@ -1049,6 +1049,7 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
             format!("TlmJoinAll([{}])", descs.join(", "))
         }
         Stmt::ErrorIncrement => "ErrorIncrement".to_string(),
+        Stmt::HelperCall { call } => format!("HelperCall({call:?})"),
     }
 }
 

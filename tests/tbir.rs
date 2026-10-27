@@ -19172,6 +19172,50 @@ fn helper_categorization_pure_vs_impure() {
     assert!(calls_double_it, "pure call survives as Expr::Call:\n{run}");
 }
 
+#[test]
+fn pure_void_helper_statement_calls_lower_and_verify() {
+    let src = r#"
+function empty()
+end function empty
+
+function local_only()
+    let x: uint<8> = 7
+end function local_only
+
+function bare_return()
+    return
+end function bare_return
+
+function typed() -> uint<8>
+    return 7
+end function typed
+
+test PureVoidHelperCalls
+    let dut : Top
+    run
+        empty()
+        local_only()
+        bare_return()
+        let value = typed()
+        assert value == 7 else fail("typed helper")
+    end run
+end test PureVoidHelperCalls
+"#;
+    let prog = lower_src(src).expect("pure void helper calls lower");
+    verify::verify_program(&prog).expect("pure void helper calls verify");
+    let run = prog.function(prog.tests[0].run);
+    let void_calls = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .filter(|stmt| matches!(stmt, ir::Stmt::HelperCall { .. }))
+        .count();
+    assert_eq!(void_calls, 3, "void helpers use statement calls:\n{run}");
+    assert!(run.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+        matches!(stmt, ir::Stmt::Assign(_, ir::Expr::Call(ir::CallTarget::Helper { name, ret, .. }, _)) if name == "typed" && matches!(ret, ir::IrType::UInt(Some(8))))
+    }));
+}
+
 /// CFG-inlined free helpers and direct testbench-method calls are value
 /// preludes. Lazy operators must therefore place each effect in the selected
 /// branch, including when impurity is reached through a nested call.

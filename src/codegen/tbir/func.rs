@@ -3018,6 +3018,10 @@ fn emit_stmt(
             let e = scalar_sink_expr_cpp(cx, e, local_ir_type(cx, *l).cloned())?;
             writeln!(out, "{pad}{name} = {e};").ok();
         }
+        Stmt::HelperCall { call } => {
+            let e = expr_cpp(cx, call)?;
+            writeln!(out, "{pad}{e};").ok();
+        }
         Stmt::RecordInit(l, r) => {
             let name = local_cpp_name(cx, *l)?;
             // Shared test-scope records are default-constructed once by

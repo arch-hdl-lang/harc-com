@@ -862,7 +862,15 @@ impl FuncBuilder<'_> {
                                 // (already evaluated); pure calls keep
                                 // the `Expr::Call` in a discard temp so
                                 // the C++ call survives, mirroring v1.
+                                let void_pure = self
+                                    .helpers
+                                    .get(&id.name)
+                                    .is_some_and(|entry| entry.pure && entry.decl.return_ty.is_none());
                                 let val = self.lower_helper_call(&id.name, args)?;
+                                if void_pure {
+                                    self.push(Stmt::HelperCall { call: val });
+                                    return Ok(());
+                                }
                                 if !matches!(val, crate::ir::Expr::Local(_)) {
                                     let val = self.hoist_ports(val);
                                     let t = self.fresh_temp();

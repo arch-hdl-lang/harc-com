@@ -2826,6 +2826,10 @@ pub enum Stmt {
         dest: Option<LocalId>,
         call: Expr,
     },
+    /// Statement-position invocation of a pure helper with no declared
+    /// return type.  The call is kept out of `Assign` because a void helper
+    /// has no return local and therefore cannot carry value-return metadata.
+    HelperCall { call: Expr },
     /// One `wait until … timeout` failure-diagnostic line: a
     /// `sim_log_line("FAIL", …)` that does NOT bump the error counter
     /// (v1 bumps `errors` exactly once per timed-out wait — that bump
