@@ -3230,11 +3230,10 @@ impl Parser {
                 // Statements are separated by newlines. A bare `return` must
                 // therefore stop at the next line instead of consuming the
                 // following statement as its value. An opening parenthesis
-                // explicitly opts into a multiline value expression, so
+                // on the same line remains part of a value expression, so
                 // `return (\n    expr\n)` remains valid.
-                let bare = self.is_block_terminator()
-                    || (self.newline_before_peek(return_span.end_usize())
-                        && !self.check(TokenKind::LParen));
+                let bare =
+                    self.is_block_terminator() || self.newline_before_peek(return_span.end_usize());
                 if bare {
                     Ok(Stmt {
                         kind: StmtKind::Return(None),
@@ -5393,7 +5392,8 @@ end bus BusGated"#;
 
     #[test]
     fn return_ends_at_newline_but_parenthesized_value_can_continue() {
-        let bare_src = "test T\n    phase p\n        return\n        g()\n    end phase p\nend test T";
+        let bare_src =
+            "test T\n    phase p\n        return\n        g()\n    end phase p\nend test T";
         let bare = parse(bare_src).unwrap();
         let Item::Test(test) = &bare.items[0] else {
             panic!("expected test");
@@ -5403,6 +5403,34 @@ end bus BusGated"#;
         };
         assert!(matches!(phase.stmts[0].kind, StmtKind::Return(None)));
         assert!(matches!(phase.stmts[1].kind, StmtKind::Expr(_)));
+
+        for next_stmt in ["(g())", "log(info, \"next\")"] {
+            let source = format!(
+                "test T\n    phase p\n        return\n        {next_stmt}\n    end phase p\nend test T"
+            );
+            let parsed = parse(&source).unwrap();
+            let Item::Test(test) = &parsed.items[0] else {
+                panic!("expected next-statement test");
+            };
+            let TestItem::Phase(_, phase) = &test.items[0] else {
+                panic!("expected next-statement phase");
+            };
+            assert!(matches!(phase.stmts[0].kind, StmtKind::Return(None)));
+            assert_eq!(phase.stmts.len(), 2);
+        }
+
+        let commented = parse(
+            "test T\n    phase p\n        return // keep this bare\n        log(info, \"next\")\n    end phase p\nend test T",
+        )
+        .unwrap();
+        let Item::Test(test) = &commented.items[0] else {
+            panic!("expected commented test");
+        };
+        let TestItem::Phase(_, phase) = &test.items[0] else {
+            panic!("expected commented phase");
+        };
+        assert!(matches!(phase.stmts[0].kind, StmtKind::Return(None)));
+        assert_eq!(phase.stmts.len(), 2);
 
         let printed = crate::pretty::print(&bare);
         assert!(printed.contains("        return\n        g()"));
@@ -5416,7 +5444,8 @@ end bus BusGated"#;
         assert!(matches!(phase.stmts[0].kind, StmtKind::Return(None)));
         assert!(matches!(phase.stmts[1].kind, StmtKind::Expr(_)));
 
-        let same_line = parse("test T\n    phase p\n        return g()\n    end phase p\nend test T").unwrap();
+        let same_line =
+            parse("test T\n    phase p\n        return g()\n    end phase p\nend test T").unwrap();
         let Item::Test(test) = &same_line.items[0] else {
             panic!("expected same-line test");
         };
