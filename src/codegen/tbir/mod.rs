@@ -2373,12 +2373,25 @@ fn emit_on_handler_regs(
                 continue;
             }
             let lambda = func::on_handler_lambda_name(comp, oh);
+            // The subscriber's payload binder is emitted in the same lexical
+            // scope as the component receiver.  A fixed `_t` binder therefore
+            // turns a perfectly legal local named `_t` into a self-shadowing
+            // callback (`Listener_on_h1(_t, _t)`).  Keep the generated name
+            // fresh against the receiver, source locals, and adapter/binding
+            // names used by the call expression.
+            let payload = on_handler_payload_name(
+                prog,
+                oh.function,
+                inst_path,
+                bound_bus,
+                bus_adapters,
+            );
             let call = component_callable_call(
                 prog,
                 oh.function,
                 &lambda,
                 inst_path,
-                &["_t"],
+                &[&payload],
                 bound_bus,
                 bus_adapters,
                 run_context,
@@ -2387,8 +2400,8 @@ fn emit_on_handler_regs(
                 let capture = persistent_setup_capture(run_context, Some(inst_path));
                 writeln!(
                     out,
-                    "{pad}{inst_path}.{}.push_back([{capture}](auto _t) {{",
-                    oh.event
+                    "{pad}{inst_path}.{}.push_back([{capture}](auto {payload}) {{",
+                    oh.event,
                 )
                 .ok();
                 emit_persistent_setup_bindings(out, depth + 1, run_context);
@@ -2402,8 +2415,8 @@ fn emit_on_handler_regs(
             } else {
                 writeln!(
                     out,
-                    "{pad}{inst_path}.{}.push_back([&](auto _t) {{ {inst_path}.{input_heartbeat} = (uint64_t)cycle_count; {call}; }});",
-                    oh.event
+                    "{pad}{inst_path}.{}.push_back([&](auto {payload}) {{ {inst_path}.{input_heartbeat} = (uint64_t)cycle_count; {call}; }});",
+                    oh.event,
                 )
                 .ok();
             }
@@ -2435,6 +2448,39 @@ fn emit_on_handler_regs(
         }
     }
     Ok(())
+}
+
+/// Pick a generated subscriber payload binder that cannot hide the receiver
+/// or a source name appearing in the callable's lowered arguments.  The
+/// The historical `_t` spelling remains the preferred candidate so unrelated
+/// generated output stays stable; source identifiers are still collected so a
+/// collision advances to a fresh suffix without changing callback meaning.
+fn on_handler_payload_name(
+    prog: &TbProgram,
+    function: ir::FunctionId,
+    receiver: &str,
+    bound_bus: Option<&ir::BusBindingSchema>,
+    bus_adapters: Option<&[expr::TestbenchBusAdapterPlan]>,
+) -> String {
+    let mut occupied = HashSet::new();
+    occupied.extend(receiver.split('.').map(str::to_string));
+    if let Some(func) = prog.functions.get(function.index()) {
+        occupied.extend(func.locals.iter().map(|local| local.name.clone()));
+    }
+    if let Some(bus) = bound_bus {
+        occupied.insert(bus.field.clone());
+    }
+    if let Some(adapters) = bus_adapters {
+        for adapter in adapters {
+            for signal in &adapter.signals {
+                occupied.insert(signal.field.clone());
+                occupied.insert(signal.symbol.clone());
+            }
+        }
+    }
+    occupied.insert("dut".to_string());
+    occupied.insert("value".to_string());
+    crate::codegen::render_support::collision_free_generated_ident("_t", &occupied)
 }
 
 /// Restore runtime-only state owned by `component` and its nested by-value
