@@ -50,6 +50,8 @@ typedef unsigned __int128 _harc_u128;
 
 namespace harc_rt {
 
+struct HarcFatalAbort {};
+
 // ── Wide-vector interop ─────────────────────────────────────────────────────
 //
 // Verilator lowers SystemVerilog ports by bit-width:
@@ -1194,13 +1196,18 @@ struct ThreadScheduler;
 // handle is owned by the scheduler via a ThreadSlot.
 struct HarcThread {
     struct promise_type {
+        bool fatal_aborted = false;
         HarcThread get_return_object() {
             return HarcThread{ std::coroutine_handle<promise_type>::from_promise(*this) };
         }
         std::suspend_always initial_suspend() noexcept { return {}; }
         std::suspend_always final_suspend()   noexcept { return {}; }
         void return_void() noexcept {}
-        void unhandled_exception() { std::terminate(); }
+        void unhandled_exception() noexcept {
+            try { throw; }
+            catch (const HarcFatalAbort&) { fatal_aborted = true; }
+            catch (...) { std::terminate(); }
+        }
     };
     std::coroutine_handle<promise_type> h = nullptr;
     HarcThread() = default;
@@ -1218,6 +1225,7 @@ struct HarcThread {
     }
     ~HarcThread() { destroy(); }
     bool done() const { return !h || h.done(); }
+    bool fatal_aborted() const { return h && h.promise().fatal_aborted; }
     void resume() { if (h && !h.done()) h.resume(); }
     void destroy() { if (h) { h.destroy(); h = nullptr; } }
 };

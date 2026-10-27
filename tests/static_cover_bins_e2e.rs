@@ -7,11 +7,11 @@ const DUT: &str = r#"module Top(input logic clk); endmodule"#;
 const TEST: &str = r#"
 const NEG8 : sint<8> = -1
 const MIN64 : sint<64> = -9223372036854775808
-const UMAX8 : uint<8> = 255
+const UMAX64 : uint<64> = 0xFFFFFFFFFFFFFFFF
 
 scoreboard Sink
     calls : uint<32> default 0
-    hookable accept(value: sint<8>, lo: sint<8>, hi: sint<8>, uvalue: uint<8>)
+    hookable accept(value: sint<8>, lo: sint<8>, hi: sint<8>, uvalue: uint<64>)
         assert value >= lo else fail("signed lower control")
         assert value <= hi else fail("signed upper control")
         calls = calls + 1
@@ -29,7 +29,7 @@ covergroup Cov @(sink.accept(value, lo, hi, uvalue) post)
         end bins
     unsigned_cp : cover uvalue
         bins
-            high_bit = [UMAX8..UMAX8]
+            high_bit = [UMAX64..UMAX64]
         end bins
 end covergroup Cov
 
@@ -41,7 +41,7 @@ end testbench Tb
 
 impl Test for Tb
     run
-        sink.accept(-1, -1, 1, 255)
+        sink.accept(-1, -1, 1, UMAX64)
         sink.accept(0, -1, 1, 0)
         sink.accept(1, -1, 1, 1)
         wait 1 cycle
@@ -84,6 +84,9 @@ fn static_signed_cover_bins_native_regression() {
         .arg(outdir.join("static_cover_bins.harc"))
         .args(["--top", "Top", "--outdir"])
         .arg(&outdir)
+        .args(["--jobs", "2"])
+        .env("HARC_NO_LEARN", "1")
+        .env("ARCH_NO_LEARN", "1")
         .env("HARC_REQUIRE_VERILATOR", "1")
         .output()
         .expect("spawn harc sim");
@@ -96,8 +99,12 @@ fn static_signed_cover_bins_native_regression() {
     let cpp =
         std::fs::read_to_string(outdir.join("static_cover_bins.cpp")).expect("read generated C++");
     assert!(
-        cpp.contains("harc_rt::harc_slt_u128"),
-        "signed bounds were not emitted through the signed comparison helper: {cpp}"
+        cpp.contains("_v >= -1 && _v <= 1"),
+        "narrow signed bounds were not emitted as signed operands: {cpp}"
+    );
+    assert!(
+        cpp.contains("(-9223372036854775807LL - 1)"),
+        "minimum signed bound lost its safe signed spelling: {cpp}"
     );
     assert!(
         !cpp.contains("18446744073709551615 && _v <= 1"),
