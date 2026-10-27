@@ -577,7 +577,11 @@ fn emit_function_with_tseq_calls(
                 } else {
                     writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
                 }
-                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+                if *ps > 0 {
+                    writeln!(out, "{pad3}if (_fatal) {{ throw harc_rt::HarcFatalAbort{{}}; }} else {{ __bb = {}; }}", b.0).ok();
+                } else {
+                    writeln!(out, "{pad3}__bb = {};", b.0).ok();
+                }
             }
             Terminator::Return => {
                 writeln!(out, "{pad3}__done = true;").ok();
@@ -652,6 +656,7 @@ fn emit_function_with_tseq_calls(
                              harc_rt::harc_lifecycle_yield(); _lc_sub.resume(); }}"
                         )
                         .ok();
+                        writeln!(out, "{pad3}{INDENT}if (_lc_sub.fatal_aborted()) throw harc_rt::HarcFatalAbort{{}};").ok();
                         writeln!(out, "{pad3}{INDENT}_lc_sub.destroy(); }}").ok();
                     }
                     None => {
@@ -1888,7 +1893,11 @@ fn emit_tseq_impl(
                         )));
                     }
                 }
-                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+                if ps > &0 {
+                    writeln!(out, "{pad3}if (_fatal) {{ throw harc_rt::HarcFatalAbort{{}}; }} else {{ __bb = {}; }}", b.0).ok();
+                } else {
+                    writeln!(out, "{pad3}__bb = {};", b.0).ok();
+                }
             }
             Terminator::Randomize {
                 target,
@@ -3017,6 +3026,10 @@ fn emit_stmt(
             let name = local_cpp_name(cx, *l)?;
             let e = scalar_sink_expr_cpp(cx, e, local_ir_type(cx, *l).cloned())?;
             writeln!(out, "{pad}{name} = {e};").ok();
+        }
+        Stmt::HelperCall { call } => {
+            let e = expr_cpp(cx, call)?;
+            writeln!(out, "{pad}{e};").ok();
         }
         Stmt::RecordInit(l, r) => {
             let name = local_cpp_name(cx, *l)?;
@@ -5858,7 +5871,11 @@ pub(super) fn emit_method(
                 // v1 advances absolute simulation time inline, and these
                 // lambdas capture `now_ps` / `eval_clocks_until` by reference.
                 writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
-                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+                if ps > &0 {
+                    writeln!(out, "{pad3}if (_fatal) {{ throw harc_rt::HarcFatalAbort{{}}; }} else {{ __bb = {}; }}", b.0).ok();
+                } else {
+                    writeln!(out, "{pad3}__bb = {};", b.0).ok();
+                }
             }
             Terminator::Return => {
                 // Hook-vector fan-out for hook-triggered covergroups
@@ -7410,7 +7427,11 @@ fn emit_component_fn_lambda(
                         writeln!(out, "{pad3}harc_eval_clocks_until(ctx, ctx.now_ps + {ps});").ok();
                     }
                 }
-                writeln!(out, "{pad3}__bb = {};", b.0).ok();
+                if ps > &0 {
+                    writeln!(out, "{pad3}if (_fatal) {{ throw harc_rt::HarcFatalAbort{{}}; }} else {{ __bb = {}; }}", b.0).ok();
+                } else {
+                    writeln!(out, "{pad3}__bb = {};", b.0).ok();
+                }
             }
             Terminator::Return => match func.ret {
                 Some(r) => {

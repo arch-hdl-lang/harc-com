@@ -440,6 +440,9 @@ pub struct ConstraintSite {
     /// Lexically visible scalar bindings at this site. Preserve local identity
     /// across shadowing and backend-specific C++ name assignment.
     pub scalar_bindings: Vec<(String, LocalId, IrType)>,
+    /// Lexically visible record bindings used to type captured record fields
+    /// in constraints (including their declared signedness and width).
+    pub record_bindings: Vec<(String, String)>,
     /// Stable problem-table identity (`ConstraintProblemId.0`) when the typed
     /// constraint IR built a Z3-ready problem for this site; `None` when
     /// the site has no solver problem (lower/backend error — v1 then
@@ -2826,6 +2829,10 @@ pub enum Stmt {
         dest: Option<LocalId>,
         call: Expr,
     },
+    /// Statement-position invocation of a pure helper with no declared
+    /// return type.  The call is kept out of `Assign` because a void helper
+    /// has no return local and therefore cannot carry value-return metadata.
+    HelperCall { call: Expr },
     /// One `wait until … timeout` failure-diagnostic line: a
     /// `sim_log_line("FAIL", …)` that does NOT bump the error counter
     /// (v1 bumps `errors` exactly once per timed-out wait — that bump
@@ -3956,6 +3963,10 @@ pub enum CovBinValue {
 #[derive(Debug, Clone)]
 pub enum CovBinBound {
     Const(u64),
+    /// A folded signed constant. Keeping signedness here prevents a
+    /// negative constant's two's-complement carrier bits from becoming an
+    /// unsigned C++ comparison operand during covergroup emission.
+    ConstSigned(i64),
     Runtime(Expr),
 }
 

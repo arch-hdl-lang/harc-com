@@ -177,9 +177,9 @@ end agent Listener
 test LocalListenerTest
     let dut : Top
     run
-        let listener : Listener
-        emit listener.input(9)
-        assert listener.read() == 9 else fail("local handler did not run")
+        let _t : Listener
+        emit _t.input(9)
+        assert _t.read() == 9 else fail("local handler did not run")
     end run
 end test LocalListenerTest
 "#;
@@ -189,11 +189,11 @@ end test LocalListenerTest
     let cpp = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default())
         .expect("TB-IR emits the local handler registration");
     assert!(
-        cpp.contains("listener.input.push_back([&](auto _t)"),
+        cpp.contains("_t.input.push_back([&](auto _t_1)"),
         "local event handler must subscribe at ComponentInit:\n{cpp}"
     );
     assert!(
-        cpp.contains("(listener, _t);"),
+        cpp.contains("Listener_on_h1(_t, _t_1);"),
         "local event handler must dispatch on the local receiver:\n{cpp}"
     );
 }
@@ -401,13 +401,13 @@ end agent Listener
 test LocalListenerCopyTest
     let dut : Top
     run
-        let original : Listener
-        emit original.input(3)
-        let copy : Listener = original
+        let _t : Listener
+        emit _t.input(3)
+        let copy : Listener = _t
         assert copy.read() == 3 else fail("component state was not copied")
         emit copy.input(2)
         assert copy.read() == 5 else fail("component copy owns no event handler")
-        assert original.read() == 3 else fail("component copy handler targets its source")
+        assert _t.read() == 3 else fail("component copy handler targets its source")
         log(info, "ALL TESTS PASSED - component copy graph")
     end run
 end test LocalListenerCopyTest
@@ -441,36 +441,43 @@ end test LocalListenerCopyTest
         return;
     }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let outdir = runtime_outdir("tbir_copy");
-    let _ = std::fs::remove_dir_all(&outdir);
-    std::fs::create_dir_all(&outdir).expect("create component-copy runtime directory");
-    let source_path = outdir.join("component_copy_graph.harc");
-    std::fs::write(&source_path, source).expect("write component-copy source");
-    let output = Command::new(env!("CARGO_BIN_EXE_harc"))
-        .arg("sim")
-        .arg("--codegen")
-        .arg("tbir")
-        .arg("--sv")
-        .arg(root.join("tests/dut/top_counter.sv"))
-        .arg(&source_path)
-        .arg("--top")
-        .arg("Top")
-        .arg("--outdir")
-        .arg(&outdir)
-        .output()
-        .unwrap_or_else(|error| panic!("spawn tbir component-copy simulation: {error}"));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "tbir component-copy simulation failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
-    );
-    assert!(
-        stdout.contains("ALL TESTS PASSED - component copy graph")
-            || stderr.contains("ALL TESTS PASSED - component copy graph"),
-        "tbir component-copy simulation did not reach its success marker:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
-    );
-    std::fs::remove_dir_all(&outdir).expect("remove component-copy runtime directory");
+    for layout in ["self-contained", "common"] {
+        let outdir = runtime_outdir(&format!("tbir_copy_{layout}"));
+        let _ = std::fs::remove_dir_all(&outdir);
+        std::fs::create_dir_all(&outdir).expect("create component-copy runtime directory");
+        let source_path = outdir.join("component_copy_graph.harc");
+        std::fs::write(&source_path, source).expect("write component-copy source");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_harc"));
+        command
+            .arg("sim")
+            .arg("--codegen")
+            .arg("tbir")
+            .arg("--sv")
+            .arg(root.join("tests/dut/top_counter.sv"))
+            .arg(&source_path)
+            .arg("--top")
+            .arg("Top")
+            .arg("--outdir")
+            .arg(&outdir);
+        if layout == "common" {
+            command.args(["--cpp-split", "tests", "--cpp-split-layout", "common"]);
+        }
+        let output = command
+            .output()
+            .unwrap_or_else(|error| panic!("spawn tbir {layout} component-copy simulation: {error}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "tbir {layout} component-copy simulation failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("ALL TESTS PASSED - component copy graph")
+                || stderr.contains("ALL TESTS PASSED - component copy graph"),
+            "tbir {layout} component-copy simulation did not reach its success marker:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        std::fs::remove_dir_all(&outdir).expect("remove component-copy runtime directory");
+    }
 }
 
 #[test]

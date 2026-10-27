@@ -238,7 +238,7 @@ fn bin_bounds(v: &crate::ir::CovBinValue) -> Vec<&Expr> {
     fn runtime(b: &CovBinBound) -> Option<&Expr> {
         match b {
             CovBinBound::Runtime(e) => Some(e),
-            CovBinBound::Const(_) => None,
+            CovBinBound::Const(_) | CovBinBound::ConstSigned(_) => None,
         }
     }
     match v {

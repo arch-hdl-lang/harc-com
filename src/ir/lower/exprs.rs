@@ -5677,10 +5677,20 @@ impl FuncBuilder<'_> {
                 "`.{kind_name}<N>()` requires a constant integer width"
             )));
         };
-        // Best-effort receiver-width inference (v1's
-        // `infer_expr_width_best_effort`) for the direction check and
-        // the sext shift-fill shape.
-        let src_width = self.infer_expr_width(target);
+        // Preserve AST inference as a fallback, but prefer the lowered
+        // expression's scalar type. Lowering is authoritative for shapes
+        // whose width is established by a compound expression or by an
+        // inferred local whose RHS has a typed scalar result.
+        let ast_src_width = self.infer_expr_width(target);
+        let inner = self.lower_expr(target)?;
+        let src_width = self
+            .expr_type(&inner)
+            .and_then(|ty| scalar_ir_width(&ty))
+            .or_else(|| {
+                self.scalar_assignment_type(&inner)
+                    .and_then(|ty| scalar_ir_width(&ty))
+            })
+            .or(ast_src_width);
         if let Some(why) = width_method_violation(kind_name, width, src_width) {
             return Err(LowerError::Invalid(why));
         }
@@ -5690,7 +5700,6 @@ impl FuncBuilder<'_> {
         // reach the sext shift-fill as `64 - 0` (UB). Record it as
         // unknown, which selects the plain-cast shape instead.
         let src_width = src_width.filter(|w| *w > 0);
-        let inner = self.lower_expr(target)?;
         if matches!(self.expr_type(&inner), Some(IrType::FixedVec { .. })) {
             return Err(not_implemented(
                 "a scalar width method applied to a fixed-vector local",

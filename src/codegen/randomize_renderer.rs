@@ -1800,6 +1800,7 @@ pub(crate) struct TbirRandomizeEmitter {
     relations: std::collections::HashMap<String, RelationDecl>,
     shadowed_lets: std::collections::HashSet<String>,
     let_widths: std::collections::HashMap<String, LetWidth>,
+    record_bindings: std::collections::HashMap<String, String>,
     scalar_bindings: std::collections::HashMap<String, String>,
     enums: std::collections::HashMap<String, usize>,
     enum_variants: std::collections::HashMap<String, i64>,
@@ -1969,6 +1970,7 @@ fn build_randomize_emitter(file: &SourceFile, _opts: &EmitOpts) -> TbirRandomize
         relations,
         shadowed_lets: std::collections::HashSet::new(),
         let_widths: std::collections::HashMap::new(),
+        record_bindings: std::collections::HashMap::new(),
         scalar_bindings: std::collections::HashMap::new(),
         enums,
         enum_variants,
@@ -1996,6 +1998,7 @@ impl TbirRandomizeEmitter {
         self.errors.clear();
         self.current_source_id = site.source_id;
         self.let_widths.clear();
+        self.record_bindings.clear();
         self.scalar_bindings.clear();
         for (name, local, ty) in &site.scalar_bindings {
             // Constraint identifiers resolve fields, file constants and enum
@@ -2020,6 +2023,7 @@ impl TbirRandomizeEmitter {
                 crate::codegen::randomize::scalar_binding_sentinel(*local),
             );
         }
+        self.record_bindings.extend(site.record_bindings.iter().cloned());
         let cell_start = self.per_run_cells.len();
         self.emit_randomize_for_site(site, depth);
         if let Some(error) = self.errors.first() {
@@ -3748,11 +3752,27 @@ impl TbirRandomizeEmitter {
                 ));
             }
         }
+        let captured_fields = self.captured_field_infos();
+        let mut captured_refs = std::collections::HashSet::new();
+        for constraint in with_body {
+            collect_randomize_target_field_refs(
+                constraint,
+                &captured_fields,
+                None,
+                &mut captured_refs,
+            );
+        }
+        let capture_width = captured_refs
+            .iter()
+            .filter_map(|field| captured_fields.get(field).map(|info| info.width))
+            .max()
+            .unwrap_or(0);
         let solver_width = fields
             .iter()
             .map(txn_field_solver_width)
             .max()
             .unwrap_or(64)
+            .max(capture_width)
             .max(64);
         if solver_width > 1024 {
             self.errors.push(format!(
@@ -5794,6 +5814,29 @@ impl TbirRandomizeEmitter {
                             self.reject_non_flag_field(&field);
                         }
                         return;
+                    } else if blocking
+                        && target_root
+                            .zip(expr_field_root(e).as_deref())
+                            .is_some_and(|(target, root)| root != target)
+                    {
+                        if let Some(info) = self.captured_scalar_field_info(e, target_root) {
+                            if is_flag_field(info) {
+                                // Captured runtime flags are host-language
+                                // booleans, while captured numeric fields
+                                // remain values and must use comparisons.
+                                write!(self.out, "_ctx.bool_val((bool)(").ok();
+                                self.emit_expr(e);
+                                write!(self.out, "))").ok();
+                            } else {
+                                self.reject_non_flag_field(&field);
+                            }
+                        } else {
+                            self.errors.push(format!(
+                                "constraint references unknown captured field `{field}`"
+                            ));
+                            write!(self.out, "_ctx.bool_val(true)").ok();
+                        }
+                        return;
                     }
                 }
             }
@@ -6054,6 +6097,21 @@ impl TbirRandomizeEmitter {
         }
     }
 
+    fn captured_field_infos(&self) -> std::collections::HashMap<String, TxnFieldInfo> {
+        let mut out = std::collections::HashMap::new();
+        for (root, record) in &self.record_bindings {
+            let Some(fields) = self.txn_fields.get(record) else {
+                continue;
+            };
+            for info in fields {
+                let mut captured = info.clone();
+                captured.name = format!("{root}.{}", info.name);
+                out.insert(captured.name.clone(), captured);
+            }
+        }
+        out
+    }
+
     fn emit_constraint_bit_slice_expr(
         &mut self,
         target: &Expr,
@@ -6090,6 +6148,24 @@ impl TbirRandomizeEmitter {
             write!(self.out, ", _ctx.bv_val((uint64_t){lo}, {width}))").ok();
         }
         write!(self.out, " & harc_z3_bv_value(_ctx, {mask}, {width}))").ok();
+    }
+
+    fn captured_scalar_field_info(
+        &self,
+        e: &Expr,
+        target_root: Option<&str>,
+    ) -> Option<&TxnFieldInfo> {
+        let root = expr_field_root(e)?;
+        if target_root == Some(root.as_str()) {
+            return None;
+        }
+        let record = self.record_bindings.get(&root)?;
+        let path = expr_field_path(e, None)?;
+        let field = path.strip_prefix(&format!("{root}."))?;
+        self.txn_fields
+            .get(record)
+            .and_then(|fields| fields.iter().find(|info| info.name == field))
+            .filter(|info| info.list.is_none() && info.width != 0)
     }
 
     /// Translate a HARC expression to a z3++ C++ expression. Field accesses
@@ -6235,7 +6311,26 @@ impl TbirRandomizeEmitter {
                             .zip(expr_field_root(e).as_deref())
                             .is_some_and(|(target, root)| root != target)
                     {
-                        if width <= 64 {
+                        if let Some((captured_signed, captured_width)) = self
+                            .captured_scalar_field_info(e, target_root)
+                            .map(|info| (info.signed, info.width))
+                        {
+                            if captured_signed {
+                                write!(self.out, "harc_z3_bv_signed_value(_ctx, ").ok();
+                                self.emit_expr(e);
+                                write!(self.out, ", {}, {})", captured_width, width).ok();
+                            } else {
+                                write!(self.out, "harc_z3_bv_value(_ctx, ").ok();
+                                if captured_width <= 64 {
+                                    write!(self.out, "(uint64_t)(").ok();
+                                    self.emit_expr(e);
+                                    write!(self.out, ")").ok();
+                                } else {
+                                    self.emit_expr(e);
+                                }
+                                write!(self.out, ", {})", width).ok();
+                            }
+                        } else if width <= 64 {
                             write!(self.out, "_ctx.bv_val((uint64_t)(").ok();
                             self.emit_expr(e);
                             write!(self.out, "), {width})").ok();

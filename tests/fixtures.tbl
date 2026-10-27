@@ -181,6 +181,7 @@ buf_mgr_test            | BufMgr         | buf_mgr.sv data_mem.sv next_ptr_mem.s
 sha256_test             | Sha256         | sha256.sv              |
 cov_cross_bins_test     | Top            | top_counter.sv         |
 cov_runtime_bound_test  | Top            | top_counter.sv         |
+cov_runtime_signed_bounds_test | Top            | top_counter.sv         |
 cov_runtime_bin_value_test | Top         | top_counter.sv         |
 wide_cover_helper_test | WideCoverHelperTop | wide_cover_helper.sv |
 wait_any_of_test        | Top            | top_counter.sv         |

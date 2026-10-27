@@ -305,6 +305,7 @@ pub fn try_visit_stmt_exprs<E>(
             visit_exprs(args, visit)
         }
         Stmt::TransactorCall { call, .. } | Stmt::TransactorSelfCall { call, .. } => visit(call),
+        Stmt::HelperCall { call } => visit(call),
         Stmt::TlmFork(desc) => visit_exprs(&desc.args, visit),
         Stmt::TlmJoinAll(pending) => {
             for desc in pending {
@@ -422,6 +423,7 @@ pub fn visit_stmt_exprs_mut(stmt: &mut Stmt, visit: &mut impl FnMut(&mut Expr)) 
             }
         }
         Stmt::TransactorCall { call, .. } | Stmt::TransactorSelfCall { call, .. } => visit(call),
+        Stmt::HelperCall { call } => visit(call),
         Stmt::TlmFork(desc) => {
             for expr in &mut desc.args {
                 visit(expr);

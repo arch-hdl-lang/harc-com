@@ -128,7 +128,9 @@ int run_WaitUntilCounterTest(int argc, char** argv) {
     dut->clk = 0;
 
     auto eval_clocks_until = [&](unsigned __int128 t_ps) {
-        while (now_ps < t_ps) {
+        // Complete the current edge (including post-eval services), then
+        // stop before any later edge once a service raises fatal.
+        while (now_ps < t_ps && !_fatal) {
             unsigned __int128 next = t_ps;
             for (auto& c : clocks_) if (c.next_edge_ps < next) next = c.next_edge_ps;
             now_ps = next;
