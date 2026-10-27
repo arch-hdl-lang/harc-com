@@ -966,7 +966,22 @@ fn bin_membership(
                    rhs_source_width: Option<u32>,
                    op: BinOp,
                    width: Option<u32>| {
-        if let Some(width) = width.filter(|w| *w <= 128) {
+        // Keep the established C++ spelling for narrow signed comparisons.
+        // The unsigned carrier only needs width-aware ordering once a common
+        // signed operand is wider than the host signed integer range.
+        if let Some(width) = width {
+            if width <= 64 {
+                return match op {
+                    BinOp::Eq => format!("({lhs} == {rhs})"),
+                    _ => format!("{lhs} {} {rhs}", cover_bin_op_cpp(op)),
+                };
+            }
+            if width > 128 {
+                return match op {
+                    BinOp::Eq => format!("({lhs} == {rhs})"),
+                    _ => format!("{lhs} {} {rhs}", cover_bin_op_cpp(op)),
+                };
+            }
             let lhs = signed_operand(lhs, Some(target), None, width);
             let rhs = signed_operand(rhs, rhs_expr, rhs_source_width, width);
             let less = |a: &str, b: &str| {
@@ -981,7 +996,10 @@ fn bin_membership(
                 _ => format!("({lhs} {} {rhs})", cover_bin_op_cpp(op)),
             };
         }
-        format!("({lhs} {} {rhs})", cover_bin_op_cpp(op))
+        match op {
+            BinOp::Eq => format!("({lhs} == {rhs})"),
+            _ => format!("{lhs} {} {rhs}", cover_bin_op_cpp(op)),
+        }
     };
     let mut parts = Vec::with_capacity(values.len());
     for v in values {
