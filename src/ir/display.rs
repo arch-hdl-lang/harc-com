@@ -1180,6 +1180,7 @@ fn bin_value_str(v: &CovBinValue) -> String {
     fn bound_str(b: &CovBinBound) -> String {
         match b {
             CovBinBound::Const(x) => x.to_string(),
+            CovBinBound::ConstSigned(x) => x.to_string(),
             CovBinBound::Runtime(e) => cover_expr_str(e),
         }
     }

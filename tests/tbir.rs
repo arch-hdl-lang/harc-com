@@ -247,6 +247,7 @@ fn bin_repr(v: &ir::CovBinValue) -> (&'static str, Option<u64>, Option<u64>) {
     fn bound(b: &ir::CovBinBound) -> Option<u64> {
         match b {
             ir::CovBinBound::Const(x) => Some(*x),
+            ir::CovBinBound::ConstSigned(x) => Some(*x as u64),
             ir::CovBinBound::Runtime(_) => Some(u64::MAX),
         }
     }
@@ -22048,6 +22049,42 @@ fn covergroup_runtime_range_bounds_lower_and_emit() {
 /// Width-method coverpoint targets carry source widths when they can be
 /// inferred, so signed extension samples the same values as ordinary
 /// TBIR expressions.
+#[test]
+fn covergroup_static_signed_bounds_preserve_signedness() {
+    let src = r#"
+const NEG8 : sint<8> = -1
+
+covergroup Cov @(posedge dut.clk)
+    cp : cover dut.count_out
+        bins
+            cross_zero = [NEG8..1]
+            negative = [NEG8..NEG8]
+            positive = [1..1]
+        end bins
+end covergroup Cov
+
+testbench Tb
+    dut : Top
+    cov : Cov
+end testbench Tb
+
+impl T for Tb
+    run
+        wait 1 cycle
+    end run
+end impl T
+"#;
+    let prog = lower_src(src).expect("signed static bounds lower");
+    verify::verify_program(&prog).expect("signed static bounds verify");
+    let cpp = emit_cpp_src(src);
+    assert!(cpp.contains("_v >= -1 && _v <= 1"), "{cpp}");
+    assert!(!cpp.contains("18446744073709551615 && _v <= 1"), "{cpp}");
+    match &prog.covgroups[0].points[0].bins[0].values[0] {
+        ir::CovBinValue::Range { lo: Some(ir::CovBinBound::ConstSigned(-1)), hi: Some(ir::CovBinBound::Const(1)) } => {}
+        other => panic!("cross-zero bound lost signedness: {other:?}"),
+    }
+}
+
 #[test]
 fn covergroup_width_methods_lower_with_source_width() {
     let src = r#"

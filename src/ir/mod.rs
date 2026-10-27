@@ -3960,6 +3960,10 @@ pub enum CovBinValue {
 #[derive(Debug, Clone)]
 pub enum CovBinBound {
     Const(u64),
+    /// A folded signed constant. Keeping signedness here prevents a
+    /// negative constant's two's-complement carrier bits from becoming an
+    /// unsigned C++ comparison operand during covergroup emission.
+    ConstSigned(i64),
     Runtime(Expr),
 }
 

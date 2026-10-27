@@ -913,6 +913,7 @@ fn bin_membership(values: &[CovBinValue], widths: &CoverWidths<'_>) -> Result<St
     let bound = |b: &CovBinBound| -> Result<String, EmitError> {
         match b {
             CovBinBound::Const(x) => Ok(x.to_string()),
+            CovBinBound::ConstSigned(x) => Ok(x.to_string()),
             CovBinBound::Runtime(e) => cover_expr_cpp(e, widths),
         }
     };

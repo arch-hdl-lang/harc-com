@@ -1230,10 +1230,10 @@ fn program_has_probes(prog: &TbProgram) -> bool {
                         ir::CovBinValue::Range { lo, hi } => {
                             [lo, hi].into_iter().flatten().any(|bound| match bound {
                                 ir::CovBinBound::Runtime(expr) => expr_has_probe(expr),
-                                ir::CovBinBound::Const(_) => false,
+                                ir::CovBinBound::Const(_) | ir::CovBinBound::ConstSigned(_) => false,
                             })
                         }
-                        ir::CovBinValue::Eq(ir::CovBinBound::Const(_)) => false,
+                        ir::CovBinValue::Eq(ir::CovBinBound::Const(_) | ir::CovBinBound::ConstSigned(_)) => false,
                     };
                     if has_probe {
                         return true;
