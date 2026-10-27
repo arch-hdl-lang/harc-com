@@ -29128,6 +29128,50 @@ fn width_methods_dump_ir_snapshot() {
 }
 
 #[test]
+fn width_methods_preserve_lowered_receiver_width_metadata() {
+    let source = r#"test T
+    let dut : Top
+    run
+        let n : sint<65> = -8 / 3
+        let z : sint<65> = 0
+        let direct : sint<129> = n.sext<129>()
+        let compound : sint<129> = (n + z).sext<129>()
+        let inferred = n + z
+        let inferred_cast : sint<129> = inferred.sext<129>()
+        let nested : uint<65> = ((n + z).sext<129>()).trunc<65>()
+        let n8 : sint<8> = -1
+        let compound_zext : uint<16> = (n8 + (0 as sint<8>)).zext<16>()
+    end run
+end test T"#;
+    let prog = lower_src(source).expect("lowers");
+    let mut casts = Vec::new();
+    fn collect(e: &ir::Expr, out: &mut Vec<(ir::WidthCastKind, u32, Option<u32>)>) {
+        if let ir::Expr::WidthCast {
+            kind,
+            width,
+            src_width,
+            inner,
+        } = e
+        {
+            out.push((*kind, *width, *src_width));
+            collect(inner, out);
+        }
+    }
+    for function in &prog.functions {
+        for block in &function.blocks {
+            for stmt in &block.stmts {
+                if let ir::Stmt::Assign(_, value) = stmt {
+                    collect(value, &mut casts);
+                }
+            }
+        }
+    }
+    assert!(casts.contains(&(ir::WidthCastKind::Sext, 129, Some(65))), "{casts:?}");
+    assert!(casts.contains(&(ir::WidthCastKind::Trunc, 65, Some(129))), "{casts:?}");
+    assert!(casts.contains(&(ir::WidthCastKind::Zext, 16, Some(8))), "{casts:?}");
+}
+
+#[test]
 fn wide_cast_dump_ir_snapshot() {
     let prog = lower_src(&fixture("wide_cast_test.harc")).expect("lowers");
     verify::verify_program(&prog).expect("verifies");
