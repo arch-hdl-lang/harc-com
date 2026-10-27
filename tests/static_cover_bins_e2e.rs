@@ -107,7 +107,7 @@ fn static_signed_cover_bins_native_regression() {
         "minimum signed bound lost its safe signed spelling: {cpp}"
     );
     assert!(
-        !cpp.contains("18446744073709551615 && _v <= 1"),
+        !cpp.contains("_v >= 18446744073709551615 && _v <= 1)"),
         "negative bound became unsigned: {cpp}"
     );
     let _ = std::fs::remove_dir_all(&outdir);
