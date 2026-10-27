@@ -112,7 +112,10 @@ test LargePositiveCapture
     let dut : Top
     run
         let c : Cap
-        c.s = 1 << 70
+        let one : sint<80> = 1
+        c.s = one << 70
+        assert c.s > 0 else fail("capture setup must be positive")
+        assert c.s >> 70 == 1 else fail("capture setup must preserve bit 70")
         let r : Req
         blocking randomize(r) with
             r.s == c.s
@@ -132,7 +135,10 @@ test LargeRelationalCapture
     let dut : Top
     run
         let c : Cap
-        c.s = 1 << 70
+        let one : sint<80> = 1
+        c.s = one << 70
+        assert c.s > 0 else fail("capture setup must be positive")
+        assert c.s >> 70 == 1 else fail("capture setup must preserve bit 70")
         let r : Req
         blocking randomize(r) with
             r.s == 0
@@ -140,7 +146,7 @@ test LargeRelationalCapture
         end randomize
         assert r.s == 0 else fail("large positive less-than capture")
         blocking randomize(r) with
-            r.s == 0 || c.s == 1 << 70
+            r.s == 0 || c.s == 0
         end randomize
         assert r.s == 0 else fail("unused large capture disjunction")
     end run
