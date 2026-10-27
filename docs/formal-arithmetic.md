@@ -7,7 +7,7 @@ python3 proofs/arithmetic/test_runner.py
 python3 proofs/arithmetic/run.py
 ```
 
-The default suite runs 28 CBMC obligations and 12 Kani harnesses. Inputs are
+The default suite runs 30 CBMC obligations and 12 Kani harnesses. Inputs are
 symbolic: a passing obligation covers every input admitted by its assumptions,
 not a random sample. The separate `Formal arithmetic` workflow runs these
 checks on pushes and pull requests. Missing tools, failed assertions, incomplete
@@ -20,6 +20,8 @@ unwinding, unrecognized success output and timeouts fail the run.
 | `runtime/harc_thread_rt.h`: `harc_mask_u128`, `harc_trunc_u128`, `harc_negate_u128` | Low-bit mask, truncation, modular negation | Every 128-bit input; declared width 0..128 |
 | `harc_slt_u128` | Signed order equals unsigned order after sign-bit bias | Every pair of 128-bit storage inputs; width 0..128 |
 | `harc_shl_u128`, `harc_shr_u128`, `harc_ashr_u128` | Logical shifts and signed arithmetic right shift, including saturation | Every 128-bit storage input and 64-bit unsigned shift amount; width 0..128 |
+| `harc_sext_u128` | Every result bit preserves source data, replicates its declared sign, or clears destination padding | Every 128-bit storage input; source/destination widths 0..128, including narrowing |
+| `harc_u64_shift_count`, `harc_u128_shift_count` | Clamp the mathematical count to the limit without discarding high bits | Every 64/128-bit count and every 64-bit limit, including zero and UINT64_MAX |
 | `harc_sdiv_u128`, `harc_smod_u128` | Native signed quotient/remainder; truncation toward zero; dividend-signed remainder; explicit zero-divisor and modular MIN/-1 policies | Complete equivalence at each width 1..8; zero-divisor policy separately covers every width 0..128 |
 | `harc_word_add`, `harc_word_sub` | Addition/subtraction modulo storage capacity | All stored bits at word counts 1, 2, 4, 5, 8, 32 (32..1024 bits) |
 | `harc_word_mask`, `harc_word_sext` | Each output bit preserves an input bit, extends the declared sign bit, or clears padding | Same six capacities; all source/destination widths from zero through capacity, including narrowing |
@@ -76,6 +78,13 @@ on the supported target. Array/pointer checks and unwinding assertions remain
 enabled. A universally quantified bit index checks wide extension at every
 output position. The loops are bounded by the selected storage capacity.
 
+The scalar sign-extension and shift-count functions are extracted from their
+unique production signatures through their unindented closing braces. Missing,
+duplicate or unterminated functions fail extraction. These obligations check
+the runtime functions, not whether every compiler emitter selects them or
+passes the correct logical width; those integration contracts need separate
+executable properties.
+
 The RNG template is extracted verbatim from its unique signature through its
 unindented closing brace. Missing/duplicate signatures or missing terminators
 fail extraction; invalid extractions fail compilation. Its harness models the
@@ -118,8 +127,9 @@ See the [CBMC documentation](https://diffblue.github.io/cbmc/) and
 [Kani installation guide](https://model-checking.github.io/kani/install-guide.html).
 
 `test_runner.py` checks fail-closed result classification and deliberately
-injects seven defects into temporary copies: reversed signed comparison,
+injects ten defects into temporary copies: reversed signed comparison,
 dropped word carry, missing sign extension, logical instead of arithmetic
 constant right shift, Boolean bitwise recanonicalization, canonicalizing bitwise
-AND, and skipping the full-domain RNG draw. Each must produce a real assertion counterexample;
+AND, skipping the full-domain RNG draw, dropped scalar sign fill, leaked scalar
+source padding, and discarded high shift-count bits. Each must produce a real assertion counterexample;
 compilation failure or timeout does not count as defect detection.

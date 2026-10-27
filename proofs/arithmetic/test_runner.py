@@ -28,6 +28,45 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 proof.slice_source(source, "WORD")
 
+    def test_conversion_extraction_requires_unique_complete_functions(self):
+        source = (proof.ROOT / "runtime/harc_thread_rt.h").read_text()
+        for signature in (proof.SEXT_SIGNATURE, *proof.COUNT_SIGNATURES):
+            body = proof.function_source(source, signature)
+            self.assertTrue(body.startswith(signature))
+            for broken in ("", body + body, body.rsplit("\n}", 1)[0]):
+                with self.assertRaises(ValueError):
+                    proof.function_source(broken, signature)
+
+    def test_conversion_mutations_are_counterexamples(self):
+        cbmc = shutil.which("cbmc")
+        self.assertIsNotNone(cbmc, "CBMC required: mutation checks must execute")
+        source = (proof.ROOT / "runtime/harc_thread_rt.h").read_text()
+        out = proof.ROOT / "target/formal/mutations"
+        out.mkdir(parents=True, exist_ok=True)
+        cases = [
+            ("sext-fill", "sext", "PROOF_SEXT",
+             "return (value | fill) & harc_mask_u128(dest_width);",
+             "return value & harc_mask_u128(dest_width);"),
+            ("sext-padding", "sext", "PROOF_SEXT",
+             "value &= harc_mask_u128(source_width);", "value = value;"),
+            ("count-high-bits", "counts", "PROOF_SHIFT_COUNT",
+             "if ((value >> 64) != 0) return limit;", "if (false) return limit;"),
+        ]
+        for name, group, macro, old, new in cases:
+            with self.subTest(name=name):
+                body = proof.conversion_source(source, group)
+                self.assertEqual(body.count(old), 1)
+                unit = out / f"{name}.cpp"
+                unit.write_text(proof.PREFIX + body.replace(old, new)
+                                + (proof.ROOT / "proofs/arithmetic/u128.cpp").read_text())
+                code, log = proof.run([cbmc, str(unit), "--cpp11", f"-D{macro}",
+                                       "--unwind", "1", "--unwinding-assertions", "--json-ui"], 60)
+                (out / f"{name}.log").write_text(log)
+                self.assertEqual(code, 10, log)
+                results = [r for m in json.loads(log) for r in m.get("result", [])]
+                self.assertTrue(any(r.get("property", "").startswith("main.assertion.")
+                                    and r.get("status") == "FAILURE" for r in results), log)
+
     def test_cpp_mutations_are_counterexamples(self):
         cbmc = shutil.which("cbmc")
         self.assertIsNotNone(cbmc, "CBMC required: mutation checks must execute")
