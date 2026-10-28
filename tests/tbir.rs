@@ -21246,7 +21246,7 @@ fn tbir_emit_helper_mix() {
         "static uint64_t harc_helper_double_it(uint64_t x);",
         "static uint64_t harc_helper_double_it(uint64_t x) {",
         "harc_helper_double_it(__t",
-        "for (int64_t _w = 0; _w < 1; _w++) tick();",
+        "for (int64_t _w = 0; _w < 1; _w++) { if (_fatal) throw harc_rt::HarcFatalAbort{}; tick(); }",
     ] {
         assert!(cpp.contains(marker), "missing marker `{marker}` in:\n{cpp}");
     }
@@ -26690,7 +26690,7 @@ fn transactor_method_timed_wait_lowers_to_the_sync_poll_loop() {
     for needle in [
         "uint64_t _wu_budget = (uint64_t)(",
         "uint64_t _wu_start = cycle_count;",
-        ") < _wu_budget) tick();",
+        ") < _wu_budget) { if (_fatal) throw harc_rt::HarcFatalAbort{}; tick(); }",
         "ctx.errors++;",
     ] {
         assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
@@ -36025,7 +36025,7 @@ end impl T"#,
     );
     assert!(
         cpp.contains("uint64_t _wu_start = cycle_count;")
-            && cpp.contains(") < _wu_budget) tick();"),
+            && cpp.contains(") < _wu_budget) { if (_fatal) throw harc_rt::HarcFatalAbort{}; tick(); }"),
         "a component method must render the same sync poll loop; got:\n{cpp}"
     );
 }

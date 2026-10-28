@@ -6541,7 +6541,10 @@ fn emit_common_tseq_tick(out: &mut String, plan: &CommonCppPlan) {
     writeln!(out, "{INDENT}{INDENT}if (ctx.trace_time <= ctx.now_ps) ctx.trace_time = ctx.now_ps + 1;").ok();
     writeln!(out, "{INDENT}{INDENT}return;").ok();
     writeln!(out, "{INDENT}}}").ok();
-    writeln!(out, "{INDENT}while (ctx.now_ps < target_ps) {{").ok();
+    // Complete the current edge (including post-eval services), then stop
+    // before any later edge once a service raises fatal, as the default
+    // layout's `eval_clocks_until` does.
+    writeln!(out, "{INDENT}while (ctx.now_ps < target_ps && !ctx.fatal) {{").ok();
     writeln!(out, "{INDENT}{INDENT}unsigned __int128 next = target_ps;").ok();
     writeln!(out, "{INDENT}{INDENT}for (auto& clock : ctx.clocks) if (clock.next_edge_ps < next) next = clock.next_edge_ps;").ok();
     writeln!(out, "{INDENT}{INDENT}ctx.now_ps = next;").ok();
