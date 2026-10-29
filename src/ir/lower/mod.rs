@@ -8368,6 +8368,30 @@ impl LowerCtx {
 /// that will not fold is `SilentlyMisLowers`, because v1 accepts it and yields
 /// ZERO. Pointing a user at v1 for `@ dut.count_out` would hand them a register
 /// at address 0.
+/// Fold a compile-time constant as a mathematical integer, keeping its
+/// sign: a negative fold is returned negative, a non-negative one as its
+/// unsigned value. Used where a negative constant is meaningful (a signed
+/// regblock field's reset), unlike [`fold_addr_const`].
+pub(crate) fn fold_signed_const(
+    e: &crate::ast::Expr,
+    consts: &HashMap<String, ConstVal>,
+    what: &str,
+) -> Result<i128, LowerError> {
+    let v = fold_const(e, consts, "").map_err(|err| match err {
+        ConstFoldErr::Unsupported(detail) => not_implemented(
+            &format!("a non-constant {what}"),
+            detail,
+            V1Status::SilentlyMisLowers,
+        ),
+        ConstFoldErr::Invalid(detail) => LowerError::Invalid(format!("the {what}: {detail}")),
+    })?;
+    Ok(if v.is_negative() {
+        v.as_i64() as i128
+    } else {
+        v.bits as i128
+    })
+}
+
 pub(crate) fn fold_addr_const(
     e: &crate::ast::Expr,
     consts: &HashMap<String, ConstVal>,

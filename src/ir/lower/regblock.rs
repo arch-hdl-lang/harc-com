@@ -140,10 +140,41 @@ pub(crate) fn lower_regblock(
                     fld.bit_pos
                 )));
             }
+            let field_signed = field_is_signed(&fld.ty);
             let field_reset = match &fld.reset {
                 None => None,
                 Some(rv) => match &*rv.kind {
                     ExprKind::Bool(b) => Some(*b as u64),
+                    // A `sint<N>` field's reset is a VALUE of that type:
+                    // it must lie in [-2^(N-1), 2^(N-1)) and is stored as
+                    // its N-bit two's-complement pattern.
+                    _ if field_signed => {
+                        let value = super::fold_signed_const(
+                            rv,
+                            consts,
+                            &format!(
+                                "reset value on regblock `{name}` register `{rname}` field `{fname}`"
+                            ),
+                        )?;
+                        let min = -(1i128 << (bit_width - 1));
+                        let max = (1i128 << (bit_width - 1)) - 1;
+                        if value < min || value > max {
+                            let hint = if value > max && value < (1i128 << bit_width) {
+                                format!(
+                                    "; to store the bit pattern {value:#X}, write {}",
+                                    value - (1i128 << bit_width)
+                                )
+                            } else {
+                                String::new()
+                            };
+                            return Err(LowerError::Invalid(format!(
+                                "the reset value on regblock `{name}` register `{rname}` field \
+                                 `{fname}` is {value}, which is outside the range of its signed \
+                                 {bit_width}-bit type [{min}, {max}]{hint}"
+                            )));
+                        }
+                        Some((value as u64) & field_mask(bit_width))
+                    }
                     _ => Some(super::fold_addr_const(
                         rv,
                         consts,
@@ -170,7 +201,7 @@ pub(crate) fn lower_regblock(
                 name: fname.clone(),
                 bit_pos: fld.bit_pos,
                 bit_width,
-                signed: field_is_signed(&fld.ty),
+                signed: field_signed,
                 access: lower_access(fld.access),
             });
         }

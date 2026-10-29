@@ -184,6 +184,14 @@ mirror and from a frontdoor bus read. Writing a negative value stores its
 the other bits of the register untouched. `uint<N>` / `bits<N>` fields read
 back zero-extended.
 
+A signed field's `reset` is likewise a value of its type: it must lie in
+`[-2^(N-1), 2^(N-1))` and is stored as its `N`-bit two's-complement pattern
+(`field F : sint<4> @ 0 reset -2` resets those bits to `0xE` and reads back
+`-2`). A value outside that range is a compile error — including a positive
+bit pattern such as `reset 0xE` on a `sint<4>`, for which the diagnostic
+names the signed value to write (`-2`). Unsigned field resets keep the
+`0 ..= 2^N - 1` range.
+
 ### 3.2 Passive record API + per-register write callbacks  *(shipped, Phase 1f)*
 
 The Phase 1a frontdoor (`regs.REG = v` / `let x = regs.REG`) is *active*:
