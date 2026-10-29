@@ -3880,6 +3880,9 @@ fn cmd_sim_check_backends(
             "--check-backends requires BOTH --dut <file.arch> and --sv <file.sv>"
         ));
     }
+    // The ARCH leg cannot forward --sim-arg; refuse before creating any
+    // output directory (its inner `cmd_sim` would refuse only afterwards).
+    reject_arch_backend_sim_args(&waves.sim_args)?;
     // Both backends emit the testbench through the SAME codegen so the diff
     // isolates DUT-backend divergence (ARCH sim vs Verilator), not emitter
     // differences. Defaults to the global default (tbir); `--codegen v1`
