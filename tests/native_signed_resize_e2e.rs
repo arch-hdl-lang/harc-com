@@ -7,8 +7,10 @@
 //! by a raw unsigned cast to all-ones in a 64/128-bit carrier, typed
 //! unsigned, while >128-bit destinations masked to the 8 source bits.
 //!
-//! Sub-64 destinations are asserted only for parity with `.sext<N>()`:
-//! both share the existing sub-64 width-method carrier.
+//! Sub-64 destinations are signed VALUES too (`== -1`, `< 0`), like a
+//! declared `sint<N>` local; `.sext<N>()` below 64 bits used to yield the
+//! masked N-bit pattern (`sint<8>(-1).sext<16>()` was 65535), which the
+//! `.sext` cases here also pin.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -24,6 +26,13 @@ impl SignedResize for Tb
         let ubits : uint<8> = 255
 
         // Widening a signed source sign-extends; the result is signed.
+        let n16 = neg.resize<16>()
+        let n32 = neg.resize<32>()
+        assert n16 == -1 else fail("n16 == -1: ${n16}")
+        assert n16 < 0 else fail("n16 < 0")
+        assert n32 == -1 else fail("n32 == -1: ${n32}")
+        let t16 : sint<16> = neg.resize<16>()
+        assert t16 == -1 else fail("declared sint<16> from resize: ${t16}")
         let n64 = neg.resize<64>()
         let n100 = neg.resize<100>()
         let n128 = neg.resize<128>()
@@ -42,6 +51,7 @@ impl SignedResize for Tb
         assert n128.trunc<16>() == n129.trunc<16>() else fail("128/129 carrier boundary")
         assert neg.resize<16>() == neg.sext<16>() else fail("resize<16> != sext<16>")
         assert neg.resize<16>()[15:8] == 0xFF else fail("resize<16> sign fill")
+        assert neg.resize<16>().zext<32>() == 0xFFFF else fail("resize<16> low bits")
 
         let p16 = pos.resize<16>()
         let p64 = pos.resize<64>()
@@ -69,7 +79,28 @@ impl SignedResize for Tb
         assert nn100 < 0 else fail("narrow 256->100 < 0")
         assert nn64 == -2 else fail("narrow 256->64")
         let s16 : sint<16> = 0x0180
-        assert s16.resize<8>() == s16.trunc<8>() else fail("narrow 16->8 bits")
+        let nn8 = s16.resize<8>()
+        assert nn8 == -128 else fail("narrow 16->8: ${nn8}, want -128")
+        assert nn8 < 0 else fail("narrow 16->8 < 0")
+        assert nn8.zext<16>() == 0x80 else fail("narrow 16->8 bits")
+        let k16 : sint<16> = 0x017F
+        assert k16.resize<8>() == 127 else fail("narrow 16->8 positive")
+        let m64 : sint<64> = -200
+        assert m64.resize<8>() == 56 else fail("narrow 64->8 wraps to 56")
+        assert m64.resize<32>() == -200 else fail("narrow 64->32 keeps -200")
+
+        // `.sext<N>()` below 64 bits is a sign-extended value as well.
+        let e16 = neg.sext<16>()
+        let e32 = neg.sext<32>()
+        assert e16 == -1 else fail("sext<16> == -1: ${e16}")
+        assert e16 < 0 else fail("sext<16> < 0")
+        assert e32 == -1 else fail("sext<32> == -1: ${e32}")
+        let d16 : sint<16> = neg.sext<16>()
+        assert d16 == -1 else fail("declared sint<16> from sext: ${d16}")
+        let ub : uint<8> = 0xBC
+        assert ub.sext<16>() == -68 else fail("uint<8> 0xBC sext<16>")
+        assert ub.sext<16>().zext<32>() == 0xFFBC else fail("sext<16> low bits")
+        assert pos.sext<16>() == 100 else fail("positive sext<16>")
 
         // Unsigned sources are unchanged: zero-extend / truncate.
         let u16 = ubits.resize<16>()
@@ -160,5 +191,57 @@ end impl SignedResizeType
         !output.status.success() && stderr.contains("signed 16-bit value"),
         "signed resize result must be typed sint<16>:\nstdout:\n{}\nstderr:\n{stderr}",
         String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// `.sext<N>()` below 64 bits yields a sign-extended `sint<N>` VALUE, the
+/// same as a declared `sint<N>` local holding it. It used to mask to the
+/// N-bit pattern: `sint<8>(-1).sext<16>()` compared, printed and stored
+/// (even into a `sint<16>`) as 65535.
+#[test]
+fn native_sub64_sext_is_a_signed_value() {
+    let outdir =
+        std::env::temp_dir().join(format!("harc_native_sub64_sext_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&outdir);
+    std::fs::create_dir_all(&outdir).expect("create output directory");
+    let source = outdir.join("sub64_sext.harc");
+    std::fs::write(
+        &source,
+        r#"
+testbench Tb
+    dut : Top
+end testbench Tb
+impl Sub64Sext for Tb
+    run
+        let neg : sint<8> = -1
+        let s16 = neg.sext<16>()
+        let d16 : sint<16> = neg.sext<16>()
+        let local : sint<16> = -1
+        log(info, "SEXT16=${s16} DECL16=${d16}")
+        assert s16 == -1 else fail("sext<16> of -1 is ${s16}")
+        assert s16 < 0 else fail("sext<16> of -1 is not negative")
+        assert d16 == local else fail("sint<16> from sext<16> is ${d16}")
+    end run
+end impl Sub64Sext
+"#,
+    )
+    .expect("write fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_harc"))
+        .args(["sim", "--sv"])
+        .arg(repo_root().join("tests/dut/top_counter.sv"))
+        .arg(&source)
+        .args(["--top", "Top", "--outdir"])
+        .arg(&outdir)
+        .args(["--jobs", "2"])
+        .output()
+        .expect("run harc");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success()
+            && stdout.contains("ALL TESTS PASSED")
+            && stdout.contains("SEXT16=-1 DECL16=-1"),
+        "sub-64 sext must be a signed value:\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
     );
 }

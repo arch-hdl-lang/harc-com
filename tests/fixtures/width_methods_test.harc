@@ -62,13 +62,19 @@ impl WidthMethodsTest for WidthMethodsTb
             else fail("sint<64>(-1).zext<128> did not preserve 64 source bits")
 
         // ── sext: sign-extension ────────────────────────────────────
+        // The result is a sign-extended `sint<N>` value at every width:
+        // all-ones in N bits is -1 (and still 0xFFFF in its low 16 bits).
         let s8 : uint<8> = 0xFF              // MSB set → sign-extends to all-ones
         let se16 = s8.sext<16>()
         let se32 = s8.sext<32>()
-        assert se16 == 0xFFFF
-            else fail("sext<16> of 0xFF: got 0x${se16:04x}")
-        assert se32 == 0xFFFFFFFF
-            else fail("sext<32> of 0xFF: got 0x${se32:08x}")
+        assert se16 == -1
+            else fail("sext<16> of 0xFF: got ${se16}, want -1")
+        assert se16.zext<32>() == 0xFFFF
+            else fail("sext<16> of 0xFF: low 16 bits 0x${se16.zext<32>():04x}")
+        assert se16 < 0
+            else fail("sext<16> of 0xFF is not negative")
+        assert se32 == -1
+            else fail("sext<32> of 0xFF: got ${se32}, want -1")
 
         // Positive value: MSB clear → no extension change.
         let p8 : uint<8> = 0x7F

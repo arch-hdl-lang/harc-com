@@ -5725,7 +5725,7 @@ impl FuncBuilder<'_> {
         // the `Sext` node so every width class (≤64, 65..128, >128) takes
         // the one sign-extension emission. An equal-width `Sext` is the
         // signed identity; a narrowing one truncates first and then
-        // relabels the low `N` bits as `sint<N>`. Unsigned sources and
+        // reinterprets the low `N` bits as a `sint<N>` value. Unsigned sources and
         // sources of unknown width keep the zero-extend / truncate
         // `Resize` node.
         if kind == WidthCastKind::Resize {
@@ -5736,11 +5736,26 @@ impl FuncBuilder<'_> {
             );
             if let (true, Some(sw)) = (source_signed, src_width) {
                 let inner = if width < sw {
-                    Expr::WidthCast {
+                    let low = Expr::WidthCast {
                         kind: WidthCastKind::Trunc,
                         width,
                         src_width: Some(sw),
                         inner: Box::new(inner),
+                    };
+                    // Below 64 bits the kept `N` bits must be sign-filled
+                    // into the `int64_t` carrier (a 64-bit `Sext` from
+                    // `N`) before the `sint<N>` relabel, so
+                    // `sint<16>(0x0180).resize<8>()` is -128. At 65+ bits
+                    // the masked pattern already is the `sint<N>` value.
+                    if width < 64 {
+                        Expr::WidthCast {
+                            kind: WidthCastKind::Sext,
+                            width: 64,
+                            src_width: Some(width),
+                            inner: Box::new(low),
+                        }
+                    } else {
+                        low
                     }
                 } else {
                     inner

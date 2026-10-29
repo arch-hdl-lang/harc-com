@@ -60,8 +60,10 @@ fn fn0 run_WidthMethodsTest [kind=Run, owner=tb0]
     Assign(%s8, 255)
     Assign(%se16, %s8.sext<16 from 8>())
     Assign(%se32, %s8.sext<32 from 8>())
-    AssertCheck { cond: (%se16 == 65535), on_fail: "sext<16> of 0xFF: got 0x%04llx", %se16 }
-    AssertCheck { cond: (%se32 == 4294967295), on_fail: "sext<32> of 0xFF: got 0x%08llx", %se32 }
+    AssertCheck { cond: (%se16 == -1), on_fail: "sext<16> of 0xFF: got %lld, want -1", %se16 }
+    AssertCheck { cond: (%se16.zext<32 from 16>() == 65535), on_fail: "sext<16> of 0xFF: low 16 bits 0x%04llx", %se16.zext<32 from 16>() }
+    AssertCheck { cond: (%se16 < 0), on_fail: "sext<16> of 0xFF is not negative" }
+    AssertCheck { cond: (%se32 == -1), on_fail: "sext<32> of 0xFF: got %lld, want -1", %se32 }
     Assign(%p8, 127)
     Assign(%pe16, %p8.sext<16 from 8>())
     Assign(%pe32, %p8.sext<32 from 8>())

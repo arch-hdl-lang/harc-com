@@ -1845,9 +1845,9 @@ fn wide_eq_cpp(
 /// - trunc: ≤64 masks (plain cast at width 64), 65..128 routes through
 ///   `harc_rt::harc_trunc_u128`, wider values through `harc_wide_trunc`.
 /// - zext: scalar cast through 128, then width-normalized `harc_wide_zext`.
-/// - sext: shift-fills (≤64) / `harc_rt::harc_sext_u128` (65..128) when
-///   the source width is known and smaller; wider values use
-///   `harc_wide_sext`.
+/// - sext: shift-fills into a sign-extended `int64_t` value (≤64) /
+///   `harc_rt::harc_sext_u128` (65..128) when the source width is known
+///   and smaller; wider values use `harc_wide_sext`.
 /// - resize: narrows via trunc-shape, widens via plain cast (mask-narrow
 ///   when the source width is unknown); the same choice selects wide
 ///   truncation or zero-extension above 128.
@@ -1920,23 +1920,14 @@ fn width_cast_cpp(
                 if width > 64 {
                     format!("harc_rt::harc_sext_u128((_harc_u128)({e}), {sw}, {width})")
                 } else {
+                    // A `sint<N>` result is a sign-extended VALUE in the
+                    // `int64_t` carrier at every N ≤ 64, exactly like a
+                    // declared `sint<N>` local: `sint<8>(-1).sext<16>()`
+                    // is -1, not the 16-bit pattern 0xFFFF. (Sub-64 widths
+                    // used to mask to that pattern, so the result compared,
+                    // printed and assigned as a large positive number.)
                     let shift = 64 - sw;
-                    if width == 64 {
-                        // `int64_t`, not `uint64_t`: a full-width fill is
-                        // the one shape whose sign bit survives into the
-                        // result, and v1 binds this expression to `auto`.
-                        // Spelling it unsigned there made `auto` deduce
-                        // `uint64_t` while TB-IR's own local is `int64_t`,
-                        // so `p[7:0].sext<64>() > 0` came out true under v1
-                        // and false under TB-IR.
-                        format!("((int64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}))")
-                    } else {
-                        format!(
-                            "((uint64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}) \
-                             & 0x{:X}ULL)",
-                            mask(width)
-                        )
-                    }
+                    format!("((int64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}))")
                 }
             }
             // Narrow to `uint64_t` before the signed relabel: a
