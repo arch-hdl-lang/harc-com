@@ -346,7 +346,7 @@ fn dump_ir_locates_a_genuine_component_field_width_error() {
         wide = value
         narrow = value
         wide = value
-    end update
+    end function update
 end agent WidthSink
 "#,
     );
@@ -463,7 +463,7 @@ end test BadStringUnknownArgument
         r#"agent Sink
     function take(value: uint<8>)
         let copy : uint<8> = value
-    end take
+    end function take
 end agent Sink
 testbench Tb
     dut : Top
@@ -837,11 +837,11 @@ fn dump_ir_ignores_a_recovered_message_error_when_locating_a_later_assignment() 
 
     function read() -> uint<8>
         return value
-    end read
+    end function read
 
     function check_value()
         assert true else fail("value=${read()}")
-    end check_value
+    end function check_value
 end agent MessageModel
 "#,
     );
@@ -862,7 +862,7 @@ testbench CopyTb
 
     function reset()
         destination = holder
-    end reset
+    end function reset
 end testbench CopyTb
 "#,
     );

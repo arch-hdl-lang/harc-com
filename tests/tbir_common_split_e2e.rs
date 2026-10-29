@@ -7999,7 +7999,7 @@ transactor TinyDriver bound to TinyBus
             bus.req.valid = 1
             wait 1 cycle
             bus.req.valid = 0
-        end drive_raw
+        end function drive_raw
 
         hookable drive(value: uint<8>)
             drive_raw(value)
@@ -8008,7 +8008,7 @@ transactor TinyDriver bound to TinyBus
         function read_back(addr: uint<8>) -> uint<8>
             let result = bus.read(addr)
             return result
-        end read_back
+        end function read_back
     end when
 end transactor TinyDriver
 
@@ -8021,7 +8021,7 @@ transactor TinyEventDriver bound to TinyBus
             bus.req.valid = 1
             wait 1 cycle
             bus.req.valid = 0
-        end drive_event
+        end function drive_event
 
         on request(value)
             drive_event(value)

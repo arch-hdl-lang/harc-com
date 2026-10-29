@@ -3361,7 +3361,7 @@ transactor ProtocolModel
         r.matched = 1
         r.data = addr + 256
         return r
-    end predict_read
+    end function predict_read
 end transactor ProtocolModel
 
 transactor BusResponder
@@ -3466,7 +3466,7 @@ transactor ProtocolModel
         r.matched = 1
         r.data = addr + 256
         return r
-    end predict_read
+    end function predict_read
 end transactor ProtocolModel
 
 transactor OuterModel
@@ -3475,7 +3475,7 @@ transactor OuterModel
         r.matched = 1
         r.data = addr + 512
         return r
-    end check_read
+    end function check_read
 end transactor OuterModel
 
 transactor BusResponder
@@ -3529,13 +3529,13 @@ transactor ProtocolModel
         r.matched = 1
         r.data = addr + 256
         return r
-    end predict_read
+    end function predict_read
 end transactor ProtocolModel
 
 scoreboard ResponseScoreboard
     function observe(addr: uint<8>, model: ProtocolModel)
         let r : ReadResponse = model.predict_read(addr)
-    end observe
+    end function observe
 end scoreboard ResponseScoreboard
 
 testbench Tb
@@ -3571,12 +3571,12 @@ fn testbench_method_bare_sibling_call_dispatches_through_self() {
     function write_reg(addr: uint<32>, data: uint<32>)
         dut.addr = addr
         dut.wdata = data
-    end write_reg
+    end function write_reg
 
     function program_defaults()
         write_reg(0x1000, 0)
         write_reg(0x1004, 1)
-    end program_defaults
+    end function program_defaults
 end testbench Tb
 
 impl BareSiblingTestbenchCallTest for Tb
@@ -3604,11 +3604,11 @@ fn transactor_method_bare_sibling_call_dispatches_through_self() {
         r#"transactor HelperTransactor
     function write_value(data: uint<32>)
         last = data
-    end write_value
+    end function write_value
 
     function program_defaults()
         write_value(7)
-    end program_defaults
+    end function program_defaults
 
     last : uint<32> default 0
 end transactor HelperTransactor
@@ -3642,12 +3642,12 @@ fn transactor_always_on_bare_call_to_when_active_sibling_errors_for_passive_back
         r#"transactor HelperTransactor
     function outer()
         active_only()
-    end outer
+    end function outer
 
     when active
         function active_only()
             last = 1
-        end active_only
+        end function active_only
     end when
 
     last : uint<32> default 0
@@ -3681,11 +3681,11 @@ fn scoreboard_method_bare_sibling_call_dispatches_through_self() {
 
     function bump()
         count = count + 1
-    end bump
+    end function bump
 
     function observe()
         bump()
-    end observe
+    end function observe
 end scoreboard Score
 
 testbench Tb
@@ -3768,7 +3768,7 @@ scoreboard GlobalScoreboard
         err.got = got
         err.expected = expected
         errors.push(err)
-    end record_error
+    end function record_error
 end scoreboard GlobalScoreboard
 
 testbench Tb
@@ -7114,7 +7114,7 @@ transactor ProtocolModel
         r.matched = 1
         r.data = addr + 16
         return r
-    end predict_read
+    end function predict_read
 end transactor ProtocolModel
 
 testbench Tb

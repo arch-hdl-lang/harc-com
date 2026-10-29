@@ -14,11 +14,11 @@ scoreboard Cadence
 
     function tick_fast()
         fast = fast + 1
-    end tick_fast
+    end function tick_fast
 
     function tick_slow()
         slow = slow + 1
-    end tick_slow
+    end function tick_slow
 end scoreboard Cadence
 
 testbench TbPeriodGt1

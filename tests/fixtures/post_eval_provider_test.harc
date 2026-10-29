@@ -25,7 +25,7 @@ transactor ProtocolModel
         end if
 
         return r
-    end predict_read
+    end function predict_read
 end transactor ProtocolModel
 
 scoreboard ResponseScoreboard
@@ -37,7 +37,7 @@ scoreboard ResponseScoreboard
         assert r.matched != 0 else fail("scoreboard saw unexpected addr 0x${addr:02x}")
         seen_count = seen_count + 1
         last_expected = r.data
-    end observe
+    end function observe
 end scoreboard ResponseScoreboard
 
 transactor BusResponder

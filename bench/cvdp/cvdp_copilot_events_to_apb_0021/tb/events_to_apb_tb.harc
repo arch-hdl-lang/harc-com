@@ -214,15 +214,15 @@ testbench EventsToApbTb
         src.reset_inputs()
         rsp.expect_reset_outputs()
         src.release_reset()
-    end reset_ctrl
+    end function reset_ctrl
 
     function set_payloads(addr_a: uint<32>, data_a: uint<32>, addr_b: uint<32>, data_b: uint<32>, addr_c: uint<32>, data_c: uint<32>)
         src.set_payloads(addr_a, data_a, addr_b, data_b, addr_c, data_c)
-    end set_payloads
+    end function set_payloads
 
     function pulse_events(a: bool, b: bool, c: bool)
         src.pulse(a, b, c)
-    end pulse_events
+    end function pulse_events
 
     function trigger_and_complete(a: bool, b: bool, c: bool, want_addr: uint<32>, want_data: uint<32>, ready_delay: uint<5>) -> uint<32>
         pulse_events(a, b, c)
@@ -230,19 +230,19 @@ testbench EventsToApbTb
         errors = errors + rsp.expect_setup(want_addr, want_data)
         errors = errors + rsp.complete_current(ready_delay)
         return errors
-    end trigger_and_complete
+    end function trigger_and_complete
 
     function complete_expected(want_addr: uint<32>, want_data: uint<32>, ready_delay: uint<5>) -> uint<32>
         let errors : uint<32> = 0
         errors = errors + rsp.expect_setup(want_addr, want_data)
         errors = errors + rsp.complete_current(ready_delay)
         return errors
-    end complete_expected
+    end function complete_expected
 
     function timeout_event(a: bool, b: bool, c: bool, want_addr: uint<32>, want_data: uint<32>) -> uint<32>
         pulse_events(a, b, c)
         return rsp.timeout_current(want_addr, want_data)
-    end timeout_event
+    end function timeout_event
 end testbench EventsToApbTb
 
 function make_addr(tag: uint<8>, index: uint<8>) -> uint<32>
