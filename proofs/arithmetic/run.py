@@ -49,6 +49,31 @@ def rng_source(source):
     return body.split("\n}", 1)[0] + "\n}\n"
 
 
+def function_source(source, signature):
+    """Extract one actual, unindented production function, failing on drift."""
+    if source.count(signature) != 1:
+        raise ValueError(f"missing or ambiguous production function: {signature}")
+    body = source[source.index(signature):]
+    if "\n}" not in body:
+        raise ValueError(f"missing production function terminator: {signature}")
+    return body.split("\n}", 1)[0] + "\n}\n"
+
+
+SEXT_SIGNATURE = "inline _harc_u128 harc_sext_u128(_harc_u128 value, unsigned source_width, unsigned dest_width) {"
+COUNT_SIGNATURES = (
+    "inline uint64_t harc_u64_shift_count(uint64_t value, uint64_t limit) {",
+    "inline uint64_t harc_u128_shift_count(_harc_u128 value, uint64_t limit) {",
+)
+
+
+def conversion_source(source, group):
+    if group == "sext":
+        return slice_source(source, "U128") + function_source(source, SEXT_SIGNATURE)
+    if group == "counts":
+        return "".join(function_source(source, signature) for signature in COUNT_SIGNATURES)
+    raise ValueError(f"unknown conversion group: {group}")
+
+
 def run(command, timeout):
     process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                text=True, start_new_session=True)
@@ -92,6 +117,8 @@ def main():
             cases.append((f"u128-{name}", "u128", f"PROOF_{name.upper()}", [], 1))
         for width in ((1, 8, 32, 64, 128) if args.extended_division else tuple(range(1, 9))):
             cases.append((f"u128-divrem-{width}", "u128", "PROOF_DIVREM", [f"-DCHECK_WIDTH={width}"], 1))
+        cases += [("u128-sext", "sext", "PROOF_SEXT", [], 1),
+                  ("u128-shift-count", "counts", "PROOF_SHIFT_COUNT", [], 1)]
     if args.group in ("wide", "all"):
         for words in (1, 2, 4, 5, 8, 32):
             for operation in ("arith", "extend"):
@@ -117,7 +144,7 @@ def main():
     runtime = ROOT / "runtime/harc_thread_rt.h"
     source = runtime.read_text()
     inputs = [runtime, ROOT / "runtime/harc_random_rt.h", ROOT / "src/numeric_semantics.rs", ROOT / "src/ast.rs",
-              ROOT / "src/ir/lower/mod.rs", ROOT / "src/codegen/native/constraint_solver_renderer.rs",
+              ROOT / "src/ir/lower/mod.rs",
               ROOT / "src/codegen/randomize_renderer.rs", Path(__file__),
               *(ROOT / f"proofs/arithmetic/{name}" for name in ("u128.cpp", "wide.cpp", "rng.cpp", "kani.rs"))]
     report = {"scope": "See docs/formal-arithmetic.md for domains and exclusions",
@@ -141,11 +168,16 @@ def main():
         failed |= status != "passed"
 
     for name, group, macro, defines, unwind in cases:
-        body = (rng_source((ROOT / "runtime/harc_random_rt.h").read_text()) if group == "rng"
-                else slice_source(source, "U128" if group == "u128" else "WORD"))
+        if group == "rng":
+            body = rng_source((ROOT / "runtime/harc_random_rt.h").read_text())
+        elif group in ("sext", "counts"):
+            body = conversion_source(source, group)
+        else:
+            body = slice_source(source, "U128" if group == "u128" else "WORD")
         prefix = RNG_PREFIX if group == "rng" else PREFIX
         unit = args.out / f"{name}.cpp"
-        unit.write_text(prefix + body + (ROOT / f"proofs/arithmetic/{group}.cpp").read_text())
+        harness = "u128" if group in ("sext", "counts") else group
+        unit.write_text(prefix + body + (ROOT / f"proofs/arithmetic/{harness}.cpp").read_text())
         command = [cbmc, str(unit), "--cpp11", f"-D{macro}", *defines, "--unwind", str(unwind),
                    "--unwinding-assertions", "--trace", "--json-ui"]
         if name == "wide-extend-32":

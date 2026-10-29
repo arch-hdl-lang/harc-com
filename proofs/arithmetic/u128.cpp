@@ -30,6 +30,28 @@ int main() {
     __CPROVER_assert(harc_ashr_u128(x, shift, width) == arithmetic, "arithmetic shift matches signed carrier");
     __CPROVER_assert(harc_shl_u128(x, shift, width) == (shift >= 128 ? static_cast<_harc_u128>(0) : (x << shift) & mask), "left shift truncates");
     __CPROVER_assert(harc_shr_u128(x, shift, width) == (shift >= 128 ? static_cast<_harc_u128>(0) : value >> shift), "logical shift zero fills");
+#elif defined(PROOF_SEXT)
+    unsigned dest_width, bit;
+    __CPROVER_assume(dest_width <= 128);
+    __CPROVER_assume(bit < 128);
+    // Quantifying one arbitrary bit specifies the entire result, including
+    // destination padding, without copying the production fill-mask formula.
+    const bool data = ((x >> bit) & 1) != 0;
+    const bool sign = width != 0 && ((x >> (width - 1)) & 1) != 0;
+    const bool expected = width != 0 && bit < dest_width &&
+        (bit < width ? data : sign);
+    const _harc_u128 result = harc_sext_u128(x, width, dest_width);
+    __CPROVER_assert((((result >> bit) & 1) != 0) == expected,
+        "scalar sign extension preserves data, fills sign, and clears padding");
+#elif defined(PROOF_SHIFT_COUNT)
+    uint64_t limit;
+    const uint64_t expected = x >= static_cast<_harc_u128>(limit)
+        ? limit : static_cast<uint64_t>(x);
+    __CPROVER_assert(harc_u128_shift_count(x, limit) == expected,
+        "128-bit shift counts clamp without losing high-bit magnitude");
+    const uint64_t low = static_cast<uint64_t>(x);
+    __CPROVER_assert(harc_u64_shift_count(low, limit) == (low >= limit ? limit : low),
+        "64-bit shift counts clamp at every limit including zero");
 #elif defined(PROOF_DIVZERO)
     __CPROVER_assert(harc_sdiv_u128(x, 0, width) == 0, "zero-divisor quotient policy at every width");
     __CPROVER_assert(harc_smod_u128(x, 0, width) == (x & mask), "zero-divisor remainder policy at every width");

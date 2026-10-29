@@ -155,7 +155,7 @@ def render(e, names=None, extra=False):
     return f'(({text}))' if extra else text
 
 
-def trees(seed):
+def trees(seed, random_count=80):
     rng = random.Random(seed)
     leaves = [var('x'), var('y'), var('u', U), lit(0), lit(1), lit(3), lit(7)]
     def number(depth):
@@ -194,7 +194,8 @@ def trees(seed):
             return Node(rng.choice(['&&', '||']), (boolean(depth-1), boolean(depth-1)))
         return Node(rng.choice(['==', '!=', '<', '<=', '>', '>=']),
                     (number(max(0, depth-1)), number(max(0, depth-1))))
-    result = [number(4) for _ in range(48)] + [boolean(4) for _ in range(32)]
+    numeric_count = random_count * 3 // 5
+    result = [number(4) for _ in range(numeric_count)] + [boolean(4) for _ in range(random_count - numeric_count)]
     bad = Node('/', (lit(1), lit(0)))
     bad_bool = Node('==', (bad, lit(0)))
     result += [Node('&&', (Node('bool', data=False), bad_bool)),
@@ -210,8 +211,8 @@ def trees(seed):
     return result
 
 
-def generate_expressions(root, seed):
-    expressions = trees(seed)
+def generate_expressions(root, seed, expressions=None):
+    expressions = trees(seed) if expressions is None else expressions
     environments = [dict(x=-7, y=3, u=5), dict(x=0, y=-2, u=0),
                     dict(x=7, y=1, u=15), dict(x=-1, y=0, u=1)]
     constants, body, expected, cases = [], '', {}, []
@@ -241,7 +242,7 @@ def generate_expressions(root, seed):
                     body += observe(identity, expr, width)
                 cases.append({'id': key, 'tree': dataclasses.asdict(e), 'environment': env,
                               'source': runtime, 'expected': want.bits, 'width': width})
-    assert len(expressions) == 90 and len(expected) == 1440
+    assert expressions and len(expected) == len(expressions) * len(environments) * 4
     (root/'expressions.harc').write_text(''.join(constants) + test('Expressions', body))
     (root/'expression_expected.json').write_text(json.dumps(expected, indent=2))
     (root/'expression_cases.json').write_text(json.dumps(cases, indent=2))
@@ -450,9 +451,9 @@ def compare_models(label, actual, expected):
         raise AssertionError(f'{label}: missing valid models {sorted(missing)[:8]}; accepted invalid models {sorted(extra)[:8]}')
 
 
-def native_expressions(root, harc):
+def native_expressions(root, harc, backends=('v1', 'tbir')):
     expected = json.loads((root/'expression_expected.json').read_text())
-    for backend in ['v1', 'tbir']:
+    for backend in backends:
         code, output = run([harc, 'sim', root/'expressions.harc', '--sv', root/'dut.sv', '--top', 'Top',
                             '--codegen', backend, '--seed', '1', '--jobs', '2', '--outdir', root/f'expressions_{backend}'], root, 240, env={**os.environ, 'HARC_NO_LEARN': '1'})
         (root/f'expressions_{backend}.log').write_text(output)

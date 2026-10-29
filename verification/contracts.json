@@ -1,0 +1,499 @@
+{
+  "schema_version": 2,
+  "contracts": [
+    {
+      "id": "parser-boundaries",
+      "area": "parser",
+      "owners": [
+        "src/parser.rs"
+      ],
+      "domain": "Rust unit tests and CLI fixtures; grammar cases enumerated by tests, not all programs",
+      "checks": [
+        "rust-lib",
+        "check_cli"
+      ],
+      "required": true,
+      "formal": false
+    },
+    {
+      "id": "arithmetic-kernels",
+      "area": "arithmetic",
+      "owners": [
+        "runtime/harc_thread_rt.h",
+        "runtime/harc_random_rt.h",
+        "src/numeric_semantics.rs"
+      ],
+      "domain": "42 symbolic obligations with exact domains in docs/formal-arithmetic.md; division equivalence widths 1..8 only",
+      "checks": [
+        "arithmetic-formal",
+        "proof-runner"
+      ],
+      "required": true,
+      "formal": true
+    },
+    {
+      "id": "solver-capture",
+      "area": "solver",
+      "owners": [
+        "src/codegen/randomize_renderer.rs",
+        "src/codegen/randomize.rs"
+      ],
+      "domain": "Bounded native Boolean and signed-width capture SAT/UNSAT fixtures",
+      "checks": [
+        "native_signed_capture_e2e",
+        "native_bool_capture_e2e",
+        "arithmetic_solver_conformance"
+      ],
+      "required": true,
+      "formal": false
+    },
+    {
+      "id": "control-flow",
+      "area": "control",
+      "owners": [
+        "src/codegen/tbir/func.rs"
+      ],
+      "domain": "Bounded fatal wait, helper continuation and argument-order fixtures",
+      "checks": [
+        "fatal_wall_wait_e2e",
+        "tbir_void_helper_e2e"
+      ],
+      "required": true,
+      "formal": false
+    },
+    {
+      "id": "component-ownership",
+      "area": "components",
+      "owners": [
+        "src/ir/lower/components_impl.rs"
+      ],
+      "domain": "Bounded callback receiver ownership and sub-assignment fixtures",
+      "checks": [
+        "tbir_component_local_init",
+        "tbir_component_sub_assign"
+      ],
+      "required": true,
+      "formal": false
+    },
+    {
+      "id": "clock-progress",
+      "area": "clocks",
+      "owners": [
+        "runtime/harc_thread_rt.h",
+        "src/codegen/tbir/common.rs"
+      ],
+      "domain": "Bounded fatal waits and temporal helper scenarios; no scheduler proof",
+      "checks": [
+        "fatal_wall_wait_e2e",
+        "temporal_helpers_e2e"
+      ],
+      "required": true,
+      "formal": false
+    },
+    {
+      "id": "aggregate-widths",
+      "area": "aggregates",
+      "owners": [
+        "src/codegen/tbir/expr.rs"
+      ],
+      "domain": "Rust unit suite and bounded wide coverage selector fixtures; no arbitrary nesting proof",
+      "checks": [
+        "rust-lib",
+        "tbir_wide_cover_selectors_e2e"
+      ],
+      "required": true,
+      "formal": false
+    },
+    {
+      "id": "coverage-ordering",
+      "area": "coverage",
+      "owners": [
+        "src/codegen/tbir/covergroup.rs",
+        "src/ir/lower/covergroups.rs"
+      ],
+      "domain": "Bounded signed static bounds and wide selector fixtures",
+      "checks": [
+        "static_cover_bins_e2e",
+        "tbir_wide_cover_selectors_e2e"
+      ],
+      "required": true,
+      "formal": false
+    },
+    {
+      "id": "cli-launch",
+      "area": "CLI",
+      "owners": [
+        "src/main.rs"
+      ],
+      "domain": "Rust CLI tests including launcher routing; stub routing is not DUT verification",
+      "checks": [
+        "rust-cli",
+        "check_cli"
+      ],
+      "required": true,
+      "formal": false
+    },
+    {
+      "id": "ral-assignment",
+      "area": "RAL",
+      "owners": [
+        "src/ir/lower/regblock.rs",
+        "src/ir/lower/addrmap.rs"
+      ],
+      "domain": "Bounded TBIR register frontdoor assignment fixture",
+      "checks": [
+        "native_ral_assignment_e2e"
+      ],
+      "required": true,
+      "formal": false
+    }
+  ],
+  "checks": [
+    {
+      "id": "rust-lib",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "--",
+        "--nocapture"
+      ],
+      "parser": "rust",
+      "timeout": 1800,
+      "requires": [
+        "c++"
+      ]
+    },
+    {
+      "id": "rust-cli",
+      "command": [
+        "cargo",
+        "test",
+        "--bin",
+        "harc",
+        "--",
+        "--nocapture"
+      ],
+      "parser": "rust",
+      "timeout": 600
+    },
+    {
+      "id": "proof-runner",
+      "command": [
+        "python3",
+        "proofs/arithmetic/test_runner.py"
+      ],
+      "parser": "unittest",
+      "expected_tests": 10,
+      "timeout": 120,
+      "requires": [
+        "cbmc",
+        "kani"
+      ]
+    },
+    {
+      "id": "arithmetic-formal",
+      "command": [
+        "python3",
+        "proofs/arithmetic/run.py",
+        "--out",
+        "{out}/formal"
+      ],
+      "parser": "formal",
+      "timeout": 7200,
+      "requires": [
+        "cbmc",
+        "kani",
+        "z3"
+      ]
+    },
+    {
+      "id": "check_cli",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "check_cli",
+        "--",
+        "--nocapture"
+      ],
+      "parser": "rust",
+      "timeout": 1800,
+      "requires": [
+        "clang++",
+        "verilator",
+        "z3"
+      ]
+    },
+    {
+      "id": "arithmetic_solver_conformance",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "arithmetic_solver_conformance",
+        "--",
+        "--nocapture"
+      ],
+      "parser": "rust",
+      "timeout": 1800,
+      "requires": [
+        "clang++",
+        "verilator",
+        "z3"
+      ]
+    },
+    {
+      "id": "native_signed_capture_e2e",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "native_signed_capture_e2e",
+        "--",
+        "--nocapture"
+      ],
+      "parser": "rust",
+      "timeout": 1800,
+      "requires": [
+        "clang++",
+        "verilator",
+        "z3"
+      ]
+    },
+    {
+      "id": "native_bool_capture_e2e",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "native_bool_capture_e2e",
+        "--",
+        "--nocapture"
+      ],
+      "parser": "rust",
+      "timeout": 1800,
+      "requires": [
+        "clang++",
+        "verilator",
+        "z3"
+      ]
+    },
+    {
+      "id": "fatal_wall_wait_e2e",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "fatal_wall_wait_e2e",
+        "--",
+        "--nocapture"
+      ],
+      "parser": "rust",
+      "timeout": 1800,
+      "requires": [
+        "clang++",
+        "verilator",
+        "z3"
+      ]
+    },
+    {
+      "id": "tbir_component_local_init",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "tbir_component_local_init",
+        "--",
+        "--nocapture"
+      ],
+      "parser": "rust",
+      "timeout": 1800,
+      "requires": [
+        "clang++",
+        "verilator",
+        "z3"
+      ]
+    },
+    {
+      "id": "tbir_component_sub_assign",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "tbir_component_sub_assign",
+        "--",
+        "--nocapture"
+      ],
+      "parser": "rust",
+      "timeout": 1800,
+      "requires": [
+        "clang++",
+        "verilator",
+        "z3"
+      ]
+    },
+    {
+      "id": "static_cover_bins_e2e",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "static_cover_bins_e2e",
+        "--",
+        "--nocapture"
+      ],
+      "parser": "rust",
+      "timeout": 1800,
+      "requires": [
+        "clang++",
+        "verilator",
+        "z3"
+      ]
+    },
+    {
+      "id": "tbir_wide_cover_selectors_e2e",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "tbir_wide_cover_selectors_e2e",
+        "--",
+        "--nocapture"
+      ],
+      "parser": "rust",
+      "timeout": 1800,
+      "requires": [
+        "clang++",
+        "verilator",
+        "z3"
+      ]
+    },
+    {
+      "id": "native_ral_assignment_e2e",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "native_ral_assignment_e2e",
+        "--",
+        "--nocapture"
+      ],
+      "parser": "rust",
+      "timeout": 1800,
+      "requires": [
+        "clang++",
+        "verilator",
+        "z3"
+      ]
+    },
+    {
+      "id": "tbir_void_helper_e2e",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "tbir_void_helper_e2e",
+        "--",
+        "--nocapture"
+      ],
+      "parser": "rust",
+      "timeout": 1800,
+      "requires": [
+        "clang++",
+        "verilator",
+        "z3"
+      ]
+    },
+    {
+      "id": "temporal_helpers_e2e",
+      "command": [
+        "cargo",
+        "test",
+        "--test",
+        "temporal_helpers_e2e",
+        "--",
+        "--nocapture"
+      ],
+      "parser": "rust",
+      "timeout": 1800,
+      "requires": [
+        "clang++",
+        "verilator",
+        "z3"
+      ]
+    }
+  ],
+  "formal": {
+    "cbmc": [
+      "u128-mask",
+      "u128-compare",
+      "u128-shift",
+      "u128-divzero",
+      "u128-divrem-1",
+      "u128-divrem-2",
+      "u128-divrem-3",
+      "u128-divrem-4",
+      "u128-divrem-5",
+      "u128-divrem-6",
+      "u128-divrem-7",
+      "u128-divrem-8",
+      "u128-sext",
+      "u128-shift-count",
+      "wide-arith-1",
+      "wide-extend-1",
+      "wide-arith-2",
+      "wide-extend-2",
+      "wide-arith-4",
+      "wide-extend-4",
+      "wide-arith-5",
+      "wide-extend-5",
+      "wide-arith-8",
+      "wide-extend-8",
+      "wide-arith-32",
+      "wide-extend-32",
+      "rng-full",
+      "rng-half",
+      "rng-small",
+      "rng-degenerate"
+    ],
+    "kani": [
+      "const_add_sub",
+      "const_mul",
+      "const_wrap",
+      "const_compare",
+      "const_shift",
+      "const_bit_logic",
+      "const_bitwise_laws",
+      "const_wrapping_roundtrip",
+      "const_div_rem",
+      "const_errors",
+      "solver_promotion",
+      "solver_unknown_widths"
+    ]
+  },
+  "missing_families": [
+    "Complete parser grammar and diagnostic equivalence",
+    "Whole expression lowering, SMT sort construction and solver emission",
+    "32/64/128-bit full signed division and remainder equivalence",
+    "Wide multiply/divide and arbitrary storage capacities",
+    "Coroutine scheduling, fairness and unbounded temporal behavior",
+    "Unbounded component graphs and arbitrary aggregate nesting",
+    "Complete coverage cross-bin semantics",
+    "Complete RAL bus/protocol and external DUT behavior",
+    "Scoreboards, transactors and sequence (tseq) semantics",
+    "Bus, addrmap and register-model behavior beyond single frontdoor assignment",
+    "Temporal properties and assertions",
+    "Randomization distribution and constraint solution quality"
+  ],
+  "stop_gate": {
+    "minimum_mutation_areas": 8,
+    "minimum_mutation_percent": 90,
+    "minimum_distinct_fuzz_cases": 10000,
+    "minimum_fuzz_seeds": 3,
+    "flat_fuzz_campaigns": 3,
+    "clean_hunts": 3,
+    "hunt_scopes": 10,
+    "minimum_mutation_count": 30
+  }
+}
