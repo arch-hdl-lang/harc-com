@@ -177,6 +177,13 @@ whole-register reset; omitted field resets contribute zero only when no
 whole-register baseline is present. This same composed value is used by the
 mirror initializer and `reset_all()`.
 
+A field declared `sint<N>` (or `SInt<N>`) reads back **sign-extended** as a
+`sint<N>` value: a 4-bit field holding `0xF` reads as `-1`, both from the
+mirror and from a frontdoor bus read. Writing a negative value stores its
+`N`-bit two's-complement pattern (`regs.R.F = -2` stores `0xE`) and leaves
+the other bits of the register untouched. `uint<N>` / `bits<N>` fields read
+back zero-extended.
+
 ### 3.2 Passive record API + per-register write callbacks  *(shipped, Phase 1f)*
 
 The Phase 1a frontdoor (`regs.REG = v` / `let x = regs.REG`) is *active*:
