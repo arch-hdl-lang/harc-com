@@ -5719,6 +5719,40 @@ impl FuncBuilder<'_> {
                 "`.{kind_name}<N>()` is not defined for `String` values"
             )));
         }
+        // `.resize<N>()` keeps the receiver's signedness (ARCH emits
+        // `N'($signed(x))` for a signed base type): a signed source
+        // sign-extends when widening and the result is `sint<N>`. Reuse
+        // the `Sext` node so every width class (≤64, 65..128, >128) takes
+        // the one sign-extension emission. An equal-width `Sext` is the
+        // signed identity; a narrowing one truncates first and then
+        // relabels the low `N` bits as `sint<N>`. Unsigned sources and
+        // sources of unknown width keep the zero-extend / truncate
+        // `Resize` node.
+        if kind == WidthCastKind::Resize {
+            let source_signed = matches!(
+                self.expr_type(&inner)
+                    .or_else(|| self.scalar_assignment_type(&inner)),
+                Some(IrType::SInt(_))
+            );
+            if let (true, Some(sw)) = (source_signed, src_width) {
+                let inner = if width < sw {
+                    Expr::WidthCast {
+                        kind: WidthCastKind::Trunc,
+                        width,
+                        src_width: Some(sw),
+                        inner: Box::new(inner),
+                    }
+                } else {
+                    inner
+                };
+                return Ok(Expr::WidthCast {
+                    kind: WidthCastKind::Sext,
+                    width,
+                    src_width: Some(sw.min(width)),
+                    inner: Box::new(inner),
+                });
+            }
+        }
         Ok(Expr::WidthCast {
             kind,
             width,
