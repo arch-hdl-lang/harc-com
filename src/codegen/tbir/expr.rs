@@ -1186,7 +1186,7 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                     && b_signed
                     && expr_binary_operand_width(cx, a)
                         .max(expr_binary_operand_width(cx, b))
-                        .is_some_and(|width| (65..=128).contains(&width));
+                        .is_some_and(|width| width > 64);
                 if signed_wide_arithmetic {
                     (a_cpp, b_cpp) = coerce_signed_wide_pair(cx, a, b)?;
                 }
@@ -1278,10 +1278,12 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
             // bind into a surrounding higher-precedence operator.
             let c = truthy_cpp(cx, c, expr_cpp(cx, c)?);
             let (t_cpp, e2_cpp) = if expr_is_signed(cx, t) && expr_is_signed(cx, e2) {
-                // A 65..=128-bit signed scalar is carried as `_harc_u128`,
-                // so C++ cannot recover its declared sign bit when the
-                // conditional promotes a narrower arm. Keep the extension
-                // in the selected arm to preserve conditional laziness.
+                // A signed scalar above 64 bits is carried as `_harc_u128`
+                // or `HarcWide<N>`, so C++ cannot recover its declared sign
+                // bit when the conditional promotes a narrower arm (and
+                // differently sized `HarcWide` arms have no common type).
+                // Keep the extension in the selected arm to preserve
+                // conditional laziness.
                 coerce_signed_wide_pair(cx, t, e2)?
             } else {
                 let t_cpp = expr_cpp(cx, t)?;
@@ -2216,11 +2218,11 @@ fn coerce_unsigned_wide_pair(
     )
 }
 
-/// Sign-extend signed scalar operands to their common `_harc_u128` width
-/// before native arithmetic. Unlike `HarcWide<N>`, the 65..=128-bit scalar
-/// carrier has no operator overload that can preserve the declared sign bit;
-/// without this normalization a masked negative result from a narrower
-/// signed operation is promoted as a positive `_harc_u128` value.
+/// Sign-extend signed scalar operands to their common carrier width before
+/// native arithmetic. Neither the `_harc_u128` nor `HarcWide<N>` carrier
+/// retains the source expression's declared sign width when a masked
+/// negative result is promoted; without this normalization a narrower
+/// signed result is treated as a positive value by the native operator.
 fn coerce_signed_wide_pair(
     cx: &ECx<'_>,
     lhs: &Expr,
@@ -2230,7 +2232,7 @@ fn coerce_signed_wide_pair(
     let rhs_width = expr_binary_operand_width(cx, rhs);
     let Some(target_width) = lhs_width
         .max(rhs_width)
-        .filter(|width| (65..=128).contains(width))
+        .filter(|width| *width > 64)
     else {
         return Ok((expr_cpp(cx, lhs)?, expr_cpp(cx, rhs)?));
     };

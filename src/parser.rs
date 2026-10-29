@@ -289,8 +289,12 @@ impl Parser {
                 kw_tok.span,
             ));
         }
-        // Optional closing name (named-end form). When present, must match.
-        if let Some(TokenKind::Ident(_)) = self.peek_kind() {
+        // Optional closing name (named-end form). It is part of the same
+        // line as `end <kw>`; otherwise an identifier-led declaration after
+        // an unnamed closer would be consumed as the closing name.
+        if matches!(self.peek_kind(), Some(TokenKind::Ident(_)))
+            && !self.newline_before_peek(kw_tok.span.end_usize())
+        {
             let id = self.expect_ident()?;
             if id.name != name {
                 return Err(CompileError::mismatched_closing(name, &id.name, id.span));
@@ -5465,5 +5469,56 @@ end bus BusGated"#;
             panic!("expected explicit phase");
         };
         assert!(matches!(phase.stmts[0].kind, StmtKind::Return(Some(_))));
+    }
+
+    #[test]
+    fn unnamed_component_function_closer_does_not_consume_following_items() {
+        let src = r#"testbench Tb
+    function first() -> uint<8>
+        return 1
+    end function // the next line starts a field
+    count : uint<8> = 0
+    function second()
+    end function
+end testbench Tb"#;
+        let f = parse(src).expect("unnamed component function closer should end at its line");
+        let Item::Env(component) = &f.items[0] else {
+            panic!("expected testbench component");
+        };
+        let names: Vec<&str> = component
+            .items
+            .iter()
+            .map(|item| match item {
+                ComponentItem::Field(field) => field.name.name.as_str(),
+                ComponentItem::Hookable(method) => method.name.name.as_str(),
+                other => panic!("unexpected component item: {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["first", "count", "second"]);
+    }
+
+    #[test]
+    fn named_end_closers_remain_same_line_and_mismatches_are_diagnosed() {
+        let named = parse("function named() -> uint<8>\n    return 1\nend function named")
+            .expect("same-line named closer should remain valid");
+        assert!(matches!(named.items[0], Item::Function(_)));
+
+        let mismatch = parse("function named() -> uint<8>\n    return 1\nend function other")
+            .expect_err("same-line mismatched closer must remain an error");
+        assert!(format!("{mismatch:?}").contains("MismatchedClosing"));
+    }
+
+    #[test]
+    fn shared_named_end_boundary_preserves_following_top_level_function() {
+        let src = r#"function first() -> uint<8>
+    return 1
+end function
+function second() -> uint<8>
+    return 2
+end function second"#;
+        let f = parse(src).expect("both top-level functions should parse");
+        assert_eq!(f.items.len(), 2);
+        assert!(matches!(f.items[0], Item::Function(_)));
+        assert!(matches!(f.items[1], Item::Function(_)));
     }
 }

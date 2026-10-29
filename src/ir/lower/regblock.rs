@@ -274,7 +274,11 @@ fn field_bit_width(t: &crate::ast::TypeExpr) -> u32 {
     };
     match name {
         BuiltinTy::Bit | BuiltinTy::Bool | BuiltinTy::BoolLower => 1,
-        BuiltinTy::UInt | BuiltinTy::SInt | BuiltinTy::Bits => match args.first() {
+        BuiltinTy::UInt
+        | BuiltinTy::SInt
+        | BuiltinTy::UIntCap
+        | BuiltinTy::SIntCap
+        | BuiltinTy::Bits => match args.first() {
             Some(TypeArg::Expr(e)) => match &*e.kind {
                 ExprKind::Int(s) => s.replace('_', "").parse::<u32>().unwrap_or(1),
                 _ => 1,

@@ -5404,8 +5404,12 @@ impl TbirRandomizeEmitter {
                     })
                 })
                 .unwrap_or(ConstraintOperandSignedness::Unsigned),
+            // Same lookup order as the value emitter: a target field first,
+            // then a captured record field, whose value is sign-encoded
+            // from the same metadata.
             ExprKind::Field { .. } => expr_field_path(e, target_root)
                 .and_then(|f| field_info.get(&f))
+                .or_else(|| self.captured_scalar_field_info(e, target_root))
                 .map(|f| {
                     if f.signed {
                         ConstraintOperandSignedness::Signed

@@ -534,7 +534,7 @@ fn emit_function_with_tseq_calls(
                         if let Some(context) = cx.bindings.run_context {
                             writeln!(
                                 out,
-                                "{pad3}harc_wait_clock_cycles({context}, \"{}\", (long long)({n}));",
+                                "{pad3}if (!harc_wait_clock_cycles({context}, \"{}\", (long long)({n}))) throw harc_rt::HarcFatalAbort{{}};",
                                 super::expr::escape_c(&c.name)
                             )
                             .ok();
@@ -545,7 +545,7 @@ fn emit_function_with_tseq_calls(
                             // simulated time edge-by-edge until the named
                             // clock has seen N more rising edges, then run
                             // the checkers.
-                            emit_local_qualified_clock_wait(out, &pad3, c.index, &n);
+                            emit_local_qualified_clock_wait(out, &pad3, c.index, &n, true);
                         }
                     }
                 }
@@ -561,7 +561,12 @@ fn emit_function_with_tseq_calls(
                     .run_context
                     .map(|context| format!("harc_tseq_tick({context})"))
                     .unwrap_or_else(|| "tick()".to_string());
-                writeln!(out, "{pad3}for (int64_t _w = 0; _w < {n}; _w++) {tick};").ok();
+                writeln!(
+                    out,
+                    "{pad3}for (int64_t _w = 0; _w < {n}; _w++) {}",
+                    fatal_guarded_tick(&tick)
+                )
+                .ok();
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::WaitTimePs(ps, b) => {
@@ -1861,14 +1866,20 @@ fn emit_tseq_impl(
                 let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
                 writeln!(
                     out,
-                    "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) tick();"
+                    "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) {}",
+                    fatal_guarded_tick("tick()")
                 )
                 .ok();
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::WaitUntil { preds, mode, succ } => {
                 let cond = preds_cpp(&cx, preds, *mode)?;
-                writeln!(out, "{pad3}while (!({cond})) tick();").ok();
+                writeln!(
+                    out,
+                    "{pad3}while (!({cond})) {}",
+                    fatal_guarded_tick("tick()")
+                )
+                .ok();
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
             Terminator::WaitTimePs(ps, b) => {
@@ -2506,7 +2517,31 @@ fn scalar_sink_expr_cpp(
     }
 }
 
-fn emit_local_qualified_clock_wait(out: &mut String, pad: &str, clock_index: usize, cycles: &str) {
+/// Body of a synchronous wait loop (`tick()` per cycle or per poll) in a
+/// context whose caller runs inside a coroutine. Once a service raises
+/// fatal, `tick()` no longer advances time, so an unguarded loop would
+/// either fall through to its successor in the fatal cycle (cycle waits)
+/// or spin forever (polling waits). Checking before each tick keeps a wait
+/// that completes on the fatal edge and aborts one that still owes time
+/// (spec §7.7), as a positive wall-clock wait does.
+fn fatal_guarded_tick(tick: &str) -> String {
+    format!("{{ if (_fatal) throw harc_rt::HarcFatalAbort{{}}; {tick}; }}")
+}
+
+/// `abort_on_fatal`: a fatal ends the wait loop early; with edges still
+/// owed, the caller's successor must not run (spec §7.7 aborts the test
+/// at end of the current cycle), so after the usual checker pass the wait
+/// throws `HarcFatalAbort` like a positive wall-clock wait. Zero waits and
+/// waits whose last edge lands in the fatal cycle still reach their
+/// successor. Test hooks pass `false`: they fire in synchronous callback
+/// dispatch, outside the coroutine that catches the abort.
+fn emit_local_qualified_clock_wait(
+    out: &mut String,
+    pad: &str,
+    clock_index: usize,
+    cycles: &str,
+    abort_on_fatal: bool,
+) {
     writeln!(
         out,
         "{pad}{{ if (_harc_actor_tick_due) {{ _harc_advance_actors(); _harc_actor_tick_due = false; }} uint64_t _remaining = (uint64_t)({cycles}); while (_remaining > 0 && !_fatal) {{"
@@ -2528,7 +2563,12 @@ fn emit_local_qualified_clock_wait(out: &mut String, pad: &str, clock_index: usi
         "{pad}{INDENT}if (cycle_count != _before_cycle) _harc_advance_actors();"
     )
     .ok();
-    writeln!(out, "{pad}}} for (auto& _c : _checkers) _c(); }}").ok();
+    let abort = if abort_on_fatal {
+        " if (_remaining > 0) throw harc_rt::HarcFatalAbort{};"
+    } else {
+        ""
+    };
+    writeln!(out, "{pad}}} for (auto& _c : _checkers) _c();{abort} }}").ok();
 }
 
 fn event_payload_ir_type(payload: crate::ir::EventPayload) -> IrType {
@@ -5855,7 +5895,8 @@ pub(super) fn emit_method(
                 let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
                 writeln!(
                     out,
-                    "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) tick();"
+                    "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) {}",
+                    fatal_guarded_tick("tick()")
                 )
                 .ok();
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
@@ -5863,7 +5904,12 @@ pub(super) fn emit_method(
             Terminator::WaitUntil { preds, mode, succ } => {
                 // v1's synchronous polling loop.
                 let cond = preds_cpp(&cx, preds, *mode)?;
-                writeln!(out, "{pad3}while (!({cond})) tick();").ok();
+                writeln!(
+                    out,
+                    "{pad3}while (!({cond})) {}",
+                    fatal_guarded_tick("tick()")
+                )
+                .ok();
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
             Terminator::WaitTimePs(ps, b) => {
@@ -5964,8 +6010,8 @@ pub(super) fn emit_method(
                 writeln!(out, "{pad3}uint64_t _wu_start = cycle_count;").ok();
                 writeln!(
                     out,
-                    "{pad3}while (!({cond}) && (cycle_count - _wu_start) < _wu_budget) \
-                     tick();"
+                    "{pad3}while (!({cond}) && (cycle_count - _wu_start) < _wu_budget) {}",
+                    fatal_guarded_tick("tick()")
                 )
                 .ok();
                 writeln!(
@@ -7378,7 +7424,8 @@ fn emit_component_fn_lambda(
                 let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
                 writeln!(
                     out,
-                    "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) {tick_call};"
+                    "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) {}",
+                    fatal_guarded_tick(&tick_call)
                 )
                 .ok();
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
@@ -7388,7 +7435,7 @@ fn emit_component_fn_lambda(
                     let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
                     writeln!(
                         out,
-                        "{pad3}harc_wait_clock_cycles(ctx, \"{}\", (long long)({n}));",
+                        "{pad3}if (!harc_wait_clock_cycles(ctx, \"{}\", (long long)({n}))) throw harc_rt::HarcFatalAbort{{}};",
                         super::expr::escape_c(&clock.name)
                     )
                     .ok();
@@ -7409,13 +7456,18 @@ fn emit_component_fn_lambda(
                             ))
                         })?;
                     let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
-                    emit_local_qualified_clock_wait(out, &pad3, index, &n);
+                    emit_local_qualified_clock_wait(out, &pad3, index, &n, true);
                 }
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::WaitUntil { preds, mode, succ } => {
                 let cond = preds_cpp(&cx, preds, *mode)?;
-                writeln!(out, "{pad3}while (!({cond})) {tick_call};").ok();
+                writeln!(
+                    out,
+                    "{pad3}while (!({cond})) {}",
+                    fatal_guarded_tick(&tick_call)
+                )
+                .ok();
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
             Terminator::WaitTimePs(ps, b) => {
@@ -7514,8 +7566,8 @@ fn emit_component_fn_lambda(
                 writeln!(out, "{pad3}uint64_t _wu_start = cycle_count;").ok();
                 writeln!(
                     out,
-                    "{pad3}while (!({cond}) && (cycle_count - _wu_start) < _wu_budget) \
-                     {tick_call};"
+                    "{pad3}while (!({cond}) && (cycle_count - _wu_start) < _wu_budget) {}",
+                    fatal_guarded_tick(&tick_call)
                 )
                 .ok();
                 writeln!(
@@ -8477,6 +8529,15 @@ fn emit_log_call(
     Ok(())
 }
 
+/// The fatal flag as spelled inside a test-hook body: the common layout
+/// reaches it through the run context, the default layout's hook lambdas
+/// capture the runtime's `_fatal`.
+fn hook_fatal_flag(run_context: Option<&str>) -> String {
+    run_context
+        .map(|context| format!("{context}.fatal"))
+        .unwrap_or_else(|| "_fatal".to_string())
+}
+
 /// Emit one closure-hook body (`FunctionKind::TestHook`) as a free lambda
 /// named by `func.name`. Structurally identical to a transactor method
 /// (synchronous loop-switch, `tick()`-based waits) since a hook fires inside
@@ -8740,9 +8801,14 @@ pub(super) fn emit_test_hook(
                         .run_context
                         .map(|context| format!("harc_tseq_tick({context})"))
                         .unwrap_or_else(|| "tick()".to_string());
+                    // A hook runs in synchronous dispatch, where nothing
+                    // catches `HarcFatalAbort`; once fatal stops time the
+                    // wait just ends instead (a polling wait would
+                    // otherwise spin forever).
+                    let fatal = hook_fatal_flag(render.flow.run_context);
                     writeln!(
                         out,
-                        "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}); _w++) {tick};"
+                        "{pad3}for (int64_t _w = 0; _w < (int64_t)({n}) && !{fatal}; _w++) {tick};"
                     )
                     .ok();
                 }
@@ -8784,7 +8850,7 @@ pub(super) fn emit_test_hook(
                             ))
                         })?;
                     let n = bounded_count_expr_cpp(&cx, n, i64::MAX as u64)?;
-                    emit_local_qualified_clock_wait(out, &pad3, index, &n);
+                    emit_local_qualified_clock_wait(out, &pad3, index, &n, false);
                 }
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
@@ -8798,7 +8864,12 @@ pub(super) fn emit_test_hook(
                         .run_context
                         .map(|context| format!("harc_tseq_tick({context})"))
                         .unwrap_or_else(|| "tick()".to_string());
-                    writeln!(out, "{pad3}while (!({cond})) {tick};").ok();
+                    // A hook runs in synchronous dispatch, where nothing
+                    // catches `HarcFatalAbort`; once fatal stops time the
+                    // wait just ends instead (a polling wait would
+                    // otherwise spin forever).
+                    let fatal = hook_fatal_flag(render.flow.run_context);
+                    writeln!(out, "{pad3}while (!({cond}) && !{fatal}) {tick};").ok();
                 }
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
