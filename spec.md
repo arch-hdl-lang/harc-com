@@ -1334,6 +1334,8 @@ Compiles to one coroutine per branch with explicit suspend points at each cycle 
 - `while <cond> ... end while` — pre-tested loop; the body re-checks `cond` on each iteration.
 - `loop ... end loop` — infinite; exit via `break` (typically inside an `if`).
 
+A `for` range's bounds and a `repeat` count are evaluated **once, on loop entry**; assignments in the body to variables they mention (e.g. `for i in 0 .. n … n = 0`) do not change the iteration count. Only a `while` condition is re-evaluated on every iteration.
+
 `break` exits the innermost enclosing loop; `continue` skips to its next iteration. Both are statements in their own right and lower to C++ `break` / `continue`, so they also work inside `for` / `repeat` / `loop` bodies.
 
 ```
