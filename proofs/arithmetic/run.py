@@ -144,7 +144,7 @@ def main():
     runtime = ROOT / "runtime/harc_thread_rt.h"
     source = runtime.read_text()
     inputs = [runtime, ROOT / "runtime/harc_random_rt.h", ROOT / "src/numeric_semantics.rs", ROOT / "src/ast.rs",
-              ROOT / "src/ir/lower/mod.rs", ROOT / "src/codegen/native/constraint_solver_renderer.rs",
+              ROOT / "src/ir/lower/mod.rs",
               ROOT / "src/codegen/randomize_renderer.rs", Path(__file__),
               *(ROOT / f"proofs/arithmetic/{name}" for name in ("u128.cpp", "wide.cpp", "rng.cpp", "kani.rs"))]
     report = {"scope": "See docs/formal-arithmetic.md for domains and exclusions",
