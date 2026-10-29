@@ -61,9 +61,9 @@ class Fixture(unittest.TestCase):
     def hunt(self, n=1):
         return dict(self.bound('hunt', n), previous_run_id=None, previous_sha256=None,
                     scopes=[dict(id=str(i), area=area, investigator='agent' + str(i), complete=True,
-                                 summary='completed scoped review') for i, area in enumerate(sorted(v.AREAS))],
+                                 summary='completed scoped review ' + str(n)) for i, area in enumerate(sorted(v.AREAS))],
                     candidates=[], review=dict(accepted=True, reviewer='independent-reviewer',
-                                               attestation='reviewed ledger and scopes'))
+                                               attestation='reviewed ledger and scopes of hunt ' + str(n)))
 
     def mutant(self, i, area, status='killed'):
         log = self.tmp / 'mutants' / (str(i) + '.log')
@@ -546,6 +546,20 @@ class HuntTests(Fixture):
     def test_campaign_threshold(self):
         evidence = self.evidence(); del evidence[5]
         self.assertNotReady('hunt: missing campaigns', evidence=evidence)
+
+    def test_copied_hunt_is_not_another_hunt(self):
+        evidence = self.evidence()
+        for i in (4, 5):
+            evidence[i] = dict(copy.deepcopy(evidence[3]), run_id='hunt-copy-' + str(i), completed_at=evidence[i]['completed_at'])
+        self.chain(evidence[3:6])
+        self.assertNotReady('hunt: hunt campaigns have identical scopes, candidates and review', evidence=evidence)
+
+    def test_hunts_differing_only_in_review_are_distinct(self):
+        evidence = self.evidence()
+        for i in (4, 5):
+            evidence[i].update(scopes=copy.deepcopy(evidence[3]['scopes']), candidates=[])
+        self.chain(evidence[3:6])
+        self.assertReady(evidence=evidence)
 
     def test_omitted_hunt_breaks_chain(self):
         hunts = self.chain([self.hunt(i) for i in range(1, 6)])

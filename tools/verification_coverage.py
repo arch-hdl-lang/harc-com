@@ -554,6 +554,10 @@ def validate_campaigns(kind, records, validator, minimum, root, inputs, ledger=N
                     'campaigns not consecutive in the ledger')
         require(ledger is not None, 'missing campaign ledger')
         validate_ledger(records, read_ledger(ledger))
+    if kind == 'hunt':
+        # A hunt copied under a new run ID is not another hunt.
+        contents = [canonical([r['scopes'], r['candidates'], r['review']]) for r in records]
+        require(len(contents) == len(set(contents)), 'hunt campaigns have identical scopes, candidates and review')
     if kind == 'fuzz':
         for i, a in enumerate(records):
             for b in records[i + 1:]:

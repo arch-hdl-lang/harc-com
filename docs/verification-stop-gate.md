@@ -207,7 +207,10 @@ reports fail. A proven fixed bug also makes that hunt unclean and resets the
 consecutive clean count. The record's `review` has `accepted: true`, a
 `reviewer` outside the ten investigators and nonempty `attestation`. The three
 most recent hunts in the hunt ledger must be chained, source-current, clean and
-reviewed. IDs attest
+reviewed, and no two of them may have identical `scopes`, `candidates` and
+`review` together: a hunt copied under a new run ID is not another hunt. This
+catches copies, not near-copies; that the hunts were separate work remains the
+coordinator's attestation. IDs attest
 independence; the checker cannot establish who operated an account or whether
 an evidence description is truthful. Scope summaries and candidate evidence
 are free text and are not reparsed.
@@ -217,7 +220,7 @@ are free text and are not reparsed.
 `READY` requires every registered required check to pass with current sources,
 adequate broad mutation detection, the last three fuzz campaigns in the ledger
 chained, flat and distinct, and the last three hunts in the ledger chained,
-clean, ten-scope and independently reviewed. Missing, stale,
+distinct, clean, ten-scope and independently reviewed. Missing, stale,
 blocked, malformed or unrecognized evidence keeps it false.
 
 The report lists which contracts have all their checks passing (`contracts`),
