@@ -2516,7 +2516,10 @@ fn scalar_sink_expr_cpp(
 /// elapsed — including one landing exactly on the fatal edge — completes
 /// and its successor runs in that cycle (the test still aborts at the end
 /// of it); a wait the fatal interrupted with time still owed throws. A
-/// zero wait never advances and always reaches its successor.
+/// positive wait that BEGINS after the fatal owes its whole duration, so it
+/// throws before advancing — checked explicitly rather than inferred from
+/// `now < target`, which holds only if the scheduler refused to advance.
+/// A zero wait never advances and always reaches its successor.
 fn emit_wall_clock_wait(
     out: &mut String,
     pad: &str,
@@ -2528,7 +2531,8 @@ fn emit_wall_clock_wait(
     if ps > 0 {
         writeln!(
             out,
-            "{pad}{{ unsigned __int128 _harc_wall_target = {now} + {ps}; {}; \
+            "{pad}{{ if (_fatal) throw harc_rt::HarcFatalAbort{{}}; \
+             unsigned __int128 _harc_wall_target = {now} + {ps}; {}; \
              if (_fatal && {now} < _harc_wall_target) throw harc_rt::HarcFatalAbort{{}}; }}",
             advance(&format!("{now} + {ps}"))
         )

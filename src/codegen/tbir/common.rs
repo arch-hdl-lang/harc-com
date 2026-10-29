@@ -6529,7 +6529,9 @@ fn emit_common_tseq_tick(out: &mut String, plan: &CommonCppPlan) {
     )
     .ok();
     writeln!(out, "{INDENT}if (ctx.clocks.empty()) {{").ok();
-    writeln!(out, "{INDENT}{INDENT}if (target_ps <= ctx.now_ps) return;").ok();
+    // Time does not advance once a fatal has been raised, as on the
+    // clocked path below (spec §7.7).
+    writeln!(out, "{INDENT}{INDENT}if (target_ps <= ctx.now_ps || ctx.fatal) return;").ok();
     writeln!(out, "{INDENT}{INDENT}ctx.now_ps = target_ps;").ok();
     writeln!(out, "{INDENT}{INDENT}ctx.dut->eval();").ok();
     writeln!(out, "{INDENT}{INDENT}ctx.trace.set_timing(ctx.now_ps, \"\", (uint64_t)ctx.cycle_count);").ok();

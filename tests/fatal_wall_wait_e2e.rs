@@ -695,3 +695,98 @@ fn completed_wall_wait_on_fatal_edge_runs_its_successor_in_both_layouts() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Clockless testbench: a wall-clock wait that BEGINS after a fatal owes
+/// its whole duration, so it must abort rather than advance time and run
+/// its successor (spec §7.7). The clockless scheduler advanced `now_ps`
+/// unconditionally, so a "time still owed" check after the advance could
+/// not see it.
+fn clockless_fixture(severity: &str, body: &str) -> String {
+    format!(
+        r#"testbench Tb
+    dut : Top
+    function helper()
+        wait 100ns
+        log(info, "HELPER_AFTER")
+    end function helper
+end testbench Tb
+impl W for Tb
+    run
+        dut.rst = 0
+        dut.en = 1
+        log({severity}, "RAISED")
+{body}
+    end run
+end impl W
+"#
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn clockless_wall_wait_after_fatal_aborts_in_both_layouts() {
+    if Command::new("verilator")
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        if std::env::var_os("HARC_REQUIRE_VERILATOR").is_some() {
+            panic!("verilator required");
+        }
+        eprintln!("SKIP clockless_wall_wait_after_fatal: verilator not found");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "harc_fatal_wall_wait_clockless_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create test directory");
+
+    let run_level = "        wait 100ns\n        log(info, \"RUN_AFTER\")";
+    let helper = "        helper()\n        log(info, \"CALLER_AFTER\")";
+    let layouts: [(&str, &[&str]); 2] = [
+        ("default", &[]),
+        (
+            "common",
+            &["--cpp-split", "tests", "--cpp-split-layout", "common"],
+        ),
+    ];
+    for (layout, extra) in layouts {
+        let run = |name: &str, severity: &str, body: &str| {
+            run_case_bounded(
+                &dir,
+                &format!("{layout}_{name}"),
+                &clockless_fixture(severity, body),
+                extra,
+            )
+        };
+        // The common layout rejects a run-level wall-clock wait at compile
+        // time; it is covered through the helper only.
+        let cases: &[(&str, &str)] = if layout == "default" {
+            &[("run", run_level), ("helper", helper)]
+        } else {
+            &[("helper", helper)]
+        };
+        for (name, body) in cases {
+            let (ok, log) = run(name, "fatal", body);
+            assert!(!ok, "{layout} {name}: fatal run passed:\n{log}");
+            assert!(
+                !log.contains("RUN_AFTER")
+                    && !log.contains("HELPER_AFTER")
+                    && !log.contains("CALLER_AFTER"),
+                "{layout} {name}: a wait begun after fatal ran its successor:\n{log}"
+            );
+
+            // Control: without a fatal the same wait completes.
+            let (ok, log) = run(&format!("{name}_info"), "info", body);
+            assert!(ok, "{layout} {name}_info: nonfatal run failed:\n{log}");
+            assert!(
+                log.contains("RUN_AFTER") || log.contains("CALLER_AFTER"),
+                "{layout} {name}_info: wait did not complete:\n{log}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
