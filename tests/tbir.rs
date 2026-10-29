@@ -21246,7 +21246,7 @@ fn tbir_emit_helper_mix() {
         "static uint64_t harc_helper_double_it(uint64_t x);",
         "static uint64_t harc_helper_double_it(uint64_t x) {",
         "harc_helper_double_it(__t",
-        "for (int64_t _w = 0; _w < 1; _w++) tick();",
+        "for (int64_t _w = 0; _w < 1; _w++) { if (_fatal) throw harc_rt::HarcFatalAbort{}; tick(); }",
     ] {
         assert!(cpp.contains(marker), "missing marker `{marker}` in:\n{cpp}");
     }
@@ -21369,7 +21369,8 @@ fn verifier_catches_bad_wait_clock() {
 /// eval_clocks_until loop: advance to whichever clock's next edge is
 /// sooner until the named clock has seen N more rising edges, service
 /// actor schedulers on each primary edge without re-entering the active
-/// run slot, then run the checkers.
+/// run slot, then run the checkers. A fatal that ended the loop with edges
+/// still owed aborts the run after that checker pass.
 #[test]
 fn tbir_emit_wait_on_clock_inline_loop() {
     let merged = merged_src(WAIT_ON_CLOCK_SRC);
@@ -21387,7 +21388,8 @@ fn tbir_emit_wait_on_clock_inline_loop() {
         "uint64_t _advanced = clocks_[1].rising_count - _before_rising;",
         "if (_advanced > 0) _remaining = _advanced >= _remaining ? 0 : _remaining - _advanced;",
         "if (cycle_count != _before_cycle) _harc_advance_actors();",
-        "} for (auto& _c : _checkers) _c(); }",
+        "} for (auto& _c : _checkers) _c(); \
+         if (_remaining > 0) throw harc_rt::HarcFatalAbort{}; }",
     ] {
         assert!(
             cpp.contains(marker),
@@ -26688,7 +26690,7 @@ fn transactor_method_timed_wait_lowers_to_the_sync_poll_loop() {
     for needle in [
         "uint64_t _wu_budget = (uint64_t)(",
         "uint64_t _wu_start = cycle_count;",
-        ") < _wu_budget) tick();",
+        ") < _wu_budget) { if (_fatal) throw harc_rt::HarcFatalAbort{}; tick(); }",
         "ctx.errors++;",
     ] {
         assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
@@ -30796,6 +30798,51 @@ fn regblock_field_resets_compose_into_mirror_default() {
         error.to_string().contains("field `MODE`")
             && error.to_string().contains("does not fit its 3-bit width"),
         "unexpected field reset diagnostic: {error}"
+    );
+}
+
+/// `UInt<N>`/`SInt<N>` are exactly `N` bits, like `uint<N>`/`sint<N>`
+/// (spec §2). A capitalized field type must lower identically to its
+/// lowercase spelling — width, reset fit, overlay mask and overflow check
+/// all come from the same field width.
+#[test]
+fn regblock_capitalized_field_types_lower_like_lowercase() {
+    let fixture = fixture("regblock_fields_test.harc");
+    let field = "field MODE : uint<3> @ 4  reset 0";
+    assert!(fixture.contains(field), "fixture field line moved");
+    let lower = |ty: &str, reset: &str| {
+        lower_with_stdlib_bus_src(
+            &fixture.replace(field, &format!("field MODE : {ty} @ 4  reset {reset}")),
+        )
+    };
+    for (lowercase, capitalized) in [("uint<3>", "UInt<3>"), ("sint<3>", "SInt<3>")] {
+        let expected = format!("{}", lower(lowercase, "3").expect("lowercase field lowers"));
+        let actual = format!(
+            "{}",
+            lower(capitalized, "3").expect("capitalized field lowers")
+        );
+        assert_eq!(
+            actual, expected,
+            "{capitalized} must lower like {lowercase}"
+        );
+    }
+    let reset = lower("UInt<3>", "5").expect("a 3-bit reset fits UInt<3>");
+    let record = reset
+        .records
+        .iter()
+        .find(|record| record.name == "DmaRegs")
+        .expect("regblock mirror record");
+    assert_eq!(
+        record.field("DMACR").and_then(|field| field.default),
+        Some(0x50)
+    );
+
+    let overflow = fixture.replace(field, "field MODE : UInt<32> @ 4  reset 0");
+    let error = lower_with_stdlib_bus_src(&overflow)
+        .expect_err("a capitalized field wider than its register must be rejected");
+    assert!(
+        error.to_string().contains("exceeds the register width"),
+        "unexpected field overflow diagnostic: {error}"
     );
 }
 
@@ -35978,7 +36025,7 @@ end impl T"#,
     );
     assert!(
         cpp.contains("uint64_t _wu_start = cycle_count;")
-            && cpp.contains(") < _wu_budget) tick();"),
+            && cpp.contains(") < _wu_budget) { if (_fatal) throw harc_rt::HarcFatalAbort{}; tick(); }"),
         "a component method must render the same sync poll loop; got:\n{cpp}"
     );
 }

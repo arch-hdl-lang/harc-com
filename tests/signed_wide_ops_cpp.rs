@@ -44,6 +44,9 @@ impl I for T
         let q65 : sint<65> = -8 / 3
         let zero100 : sint<100> = 0
         assert q65 + zero100 == -2 else fail("mixed signed add")
+        let q129 : sint<129> = -8 / 3
+        let zero160 : sint<160> = 0
+        assert q129 + zero160 == -2 else fail("mixed HarcWide signed add")
         wait 1 cycle
     end run
 end impl I
@@ -86,5 +89,11 @@ fn signed_wide_operators_route_to_twos_complement_helpers() {
     assert!(
         cpp.contains("harc_sext_u128"),
         "mixed signed scalar arithmetic must sign-extend to its common width:\n{cpp}"
+    );
+    // `q129 + zero160`: the 129-bit operand is sign-extended to the
+    // 160-bit common width before the HarcWide<5> operator.
+    assert!(
+        cpp.contains("harc_wide_sext<5>(") && cpp.contains(", 129, 160)"),
+        "mixed signed HarcWide arithmetic must sign-extend to its common width:\n{cpp}"
     );
 }

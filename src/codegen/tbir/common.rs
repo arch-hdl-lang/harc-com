@@ -5875,7 +5875,7 @@ fn render_common_interface_template(plan: &CommonCppPlan) -> Result<String, Emit
     .ok();
     writeln!(
         out,
-        "void harc_wait_clock_cycles(HarcTestContext& ctx, const char* clock, long long cycles);"
+        "bool harc_wait_clock_cycles(HarcTestContext& ctx, const char* clock, long long cycles);"
     )
     .ok();
     writeln!(out, "void harc_tseq_tick(HarcTestContext& ctx);").ok();
@@ -6541,7 +6541,10 @@ fn emit_common_tseq_tick(out: &mut String, plan: &CommonCppPlan) {
     writeln!(out, "{INDENT}{INDENT}if (ctx.trace_time <= ctx.now_ps) ctx.trace_time = ctx.now_ps + 1;").ok();
     writeln!(out, "{INDENT}{INDENT}return;").ok();
     writeln!(out, "{INDENT}}}").ok();
-    writeln!(out, "{INDENT}while (ctx.now_ps < target_ps) {{").ok();
+    // Complete the current edge (including post-eval services), then stop
+    // before any later edge once a service raises fatal, as the default
+    // layout's `eval_clocks_until` does.
+    writeln!(out, "{INDENT}while (ctx.now_ps < target_ps && !ctx.fatal) {{").ok();
     writeln!(out, "{INDENT}{INDENT}unsigned __int128 next = target_ps;").ok();
     writeln!(out, "{INDENT}{INDENT}for (auto& clock : ctx.clocks) if (clock.next_edge_ps < next) next = clock.next_edge_ps;").ok();
     writeln!(out, "{INDENT}{INDENT}ctx.now_ps = next;").ok();
@@ -6598,15 +6601,19 @@ fn emit_common_tseq_tick(out: &mut String, plan: &CommonCppPlan) {
     writeln!(out).ok();
     writeln!(
         out,
-        "void harc_wait_clock_cycles(HarcTestContext& ctx, const char* name, long long cycles) {{"
+        "bool harc_wait_clock_cycles(HarcTestContext& ctx, const char* name, long long cycles) {{"
     )
     .ok();
-    writeln!(out, "{INDENT}if (cycles <= 0) return;").ok();
+    // Returns false when a fatal ended the wait with edges still owed
+    // (after the same checker pass as a completed wait); run and callable
+    // callers then abort instead of reaching their successor, while test
+    // hooks ignore the result (see `emit_local_qualified_clock_wait`).
+    writeln!(out, "{INDENT}if (cycles <= 0) return true;").ok();
     writeln!(out, "{INDENT}size_t index = ctx.clocks.size();").ok();
     writeln!(out, "{INDENT}for (size_t i = 0; i < ctx.clocks.size(); ++i) if (std::strcmp(ctx.clocks[i].name, name) == 0) {{ index = i; break; }}").ok();
     writeln!(
         out,
-        "{INDENT}if (index == ctx.clocks.size()) {{ ctx.errors++; ctx.fatal = true; return; }}"
+        "{INDENT}if (index == ctx.clocks.size()) {{ ctx.errors++; ctx.fatal = true; return false; }}"
     )
     .ok();
     writeln!(out, "{INDENT}uint64_t remaining = (uint64_t)cycles;").ok();
@@ -6634,6 +6641,7 @@ fn emit_common_tseq_tick(out: &mut String, plan: &CommonCppPlan) {
     .ok();
     writeln!(out, "{INDENT}}}").ok();
     super::runtime::checker_callbacks(out, 1, "ctx._checkers");
+    writeln!(out, "{INDENT}return remaining == 0;").ok();
     writeln!(out, "}}").ok();
     writeln!(out).ok();
     writeln!(out, "void harc_tseq_tick(HarcTestContext& ctx) {{").ok();

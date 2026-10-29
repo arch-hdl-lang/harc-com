@@ -309,3 +309,72 @@ fn native_signed_capture_rejects_large_positive_narrowing() {
     assert!(!output.status.success(), "large positive unexpectedly solved: {log}");
     assert!(log.contains("constraint UNSAT"), "expected UNSAT diagnostic: {log}");
 }
+
+const CAPTURED_COMPARISON: &str = r#"
+transaction Cap
+    s : sint<8>
+end transaction Cap
+transaction UCap
+    u : uint<8>
+end transaction UCap
+transaction Req
+    x : uint<8>
+    s : sint<8>
+end transaction Req
+test CapturedComparison
+    let dut : Top
+    run
+        let c : Cap
+        c.s = -1
+        let r : Req
+        blocking randomize(r) with
+            c.s < 0
+            r.x == 3
+        end randomize
+        assert r.x == 3 else fail("captured signed field compared as signed")
+        blocking randomize(r) with
+            r.s > c.s
+            r.s < 1
+        end randomize
+        assert r.s == 0 else fail("target compared against captured signed field")
+        let uc : UCap
+        uc.u = 255
+        blocking randomize(r) with
+            uc.u > 0
+            r.x == 4
+        end randomize
+        assert r.x == 4 else fail("captured unsigned field stays unsigned")
+    end run
+end test CapturedComparison
+"#;
+
+/// A captured record field's value is sign-encoded from its declared type,
+/// so its relational operators must be signed too: `c.s < 0` with
+/// `c.s = -1` is satisfiable, and `r.s > c.s` admits `r.s == 0`.
+#[test]
+fn native_signed_capture_compares_captured_fields_as_signed() {
+    let outdir = std::env::temp_dir().join(format!(
+        "harc_native_signed_capture_compare_{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&outdir);
+    fs::create_dir_all(&outdir).expect("create output directory");
+    let source = outdir.join("compare.harc");
+    fs::write(&source, CAPTURED_COMPARISON).expect("write comparison fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_harc"))
+        .args(["sim", "--sv"])
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/dut/top_counter.sv"))
+        .arg(&source)
+        .args(["--top", "Top", "--jobs", "2", "--outdir"])
+        .arg(&outdir)
+        .env("HARC_NO_LEARN", "1")
+        .output()
+        .expect("run comparison fixture");
+    assert!(
+        output.status.success(),
+        "comparison fixture failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ALL TESTS PASSED"));
+}

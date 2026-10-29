@@ -116,6 +116,59 @@ impl SignedWideOpsTest for SignedWideTb
         assert (q65 | zero100) == -2 else fail("mixed-width signed or")
         assert (q65 ^ zero100) == -2 else fail("mixed-width signed xor")
 
+        // Boundary matrix for implicit signed normalization. Division
+        // produces a masked negative value whose logical width is retained
+        // only by the IR; the native carrier must be sign-extended before
+        // mixed-width arithmetic. 129 and 160 share five carrier words;
+        // 256 uses eight words. Both operand orders and non-negative
+        // controls cover the same and different word-count paths.
+        let q128 : sint<128> = -8 / 3
+        let q129 : sint<129> = -8 / 3
+        let q160 : sint<160> = -8 / 3
+        let q256 : sint<256> = -8 / 3
+        let p129 : sint<129> = 8 / 3
+        let p256 : sint<256> = 8 / 3
+        let zero129 : sint<129> = 0
+        let zero160 : sint<160> = 0
+        let zero256 : sint<256> = 0
+        let one160 : sint<160> = 1
+        assert q128 + zero160 == -2 else fail("signed128 to signed160 add")
+        assert zero160 + q128 == -2 else fail("signed128 to signed160 add reversed")
+        assert q129 + zero160 == -2 else fail("signed129 to signed160 add")
+        assert zero160 + q129 == -2 else fail("signed129 to signed160 add reversed")
+        assert q129 - zero160 == -2 else fail("signed129 to signed160 sub")
+        assert zero160 - q129 == 2 else fail("signed129 to signed160 sub reversed")
+        assert q129 * one160 == -2 else fail("signed129 to signed160 mul")
+        assert one160 * q129 == -2 else fail("signed129 to signed160 mul reversed")
+        assert (q129 | zero160) == -2 else fail("signed129 to signed160 or")
+        assert (zero160 | q129) == -2 else fail("signed129 to signed160 or reversed")
+        assert (q129 ^ zero160) == -2 else fail("signed129 to signed160 xor")
+        assert (zero160 ^ q129) == -2 else fail("signed129 to signed160 xor reversed")
+        assert q129 + zero256 == -2 else fail("signed129 to signed256 add")
+        assert zero256 + q129 == -2 else fail("signed129 to signed256 add reversed")
+        assert q160 + zero256 == -2 else fail("signed160 to signed256 add")
+        assert zero256 + q160 == -2 else fail("signed160 to signed256 add reversed")
+        assert q256 + zero129 == -2 else fail("signed256 to signed129 add")
+        assert zero129 + q256 == -2 else fail("signed256 to signed129 add reversed")
+        assert q256 - zero129 == -2 else fail("signed256 to signed129 sub")
+        assert zero129 - q256 == 2 else fail("signed256 to signed129 sub reversed")
+        assert q256 * one100 == -2 else fail("signed256 to signed100 mul")
+        assert one100 * q256 == -2 else fail("signed100 to signed256 mul reversed")
+        assert (q256 | zero129) == -2 else fail("signed256 to signed129 or")
+        assert (zero129 | q256) == -2 else fail("signed129 to signed256 or reversed")
+        assert (q256 ^ zero129) == -2 else fail("signed256 to signed129 xor")
+        assert (zero129 ^ q256) == -2 else fail("signed129 to signed256 xor reversed")
+        assert p129 + zero256 == 2 else fail("nonnegative signed129 control")
+        assert zero256 + p129 == 2 else fail("nonnegative signed129 control reversed")
+        assert p256 + zero129 == 2 else fail("nonnegative signed256 control")
+        assert zero129 + p256 == 2 else fail("nonnegative signed256 control reversed")
+        // The conditional shares the same normalization: the narrower
+        // signed arm is sign-extended to the common carrier width.
+        let pick : bool = true
+        assert (pick ? q129 : zero256) == -2 else fail("signed129 ternary arm widened to 256")
+        assert (pick ? q129 : zero160) == -2 else fail("signed129 ternary arm widened to 160")
+        assert (pick ? zero256 : q129) == 0 else fail("signed256 ternary arm control")
+
         // --- signed equality with a negative literal (padding-safe) ---
         let e : sint<129> = -4
         assert e == -4 else fail("sint129 == negative literal")
