@@ -154,6 +154,11 @@ impl Parser {
     }
 
     fn peek2_kind(&self) -> Option<&TokenKind> {
+        self.peek2().map(|t| &t.kind)
+    }
+
+    /// The token after `peek()`, skipping doc tokens.
+    fn peek2(&self) -> Option<&Token> {
         let mut i = self.pos;
         let mut seen = 0;
         while let Some(t) = self.tokens.get(i) {
@@ -162,7 +167,7 @@ impl Parser {
                 continue;
             }
             if seen == 1 {
-                return Some(&t.kind);
+                return Some(t);
             }
             seen += 1;
             i += 1;
@@ -302,6 +307,38 @@ impl Parser {
             Ok(end_tok.span.merge(id.span))
         } else {
             Ok(end_tok.span.merge(kw_tok.span))
+        }
+    }
+
+    /// `end [<name>]` — the `hookable name(...) … end name` closer
+    /// (spec.md, hookable methods). The optional closing name must be
+    /// the hookable's own name and on the same line as `end`; an
+    /// identifier on the next line starts the next item. Any other
+    /// same-line token (`end hookable`, `end function name`) is an error.
+    fn expect_hookable_end(&mut self, name: &str) -> Result<Span, CompileError> {
+        let end_tok = self.expect(TokenKind::End)?;
+        if self.peek().is_none() || self.newline_before_peek(end_tok.span.end_usize()) {
+            return Ok(end_tok.span);
+        }
+        match self.peek_kind() {
+            Some(TokenKind::Ident(_)) => {
+                let id = self.expect_ident()?;
+                if id.name != name {
+                    return Err(CompileError::mismatched_closing(name, &id.name, id.span));
+                }
+                Ok(end_tok.span.merge(id.span))
+            }
+            other => {
+                let found = other.map(|k| k.to_string()).unwrap_or_default();
+                Err(CompileError::unsupported_syntax(
+                    &format!(
+                        "hookable `{name}` must close with `end` or `end {name}`, \
+                         not `end {found}`"
+                    ),
+                    &format!("write `end {name}`"),
+                    end_tok.span.merge(self.peek_span()),
+                ))
+            }
         }
     }
 
@@ -1355,10 +1392,7 @@ impl Parser {
         };
         let body_start = self.peek_span();
         let stmts = self.parse_stmt_list_until_end()?;
-        let end = self.expect_end(TokenKind::End, &name.name).or_else(|_| {
-            // Allow `end <ident>` form (no specific keyword) — rare.
-            Ok::<Span, CompileError>(body_start)
-        })?;
+        let end = self.expect_hookable_end(&name.name)?;
         Ok(HookableMethod {
             name,
             params,
@@ -1376,9 +1410,9 @@ impl Parser {
     /// hook-vector emission and the corresponding fan-out in the
     /// method body. See docs/test-ergonomics.md §3.2.
     ///
-    /// The `end` form accepts both `end function` and `end function
-    /// <name>` (matching the open form), with the same lenient
-    /// fallback as `parse_hookable`.
+    /// The `end` form is `end function [<name>]` (spec.md §1, block
+    /// syntax): an optional closing name must match and sit on the same
+    /// line as `end function`, exactly like a top-level function.
     fn parse_component_function(&mut self) -> Result<HookableMethod, CompileError> {
         let start = self.expect(TokenKind::Function)?.span;
         let name = self.expect_ident()?;
@@ -1391,9 +1425,31 @@ impl Parser {
         };
         let body_start = self.peek_span();
         let stmts = self.parse_stmt_list_until_end()?;
-        let end = self
-            .expect_end(TokenKind::Function, &name.name)
-            .or_else(|_| Ok::<Span, CompileError>(body_start))?;
+        // `end <name>` is the hookable closer, not a function's: say so
+        // rather than reporting `<name>` as a mismatched block kind.
+        if self.check(TokenKind::End) {
+            let end_span = self.peek_span();
+            if let Some(Token {
+                kind: TokenKind::Ident(found),
+                span,
+            }) = self.peek2()
+            {
+                if *found == name.name
+                    && !self.source[end_span.end_usize()..span.start_usize()].contains('\n')
+                {
+                    return Err(CompileError::unsupported_syntax(
+                        &format!(
+                            "component function `{0}` must close with `end function` \
+                             or `end function {0}`, not `end {0}`",
+                            name.name
+                        ),
+                        &format!("write `end function {}`", name.name),
+                        end_span.merge(*span),
+                    ));
+                }
+            }
+        }
+        let end = self.expect_end(TokenKind::Function, &name.name)?;
         Ok(HookableMethod {
             name,
             params,
@@ -2159,12 +2215,35 @@ impl Parser {
                         span,
                     });
                 }
-                self.expect(TokenKind::End)?;
-                if self.check_ident("handshake_channel") {
-                    self.advance();
+                // `end handshake_channel [<name>]` (spec.md, bus): the
+                // keyword is required, and an optional closing name must
+                // match and sit on the same line — a signal named on the
+                // next line is the bus's next item, not the closer.
+                let end_tok = self.expect(TokenKind::End)?;
+                let kw_same_line = !self.newline_before_peek(end_tok.span.end_usize());
+                if !(kw_same_line && self.check_ident("handshake_channel")) {
+                    return Err(CompileError::unsupported_syntax(
+                        &format!(
+                            "handshake_channel `{0}` must close with `end handshake_channel` \
+                             or `end handshake_channel {0}`",
+                            h_name.name
+                        ),
+                        &format!("write `end handshake_channel {}`", h_name.name),
+                        end_tok.span,
+                    ));
                 }
-                if self.check_ident(&h_name.name) {
-                    self.advance();
+                let kw_end = self.advance().expect("checked above").span.end_usize();
+                if matches!(self.peek_kind(), Some(TokenKind::Ident(_)))
+                    && !self.newline_before_peek(kw_end)
+                {
+                    let id = self.expect_ident()?;
+                    if id.name != h_name.name {
+                        return Err(CompileError::mismatched_closing(
+                            &h_name.name,
+                            &id.name,
+                            id.span,
+                        ));
+                    }
                 }
                 let span = h_name.span;
                 handshakes.push(HandshakeChannel {
@@ -5520,5 +5599,132 @@ end function second"#;
         assert_eq!(f.items.len(), 2);
         assert!(matches!(f.items[0], Item::Function(_)));
         assert!(matches!(f.items[1], Item::Function(_)));
+    }
+
+    fn component_member_names(src: &str) -> Vec<String> {
+        let f = parse(src).unwrap_or_else(|e| panic!("should parse: {e:?}\n{src}"));
+        let Item::Agent(component) = &f.items[0] else {
+            panic!("expected agent component");
+        };
+        component
+            .items
+            .iter()
+            .map(|item| match item {
+                ComponentItem::Field(field) => field.name.name.clone(),
+                ComponentItem::Hookable(method) => method.name.name.clone(),
+                other => panic!("unexpected component item: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn component_function_closer_name_must_match() {
+        let ok = "agent Model\n    value : uint<32> = 0\n    function peek() -> uint<32>\n        return value\n    end function peek\n    function poke() -> uint<32>\n        return value\n    end function\nend agent Model";
+        assert_eq!(component_member_names(ok), ["value", "peek", "poke"]);
+
+        let mismatch = parse(&ok.replace("end function peek", "end function other"))
+            .expect_err("a mismatched component function closer must be rejected");
+        assert!(
+            matches!(mismatch, CompileError::MismatchedClosingName { ref expected, ref found, .. }
+                if expected == "peek" && found == "other"),
+            "{mismatch:?}"
+        );
+
+        let wrong_kind = parse(&ok.replace("end function peek", "end agent peek"))
+            .expect_err("a component function closed by another kind must be rejected");
+        assert!(
+            matches!(wrong_kind, CompileError::MismatchedClosingKind { .. }),
+            "{wrong_kind:?}"
+        );
+
+        let bare_name = parse(&ok.replace("end function peek", "end peek"))
+            .expect_err("`end <name>` is the hookable closer, not a function's");
+        let msg = format!("{bare_name}");
+        assert!(
+            msg.contains("component function `peek` must close with `end function`"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn hookable_closer_name_must_match_and_stay_on_its_line() {
+        let ok = "agent Model\n    value : uint<32> = 0\n    hookable a(x: uint<8>)\n        value = 1\n    end\n    hookable b(x: uint<8>)\n        value = 2\n    end b\nend agent Model";
+        // A bare `end` closes `a`; `hookable b` on the next line is the
+        // next member, not swallowed as a closing name.
+        assert_eq!(component_member_names(ok), ["value", "a", "b"]);
+
+        // A bare `end` followed on the next line by a field: the field
+        // name is not the closer.
+        let field_next = "agent Model\n    hookable a(x: uint<8>)\n        x = 1\n    end\n    count : uint<8> = 0\nend agent Model";
+        assert_eq!(component_member_names(field_next), ["a", "count"]);
+
+        let mismatch = parse(&ok.replace("end b\n", "end some_other_name\n"))
+            .expect_err("a mismatched hookable closer must be rejected");
+        assert!(
+            matches!(mismatch, CompileError::MismatchedClosingName { ref expected, ref found, .. }
+                if expected == "b" && found == "some_other_name"),
+            "{mismatch:?}"
+        );
+
+        for closer in ["end function b", "end hookable", "end hookable b"] {
+            let err = parse(&ok.replace("end b\n", &format!("{closer}\n")))
+                .expect_err("only `end` / `end <name>` close a hookable");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("hookable `b` must close with `end` or `end b`"),
+                "{closer}: {msg}"
+            );
+        }
+    }
+
+    fn bus_items(src: &str) -> (Vec<String>, Vec<String>) {
+        let f = parse(src).unwrap_or_else(|e| panic!("should parse: {e:?}\n{src}"));
+        let Item::Bus(bus) = &f.items[0] else {
+            panic!("expected bus");
+        };
+        (
+            bus.handshakes.iter().map(|h| h.name.name.clone()).collect(),
+            bus.signals.iter().map(|s| s.name.name.clone()).collect(),
+        )
+    }
+
+    #[test]
+    fn handshake_channel_closer_requires_keyword_and_matching_name() {
+        let named = "bus B\n  handshake_channel s: receive kind: valid_ready\n    data: UInt<8>;\n  end handshake_channel s\n  t: in Bool;\nend bus B";
+        assert_eq!(bus_items(named), (vec!["s".into()], vec!["t".into()]));
+
+        // Unnamed closer: a signal on the next line that happens to share
+        // the channel's name is the bus's next item, not the closer.
+        let unnamed_then_s = named.replace(
+            "end handshake_channel s\n  t:",
+            "end handshake_channel\n  s:",
+        );
+        assert_eq!(
+            bus_items(&unnamed_then_s),
+            (vec!["s".into()], vec!["s".into()])
+        );
+
+        for wrong in [
+            "end handshake_channel zz\n  t: in Bool;",
+            "end handshake_channel zz: in Bool;",
+        ] {
+            let src = named.replace("end handshake_channel s\n  t: in Bool;", wrong);
+            let err = parse(&src).expect_err("a mismatched channel closer must be rejected");
+            assert!(
+                matches!(err, CompileError::MismatchedClosingName { ref expected, ref found, .. }
+                    if expected == "s" && found == "zz"),
+                "{wrong}: {err:?}"
+            );
+        }
+
+        for bare in ["end\n  t: in Bool;", "end s\n  t: in Bool;"] {
+            let src = named.replace("end handshake_channel s\n  t: in Bool;", bare);
+            let err = parse(&src).expect_err("the `handshake_channel` keyword is required");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("handshake_channel `s` must close with `end handshake_channel`"),
+                "{bare}: {msg}"
+            );
+        }
     }
 }

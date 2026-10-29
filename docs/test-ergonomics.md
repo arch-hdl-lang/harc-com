@@ -188,7 +188,7 @@ end testbench AxiLiteTb
 
 ### 3.2 Function semantics
 
-- `function name(...) [-> T] ... end function [name]` declares a method on the testbench instance. The optional closing name must be on the same line as `end function`. (The originally-drafted `fn` keyword was renamed to `function` during implementation to keep HARC to one spelling per concept — `function` is the existing keyword for free-function declarations at top level.)
+- `function name(...) [-> T] ... end function [name]` declares a method on the testbench instance. The optional closing name must be on the same line as `end function` and must match the function name; a mismatched name, another kind (`end agent f`), or the hookable-style `end f` is a compile error. (The originally-drafted `fn` keyword was renamed to `function` during implementation to keep HARC to one spelling per concept — `function` is the existing keyword for free-function declarations at top level.)
 - Inside the body, bare field names resolve to `self.<field>` via the same field-substitution path that transactor `hookable` methods use.
 - Functions are **synchronous between waits**, same coroutine model as the test's `run` block. They may call `wait`, `for`, `if`, and other procedural constructs.
 - Functions are **not hookable**: no `<Type>_<method>_pre` / `<Type>_<method>_post` vectors are emitted, and the method body has no fan-out wrapper. Lowering: a free `[&]`-capturing lambda named `<Type>_<method>`, called as `<Type>_<method>(tb, args)` at every `tb.method(args)` call site (`resolve_component_method_call` walks the same path as for hookables).
