@@ -2083,13 +2083,18 @@ fn literal_width(e: &AstExpr) -> Option<u32> {
     }
 }
 
-/// The literal width of an `as uint<N>` / `sint<N>` / `bits<N>` cast,
+/// The literal width of an `as uint<N>` / `sint<N>` / `bits<N>` cast
+/// (or the capitalised `UInt<N>` / `SInt<N>` spellings),
 /// on the same literal-only rule as [`literal_width`]. A bare `as uint`
 /// with no argument is 64, matching `cover_cast_width`.
 fn cast_literal_width(ty: &crate::ast::TypeExpr) -> Option<u32> {
     let crate::ast::TypeExpr::Builtin {
         name:
-            crate::ast::BuiltinTy::UInt | crate::ast::BuiltinTy::SInt | crate::ast::BuiltinTy::Bits,
+            crate::ast::BuiltinTy::UInt
+            | crate::ast::BuiltinTy::SInt
+            | crate::ast::BuiltinTy::UIntCap
+            | crate::ast::BuiltinTy::SIntCap
+            | crate::ast::BuiltinTy::Bits,
         args,
         ..
     } = ty
@@ -2113,7 +2118,11 @@ fn cover_cast_width(
     let width = match ty {
         crate::ast::TypeExpr::Builtin {
             name:
-                crate::ast::BuiltinTy::UInt | crate::ast::BuiltinTy::SInt | crate::ast::BuiltinTy::Bits,
+                crate::ast::BuiltinTy::UInt
+                | crate::ast::BuiltinTy::SInt
+                | crate::ast::BuiltinTy::UIntCap
+                | crate::ast::BuiltinTy::SIntCap
+                | crate::ast::BuiltinTy::Bits,
             args,
             ..
         } => match args.first() {

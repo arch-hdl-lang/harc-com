@@ -56435,3 +56435,28 @@ end test CapturedFieldConditionTest
         .expect_err("captured numeric fields cannot be bare conditions");
     assert!(error.0.contains("value, not a condition"), "{error}");
 }
+
+/// Covergroup cast targets accept the capitalised `UInt<N>` / `SInt<N>`
+/// spellings exactly like `uint<N>` / `sint<N>`: both the cast-width and
+/// the literal-width helpers used to match only the lowercase builtins,
+/// so `cover (dut.count_out as UInt<4>)` was refused as an unsupported
+/// target expression.
+#[test]
+fn coverpoint_casts_accept_capitalised_integer_types() {
+    let cov = fixture("cov_expr_targets_test.harc");
+    const CP: &str = "cover dut.count_out[3:0]\n";
+    assert!(cov.contains(CP), "cov fixture shape changed");
+    let point = |t: &str| cov.replacen(CP, &format!("cover {t}\n"), 1);
+    for (lower, upper) in [
+        ("(dut.count_out as uint<4>)", "(dut.count_out as UInt<4>)"),
+        ("(dut.count_out as sint<4>)", "(dut.count_out as SInt<4>)"),
+        (
+            "(dut.count_out[3:0] as uint<4>) +% (1 as uint<4>)",
+            "(dut.count_out[3:0] as UInt<4>) +% (1 as UInt<4>)",
+        ),
+    ] {
+        let want = emit_cpp_src(&point(lower));
+        let got = emit_cpp_src(&point(upper));
+        assert_eq!(got, want, "`{upper}` must lower like `{lower}`");
+    }
+}
