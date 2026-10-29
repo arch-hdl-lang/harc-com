@@ -574,18 +574,14 @@ fn emit_function_with_tseq_calls(
                 // duration: advance absolute time, no coroutine yield,
                 // no checker pass.
                 if let Some(context) = cx.bindings.run_context {
-                    writeln!(
-                        out,
-                        "{pad3}harc_eval_clocks_until({context}, {context}.now_ps + {ps});"
-                    )
-                    .ok();
+                    let now = format!("{context}.now_ps");
+                    emit_wall_clock_wait(out, &pad3, &now, *ps, *b, |target| {
+                        format!("harc_eval_clocks_until({context}, {target})")
+                    });
                 } else {
-                    writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
-                }
-                if *ps > 0 {
-                    writeln!(out, "{pad3}if (_fatal) {{ throw harc_rt::HarcFatalAbort{{}}; }} else {{ __bb = {}; }}", b.0).ok();
-                } else {
-                    writeln!(out, "{pad3}__bb = {};", b.0).ok();
+                    emit_wall_clock_wait(out, &pad3, "now_ps", *ps, *b, |target| {
+                        format!("eval_clocks_until({target})")
+                    });
                 }
             }
             Terminator::Return => {
@@ -1882,34 +1878,30 @@ fn emit_tseq_impl(
                 .ok();
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
-            Terminator::WaitTimePs(ps, b) => {
-                match emission {
-                    TseqEmission::LocalLambda => {
-                        writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
-                    }
-                    TseqEmission::Common { needs_context: true, .. } => {
-                        writeln!(
-                            out,
-                            "{pad3}harc_eval_clocks_until(ctx, ctx.now_ps + {ps});"
-                        )
-                        .ok();
-                    }
-                    TseqEmission::Common {
-                        needs_context: false,
-                        ..
-                    } => {
-                        return Err(EmitError(format!(
-                            "tbir: tseq `{}` has a wall-clock wait without runtime context",
-                            func.name
-                        )));
-                    }
+            Terminator::WaitTimePs(ps, b) => match emission {
+                TseqEmission::LocalLambda => {
+                    emit_wall_clock_wait(out, &pad3, "now_ps", *ps, *b, |target| {
+                        format!("eval_clocks_until({target})")
+                    });
                 }
-                if ps > &0 {
-                    writeln!(out, "{pad3}if (_fatal) {{ throw harc_rt::HarcFatalAbort{{}}; }} else {{ __bb = {}; }}", b.0).ok();
-                } else {
-                    writeln!(out, "{pad3}__bb = {};", b.0).ok();
+                TseqEmission::Common {
+                    needs_context: true,
+                    ..
+                } => {
+                    emit_wall_clock_wait(out, &pad3, "ctx.now_ps", *ps, *b, |target| {
+                        format!("harc_eval_clocks_until(ctx, {target})")
+                    });
                 }
-            }
+                TseqEmission::Common {
+                    needs_context: false,
+                    ..
+                } => {
+                    return Err(EmitError(format!(
+                        "tbir: tseq `{}` has a wall-clock wait without runtime context",
+                        func.name
+                    )));
+                }
+            },
             Terminator::Randomize {
                 target,
                 constraints,
@@ -2515,6 +2507,36 @@ fn scalar_sink_expr_cpp(
         }
         _ => expr_cpp(cx, value),
     }
+}
+
+/// A wall-clock wait in a context that can unwind with `HarcFatalAbort`
+/// (spec §7.7). `advance(time)` renders the call that advances time to
+/// the instant `time`; it completes the current edge and stops before any later
+/// edge once a post-eval service raises fatal. A wait whose full duration
+/// elapsed — including one landing exactly on the fatal edge — completes
+/// and its successor runs in that cycle (the test still aborts at the end
+/// of it); a wait the fatal interrupted with time still owed throws. A
+/// zero wait never advances and always reaches its successor.
+fn emit_wall_clock_wait(
+    out: &mut String,
+    pad: &str,
+    now: &str,
+    ps: i64,
+    succ: BlockId,
+    advance: impl Fn(&str) -> String,
+) {
+    if ps > 0 {
+        writeln!(
+            out,
+            "{pad}{{ unsigned __int128 _harc_wall_target = {now} + {ps}; {}; \
+             if (_fatal && {now} < _harc_wall_target) throw harc_rt::HarcFatalAbort{{}}; }}",
+            advance(&format!("{now} + {ps}"))
+        )
+        .ok();
+    } else {
+        writeln!(out, "{pad}{};", advance(&format!("{now} + {ps}"))).ok();
+    }
+    writeln!(out, "{pad}__bb = {};", succ.0).ok();
 }
 
 /// Body of a synchronous wait loop (`tick()` per cycle or per poll) in a
@@ -5916,12 +5938,9 @@ pub(super) fn emit_method(
                 // Wall-clock settle inside a synchronous method body:
                 // v1 advances absolute simulation time inline, and these
                 // lambdas capture `now_ps` / `eval_clocks_until` by reference.
-                writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
-                if ps > &0 {
-                    writeln!(out, "{pad3}if (_fatal) {{ throw harc_rt::HarcFatalAbort{{}}; }} else {{ __bb = {}; }}", b.0).ok();
-                } else {
-                    writeln!(out, "{pad3}__bb = {};", b.0).ok();
-                }
+                emit_wall_clock_wait(out, &pad3, "now_ps", *ps, *b, |target| {
+                    format!("eval_clocks_until({target})")
+                });
             }
             Terminator::Return => {
                 // Hook-vector fan-out for hook-triggered covergroups
@@ -7470,21 +7489,18 @@ fn emit_component_fn_lambda(
                 .ok();
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
-            Terminator::WaitTimePs(ps, b) => {
-                match emission {
-                    ComponentFunctionEmission::LocalLambda => {
-                        writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
-                    }
-                    ComponentFunctionEmission::CommonFunction => {
-                        writeln!(out, "{pad3}harc_eval_clocks_until(ctx, ctx.now_ps + {ps});").ok();
-                    }
+            Terminator::WaitTimePs(ps, b) => match emission {
+                ComponentFunctionEmission::LocalLambda => {
+                    emit_wall_clock_wait(out, &pad3, "now_ps", *ps, *b, |target| {
+                        format!("eval_clocks_until({target})")
+                    });
                 }
-                if ps > &0 {
-                    writeln!(out, "{pad3}if (_fatal) {{ throw harc_rt::HarcFatalAbort{{}}; }} else {{ __bb = {}; }}", b.0).ok();
-                } else {
-                    writeln!(out, "{pad3}__bb = {};", b.0).ok();
+                ComponentFunctionEmission::CommonFunction => {
+                    emit_wall_clock_wait(out, &pad3, "ctx.now_ps", *ps, *b, |target| {
+                        format!("harc_eval_clocks_until(ctx, {target})")
+                    });
                 }
-            }
+            },
             Terminator::Return => match func.ret {
                 Some(r) => {
                     if func.implicit_returns.contains(&BlockId(bi as u32)) {
