@@ -176,17 +176,19 @@ meaning of existing tests.
 
 Queued randomize is the default v1 performance path: constraints that depend
 only on the randomize target, type-level metadata, enum constants,
-compile-time constants and scalar local snapshots are eligible for queued
-solving. Current codegen still solves immediately, but it enforces the queued
+compile-time constants and local snapshots are eligible for queued solving.
+Current codegen still solves immediately, but it enforces the queued
 dependency rule: queued `randomize` rejects constraints that read live runtime
-state (DUT ports, non-target transaction fields, other field paths) and tells
-the user to use `blocking randomize` or to bind the value to a scalar `let`
-first.
+state (DUT ports, component or testbench state, other non-local field paths)
+and tells the user to use `blocking randomize` or to bind the value to a local
+`let` first.
 
-A typed scalar local in scope at the call — a `let` or a method parameter —
-is a snapshot variable (spec §4.4): both queued and blocking randomize use the
-value it holds when the `randomize` call executes. Reassigning it afterwards
-affects only later calls. A future
+A snapshot variable (spec §4.4) is a local in scope at the call: a typed
+scalar `let`, a method parameter, or a scalar field of a local record `let`
+other than the randomize target (`other.len`). Both queued and blocking
+randomize use the value it holds when the `randomize` call executes.
+Reassigning it afterwards affects only later calls. A `for` loop index is not
+captured; bind it to a `let` first. A future
 pre-computing queue must preserve that rule (re-solve or invalidate queued
 solutions when a referenced snapshot changes); it may not reuse a solution
 computed from an older snapshot value.
@@ -196,7 +198,8 @@ state that cannot be safely precomputed. Current codegen snapshots supported
 runtime values into the immediate solver expression for:
 
 - scalar local dependencies (queued randomize too, see above),
-- non-target transaction fields,
+- non-target transaction fields (queued randomize too when the record is a
+  local `let`, see above),
 - DUT or other field paths,
 - runtime-dependent `dist` entries.
 

@@ -524,6 +524,57 @@ end impl WideSnapshot
     );
 }
 
+/// spec §4.4: scalar fields of a local record `let` are snapshots — a queued
+/// randomize reads them when the call executes (record wider than 64 bits).
+#[test]
+fn queued_randomize_captures_record_let_fields_at_each_call() {
+    simulate(
+        "record_let_snapshot",
+        r#"transaction T
+    b : bool
+    u : uint<8>
+    s : sint<16>
+    w : uint<100>
+end transaction T
+test RecSnap
+    let dut : Top
+    run
+        let other : T
+        other.b = true
+        other.u = 9
+        other.s = -300
+        let r : T
+        randomize(r) with
+            r.b == other.b
+            r.u == other.u
+            r.s == other.s
+        end randomize
+        assert r.b else fail("queued record bool snapshot")
+        assert r.u == 9 else fail("queued record unsigned snapshot")
+        assert r.s == -300 else fail("queued record signed snapshot")
+        other.b = false
+        other.u = 200
+        other.s = -5
+        randomize(r) with
+            r.b == other.b
+            r.u == other.u
+            r.s == other.s
+        end randomize
+        assert !r.b else fail("second call must see other.b=false")
+        assert r.u == 200 else fail("second call must see other.u=200")
+        assert r.s == -5 else fail("second call must see other.s=-5")
+        other.b = true
+        randomize(r) with
+            other.b
+            r.u > other.u
+        end randomize
+        assert r.u > 200 else fail("record flag and ordering snapshot")
+    end run
+end test RecSnap
+"#,
+    );
+}
+
 /// Width-method and `~` samples at the carrier boundaries (63/64/65/128/129
 /// bits) on signed hook parameters.
 #[test]

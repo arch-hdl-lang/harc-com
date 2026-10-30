@@ -311,3 +311,72 @@ end test Q
         "a sint<16> snapshot must sign-extend from 16 bits:\n{cpp}"
     );
 }
+
+/// spec §4.4: scalar fields of a local record `let` are snapshots too, so a
+/// queued randomize captures them at the call (here into a solver vector
+/// wider than 64 bits). DUT state is still live and stays rejected.
+#[test]
+fn queued_randomize_captures_record_let_fields_but_not_dut_state() {
+    let cpp = emit_cpp_src(
+        r#"transaction T
+    b : bool
+    u : uint<8>
+    s : sint<16>
+    w : uint<100>
+end transaction T
+test Q
+    let dut : Top
+    run
+        let other : T
+        other.b = true
+        other.u = 9
+        other.s = -300
+        let r : T
+        randomize(r) with
+            r.b == other.b
+            r.u == other.u
+            r.s == other.s
+        end randomize
+        randomize(r) with
+            other.b
+        end randomize
+    end run
+end test Q
+"#,
+    );
+    assert!(
+        cpp.contains("harc_rt::random::HarcSolveMode::Queued")
+            && !cpp.contains("HarcSolveMode::Blocking"),
+        "the calls stay queued:\n{cpp}"
+    );
+    assert!(
+        cpp.contains("_z_b == harc_z3_bv_value(_ctx, (uint64_t)(other.b), 100)")
+            && cpp.contains("_z_u == harc_z3_bv_value(_ctx, (uint64_t)(other.u), 100)")
+            && cpp.contains("_z_s == harc_z3_bv_signed_value(_ctx, other.s, 16, 100)")
+            && cpp.contains("_ctx.bool_val((bool)(other.b))"),
+        "record-let fields must be captured as snapshots:\n{cpp}"
+    );
+
+    let dut_src = r#"transaction T
+    u : uint<8>
+end transaction T
+test Q
+    let dut : Top
+    run
+        let r : T
+        randomize(r) with
+            r.u == dut.count_out
+        end randomize
+    end run
+end test Q
+"#;
+    let merged = merged_src(dut_src);
+    let prog = lower::lower_program(&merged).expect("lowers");
+    let err = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default())
+        .expect_err("queued randomize over live DUT state must be rejected");
+    assert!(
+        err.to_string()
+            .contains("queued randomize(T) constraint references runtime state `dut.count_out`"),
+        "{err}"
+    );
+}

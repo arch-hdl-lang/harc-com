@@ -2894,11 +2894,17 @@ impl TbirRandomizeEmitter {
                 {
                     return;
                 }
+                // A scalar field of a local record `let` (not the target) is a
+                // snapshot, like a scalar `let` (spec §4.4): queued and
+                // blocking randomize both read it when the call executes.
+                if self.captured_scalar_field_info(expr, target_root).is_some() {
+                    return;
+                }
                 if let ExprKind::Ident(root) = &*target.kind {
                     if !blocking && target_root.is_some_and(|expected| root.name != expected) {
                         let path = format!("{}.{}", root.name, name.name);
                         self.errors.push(format!(
-                            "queued randomize({ty}) constraint references runtime state `{path}`; use `blocking randomize`, or bind the value to a scalar `let` before the call (its value is captured when `randomize` runs)"
+                            "queued randomize({ty}) constraint references runtime state `{path}`; use `blocking randomize`, or bind the value to a local `let` before the call (its value is captured when `randomize` runs)"
                         ));
                     }
                 }
@@ -5825,7 +5831,8 @@ impl TbirRandomizeEmitter {
                             self.reject_non_flag_field(&field);
                         }
                         return;
-                    } else if blocking
+                    } else if (blocking
+                        || self.captured_scalar_field_info(e, target_root).is_some())
                         && target_root
                             .zip(expr_field_root(e).as_deref())
                             .is_some_and(|(target, root)| root != target)
@@ -6317,11 +6324,15 @@ impl TbirRandomizeEmitter {
                         } else {
                             write!(self.out, "_z_{}", c_ident(&field)).ok();
                         }
-                    } else if blocking
+                    } else if (blocking
+                        || self.captured_scalar_field_info(e, target_root).is_some())
                         && target_root
                             .zip(expr_field_root(e).as_deref())
                             .is_some_and(|(target, root)| root != target)
                     {
+                        // Blocking captures any non-target field path; queued
+                        // captures a local record `let`'s scalar field
+                        // (spec §4.4 snapshot), read when the call executes.
                         if let Some((captured_signed, captured_width)) = self
                             .captured_scalar_field_info(e, target_root)
                             .map(|info| (info.signed, info.width))

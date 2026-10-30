@@ -5334,8 +5334,17 @@ end test BlockingRandomizeTest"#,
     );
 }
 
+/// LEGACY v1 BEHAVIOUR — NOT THE CURRENT LANGUAGE RULE. `cpp_tb::emit` is
+/// the deprecated v1 native emitter, which still rejects a field of a local
+/// record `let` (`other.len`) in a queued `randomize ... with`. spec §4.4
+/// (owner decision D13 follow-up) supersedes that: a scalar field of a local
+/// record `let` is a snapshot captured at the call. The TB-IR backend
+/// implements the current rule, pinned by
+/// `tests/cover_solver_value_e2e.rs::queued_randomize_captures_record_let_fields_at_each_call`
+/// and `tests/tbir_cover_solver_shapes.rs::queued_randomize_captures_record_let_fields_but_not_dut_state`.
+/// v1 is not being fixed; this test only pins what it does today.
 #[test]
-fn randomize_rejects_runtime_state_dependencies_by_mode() {
+fn legacy_v1_randomize_rejects_runtime_state_dependencies_by_mode() {
     let queued = parse_source(
         r#"transaction T
     len : uint<8>
