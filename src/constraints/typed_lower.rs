@@ -63,6 +63,10 @@ pub enum LowerError {
         lhs_sign: Sign,
         rhs_sign: Sign,
         span: Span,
+        /// Both operands have DECLARED signedness (neither is an untyped
+        /// literal or an enum). Only such a mismatch is a program error
+        /// (owner decision D1); the others are constraint-IR gaps.
+        declared: bool,
     },
     /// Bare identifier resolves to neither a field nor an enum variant.
     UnresolvedIdent { name: String, span: Span },
@@ -1336,6 +1340,38 @@ fn solve_order_field_path(ctx: &mut LowerCtx<'_>, expr: &Expr) -> Option<FieldPa
     None
 }
 
+/// An operand with no declared signedness: a literal (or a file-scope
+/// constant, which lowers to a literal), possibly negated/complemented or
+/// combined only with other literals. It adapts to its peer, so it never
+/// takes part in a signedness mismatch.
+fn is_untyped_literal(e: &CTypedExpr) -> bool {
+    match &e.kind {
+        CExprKind::BvLit { .. } => true,
+        CExprKind::Unary {
+            op: CUnaryOp::Neg | CUnaryOp::BitNot,
+            expr,
+        } => is_untyped_literal(expr),
+        CExprKind::Binary { op, lhs, rhs }
+            if matches!(
+                op,
+                CBinaryOp::Add
+                    | CBinaryOp::Sub
+                    | CBinaryOp::Mul
+                    | CBinaryOp::Div
+                    | CBinaryOp::Mod
+                    | CBinaryOp::BitAnd
+                    | CBinaryOp::BitOr
+                    | CBinaryOp::BitXor
+                    | CBinaryOp::Shl
+                    | CBinaryOp::Shr
+            ) =>
+        {
+            is_untyped_literal(lhs) && is_untyped_literal(rhs)
+        }
+        _ => false,
+    }
+}
+
 fn type_check_binary(
     ctx: &mut LowerCtx<'_>,
     op: CBinaryOp,
@@ -1372,23 +1408,44 @@ fn type_check_binary(
                     return CType::Bottom;
                 }
             };
-            if lw != rw {
-                ctx.record_error(LowerError::WidthMismatch {
-                    op: bin_op_str(op),
-                    lhs_width: lw,
-                    rhs_width: rw,
-                    span,
-                });
-                return CType::Bottom;
-            }
-            if ls != rs {
+            // Signedness first (owner decision D1, R16 hunt 1): a sign mix
+            // between two operands of DECLARED signedness is a program
+            // error the caller surfaces; a width mismatch is a constraint-IR
+            // capability gap the native solver path still handles.
+            if ls != rs && !is_untyped_literal(lhs) && !is_untyped_literal(rhs) {
                 ctx.record_error(LowerError::SignednessMismatch {
                     op: bin_op_str(op),
                     lhs_sign: ls,
                     rhs_sign: rs,
                     span,
+                    declared: true,
                 });
                 return CType::Bottom;
+            }
+            if lw != rw || ls != rs {
+                if lw != rw {
+                    ctx.record_error(LowerError::WidthMismatch {
+                        op: bin_op_str(op),
+                        lhs_width: lw,
+                        rhs_width: rw,
+                        span,
+                    });
+                } else {
+                    ctx.record_error(LowerError::SignednessMismatch {
+                        op: bin_op_str(op),
+                        lhs_sign: ls,
+                        rhs_sign: rs,
+                        span,
+                        declared: false,
+                    });
+                }
+                // Still a typed BV, so an enclosing operator keeps
+                // judging its own operands' signedness. The recorded error
+                // already keeps this problem off the Z3 path.
+                return CType::BV {
+                    width: lw.max(rw),
+                    sign: if is_untyped_literal(lhs) { rs } else { ls },
+                };
             }
             CType::BV {
                 width: lw,
@@ -1414,6 +1471,7 @@ fn type_check_binary(
                         lhs_sign: Sign::Unsigned,
                         rhs_sign: Sign::Unsigned,
                         span,
+                        declared: false,
                     });
                     return CType::Bottom;
                 }
@@ -1441,6 +1499,16 @@ fn type_check_binary(
                     return CType::Bottom;
                 }
             };
+            if ls != rs && !is_untyped_literal(lhs) && !is_untyped_literal(rhs) {
+                ctx.record_error(LowerError::SignednessMismatch {
+                    op: bin_op_str(op),
+                    lhs_sign: ls,
+                    rhs_sign: rs,
+                    span,
+                    declared: true,
+                });
+                return CType::Bottom;
+            }
             if lw != rw {
                 ctx.record_error(LowerError::WidthMismatch {
                     op: bin_op_str(op),
@@ -1448,7 +1516,7 @@ fn type_check_binary(
                     rhs_width: rw,
                     span,
                 });
-                return CType::Bottom;
+                return CType::Bool;
             }
             if ls != rs {
                 ctx.record_error(LowerError::SignednessMismatch {
@@ -1456,8 +1524,9 @@ fn type_check_binary(
                     lhs_sign: ls,
                     rhs_sign: rs,
                     span,
+                    declared: false,
                 });
-                return CType::Bottom;
+                return CType::Bool;
             }
             CType::Bool
         }

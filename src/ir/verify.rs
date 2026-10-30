@@ -7155,7 +7155,13 @@ impl Checker<'_> {
                         dst_ty,
                         Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w))) if w > 64
                     );
-                    if non_vec_dest && wide_dest {
+                    // An untyped literal (`-1`, `5`) carries no width of
+                    // its own; lowering range-checks it against the field,
+                    // exactly as invariant 15 treats a literal into a
+                    // local. Classifying `-1` as `uint<1>` here raised an
+                    // internal error for `r = -1` on a `sint<200>` field.
+                    let untyped_literal = is_untyped_literal_value(value);
+                    if non_vec_dest && wide_dest && !untyped_literal {
                         if let (Some(expected), Some(actual)) =
                             (dst_ty, self.aggregate_assignment_expr_type(value))
                         {
@@ -10866,6 +10872,20 @@ fn queue_elem_accepts_type(elem: &QueueElem, actual: &IrType) -> bool {
 /// narrower destination would lose queue data.
 fn queue_elem_fits_dest(elem: &QueueElem, dest: &IrType) -> bool {
     matches!(dest, IrType::Unknown) || assign_compatible(dest, &elem.ir_type())
+}
+
+/// An untyped integer literal, possibly negated or complemented (`-1`).
+fn is_untyped_literal_value(e: &Expr) -> bool {
+    match e {
+        Expr::Literal {
+            ty: IrType::Unknown,
+            ..
+        } => true,
+        Expr::Unary(crate::ir::UnOp::Neg | crate::ir::UnOp::BitNot, inner) => {
+            is_untyped_literal_value(inner)
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn assign_compatible(expected: &IrType, actual: &IrType) -> bool {

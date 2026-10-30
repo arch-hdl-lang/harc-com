@@ -101,6 +101,64 @@ fn fixed_vec_element_abi_compatible(lhs: &IrType, rhs: &IrType) -> bool {
     }
 }
 
+/// Static ARCH-width shape of an expression (see `arch_result_width`).
+#[derive(Debug, Clone, Copy)]
+enum ArchShape {
+    /// A declared-width scalar.
+    Typed { width: u32, signed: bool },
+    /// An untyped literal value of this many bits; adapts to its peer.
+    Literal(u32),
+    /// Rests on a leaf with no declared width; not judged.
+    Widthless,
+    /// Not a scalar (bool, record, unknown).
+    Other,
+}
+
+/// Is `e` built only from untyped literal values — an ordinary integer
+/// literal, a wide literal, an untyped file-scope constant or enum
+/// variant (substituted as a `Literal` with no declared width), and
+/// arithmetic/unary combinations of those? Such a value has no declared
+/// signedness or width of its own: it adapts to the other operand.
+pub(crate) fn expr_is_untyped_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Literal {
+            ty: IrType::Unknown | IrType::UInt(None) | IrType::SInt(None),
+            ..
+        }
+        | Expr::WideLiteral(_) => true,
+        Expr::Unary(crate::ir::UnOp::Not, _) => false,
+        Expr::Unary(_, inner) => expr_is_untyped_literal(inner),
+        Expr::Binary(
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::And
+            | BinOp::Or,
+            _,
+            _,
+        ) => false,
+        Expr::Binary(_, a, b) | Expr::Ternary(_, a, b) => {
+            expr_is_untyped_literal(a) && expr_is_untyped_literal(b)
+        }
+        _ => false,
+    }
+}
+
+/// `uint<8>` / `sint<8>` / `uint` spelling of a scalar type for diagnostics.
+pub(crate) fn scalar_type_spelling(ty: &IrType) -> String {
+    match ty {
+        IrType::UInt(Some(w)) => format!("uint<{w}>"),
+        IrType::SInt(Some(w)) => format!("sint<{w}>"),
+        IrType::UInt(None) => "uint".to_string(),
+        IrType::SInt(None) => "sint".to_string(),
+        IrType::Bool => "bool".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
 fn narrowest_scalar_type(lhs: Option<IrType>, rhs: Option<IrType>) -> Option<IrType> {
     let scalar = |ty: IrType| match ty {
         IrType::UInt(width) => Some((width, false)),
@@ -1895,6 +1953,7 @@ impl FuncBuilder<'_> {
                         "binary operator `{op:?}` is not defined for `String` values"
                     )));
                 }
+                self.reject_mixed_signedness(*op, ir_op, &l, &r)?;
                 let (l, r) = self.zext_mixed_width_unsigned_operands(ir_op, l, r);
                 self.reject_unbuildable_wide_operator(*op, ir_op, &l, &r)?;
                 let inner = Expr::Binary(ir_op, Box::new(l), Box::new(r));
@@ -4038,6 +4097,286 @@ impl FuncBuilder<'_> {
         }
     }
 
+    /// ARCH-style static result width of `e` (owner decision D2, R16
+    /// hunt 1; ARCH spec §3.2 width table): `a + b`/`a - b` is
+    /// `max(W(a), W(b)) + 1`, `a * b` is `W(a) + W(b)`, `/ % << >>` keep
+    /// the left operand's width, `| ^` the wider operand's, `&` the
+    /// narrower unsigned operand's (a literal mask bounds it), and the
+    /// wrapping operators and `.trunc/.zext/.sext<N>()` the width they
+    /// name. An untyped literal operand contributes the bits of its value.
+    ///
+    /// `None` when the width is not statically determinable: the
+    /// expression is itself an untyped literal, it rests on a widthless
+    /// leaf (`UInt(None)`, a dynamic slice, an unsized port), or it is not
+    /// a scalar. Callers judge narrowing only on `Some`.
+    ///
+    /// Static checking only: emission carriers still come from
+    /// `expr_type`/`scalar_assignment_type`.
+    pub(crate) fn arch_result_width(&self, e: &Expr) -> Option<u32> {
+        match self.arch_shape(e) {
+            ArchShape::Typed { width, .. } => Some(width),
+            _ => None,
+        }
+    }
+
+    /// The ARCH-style static type of a COMPOSED scalar expression (an
+    /// arithmetic/bitwise operator, a unary `-`/`~`, or a ternary), for
+    /// inferring an untyped `let` (owner decision D2: `let c = a + 1` on a
+    /// `uint<8>` `a` is `uint<9>`). `None` for a bare leaf (a plain copy
+    /// keeps its existing inference), an untyped literal, a widthless
+    /// operand, or a result whose width crosses a C++ carrier tier the
+    /// operands do not (the operands are computed in the narrower carrier,
+    /// so the extra carry bit is not available there).
+    pub(crate) fn arch_inferred_type(&self, e: &Expr) -> Option<IrType> {
+        let composed = match e {
+            Expr::Binary(op, _, _) => !matches!(
+                op,
+                BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+                    | BinOp::And
+                    | BinOp::Or
+            ),
+            Expr::Unary(crate::ir::UnOp::Neg | crate::ir::UnOp::BitNot, _) => true,
+            Expr::Ternary(..) => true,
+            _ => false,
+        };
+        if !composed || expr_is_untyped_literal(e) {
+            return None;
+        }
+        let ArchShape::Typed { width, signed } = self.arch_shape(e) else {
+            return None;
+        };
+        let tier = |w: u32| match w {
+            0..=64 => 0,
+            65..=128 => 1,
+            _ => 2,
+        };
+        let operand_tier = self.arch_operand_max_width(e).map(tier).unwrap_or(0);
+        if tier(width) != operand_tier {
+            return None;
+        }
+        Some(if signed {
+            IrType::SInt(Some(width))
+        } else {
+            IrType::UInt(Some(width))
+        })
+    }
+
+    /// Widest declared leaf width in `e` (the carrier its arithmetic runs in).
+    pub(crate) fn arch_operand_max_width(&self, e: &Expr) -> Option<u32> {
+        match e {
+            Expr::Binary(BinOp::Shl | BinOp::Shr, a, _) => self.arch_operand_max_width(a),
+            Expr::Binary(_, a, b) | Expr::Ternary(_, a, b) => {
+                match (
+                    self.arch_operand_max_width(a),
+                    self.arch_operand_max_width(b),
+                ) {
+                    (Some(x), Some(y)) => Some(x.max(y)),
+                    (x, y) => x.or(y),
+                }
+            }
+            Expr::Unary(_, inner) => self.arch_operand_max_width(inner),
+            _ => match self.arch_shape(e) {
+                ArchShape::Typed { width, .. } | ArchShape::Literal(width) => Some(width),
+                _ => None,
+            },
+        }
+    }
+
+    fn arch_shape(&self, e: &Expr) -> ArchShape {
+        let value_bits = |v: u64| (64 - v.leading_zeros()).max(1);
+        match e {
+            Expr::Literal {
+                value,
+                ty: IrType::Unknown | IrType::UInt(None),
+            } => ArchShape::Literal(value_bits(*value)),
+            Expr::Literal {
+                value,
+                ty: IrType::SInt(None),
+            } => {
+                let v = *value as i64;
+                if v < 0 {
+                    ArchShape::Literal(65 - (!*value).leading_zeros().min(64))
+                } else {
+                    ArchShape::Literal(value_bits(*value))
+                }
+            }
+            Expr::WideLiteral(words) => ArchShape::Literal(wide_literal_bits(words)),
+            Expr::Binary(
+                BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+                | BinOp::And
+                | BinOp::Or,
+                _,
+                _,
+            )
+            | Expr::Unary(crate::ir::UnOp::Not, _) => ArchShape::Other,
+            Expr::Unary(crate::ir::UnOp::Neg | crate::ir::UnOp::BitNot, inner) => {
+                self.arch_shape(inner)
+            }
+            Expr::Binary(op, a, b) => {
+                let (a, b) = (self.arch_shape(a), self.arch_shape(b));
+                let operand = |s: &ArchShape| match s {
+                    ArchShape::Typed { width, signed } => Some((*width, Some(*signed))),
+                    ArchShape::Literal(width) => Some((*width, None)),
+                    _ => None,
+                };
+                let (Some((lw, ls)), Some((rw, rs))) = (operand(&a), operand(&b)) else {
+                    return match (a, b) {
+                        (ArchShape::Widthless, _) | (_, ArchShape::Widthless) => {
+                            ArchShape::Widthless
+                        }
+                        _ => ArchShape::Other,
+                    };
+                };
+                let width = match op {
+                    BinOp::Add | BinOp::Sub => lw.max(rw) + 1,
+                    BinOp::Mul => lw + rw,
+                    BinOp::Div | BinOp::Mod | BinOp::Shl | BinOp::Shr => lw,
+                    BinOp::BitOr | BinOp::BitXor => lw.max(rw),
+                    // The narrower UNSIGNED operand bounds an `&`
+                    // (an untyped literal mask is unsigned), mirroring
+                    // `narrowest_scalar_type`.
+                    BinOp::BitAnd => {
+                        let l_unsigned = ls != Some(true);
+                        let r_unsigned = rs != Some(true);
+                        if lw < rw && l_unsigned {
+                            lw
+                        } else if rw < lw && r_unsigned {
+                            rw
+                        } else {
+                            lw.max(rw)
+                        }
+                    }
+                    _ => return ArchShape::Other,
+                };
+                if matches!(op, BinOp::Shl | BinOp::Shr) {
+                    return match ls {
+                        Some(signed) => ArchShape::Typed { width, signed },
+                        None => ArchShape::Literal(width),
+                    };
+                }
+                match (ls, rs) {
+                    (None, None) => ArchShape::Literal(width),
+                    (Some(s), None) | (None, Some(s)) => ArchShape::Typed { width, signed: s },
+                    (Some(l), Some(r)) => ArchShape::Typed {
+                        width,
+                        signed: l && r,
+                    },
+                }
+            }
+            Expr::Ternary(_, t, f) => match (self.arch_shape(t), self.arch_shape(f)) {
+                (ArchShape::Widthless, _) | (_, ArchShape::Widthless) => ArchShape::Widthless,
+                (
+                    ArchShape::Typed {
+                        width: a,
+                        signed: sa,
+                    },
+                    ArchShape::Typed {
+                        width: b,
+                        signed: sb,
+                    },
+                ) => ArchShape::Typed {
+                    width: a.max(b),
+                    signed: sa && sb,
+                },
+                (ArchShape::Typed { width, signed }, ArchShape::Literal(l))
+                | (ArchShape::Literal(l), ArchShape::Typed { width, signed }) => ArchShape::Typed {
+                    width: width.max(l),
+                    signed,
+                },
+                (ArchShape::Literal(a), ArchShape::Literal(b)) => ArchShape::Literal(a.max(b)),
+                _ => ArchShape::Other,
+            },
+            _ => match self.scalar_assignment_type(e) {
+                Some(IrType::UInt(Some(width))) => ArchShape::Typed {
+                    width,
+                    signed: false,
+                },
+                Some(IrType::SInt(Some(width))) => ArchShape::Typed {
+                    width,
+                    signed: true,
+                },
+                Some(IrType::UInt(None) | IrType::SInt(None)) => ArchShape::Widthless,
+                _ => ArchShape::Other,
+            },
+        }
+    }
+
+    /// The declared signedness of a binary-operator operand, for the
+    /// mixed-signedness rule. `None` when the operand has no declared
+    /// signedness: an untyped literal tree (see `expr_is_untyped_literal`),
+    /// a `bool`, a widthless value (an enum value, a list size, an unsized
+    /// port read), or a value this context cannot type.
+    fn declared_operand_signedness(&self, e: &Expr) -> Option<(bool, IrType)> {
+        if expr_is_untyped_literal(e) {
+            return None;
+        }
+        match self.scalar_assignment_type(e) {
+            Some(ty @ IrType::UInt(Some(_))) => Some((false, ty)),
+            Some(ty @ IrType::SInt(Some(_))) => Some((true, ty)),
+            _ => None,
+        }
+    }
+
+    /// Reject a binary operator whose two operands have declared,
+    /// DIFFERENT signedness (owner decision D1, R16 hunt 1). Comparison,
+    /// equality, arithmetic and bitwise operators all qualify; a shift
+    /// count and the logical `&&`/`||` do not. The user converts one side
+    /// explicitly with `as`.
+    pub(super) fn reject_mixed_signedness(
+        &self,
+        op: BinaryOp,
+        ir_op: BinOp,
+        l: &Expr,
+        r: &Expr,
+    ) -> Result<(), LowerError> {
+        if !matches!(
+            ir_op,
+            BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Mod
+                | BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+        ) {
+            return Ok(());
+        }
+        let (Some((ls, lt)), Some((rs, rt))) = (
+            self.declared_operand_signedness(l),
+            self.declared_operand_signedness(r),
+        ) else {
+            return Ok(());
+        };
+        if ls == rs {
+            return Ok(());
+        }
+        Err(LowerError::Invalid(format!(
+            "operator `{}` mixes signed and unsigned operands (left is `{}`, right is \
+                 `{}`). Signed and unsigned values never combine implicitly — convert one \
+                 operand explicitly with `as sint<N>` or `as uint<N>`.",
+            crate::pretty::binary_op_str(op),
+            scalar_type_spelling(&lt),
+            scalar_type_spelling(&rt),
+        )))
+    }
+
     /// Does the composed width of `e` rest on a genuinely-WIDTHLESS
     /// scalar leaf — a leaf whose declared width is unknown, so its
     /// contribution to the result width is the 64-bit host-ABI
@@ -5686,9 +6025,34 @@ impl FuncBuilder<'_> {
                     .and_then(|ty| scalar_ir_width(&ty))
             })
             .or(ast_src_width);
-        if let Some(why) = width_method_violation(kind_name, width, src_width) {
+        // The direction check judges the receiver's ARCH-style result
+        // width (owner decision D2): `(a + 1).trunc<8>()` on a `uint<8>`
+        // `a` narrows a 9-bit sum, which is exactly the spelling the
+        // narrowing diagnostic prescribes. Emission metadata keeps
+        // `src_width` (the carrier view).
+        let checked_width = match (src_width, self.arch_result_width(&inner)) {
+            (Some(s), Some(a)) => Some(s.max(a)),
+            (s, a) => s.or(a),
+        };
+        if let Some(why) = width_method_violation(kind_name, width, checked_width) {
+            if width_method_violation(kind_name, width, src_width).is_some() {
+                return Err(LowerError::Invalid(why));
+            }
             return Err(LowerError::Invalid(why));
         }
+        // The cast sees the receiver's ARCH width, carry included:
+        // `(a + 1).zext<16>()` keeps bit 8 of a 9-bit sum. Only within
+        // the carrier tier the operands were computed in.
+        // A signed value past 64 bits is held as its declared-width two's
+        // complement pattern in an unsigned carrier, not sign-extended across
+        // the carrier, so its sum's extra bit is not a sign bit there; keep
+        // the operand width for those (the carry above the declared width is
+        // not available — spec §2.4).
+        let src_width = match self.arch_inferred_type(&inner) {
+            Some(IrType::UInt(Some(w))) => Some(w),
+            Some(IrType::SInt(Some(w))) if w <= 64 => Some(w),
+            _ => src_width,
+        };
         // The direction check above wants the raw inferred width (a
         // zero-width receiver is still a wrong-direction `.trunc<N>()`),
         // but a zero width is not usable *emission* metadata: it would
@@ -6232,8 +6596,24 @@ impl FuncBuilder<'_> {
             BinaryOp::MulWrap => "*%",
             _ => "+%",
         };
-        let wl = self.infer_wrap_operand_width(lhs);
-        let wr = self.infer_wrap_operand_width(rhs);
+        // The AST inference knows locals, casts, literals and ports; the
+        // lowered operands also know host-state fields (component,
+        // testbench, transactor-state, scoreboard, record leaves), whose
+        // declared width is just as static.
+        let ir_width = |e: Option<&Expr>| match e.map(|e| self.arch_shape(e)) {
+            Some(ArchShape::Typed { width, .. } | ArchShape::Literal(width)) => Some(width),
+            _ => None,
+        };
+        let (ir_l, ir_r) = match &inner {
+            Expr::Binary(_, a, b) => (Some(&**a), Some(&**b)),
+            _ => (None, None),
+        };
+        let wl = self
+            .infer_wrap_operand_width(lhs)
+            .or_else(|| ir_width(ir_l));
+        let wr = self
+            .infer_wrap_operand_width(rhs)
+            .or_else(|| ir_width(ir_r));
         let (Some(wl), Some(wr)) = (wl, wr) else {
             return Err(LowerError::Invalid(format!(
                 "wrapping operator `{sym}` needs both operands to have a statically \
@@ -6402,7 +6782,7 @@ pub(crate) fn cast_relabel_width(ty: &TypeExpr) -> Option<u32> {
 
 /// Constant width argument of a width method (v1's `eval_const_width`:
 /// integer literal, possibly parenthesized).
-fn const_eval_width(e: &AstExpr) -> Option<u32> {
+pub(crate) fn const_eval_width(e: &AstExpr) -> Option<u32> {
     match &*e.kind {
         ExprKind::Paren(inner) => const_eval_width(inner),
         ExprKind::Int(s) => parse_int_literal(s).and_then(|v| u32::try_from(v).ok()),

@@ -1786,6 +1786,13 @@ impl FuncBuilder<'_> {
         let wide_scalar_ty = self
             .host_state_scalar_type(&e)
             .filter(|t| matches!(t, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if *w > 64));
+        // Owner decision D2: an untyped `let` of a composed expression
+        // infers the ARCH result type (`let c = a + 1` is `uint<9>`).
+        let arch_scalar_ty = if l.ty.is_none() {
+            self.arch_inferred_type(&e)
+        } else {
+            None
+        };
         // v1 declares a non-call untyped let as `int64_t`, even when a
         // newly admitted sized literal makes the RHS wider than 64 bits.
         // TBIR would otherwise infer the wide carrier and preserve bits that
@@ -1855,6 +1862,7 @@ impl FuncBuilder<'_> {
             .or(helper_seq_ty)
             .or(sequence_ty)
             .or(declared_scalar_ty)
+            .or(arch_scalar_ty)
             .or(queue_query_ty)
             .or(wide_scalar_ty)
             .or(signed_scalar_ty)
@@ -1871,7 +1879,9 @@ impl FuncBuilder<'_> {
             self.record_error_span(value.span);
             return Err(error);
         }
-        self.check_scalar_assign_width(id, &e, &l.name.name)?;
+        // An untyped `let` has no declared slot: its type is inferred, so
+        // the D2 result-width rule does not judge its initializer.
+        self.check_scalar_assign_width(id, &e, &l.name.name, l.ty.is_some())?;
         self.push(Stmt::Assign(id, e));
         Ok(())
     }
@@ -1902,7 +1912,7 @@ impl FuncBuilder<'_> {
 
         if let (Some(expected), Some(actual)) = (declared_ty.as_ref(), source_ty.as_ref()) {
             if !queue_scalar_assignment_compatible(expected, actual) {
-                self.check_scalar_assign_width(id, &Expr::Port(port.clone()), name)?;
+                self.check_scalar_assign_width(id, &Expr::Port(port.clone()), name, true)?;
                 return Err(LowerError::Invalid(format!(
                     "`let {name}` is declared {expected:?}, but the DUT signal has type {actual:?}"
                 )));
@@ -2123,6 +2133,7 @@ impl FuncBuilder<'_> {
         dest: crate::ir::LocalId,
         e: &Expr,
         name: &str,
+        judge_result_width: bool,
     ) -> Result<(), LowerError> {
         // Signedness, not just width: invariant 15's `assign_compatible`
         // also requires the two to agree, so `let s : sint<8> = a +% b`
@@ -2165,7 +2176,41 @@ impl FuncBuilder<'_> {
                  declaration to {aw} bits."
             )));
         }
-        Ok(())
+        if !judge_result_width {
+            return Ok(());
+        }
+        self.check_arch_result_width(e, dw, &format!("`{name}`"))
+    }
+
+    /// Owner decision D2 (R16 hunt 1): an arithmetic result carries its
+    /// ARCH-style static width (`uint<8> + 1` is 9 bits), and storing it
+    /// into a narrower typed slot is the ordinary narrowing error.
+    /// `what` names the destination as it should read in the message.
+    pub(super) fn check_arch_result_width(
+        &self,
+        e: &Expr,
+        dest_width: u32,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        // Only a composed result can widen; a plain leaf's width is its
+        // declared one, which the ordinary narrowing check already judges
+        // with its own wording.
+        if !matches!(e, Expr::Binary(..) | Expr::Unary(..) | Expr::Ternary(..)) {
+            return Ok(());
+        }
+        let Some(rw) = self.arch_result_width(e) else {
+            return Ok(());
+        };
+        if rw <= dest_width {
+            return Ok(());
+        }
+        Err(LowerError::Invalid(format!(
+            "assignment to {what}, declared {dest_width} bits, narrows: the result \
+                 widens to {rw} bits (`+`/`-` add one bit to the wider operand, `*` sums \
+                 the operand widths). Widths must not shrink implicitly — use a wrapping \
+                 operator (`+%`, `-%`, `*%`), `.trunc<{dest_width}>()`, or widen the \
+                 declaration to {rw} bits."
+        )))
     }
 
     /// Refuse a WIDE value assigned into a narrower wide slot.
@@ -2497,6 +2542,9 @@ impl FuncBuilder<'_> {
         let crate::ir::QueueElem::Scalar { ty: expected } = elem else {
             return Ok(());
         };
+        if let IrType::UInt(Some(dest_width)) | IrType::SInt(Some(dest_width)) = expected {
+            self.check_arch_result_width(value, *dest_width, what)?;
+        }
         let actual = match value {
             crate::ir::Expr::Literal {
                 value,
@@ -2562,12 +2610,76 @@ impl FuncBuilder<'_> {
     ///
     /// `what` is rendered verbatim and names the destination
     /// ("scoreboard field `narrow`", "component field `state.value`").
-    fn check_owner_scalar_field_write(
+    pub(super) fn check_owner_scalar_field_write(
         &self,
         value: &crate::ir::Expr,
         expected: &IrType,
         what: &str,
     ) -> Result<(), LowerError> {
+        self.check_owner_scalar_field_write_declared(value, expected, what)?;
+        match expected {
+            IrType::UInt(Some(dw)) | IrType::SInt(Some(dw)) => {
+                self.check_arch_result_width(value, *dw, what)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// aggregates-1 (R16 hunt 1): a scalar write into a declared-type
+    /// slot of an aggregate — a record or transaction field, a `Vec`
+    /// element — gets the same signedness/narrowing rules as a typed
+    /// `let`. These slots used to accept `r.h = a` for a `uint<16>` `a`
+    /// into a `uint<8>` field, or a `sint` into a `uint` field, silently.
+    fn check_aggregate_scalar_slot_write(
+        &self,
+        value: &crate::ir::Expr,
+        slot: &IrType,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        if !matches!(slot, IrType::UInt(_) | IrType::SInt(_)) {
+            return Ok(());
+        }
+        if let Err(err) = self.check_owner_scalar_field_write_declared(value, slot, what) {
+            return Err(err);
+        }
+        match slot {
+            IrType::UInt(Some(dw)) | IrType::SInt(Some(dw)) => {
+                self.check_arch_result_width(value, *dw, what)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn check_owner_scalar_field_write_declared(
+        &self,
+        value: &crate::ir::Expr,
+        expected: &IrType,
+        what: &str,
+    ) -> Result<(), LowerError> {
+        // A non-negative untyped literal into a SIGNED field takes the
+        // field's signedness, as it does for a typed `let`; it only has to
+        // fit the field's non-negative range. Typing it as `uint<bits>`
+        // refused every such write with a meaningless `as sint<bits>` hint
+        // (components-2).
+        if let (
+            crate::ir::Expr::Literal {
+                value: lit,
+                ty: IrType::Unknown,
+            },
+            IrType::SInt(Some(dw)),
+        ) = (value, expected)
+        {
+            let bits = 64 - lit.leading_zeros();
+            if bits < *dw {
+                return Ok(());
+            }
+            // `bits >= dw` with `bits <= 64`, so `dw <= 64` here.
+            return Err(LowerError::Invalid(format!(
+                "the literal {lit} does not fit {what}, declared `sint<{dw}>` (largest \
+                 positive value is {}).",
+                (1u64 << (dw - 1)) - 1
+            )));
+        }
         let actual = match value {
             crate::ir::Expr::Literal {
                 value,
@@ -2886,6 +2998,11 @@ impl FuncBuilder<'_> {
                 &e,
                 &format!("`{}.{}`", chain.field, chain.path.join(".")),
             )?;
+            self.check_aggregate_scalar_slot_write(
+                &e,
+                &chain.leaf_ty,
+                &format!("`{}.{}`", chain.field, chain.path.join(".")),
+            )?;
             self.push(Stmt::TransactorStateRecordFieldWrite {
                 instance: chain.instance,
                 field: chain.field,
@@ -3050,6 +3167,11 @@ impl FuncBuilder<'_> {
             } else {
                 self.reject_record_into_scalar(
                     &value,
+                    &format!("indexed component record field `{}`", chain.field),
+                )?;
+                self.check_aggregate_scalar_slot_write(
+                    &value,
+                    &chain.leaf_ty,
                     &format!("indexed component record field `{}`", chain.field),
                 )?;
             }
@@ -3503,7 +3625,7 @@ impl FuncBuilder<'_> {
                     self.record_error_span(value.span);
                     return Err(error);
                 }
-                self.check_scalar_assign_width(local, &e, &id.name)?;
+                self.check_scalar_assign_width(local, &e, &id.name, true)?;
                 self.push(Stmt::Assign(local, e));
                 return Ok(());
             }
@@ -3660,6 +3782,14 @@ impl FuncBuilder<'_> {
                                                 id.name
                                             ),
                                         )?;
+                                        self.check_aggregate_scalar_slot_write(
+                                            &value,
+                                            &inner_elem,
+                                            &format!(
+                                                "element of nested fixed-vector local `{}`",
+                                                id.name
+                                            ),
+                                        )?;
                                     }
                                     self.push(Stmt::LocalVecElementWrite {
                                         local,
@@ -3694,6 +3824,11 @@ impl FuncBuilder<'_> {
                         } else {
                             self.reject_record_into_scalar(
                                 &value,
+                                &format!("element of fixed-vector local `{}`", id.name),
+                            )?;
+                            self.check_aggregate_scalar_slot_write(
+                                &value,
+                                &elem,
                                 &format!("element of fixed-vector local `{}`", id.name),
                             )?;
                         }
@@ -3793,6 +3928,15 @@ impl FuncBuilder<'_> {
                             chain.path.join(".")
                         ),
                     )?;
+                    self.check_aggregate_scalar_slot_write(
+                        &value,
+                        &chain.leaf_ty,
+                        &format!(
+                            "element of responder record state `{}.{}`",
+                            chain.field,
+                            chain.path.join(".")
+                        ),
+                    )?;
                     chain.leaf_index = Some(idx);
                     self.push(Stmt::TransactorStateRecordFieldWrite {
                         instance: chain.instance,
@@ -3849,6 +3993,11 @@ impl FuncBuilder<'_> {
                                     &value,
                                     &format!("element of nested `Vec` field `{field}`"),
                                 )?;
+                                self.check_aggregate_scalar_slot_write(
+                                    &value,
+                                    inner_elem,
+                                    &format!("element of nested `Vec` field `{field}`"),
+                                )?;
                             }
                             self.push(Stmt::ComponentVecElementWrite {
                                 base,
@@ -3882,6 +4031,11 @@ impl FuncBuilder<'_> {
                 } else {
                     self.reject_record_into_scalar(
                         &value,
+                        &format!("element of component `Vec` field `{field}`"),
+                    )?;
+                    self.check_aggregate_scalar_slot_write(
+                        &value,
+                        &vec.elem,
                         &format!("element of component `Vec` field `{field}`"),
                     )?;
                 }
@@ -3925,6 +4079,11 @@ impl FuncBuilder<'_> {
                                 &value,
                                 &format!("element of nested testbench `Vec` field `{field}`"),
                             )?;
+                            self.check_aggregate_scalar_slot_write(
+                                &value,
+                                inner_elem,
+                                &format!("element of nested testbench `Vec` field `{field}`"),
+                            )?;
                             self.push(Stmt::TbFieldVecElementWrite {
                                 field,
                                 index: outer,
@@ -3938,13 +4097,18 @@ impl FuncBuilder<'_> {
             }
             // `mem[i] = v` — single fixed-vector testbench-field element
             // write (`_tb.mem[i] = v`).
-            if let Some((field, IrType::FixedVec { len, .. })) = self.as_tb_vec_field(it) {
+            if let Some((field, IrType::FixedVec { len, elem })) = self.as_tb_vec_field(it) {
                 let index = self.lower_expr_no_ports(index)?;
                 self.validate_numeric_expr(&index, "testbench `Vec` index")?;
                 super::exprs::check_literal_tb_vec_index_bounds(&field, &index, len)?;
                 let value = self.lower_expr_no_ports(value)?;
                 self.reject_record_into_scalar(
                     &value,
+                    &format!("element of testbench `Vec` field `{field}`"),
+                )?;
+                self.check_aggregate_scalar_slot_write(
+                    &value,
+                    &elem,
                     &format!("element of testbench `Vec` field `{field}`"),
                 )?;
                 self.push(Stmt::TbFieldVecElementWrite {
@@ -3999,6 +4163,11 @@ impl FuncBuilder<'_> {
                         &value,
                         &format!("element of component `Vec` field `{}`", rf.dotted),
                     )?;
+                    self.check_aggregate_scalar_slot_write(
+                        &value,
+                        &elem,
+                        &format!("element of component `Vec` field `{}`", rf.dotted),
+                    )?;
                     let index_pos = rf.field.split('.').count() - 1;
                     self.push(Stmt::ComponentVecElementWrite {
                         base: rf.base,
@@ -4045,6 +4214,11 @@ impl FuncBuilder<'_> {
                     // 'std::array<...>::value_type'".
                     self.reject_record_into_scalar(
                         &e,
+                        &format!("element of `Vec` field `{}`", chain.dotted),
+                    )?;
+                    self.check_aggregate_scalar_slot_write(
+                        &e,
+                        &chain.leaf_ty,
                         &format!("element of `Vec` field `{}`", chain.dotted),
                     )?;
                 }
@@ -4220,6 +4394,11 @@ impl FuncBuilder<'_> {
                 // be one. The mirror of the record-leaf check above.
                 let e = self.lower_expr_no_ports(value)?;
                 self.reject_record_into_scalar(&e, &format!("record field `{}`", chain.dotted))?;
+                self.check_aggregate_scalar_slot_write(
+                    &e,
+                    &chain.leaf_ty,
+                    &format!("record field `{}`", chain.dotted),
+                )?;
                 self.push(Stmt::RecordFieldWrite {
                     local: chain.local,
                     field: chain.field,
@@ -5218,6 +5397,12 @@ impl FuncBuilder<'_> {
             constraints.extend(keeps.iter().cloned());
         }
         constraints.extend(with_body.iter().cloned());
+        // Record-level `keep`s are judged by the constraint-IR typing
+        // (their scope is the record, not this call site); the `with`
+        // body sees the site's locals.
+        for clause in with_body {
+            self.constraint_sign_walk(clause, record_id, &id.name, &[])?;
+        }
 
         // Problem-id handle (constraint-IR layer), keyed by target span
         // exactly like v1's `runtime_randomize_problem_id`.
@@ -5275,6 +5460,213 @@ impl FuncBuilder<'_> {
         });
         self.start_block(succ);
         Ok(())
+    }
+
+    /// Declared type of a leaf in a randomize constraint: a field of the
+    /// target record (bare or through the target's name), a visible
+    /// scalar/record local, a field of a visible record local, or a typed
+    /// file-scope constant. `None` for anything else (literals, untyped
+    /// constants, enum variants, list elements, foreach variables).
+    fn constraint_leaf_type(
+        &self,
+        e: &crate::ast::Expr,
+        record_id: crate::ir::RecordId,
+        target_name: &str,
+        bound: &[String],
+    ) -> Option<IrType> {
+        match &*e.kind {
+            ExprKind::Paren(inner) => {
+                self.constraint_leaf_type(inner, record_id, target_name, bound)
+            }
+            ExprKind::Ident(id) => {
+                if bound.contains(&id.name) {
+                    return None;
+                }
+                if id.name == target_name {
+                    return Some(IrType::Record(record_id));
+                }
+                if let Some(field) = self.ctx.records[record_id.index()].field(&id.name) {
+                    return field.vec_len.is_none().then(|| field.ty.clone());
+                }
+                // A file-scope constant wins over a same-named runtime
+                // capture in a constraint (the emitters' precedence).
+                if let Some(c) = self.ctx.consts.get(&id.name) {
+                    return match &c.provenance {
+                        super::ConstProvenance::Typed(ty) => Some(ty.clone()),
+                        _ => None,
+                    };
+                }
+                let local = self.lookup(&id.name)?;
+                if let Some(rid) = self.record_of_local(local) {
+                    return Some(IrType::Record(rid));
+                }
+                Some(self.local_type(local).clone())
+            }
+            ExprKind::Field { target, name } => {
+                let IrType::Record(rid) =
+                    self.constraint_leaf_type(target, record_id, target_name, bound)?
+                else {
+                    return None;
+                };
+                let field = self.ctx.records.get(rid.index())?.field(&name.name)?;
+                field.vec_len.is_none().then(|| field.ty.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Owner decision D1 (R16 hunt 1) at a `randomize` site: reject a
+    /// binary operator mixing operands of declared, different signedness
+    /// in the merged `keep` + `with` clauses. Unlike the constraint-IR
+    /// typing, this sees the site's scope, so `t.s < lc` against an
+    /// outer `uint` local and `t.s < other.u` against another record are
+    /// judged too. Returns the operand's declared signedness, if any.
+    fn constraint_sign_walk(
+        &self,
+        e: &crate::ast::Expr,
+        record_id: crate::ir::RecordId,
+        target_name: &str,
+        bound: &[String],
+    ) -> Result<Option<bool>, LowerError> {
+        use crate::ast::{BinaryOp, BuiltinTy, CallArg, TypeExpr, UnaryOp};
+        let walk =
+            |x: &crate::ast::Expr| self.constraint_sign_walk(x, record_id, target_name, bound);
+        match &*e.kind {
+            ExprKind::Ident(_) | ExprKind::Field { .. } => Ok(
+                match self.constraint_leaf_type(e, record_id, target_name, bound) {
+                    Some(IrType::UInt(Some(_))) => Some(false),
+                    Some(IrType::SInt(Some(_))) => Some(true),
+                    _ => None,
+                },
+            ),
+            ExprKind::Paren(inner) => walk(inner),
+            ExprKind::Cast { expr, ty } => {
+                walk(expr)?;
+                Ok(match ty {
+                    TypeExpr::Builtin {
+                        name: BuiltinTy::SInt | BuiltinTy::SIntCap,
+                        ..
+                    } => Some(true),
+                    TypeExpr::Builtin {
+                        name: BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits,
+                        ..
+                    } => Some(false),
+                    _ => None,
+                })
+            }
+            ExprKind::Unary { op, expr } => {
+                let inner = walk(expr)?;
+                Ok(match op {
+                    UnaryOp::Neg | UnaryOp::BitNot => inner,
+                    _ => None,
+                })
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                let (l, r) = (walk(lhs)?, walk(rhs)?);
+                match op {
+                    BinaryOp::Shl | BinaryOp::Shr => Ok(l),
+                    BinaryOp::AndAnd
+                    | BinaryOp::OrOr
+                    | BinaryOp::AndKw
+                    | BinaryOp::OrKw
+                    | BinaryOp::PipeImplies
+                    | BinaryOp::PipeImpliesNext
+                    | BinaryOp::Throughout
+                    | BinaryOp::Within
+                    | BinaryOp::Intersect
+                    | BinaryOp::In
+                    | BinaryOp::Inside => Ok(None),
+                    _ => {
+                        if let (Some(ls), Some(rs)) = (l, r) {
+                            if ls != rs {
+                                let side =
+                                    |signed: bool| if signed { "signed" } else { "unsigned" };
+                                return Err(LowerError::Invalid(format!(
+                                    "in a randomize constraint: operator `{}` mixes signed \
+                                         and unsigned operands (left is {}, right is {}). \
+                                         Signed and unsigned values never combine implicitly \
+                                         — convert one operand explicitly with `as sint<N>` \
+                                         or `as uint<N>`.",
+                                    crate::pretty::binary_op_str(*op),
+                                    side(ls),
+                                    side(rs),
+                                )));
+                            }
+                        }
+                        Ok(match op {
+                            BinaryOp::Eq
+                            | BinaryOp::Ne
+                            | BinaryOp::Lt
+                            | BinaryOp::Le
+                            | BinaryOp::Gt
+                            | BinaryOp::Ge => None,
+                            BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap => {
+                                Some(false)
+                            }
+                            _ => l.or(r),
+                        })
+                    }
+                }
+            }
+            ExprKind::Ternary {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                walk(cond)?;
+                let (t, f) = (walk(then_branch)?, walk(else_branch)?);
+                Ok(t.or(f))
+            }
+            ExprKind::Membership { expr, set } => {
+                walk(expr)?;
+                walk(set)?;
+                Ok(None)
+            }
+            ExprKind::SetLit(items) => {
+                for item in items {
+                    walk(item)?;
+                }
+                Ok(None)
+            }
+            ExprKind::RangeLit { lo, hi } => {
+                if let Some(lo) = lo {
+                    walk(lo)?;
+                }
+                if let Some(hi) = hi {
+                    walk(hi)?;
+                }
+                Ok(None)
+            }
+            ExprKind::Index { target, index } => {
+                walk(target)?;
+                walk(index)?;
+                Ok(None)
+            }
+            ExprKind::Call { args, .. } => {
+                for arg in args {
+                    match arg {
+                        CallArg::Expr(x) | CallArg::Named { value: x, .. } => {
+                            walk(x)?;
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            ExprKind::SoftConstraint(soft) => {
+                walk(&soft.expr)?;
+                Ok(None)
+            }
+            ExprKind::ForEachConstraint { var, iter, body } => {
+                walk(iter)?;
+                let mut inner_bound = bound.to_vec();
+                inner_bound.push(var.name.clone());
+                for clause in body {
+                    self.constraint_sign_walk(clause, record_id, target_name, &inner_bound)?;
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Lower a tseq generator call (`RandomTxns(5)`) into a
