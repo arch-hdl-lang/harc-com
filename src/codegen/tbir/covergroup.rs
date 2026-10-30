@@ -258,14 +258,6 @@ fn cover_expr_signed(e: &Expr, widths: &CoverWidths<'_>) -> bool {
             kind: WidthCastKind::Sext,
             ..
         } => true,
-        // A `.resize<N>()` keeps its receiver's signedness (spec width
-        // methods), as `cover_width_cast_cpp` emits it.
-        Expr::WidthCast {
-            kind: WidthCastKind::Resize,
-            src_width: Some(_),
-            inner,
-            ..
-        } => cover_expr_signed(inner, widths),
         Expr::WidthCast { .. } => false,
         Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
             matches!(ret, IrType::SInt(_))
@@ -830,26 +822,6 @@ fn cover_width_cast_cpp(
     inner: &Expr,
     widths: &CoverWidths<'_>,
 ) -> Result<String, EmitError> {
-    // A signed receiver's `.resize<N>()` is a signed value, exactly as in
-    // procedural code (`lower_width_method`): widening and equal width are
-    // the sign extension below; narrowing keeps the low `N` bits as a
-    // `sint<N>` value — sign-filled into the `int64_t` carrier below 64
-    // bits, the masked pattern (already the value) above.
-    if let (WidthCastKind::Resize, Some(sw)) = (kind, src_width) {
-        if cover_expr_signed(inner, widths) {
-            if width >= sw {
-                return cover_width_cast_cpp(WidthCastKind::Sext, width, Some(sw), inner, widths);
-            }
-            if width > 64 {
-                return cover_width_cast_cpp(WidthCastKind::Trunc, width, Some(sw), inner, widths);
-            }
-            let e = cover_expr_cpp(inner, widths)?;
-            let shift = 64 - width;
-            return Ok(format!(
-                "((int64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}))"
-            ));
-        }
-    }
     let e = cover_expr_cpp(inner, widths)?;
     if let Some(words) = super::wide_scalar_words(width) {
         return Ok(match kind {

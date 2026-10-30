@@ -1029,6 +1029,20 @@ fn lower_point_target(
                             "resize" => WidthCastKind::Resize,
                             _ => unreachable!(),
                         };
+                        // `.resize<N>()` keeps a signed receiver's
+                        // signedness, as in procedural code
+                        // (`lower_width_method`): Sext when widening or at
+                        // equal width; when narrowing, truncate and then
+                        // reinterpret the low `N` bits as a `sint<N>`
+                        // value (sign-filled into the 64-bit carrier below
+                        // 64 bits). Only the METHOD does this — `as uint<N>`
+                        // / `as bits<N>` lower to an unsigned `Resize`
+                        // elsewhere and stay unsigned.
+                        if let (WidthCastKind::Resize, Some(sw)) = (kind, src_width) {
+                            if cover_lowered_signed(&inner) {
+                                return Ok(signed_resize(inner, width, sw));
+                            }
+                        }
                         // (The direction check lives in
                         // `cover_width_arg` now, so it runs for every
                         // width rather than only the ones that get past
@@ -1045,6 +1059,72 @@ fn lower_point_target(
             }
             _ => return Err(unsupported_target(cur)),
         }
+    }
+}
+
+/// Whether a lowered coverpoint operand is a signed value, judged from the
+/// IR alone (the emitter's `cover_expr_signed` also consults hook-param
+/// and DUT-access types; an operand that only those make signed — a bare
+/// `sint` hook param — has no statically known width here either, so a
+/// `.resize<N>()` over it keeps the unsigned shape, as procedural code does
+/// for an unknown source width).
+fn cover_lowered_signed(e: &Expr) -> bool {
+    use crate::ir::BinOp;
+    match e {
+        Expr::Literal { ty, .. } => matches!(ty, IrType::SInt(_)),
+        Expr::Port(port) => matches!(port.value_type, Some(IrType::SInt(_))),
+        Expr::Unary(UnOp::Not, _) => false,
+        Expr::Unary(_, inner) => cover_lowered_signed(inner),
+        Expr::Binary(op, lhs, rhs) => match op {
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::And
+            | BinOp::Or => false,
+            BinOp::Shl | BinOp::Shr => cover_lowered_signed(lhs),
+            _ => cover_lowered_signed(lhs) && cover_lowered_signed(rhs),
+        },
+        Expr::Ternary(_, then_expr, else_expr) => {
+            cover_lowered_signed(then_expr) && cover_lowered_signed(else_expr)
+        }
+        Expr::WidthCast { kind, .. } => matches!(kind, WidthCastKind::Sext),
+        Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
+            matches!(ret, IrType::SInt(_))
+        }
+        _ => false,
+    }
+}
+
+/// The signed-source `.resize<N>()` shape, identical to the procedural one.
+fn signed_resize(inner: Expr, width: u32, sw: u32) -> Expr {
+    let inner = if width < sw {
+        let low = Expr::WidthCast {
+            kind: WidthCastKind::Trunc,
+            width,
+            src_width: Some(sw),
+            inner: Box::new(inner),
+        };
+        if width < 64 {
+            Expr::WidthCast {
+                kind: WidthCastKind::Sext,
+                width: 64,
+                src_width: Some(width),
+                inner: Box::new(low),
+            }
+        } else {
+            low
+        }
+    } else {
+        inner
+    };
+    Expr::WidthCast {
+        kind: WidthCastKind::Sext,
+        width,
+        src_width: Some(sw.min(width)),
+        inner: Box::new(inner),
     }
 }
 
