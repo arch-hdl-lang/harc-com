@@ -27,6 +27,7 @@ use crate::ast::{
     TransactorDecl, TransactorMode, TypeArg, TypeExpr,
 };
 use crate::ir::{
+    ScalarDefault,
     Activation, ComponentCallableId, ComponentFieldKind, ComponentFieldSchema, ComponentId,
     ComponentInstanceMode, ComponentKindTag, ComponentMethodSchema, ComponentSchema,
     ConnectEdgeSchema, EventPayload, FixedVecSchema, FunctionId, FunctionKind, IrType, RecordId,
@@ -1784,6 +1785,10 @@ fn lower_field(
             // A known component type is a nested sub-component (`source :
             // AnalysisSource`).
             if let Some(cid) = ids.get(simple) {
+                reject_component_generic_args(
+                    Some(&f.ty),
+                    &format!("field `{comp}.{fname}`"),
+                )?;
                 let mode = match mode {
                     Some(TransactorMode::Active) => Some(ComponentInstanceMode::Active),
                     Some(TransactorMode::Passive) => Some(ComponentInstanceMode::Passive),
@@ -2650,6 +2655,7 @@ fn callable_method_param_ir_type(
             .position(|c| c.name == simple)
             .map(|i| ComponentId(i as u32))
         {
+            reject_component_generic_args(ty, "a component-typed parameter")?;
             return Ok(IrType::Component(cid));
         }
     }
@@ -2718,6 +2724,7 @@ fn callable_method_schema_ir_type(
             return Ok(IrType::Record(*rid));
         }
         if let Some(cid) = ids.get(simple) {
+            reject_component_generic_args(ty, "a component-typed parameter")?;
             return Ok(IrType::Component(*cid));
         }
     }
@@ -3983,14 +3990,42 @@ fn scalar_default(
     fname: &str,
     ty: &TypeExpr,
     consts: &HashMap<String, super::ConstVal>,
-) -> Result<u64, LowerError> {
-    let Some(d) = default else { return Ok(0) };
-    fold_field_default(
+) -> Result<ScalarDefault, LowerError> {
+    let Some(d) = default else {
+        return Ok(ScalarDefault::Narrow(0));
+    };
+    fold_field_default_full(
         d,
         Some(ty),
         consts,
         &format!("component field `{comp}.{fname}`"),
     )
+}
+
+/// Reject generic arguments on a type that names a component.
+///
+/// Called wherever a `Named` type has just resolved to a component. Every
+/// component that reaches these sites declares no generic parameters (a
+/// parameterized component is refused when the component itself is
+/// lowered), so any `#(...)` argument list is a program error: there is
+/// nothing to bind it to. It used to be dropped in silence, along with an
+/// unresolved name inside it (`A#(W = 99, Q = nosuch)` lowered as `A`).
+pub(crate) fn reject_component_generic_args(
+    ty: Option<&TypeExpr>,
+    what: &str,
+) -> Result<(), LowerError> {
+    let Some(TypeExpr::Named { name, generics, .. }) = ty else {
+        return Ok(());
+    };
+    if generics.is_empty() {
+        return Ok(());
+    }
+    let simple = name.segments.last().map(|s| s.name.as_str()).unwrap_or("");
+    Err(LowerError::Invalid(format!(
+        "{what} passes {} generic argument(s) to component `{simple}`, which declares no \
+         generic parameters; write the type as `{simple}`",
+        generics.len()
+    )))
 }
 
 /// Shared by the component, scoreboard and transactor-state field
@@ -4056,6 +4091,125 @@ pub(crate) fn fold_field_default(
         .map(|v| v.bits)
         .map_err(|detail| LowerError::Invalid(format!("the default on {what}: {detail}")))
 }
+
+/// `fold_field_default` at the field's full width: the value a scalar
+/// field's member starts with, for fields of any width. A field of at most
+/// 64 bits folds exactly as `fold_field_default` does. A field wider than 64
+/// bits takes any integer literal (negated or not, at any width — `default
+/// 0x1_0000_0000_0000_0000` on a `uint<200>`) or any constant expression in
+/// the 64-bit fold domain, range-checked against the declared width and
+/// signedness, and carried as a `ScalarDefault::Wide` of the field's carrier
+/// width unless it is a small non-negative value.
+///
+/// The default slot used to be a `u64` for every field, which zero-extended
+/// a negative default on a `sint<65>` into +2^64 - 1 and refused any value
+/// past 64 bits.
+pub(crate) fn fold_field_default_full(
+    d: &crate::ast::Expr,
+    ty: Option<&crate::ast::TypeExpr>,
+    consts: &HashMap<String, super::ConstVal>,
+    what: &str,
+) -> Result<ScalarDefault, LowerError> {
+    let (width, signed) = match ty.and_then(decoded_scalar_ir_type) {
+        Some(IrType::UInt(Some(w))) if w > 64 => (w, false),
+        Some(IrType::SInt(Some(w))) if w > 64 => (w, true),
+        _ => return fold_field_default(d, ty, consts, what).map(ScalarDefault::Narrow),
+    };
+    // (negative, magnitude as LSB-first words)
+    let (negative, magnitude) = match literal_magnitude(d) {
+        Some(found) => found,
+        None => {
+            let v = super::fold_const(d, consts, "").map_err(|e| match e {
+                super::ConstFoldErr::Unsupported(detail) => not_implemented(
+                    &format!("a non-constant default on {what}"),
+                    format!(
+                        "{detail}; a default wider than 64 bits must be an integer literal, \
+                         or a constant expression whose value fits 64 bits"
+                    ),
+                    V1Status::SilentlyMisLowers,
+                ),
+                super::ConstFoldErr::Invalid(detail) => {
+                    LowerError::Invalid(format!("the default on {what}: {detail}"))
+                }
+            })?;
+            if v.is_boolean_kind() {
+                return Err(LowerError::Invalid(format!(
+                    "the default on {what} is a boolean, but the field is an integer"
+                )));
+            }
+            if v.is_negative() {
+                let m = (v.bits as i64).unsigned_abs();
+                (true, vec![m as u32, (m >> 32) as u32])
+            } else {
+                (false, vec![v.bits as u32, (v.bits >> 32) as u32])
+            }
+        }
+    };
+    let bits = super::exprs::wide_literal_bits(&magnitude);
+    let is_zero = magnitude.iter().all(|w| *w == 0);
+    let kind = if signed { "sint" } else { "uint" };
+    if negative && !is_zero && !signed {
+        return Err(LowerError::Invalid(format!(
+            "the default on {what} is negative, but the field is unsigned ({kind}<{width}>)"
+        )));
+    }
+    // A signed field holds [-2^(W-1), 2^(W-1)); -2^(W-1) is the one value
+    // whose magnitude needs W bits.
+    let fits = if !signed {
+        bits <= width
+    } else if !negative {
+        bits < width
+    } else {
+        bits < width || (bits == width && is_power_of_two(&magnitude))
+    };
+    if !fits {
+        return Err(LowerError::Invalid(format!(
+            "the default on {what} needs {bits} bits of magnitude, which does not fit its \
+             declared {kind}<{width}>"
+        )));
+    }
+    if !negative && bits <= 63 {
+        let lo = magnitude.first().copied().unwrap_or(0) as u64;
+        let hi = magnitude.get(1).copied().unwrap_or(0) as u64;
+        return Ok(ScalarDefault::Narrow(lo | (hi << 32)));
+    }
+    let carrier_words = if width <= 128 {
+        4
+    } else {
+        width.div_ceil(32) as usize
+    };
+    let mut words = magnitude;
+    words.resize(carrier_words, 0);
+    if negative {
+        // Two's complement across the whole carrier: invert, add one.
+        let mut carry = 1u64;
+        for w in words.iter_mut() {
+            let sum = (!*w) as u64 + carry;
+            *w = sum as u32;
+            carry = sum >> 32;
+        }
+    }
+    Ok(ScalarDefault::Wide(words))
+}
+
+/// `Some((negative, magnitude))` for an integer literal of any spelling and
+/// width under parentheses and unary minus signs.
+fn literal_magnitude(e: &crate::ast::Expr) -> Option<(bool, Vec<u32>)> {
+    match &*e.kind {
+        ExprKind::Paren(inner) => literal_magnitude(inner),
+        ExprKind::Unary {
+            op: crate::ast::UnaryOp::Neg,
+            expr,
+        } => literal_magnitude(expr).map(|(neg, m)| (!neg, m)),
+        ExprKind::Int(lit) => super::exprs::parse_int_literal_words(lit).map(|m| (false, m)),
+        _ => None,
+    }
+}
+
+fn is_power_of_two(words: &[u32]) -> bool {
+    words.iter().map(|w| w.count_ones()).sum::<u32>() == 1
+}
+
 
 // --- access resolution on FuncBuilder (test-body + method-body) ---
 
@@ -4445,6 +4599,64 @@ impl super::FuncBuilder<'_> {
             queue,
             method.name.clone(),
         )))
+    }
+
+    /// Resolve a scalar or whole-record field reached through a component
+    /// held in a LOCAL — a component declared inside `run` (`let z : A`), a
+    /// by-value copy, or a component-typed method parameter — as
+    /// `(base, field)`: `z.v` → `Local(z)`, `z.c.v` → `LocalPath { z, [c] }`.
+    /// Method calls on such a value already dispatched through
+    /// `ComponentBase::Local`; field access only started from a test-scope
+    /// instance or `self`, so `z.v` was "field access on a non-DUT value"
+    /// and `z.v = 3` "a target that is neither a DUT port nor a local".
+    /// `None` when the path is not rooted at a component local or does not
+    /// end at a scalar/record field (other shapes keep their resolvers).
+    pub(crate) fn component_local_field(
+        &self,
+        path: &[String],
+    ) -> Result<Option<(ComponentBase, String)>, LowerError> {
+        if path.len() < 2 {
+            return Ok(None);
+        }
+        let Some(local) = self.lookup(&path[0]) else {
+            return Ok(None);
+        };
+        let Some(head) = self.component_of_local(local) else {
+            return Ok(None);
+        };
+        let (recv, field) = path[1..].split_at(path.len() - 2);
+        let field = &field[0];
+        if self.recv_is_scoreboard_sub(head, recv) {
+            return Ok(None);
+        }
+        let owner = self.resolve_component_recv(head, recv)?;
+        let Some(schema) = self.ctx.components[owner.index()].field(field) else {
+            return Ok(None);
+        };
+        if !matches!(
+            schema.kind,
+            ComponentFieldKind::Scalar { .. } | ComponentFieldKind::Record { .. }
+        ) {
+            return Ok(None);
+        }
+        self.require_component_activation(
+            &path[0],
+            head,
+            self.component_local_instance_mode(local).flatten(),
+            recv,
+            schema.activation,
+            "field",
+            field,
+        )?;
+        let base = if recv.is_empty() {
+            ComponentBase::Local(local)
+        } else {
+            ComponentBase::LocalPath {
+                local,
+                path: recv.to_vec(),
+            }
+        };
+        Ok(Some((base, field.clone())))
     }
 
     fn has_explicit_tb_component_prefix(&self, path: &[String]) -> bool {
@@ -5168,9 +5380,18 @@ impl super::FuncBuilder<'_> {
                 }
             }
         }
-        // Dotted path `env.sb.errors`.
+        // Dotted path `env.sb.errors`, or `z.v` on a component local.
         if let Some(path) = dotted_path(target) {
             let path = self.strip_tb_prefix(&path);
+            if let Some((base, field)) = self.component_local_field(path)? {
+                return Ok(Some(ComponentFieldTarget {
+                    base,
+                    dotted: path.join("."),
+                    field,
+                    leaf_vec: None,
+                    leaf_ty: None,
+                }));
+            }
             if path.len() >= 2 {
                 if let Some((head_cid, base_head, tail, head_mode)) =
                     self.component_path_head(&path)
@@ -5312,6 +5533,9 @@ impl super::FuncBuilder<'_> {
         }
         if let Some(path) = dotted_path(e) {
             let path = self.strip_tb_prefix(&path);
+            if let Some((base, field)) = self.component_local_field(path)? {
+                return Ok(Some(IrExpr::ComponentField { base, field }));
+            }
             if path.len() >= 2 {
                 if let Some((head_cid, base_head, tail, head_mode)) =
                     self.component_path_head(&path)

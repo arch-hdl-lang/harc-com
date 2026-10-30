@@ -562,7 +562,7 @@ fn emit_state_struct_body(
     for f in &schema.state_fields {
         match &f.kind {
             crate::ir::StateFieldKind::Scalar { ty, default } => {
-                let (cty, init) = scalar_field_decl(ty, *default);
+                let (cty, init) = scalar_field_decl(ty, default);
                 writeln!(out, "{pad}{cty} {} = {init};", f.name).ok();
             }
             crate::ir::StateFieldKind::Queue { elem } => {
@@ -725,14 +725,14 @@ fn transactor_method_param_ctypes(
 /// field wider than 64 bits to a 64-bit member; `field_scalar_cty` is
 /// the same seam the queue-element emitter already uses, and it knows
 /// about `_harc_u128` and `harc_rt::HarcWide<N>`.
-fn scalar_field_decl(ty: &crate::ir::IrType, default: u64) -> (String, String) {
-    match ty {
-        crate::ir::IrType::Bool => (
-            "bool".to_string(),
-            if default != 0 { "true" } else { "false" }.to_string(),
-        ),
-        _ => (super::field_scalar_cty(ty), default.to_string()),
-    }
+fn scalar_field_decl(
+    ty: &crate::ir::IrType,
+    default: &crate::ir::ScalarDefault,
+) -> (String, String) {
+    (
+        super::field_scalar_cty(ty),
+        super::scalar_default_cpp(ty, default),
+    )
 }
 
 pub(super) fn runtime_cell_initializer(
@@ -810,17 +810,7 @@ pub(super) fn scoreboard_struct(
                 // as a limitation cannot. Its representation wins here;
                 // `scalar_field_decl` still serves the three emitters
                 // whose schema default is still a `u64`.
-                let init = match default {
-                    crate::ir::ScoreboardScalarDefault::Narrow(value) => match ty {
-                        crate::ir::IrType::Bool => {
-                            if *value != 0 { "true" } else { "false" }.to_string()
-                        }
-                        _ => value.to_string(),
-                    },
-                    crate::ir::ScoreboardScalarDefault::Wide(words) => {
-                        super::expr::wide_literal_cpp(words)
-                    }
-                };
+                let init = super::scalar_default_cpp(ty, default);
                 let cty = super::field_scalar_cty(ty);
                 writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
             }
@@ -977,7 +967,7 @@ pub(super) fn component_struct(
     for (field_index, f) in c.fields.iter().enumerate() {
         match &f.kind {
             ComponentFieldKind::Scalar { ty, default } => {
-                let (cty, init) = scalar_field_decl(ty, *default);
+                let (cty, init) = scalar_field_decl(ty, default);
                 writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
             }
             ComponentFieldKind::FixedVec(vec) => {
@@ -1753,7 +1743,7 @@ pub(super) fn tb_struct(
                 .ok();
             }
             crate::ir::TbStateFieldSchema::Scalar(f) => {
-                let (cty, init) = scalar_field_decl(&f.ty, f.default);
+                let (cty, init) = scalar_field_decl(&f.ty, &f.default);
                 writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
             }
             crate::ir::TbStateFieldSchema::Queue(f) => {

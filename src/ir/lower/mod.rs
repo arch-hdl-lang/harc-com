@@ -197,7 +197,9 @@ pub(crate) struct LowerDiagnosticRecorder(Rc<Cell<Option<(SourceId, crate::lexer
 
 impl LowerDiagnosticRecorder {
     fn record(&self, source_id: SourceId, span: crate::lexer::Span) {
-        if self.0.get().is_none() {
+        // An empty span locates nothing (`finish` drops it), so it must not
+        // claim the slot ahead of an enclosing construct's real span.
+        if span.end > span.start && self.0.get().is_none() {
             self.0.set(Some((source_id, span)));
         }
     }
@@ -1804,8 +1806,14 @@ fn lower_program_impl(
     for (item_index, it) in file.items.iter().enumerate() {
         match it {
             Item::Const(c) => {
+                // A sized literal (`const C : uint<8> = 8'h3`) is a value in
+                // a `const` initializer exactly as in a general expression,
+                // where it lowers to its numeric value. Normalized here, at
+                // the declaration, rather than inside `fold_const`, whose
+                // other callers classify a sized literal by role.
+                let value = sized_literals_as_values(&c.value);
                 let folded =
-                    fold_const_with_helpers(&c.value, &const_vals, &c.name.name, &helper_registry)
+                    fold_const_with_helpers(&value, &const_vals, &c.name.name, &helper_registry)
                         .and_then(|v| check_const_decl_type(c.ty.as_ref(), v).map_err(FoldInvalid));
                 let v = match folded {
                     Ok(v) => v,
@@ -4999,6 +5007,10 @@ fn lower_test(
                         V1Status::Rejects,
                     ));
                 }
+                components::reject_component_generic_args(
+                    l.ty.as_ref(),
+                    &format!("`let {}`", l.name.name),
+                )?;
                 let simple = type_simple_name(l.ty.as_ref()).unwrap();
                 if always_on_dut_event_host_names.contains(simple)
                     && !matches!(
@@ -5421,6 +5433,10 @@ fn lower_test(
                             // `prog.transactors`), so it lands here and not
                             // in the data-only routes above.
                             if let Some(cid) = component_ids.get(simple) {
+                                components::reject_component_generic_args(
+                                    Some(&f.ty),
+                                    &format!("testbench field `{}`", f.name.name),
+                                )?;
                                 test_scope_components.push((
                                     f.name.name.clone(),
                                     *cid,
@@ -5472,7 +5488,7 @@ fn lower_test(
                             let scalar = ir::TbScalarFieldSchema {
                                 name: f.name.name.clone(),
                                 ty,
-                                default: 0,
+                                default: ir::ScalarDefault::Narrow(0),
                             };
                             scalar_fields.push(scalar.clone());
                             state_fields.push(ir::TbStateFieldSchema::Scalar(scalar));
@@ -5484,8 +5500,8 @@ fn lower_test(
                             // testbench field as on an `env` field in
                             // the same source.
                             let default = match &f.default {
-                                None => 0,
-                                Some(d) => components::fold_field_default(
+                                None => ir::ScalarDefault::Narrow(0),
+                                Some(d) => components::fold_field_default_full(
                                     d,
                                     Some(&f.ty),
                                     consts,
@@ -6505,7 +6521,7 @@ fn lower_test(
             let scalar = ir::TbScalarFieldSchema {
                 name: l.name.name.clone(),
                 ty,
-                default,
+                default: ir::ScalarDefault::Narrow(default),
             };
             scalar_fields.push(scalar.clone());
             state_fields.push(ir::TbStateFieldSchema::Scalar(scalar));
@@ -8435,6 +8451,15 @@ pub(crate) fn fold_signed_const(
     consts: &HashMap<String, ConstVal>,
     what: &str,
 ) -> Result<i128, LowerError> {
+    // A (possibly negated, possibly parenthesized) integer literal is
+    // read as a mathematical integer directly. The 64-bit fold below
+    // cannot represent `-9223372036854775808`: the literal 2^63 folds
+    // UNSIGNED (it exceeds i64::MAX), so its negation stays unsigned and
+    // came back as +2^63. A sized literal (`4'h3`, `-4'h2`) is a
+    // value-bearing literal here exactly as in `fold_addr_const`.
+    if let Some(v) = signed_literal_value(e) {
+        return Ok(v);
+    }
     let v = fold_const(e, consts, "").map_err(|err| match err {
         ConstFoldErr::Unsupported(detail) => not_implemented(
             &format!("a non-constant {what}"),
@@ -8448,6 +8473,59 @@ pub(crate) fn fold_signed_const(
     } else {
         v.bits as i128
     })
+}
+
+/// A copy of the constant-expression `e` with every sized integer literal
+/// that fits 64 bits (`8'h3`) replaced by its plain decimal value. Only the
+/// node kinds the constant folder evaluates are descended into.
+fn sized_literals_as_values(e: &crate::ast::Expr) -> crate::ast::Expr {
+    let kind = match &*e.kind {
+        ExprKind::Int(lit) if lit.contains('\'') => match exprs::parse_sized_int_literal(lit) {
+            Some(value) => ExprKind::Int(value.to_string()),
+            None => ExprKind::Int(lit.clone()),
+        },
+        ExprKind::Paren(inner) => ExprKind::Paren(sized_literals_as_values(inner)),
+        ExprKind::Unary { op, expr } => ExprKind::Unary {
+            op: *op,
+            expr: sized_literals_as_values(expr),
+        },
+        ExprKind::Cast { expr, ty } => ExprKind::Cast {
+            expr: sized_literals_as_values(expr),
+            ty: ty.clone(),
+        },
+        ExprKind::Binary { op, lhs, rhs } => ExprKind::Binary {
+            op: *op,
+            lhs: sized_literals_as_values(lhs),
+            rhs: sized_literals_as_values(rhs),
+        },
+        ExprKind::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => ExprKind::Ternary {
+            cond: sized_literals_as_values(cond),
+            then_branch: sized_literals_as_values(then_branch),
+            else_branch: sized_literals_as_values(else_branch),
+        },
+        other => other.clone(),
+    };
+    crate::ast::Expr::new(kind, e.span)
+}
+
+/// `Some(value)` when `e` is an integer literal (plain or sized), under
+/// any number of parentheses and unary minus signs.
+fn signed_literal_value(e: &crate::ast::Expr) -> Option<i128> {
+    match &*e.kind {
+        ExprKind::Paren(inner) => signed_literal_value(inner),
+        ExprKind::Unary {
+            op: crate::ast::UnaryOp::Neg,
+            expr,
+        } => signed_literal_value(expr).map(|v| -v),
+        ExprKind::Int(lit) => exprs::parse_int_literal(lit)
+            .or_else(|| exprs::parse_sized_int_literal(lit))
+            .map(i128::from),
+        _ => None,
+    }
 }
 
 /// Fold an ADDRESS-like constant expression — an addrmap instance base

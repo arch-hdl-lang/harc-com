@@ -3364,12 +3364,13 @@ impl FuncBuilder<'_> {
                 };
                 self.resolve_component_recv(head_cid, rest).ok()
             }
-            // `ComponentBase::Local` (a component-typed method
-            // parameter) is built only by `as_component_method_call`,
-            // for a CALL receiver. No `Expr::ComponentField` carries
-            // one, so there is nothing here to resolve.
-            crate::ir::ComponentBase::Local(_) => None,
-            crate::ir::ComponentBase::LocalPath { .. } => None,
+            // A component local (run-local instance, by-value copy or
+            // component-typed parameter), optionally through `Sub` fields.
+            crate::ir::ComponentBase::Local(local) => self.component_of_local(*local),
+            crate::ir::ComponentBase::LocalPath { local, path } => {
+                let head = self.component_of_local(*local)?;
+                self.resolve_component_recv(head, path).ok()
+            }
         }
     }
 
@@ -6492,6 +6493,30 @@ fn membership_value_error() -> LowerError {
 /// a `_harc_u128` composite; the tbir emitter reconstructs the same
 /// composite from the words). Returns `None` for non-hex or ≤ 64-bit
 /// literals (those take the plain `Expr::Literal` path).
+/// Any integer literal spelling (plain or sized; hex, binary or decimal; any
+/// width) as LSB-first 32-bit words with no trailing zero words (zero is
+/// `[0]`). `None` when `s` is not an integer literal.
+pub(crate) fn parse_int_literal_words(s: &str) -> Option<Vec<u32>> {
+    let words = if let Some(v) = parse_int_literal(s).or_else(|| parse_sized_int_literal(s)) {
+        vec![v as u32, (v >> 32) as u32]
+    } else {
+        parse_wide_hex_literal(s)
+            .or_else(|| parse_wide_binary_literal(s))
+            .or_else(|| parse_wide_decimal_literal(s))
+            .or_else(|| parse_wide_sized_hex_literal(s))
+            .or_else(|| parse_wide_sized_binary_literal(s))
+            .or_else(|| parse_wide_sized_decimal_literal(s))?
+    };
+    let mut words = words;
+    while words.len() > 1 && words.last() == Some(&0) {
+        words.pop();
+    }
+    if words.is_empty() {
+        words.push(0);
+    }
+    Some(words)
+}
+
 pub(crate) fn parse_wide_hex_literal(s: &str) -> Option<Vec<u32>> {
     let t = s.replace('_', "");
     let hex = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"))?;

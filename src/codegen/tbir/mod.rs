@@ -1506,6 +1506,20 @@ fn for_each_port_in_expr(e: &ir::Expr, f: &mut impl FnMut(&ir::PortRef)) {
 
 /// C++ storage type for a record field's scalar (or Vec element) type,
 /// using the same width-aware integer policy as standalone locals.
+/// The C++ initializer for a scalar field's schema default. A `Wide`
+/// default (a field wider than 64 bits whose value is negative or does not
+/// fit 63 bits) carries every word of the field's carrier, so it renders as
+/// the carrier's own literal form and a negative value stays sign-extended.
+pub(super) fn scalar_default_cpp(ty: &ir::IrType, default: &ir::ScalarDefault) -> String {
+    match (ty, default) {
+        (_, ir::ScalarDefault::Wide(words)) => expr::wide_literal_cpp(words),
+        (ir::IrType::Bool, ir::ScalarDefault::Narrow(v)) => {
+            if *v != 0 { "true" } else { "false" }.to_string()
+        }
+        (_, ir::ScalarDefault::Narrow(v)) => v.to_string(),
+    }
+}
+
 pub(super) fn field_scalar_cty(ty: &ir::IrType) -> String {
     match ty {
         ir::IrType::Bool => "bool".to_string(),
@@ -1759,15 +1773,10 @@ fn record_members(out: &mut String, r: &ir::RecordSchema, records: &[ir::RecordS
             writeln!(out, "{INDENT}std::array<{cty}, {n}> {} = {{}};", f.name).ok();
             continue;
         }
-        let init = match f.ty {
-            ir::IrType::Bool => if f.default.is_some_and(|d| d != 0) {
-                "true"
-            } else {
-                "false"
-            }
-            .to_string(),
-            _ => f.default.unwrap_or(0).to_string(),
-        };
+        let init = scalar_default_cpp(
+            &f.ty,
+            f.default.as_ref().unwrap_or(&ir::ScalarDefault::Narrow(0)),
+        );
         writeln!(out, "{INDENT}{cty} {} = {init};", f.name).ok();
     }
     writeln!(out, "}};").ok();

@@ -556,74 +556,19 @@ fn scalar_default(
     sb: &str,
     fname: &str,
     ty: &crate::ast::TypeExpr,
-    ir_ty: &IrType,
+    _ir_ty: &IrType,
     consts: &HashMap<String, super::ConstVal>,
 ) -> Result<crate::ir::ScoreboardScalarDefault, LowerError> {
     let Some(d) = default else {
         return Ok(crate::ir::ScoreboardScalarDefault::Narrow(0));
     };
-    if matches!(ir_ty, IrType::UInt(_)) {
-        if let crate::ast::ExprKind::Int(lit) = &*d.kind {
-            if let Some(words) = scoreboard_wide_hex_words(lit) {
-                let value_bits = super::exprs::wide_literal_bits(&words);
-                let fits = matches!(ir_ty, IrType::UInt(Some(width)) if value_bits <= *width);
-                if !fits {
-                    return Err(LowerError::Invalid(format!(
-                        "the default on scoreboard field `{sb}.{fname}`: unsigned literal needs \
-                     {value_bits} bits but the field is declared {ir_ty:?}"
-                    )));
-                }
-                if value_bits <= 64 {
-                    let lo = words.first().copied().unwrap_or(0) as u64;
-                    let hi = words.get(1).copied().unwrap_or(0) as u64;
-                    return Ok(crate::ir::ScoreboardScalarDefault::Narrow(lo | (hi << 32)));
-                }
-                return Ok(crate::ir::ScoreboardScalarDefault::Wide(words));
-            }
-        }
-    }
-    super::components::fold_field_default(
+    // The shared full-width folder: a field wider than 64 bits takes any
+    // integer literal at its declared width and signedness (this used to be a
+    // scoreboard-only hex path, unsigned only).
+    super::components::fold_field_default_full(
         d,
         Some(ty),
         consts,
         &format!("scoreboard field `{sb}.{fname}`"),
     )
-    .map(crate::ir::ScoreboardScalarDefault::Narrow)
-}
-
-/// Scoreboard defaults are persistent values, so unlike the general sized-
-/// literal expression gap they retain fitting wide hexadecimal initializers.
-/// Accept both `0x...` and `N'h...` and trim leading zero words. Unsized hex
-/// already handled by the shared `u64` folder stays on that path unless its
-/// spelling is wider than 16 digits; sized hex is retained even when its value
-/// fits in `u64`, because the shared folder intentionally does not parse it.
-fn scoreboard_wide_hex_words(lit: &str) -> Option<Vec<u32>> {
-    let normalized = lit.replace('_', "");
-    let sized = normalized.find('\'');
-    let hex = if let Some(tick) = sized {
-        let tail = &normalized[tick + 1..];
-        let (kind, digits) = tail.split_at(tail.chars().next()?.len_utf8());
-        matches!(kind, "h" | "H").then_some(digits)?
-    } else {
-        normalized
-            .strip_prefix("0x")
-            .or_else(|| normalized.strip_prefix("0X"))?
-    };
-    if hex.chars().any(|c| !c.is_ascii_hexdigit()) {
-        return None;
-    }
-    if sized.is_none() && hex.len() <= 16 {
-        return None;
-    }
-    let mut words = Vec::with_capacity(hex.len().div_ceil(8));
-    let mut remaining = hex.len();
-    while remaining > 0 {
-        let start = remaining.saturating_sub(8);
-        words.push(u32::from_str_radix(&hex[start..remaining], 16).ok()?);
-        remaining = start;
-    }
-    while words.len() > 1 && words.last() == Some(&0) {
-        words.pop();
-    }
-    Some(words)
 }

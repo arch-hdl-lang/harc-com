@@ -47,6 +47,22 @@ pub fn parse_expr_fragment(source: &str) -> Result<Expr, CompileError> {
     p.parse_expr()
 }
 
+/// `parse_expr_fragment` for a fragment cut out of a larger file (a
+/// `${expr}` capture inside a message string) whose position in that file
+/// the caller does not know. Every span in the result is empty: a span
+/// relative to the fragment would be read as an offset into the FILE, and a
+/// lowering error inside `${z.v}` was reported at line 1, column 1. An empty
+/// span carries no location, so the diagnostic falls back to the enclosing
+/// statement instead.
+pub fn parse_expr_fragment_unanchored(source: &str) -> Result<Expr, CompileError> {
+    let mut tokens = crate::lexer::tokenize(source).map_err(lex_error)?;
+    for token in &mut tokens {
+        token.span = Span::new(0, 0);
+    }
+    let mut p = Parser::new(tokens, source);
+    p.parse_expr()
+}
+
 /// `parse_expr_fragment`, but the fragment must be consumed ENTIRELY.
 ///
 /// The lenient version stops as soon as it has an expression and ignores
@@ -3007,6 +3023,27 @@ impl Parser {
             Vec::new()
         };
         let end = args.last().map(arg_span).unwrap_or(start);
+        // A scalar integer type has exactly one parameter, its width.
+        // Every consumer reads `args.first()`, so `uint<8, 9>` was accepted
+        // and the trailing argument silently ignored.
+        if matches!(
+            name,
+            BuiltinTy::UInt
+                | BuiltinTy::SInt
+                | BuiltinTy::Bits
+                | BuiltinTy::UIntCap
+                | BuiltinTy::SIntCap
+        ) && args.len() > 1
+        {
+            return Err(CompileError::general(
+                &format!(
+                    "`{}` takes exactly one type argument, its width, but {} were given",
+                    builtin_scalar_spelling(name),
+                    args.len()
+                ),
+                start.merge(end),
+            ));
+        }
         Ok(TypeExpr::Builtin {
             name,
             args,
@@ -5753,5 +5790,17 @@ end function second"#;
                 "{bare}: {msg}"
             );
         }
+    }
+}
+
+/// The source keyword of a scalar integer builtin type, for diagnostics.
+fn builtin_scalar_spelling(name: BuiltinTy) -> &'static str {
+    match name {
+        BuiltinTy::UInt => "uint",
+        BuiltinTy::SInt => "sint",
+        BuiltinTy::Bits => "bits",
+        BuiltinTy::UIntCap => "UInt",
+        BuiltinTy::SIntCap => "SInt",
+        _ => "type",
     }
 }

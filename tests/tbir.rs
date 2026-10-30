@@ -3353,7 +3353,7 @@ fn scoreboard_scalar_schema_and_write_width_are_verified() {
             ir::ScoreboardFieldKind::Scalar {
                 ty: ir::IrType::UInt(Some(128)),
                 default: ir::ScoreboardScalarDefault::Wide(words),
-            } if words == &[0, 0, 1]
+            } if words == &[0, 0, 1, 0]
         ));
     }
 
@@ -6925,7 +6925,7 @@ end test ReinitTest
     // The body block is a loop participant (reachable from the header
     // branch), so the init re-runs per iteration by construction.
     assert!(
-        matches!(prog.records[0].fields[0].default, Some(5)),
+        matches!(prog.records[0].fields[0].default, Some(ir::ScalarDefault::Narrow(5))),
         "default carried into the schema"
     );
 }
@@ -6958,8 +6958,8 @@ end test StructTest
     let rec = &prog.records[0];
     assert_eq!(rec.name, "Pkt");
     assert_eq!(rec.fields.len(), 3, "fields not double-counted from body");
-    assert_eq!(rec.fields[0].default, Some(1), "bool true → 1");
-    assert_eq!(rec.fields[1].default, Some(7));
+    assert_eq!(rec.fields[0].default, Some(ir::ScalarDefault::Narrow(1)), "bool true → 1");
+    assert_eq!(rec.fields[1].default, Some(ir::ScalarDefault::Narrow(7)));
     assert_eq!(rec.fields[2].default, None, "undefaulted field re-zeroes");
     // The body carries RecordInit + a RecordFieldWrite for `p.count`.
     let run = prog.function(prog.tests[0].run);
@@ -16381,7 +16381,7 @@ fn the_record_field_arms_split_on_measured_v1_behaviour() {
         ));
         let lowered = lower_src(&src).expect("fitting sized record default lowers");
         verify::verify_program(&lowered).expect("sized record default verifies");
-        assert_eq!(lowered.records[0].fields[0].default, Some(value));
+        assert_eq!(lowered.records[0].fields[0].default, Some(ir::ScalarDefault::Narrow(value)));
         let tbir = tbir::emit(&lowered, &merged_src(&src), &cpp_tb::EmitOpts::default())
             .expect("tbir emits fitting sized record default");
         let tbir_folded = format!("uint64_t a = {value};");
@@ -30804,7 +30804,7 @@ fn regblock_field_resets_compose_into_mirror_default() {
         .iter()
         .find(|record| record.name == "DmaRegs")
         .expect("regblock mirror record");
-    assert_eq!(record.field("DMACR").and_then(|field| field.default), Some(0x8030));
+    assert_eq!(record.field("DMACR").and_then(|field| field.default.clone()), Some(ir::ScalarDefault::Narrow(0x8030)));
 
     let too_wide = src.replace("reset MODE_RESET", "reset 8");
     let error = lower_with_stdlib_bus_src(&too_wide)
@@ -30848,8 +30848,8 @@ fn regblock_capitalized_field_types_lower_like_lowercase() {
         .find(|record| record.name == "DmaRegs")
         .expect("regblock mirror record");
     assert_eq!(
-        record.field("DMACR").and_then(|field| field.default),
-        Some(0x50)
+        record.field("DMACR").and_then(|field| field.default.clone()),
+        Some(ir::ScalarDefault::Narrow(0x50))
     );
 
     let overflow = fixture.replace(field, "field MODE : UInt<32> @ 4  reset 0");
@@ -40672,8 +40672,16 @@ fn an_unfoldable_or_out_of_range_regblock_value_is_still_rejected() {
     let err = lower_src(&offset("const K = 0x8000000000000000\n\n", "K")).unwrap_err();
     let msg = assert_invalid(&err);
     assert!(msg.contains("`const NAME : uint<64> = ...`"), "{msg}");
-    lower_src(&offset("const K : uint<64> = 0x8000000000000000\n\n", "K"))
-        .expect("a uint<64> const spells a >=2^63 address");
+    // It folds; the address then has to fit the `via` helper's `addr`
+    // parameter, which this fixture declares `uint<8>`, and the frontdoor
+    // says so precisely instead of handing the verifier a 64-bit argument.
+    let err = lower_src(&offset("const K : uint<64> = 0x8000000000000000\n\n", "K"))
+        .unwrap_err();
+    let msg = assert_invalid(&err);
+    assert!(
+        msg.contains("its offset 0x8000000000000000"),
+        "a uint<64> const spells a >=2^63 address: {msg}"
+    );
 
     // A FORWARD reference folds: regblocks lower after the whole
     // constant table is built, so the declaration-order caveat that
@@ -56141,7 +56149,7 @@ end impl T
             name: "stored".into(),
             kind: ir::StateFieldKind::Scalar {
                 ty: ir::IrType::String,
-                default: 0,
+                default: ir::ScalarDefault::Narrow(0),
             },
         });
     let errors = verify::verify_program(&transactor)

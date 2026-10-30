@@ -1,0 +1,70 @@
+// A `default` on a field wider than 64 bits is carried at the field's full
+// width. Before the fix the default slot was a `u64`: a negative default on a
+// `sint<65>` was zero-extended (it started at +2^64 - 1) and a value past 64
+// bits was refused. Covers component, scoreboard and struct fields at 2^63,
+// 2^64 and negative values; narrow signed defaults are the control.
+
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+struct WideRec
+    w : sint<65> default -2
+    p : sint<96> default 5
+    big : uint<200> default 0x1_0000_0000_0000_0000
+end struct WideRec
+
+scoreboard WideSb
+    s : sint<100> default -3
+    t : sint<200> default -0x1_0000_0000_0000_0000
+end scoreboard WideSb
+
+agent WideDefaults
+    a : sint<65> default -1
+    b : sint<16> default -1
+    c : sint<200> default -5
+    m : sint<128> default -9223372036854775807 - 1
+    p : sint<65> default 0x7FFF_FFFF_FFFF_FFFF
+    h : sint<65> default 0x8000_0000_0000_0000
+    u : uint<200> default 0x1_0000_0000_0000_0000
+    n : sint<200> default -0x8000_0000_0000_0000_0000
+    lo : sint<65> default -0x1_0000_0000_0000_0000
+    sbf : WideSb
+    hookable verify()
+        assert a < 0 else fail("sint<65> default -1 is not negative")
+        assert a == -1 else fail("sint<65> default -1 reads ${a}")
+        assert a + 1 == 0 else fail("sint<65> default -1 plus 1 is not 0")
+        assert b < 0 else fail("sint<16> default -1 is not negative")
+        assert c < 0 else fail("sint<200> default -5 is not negative")
+        assert c + 5 == 0 else fail("sint<200> default -5 plus 5 is not 0")
+        assert m < 0 else fail("sint<128> default i64::MIN is not negative")
+        assert p > 0 else fail("sint<65> default 2^63 - 1 is not positive")
+        assert h > 0 else fail("sint<65> default 2^63 is not positive")
+        assert h - 1 == p else fail("sint<65> default 2^63 is not 2^63")
+        assert u != 0 else fail("uint<200> default 2^64 is zero")
+        assert u - 1 == 0xFFFF_FFFF_FFFF_FFFF else fail("uint<200> default is not 2^64")
+        assert n < 0 else fail("sint<200> default -2^79 is not negative")
+        assert n + 0x8000_0000_0000_0000_0000 == 0 else fail("sint<200> default is not -2^79")
+        assert lo == -0x1_0000_0000_0000_0000 else fail("sint<65> default -2^64 (its minimum)")
+        assert lo < 0 else fail("sint<65> default -2^64 is not negative")
+        assert sbf.s < 0 else fail("scoreboard sint<100> default -3 is not negative")
+        assert sbf.t < 0 else fail("scoreboard sint<200> default -2^64 is not negative")
+        assert sbf.t + 0x1_0000_0000_0000_0000 == 0 else fail("scoreboard sint<200> default is not -2^64")
+    end verify
+end agent WideDefaults
+
+test WideSignedDefaultTest
+    let dut : Top
+    let x : WideDefaults
+    clock clk = SysDomain
+    run
+        x.verify()
+        let r : WideRec
+        assert r.w < 0 else fail("struct sint<65> default -2 is not negative")
+        assert r.w + 2 == 0 else fail("struct sint<65> default -2 plus 2 is not 0")
+        assert r.p == 5 else fail("struct sint<96> default 5 reads ${r.p}")
+        assert r.big - 1 == 0xFFFF_FFFF_FFFF_FFFF else fail("struct uint<200> default is not 2^64")
+        log(info, "WIDE_SIGNED_DEFAULT_OK")
+        wait 1 cycle
+    end run
+end test WideSignedDefaultTest
