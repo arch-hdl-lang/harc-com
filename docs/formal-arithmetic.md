@@ -30,6 +30,27 @@ unwinding, unrecognized success output and timeouts fail the run.
 | `runtime/harc_random_rt.h`: `harc_rng_range` | Mathematical inclusive modulo mapping, output bounds, exactly one draw for ordered ranges and none for degenerate ranges | Full signed int64 domain and either half-domain with every uint64 draw; all signed 8-bit bounds with all uint8 draws; every int64 degenerate/reversed pair |
 | `solver_binary_is_signed` | Existing declared-width promotion policy and operand symmetry | All three operand classifications and widths 1..1024; separate symmetry/conservative-fallback checks for arbitrary optional `u32` widths |
 
+**Zero-divisor and MIN/-1 policies are kernel-internal, not language
+semantics.** HARC makes runtime `/` and `%` by zero, and signed `MIN / -1` /
+`MIN % -1` at the declared width, FATAL errors at every width (spec §2).
+Emitted code reaches `harc_sdiv_u128` / `harc_smod_u128` (and the `HarcWide`
+twins and native `/` / `%`) only through the checked entry points
+`harc_sdiv_i64`, `harc_smod_i64`, `harc_sdiv_u128_checked`,
+`harc_smod_u128_checked`, `harc_wide_sdiv_checked`, `harc_wide_smod_checked`,
+`harc_checked_div` and `harc_checked_mod`, which raise the fault before the
+kernel runs. The `x / 0 = 0`, `x % 0 = x` and modular `MIN / -1` results
+proved above are therefore unreachable from emitted code; the obligations that
+pin them (`u128-divzero`, and the zero/overflow cases of the u128 signed
+division equivalence) still describe the kernels but no longer the language,
+and are due to be re-derived against the checked entry points. The checked
+entry points, and the <= 64-bit shift helpers — `harc_shl_uw` /
+`harc_shl_iw` / `harc_shr_uw` / `harc_ashr_iw` for an operand of exact
+declared width `W < 64` (the result keeps `W` bits; a count >= `W`
+saturates) and `harc_shl_u64` / `harc_shr_u64` / `harc_ashr_i64` for a
+width-erased 64-bit value (a count >= 64 saturates) — are covered by the
+executable host-compiler test `tests/runtime_arith_guards_cpp.rs`, not by a
+proof.
+
 Full C++ signed division/remainder equivalence at widths 32, 64 and 128 is
 **unresolved**: exploratory SAT/SMT runs timed out. Attempt these additional
 obligations explicitly; a timeout is a failing result:

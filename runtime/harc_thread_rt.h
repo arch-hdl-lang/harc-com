@@ -34,6 +34,8 @@
 #include <coroutine>
 #include <functional>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <type_traits>
 #include <utility>
@@ -243,6 +245,13 @@ inline long long harc_printf_ll(const T& v) {
     } else {
         return static_cast<long long>(v);
     }
+}
+
+// `%llu` twin of `harc_printf_ll`, for an unsigned value of 64 bits or more
+// (the low 64 bits of a wider one, as `harc_printf_ll` prints).
+template<typename T>
+inline unsigned long long harc_printf_ull(const T& v) {
+    return static_cast<unsigned long long>(static_cast<uint64_t>(v));
 }
 
 template<std::size_t A, std::size_t B>
@@ -904,6 +913,294 @@ inline _harc_u128 harc_sext_u128(_harc_u128 value, unsigned source_width, unsign
     if ((value & sign) == 0) return value & harc_mask_u128(dest_width);
     const _harc_u128 fill = harc_mask_u128(dest_width) & ~harc_mask_u128(source_width);
     return (value | fill) & harc_mask_u128(dest_width);
+}
+
+// ── Scalar-tier shifts (<= 64-bit carriers) ─────────────────────────────────
+//
+// A <= 64-bit HARC value is evaluated in its 64-bit host carrier, so a shift
+// count of 64 or more shifts every bit out: `<<` and logical `>>` give 0, an
+// arithmetic `>>` gives the sign fill (0 or -1). C++ leaves `x << 64` and
+// `x >> 64` undefined (arm64 and x86-64 both reduce the count mod 64), so the
+// emitted code must never spell a bare shift with an unclamped count. A
+// negative signed count reaches here converted to `uint64_t` and therefore
+// saturates too. The > 64-bit tiers saturate at their declared width through
+// `harc_shl_u128` / `harc_shr_u128` / `harc_ashr_u128` and the wide helpers.
+inline uint64_t harc_shl_u64(uint64_t value, uint64_t shift) {
+    return shift >= 64 ? 0 : (value << shift);
+}
+
+inline uint64_t harc_shr_u64(uint64_t value, uint64_t shift) {
+    return shift >= 64 ? 0 : (value >> shift);
+}
+
+inline int64_t harc_ashr_i64(int64_t value, uint64_t shift) {
+    if (shift >= 64) return value < 0 ? -1 : 0;
+    return value >> shift;
+}
+
+// Declared-width shifts for a `uint<W>` / `sint<W>` operand with W < 64. A
+// shift does not widen (ARCH, IEEE 1800 §11.6.1): the result keeps the left
+// operand's width W, so `<<` drops the bits shifted past W and any count
+// >= W shifts everything out. The operand is first normalized to its W-bit
+// value (masked, or sign-extended from bit W - 1); a signed result is the
+// sign-extended W-bit value, like every `sint<W>` in its `int64_t` carrier.
+inline uint64_t harc_mask_u64(unsigned width) {
+    return width >= 64 ? ~0ULL : ((1ULL << width) - 1);
+}
+
+inline int64_t harc_sext_i64(uint64_t value, unsigned width) {
+    if (width == 0) return 0;
+    if (width >= 64) return static_cast<int64_t>(value);
+    const unsigned fill = 64 - width;
+    return static_cast<int64_t>(value << fill) >> fill;
+}
+
+inline uint64_t harc_shl_uw(uint64_t value, uint64_t shift, unsigned width) {
+    if (shift >= width) return 0;
+    return (value << shift) & harc_mask_u64(width);
+}
+
+inline int64_t harc_shl_iw(int64_t value, uint64_t shift, unsigned width) {
+    if (shift >= width) return 0;
+    return harc_sext_i64(static_cast<uint64_t>(value) << shift, width);
+}
+
+inline uint64_t harc_shr_uw(uint64_t value, uint64_t shift, unsigned width) {
+    if (shift >= width) return 0;
+    return (value & harc_mask_u64(width)) >> shift;
+}
+
+inline int64_t harc_ashr_iw(int64_t value, uint64_t shift, unsigned width) {
+    const int64_t v = harc_sext_i64(static_cast<uint64_t>(value), width);
+    if (shift >= width) return v < 0 ? -1 : 0;
+    return v >> shift;
+}
+
+// ── Runtime arithmetic faults ───────────────────────────────────────────────
+//
+// Division or modulo by zero, and signed `MIN / -1` / `MIN % -1` at the
+// operation's declared width, are runtime FATAL errors at every width (the
+// constant folder rejects the same expressions at compile time). The checked
+// entry points below test the operands and report through an installed
+// reporter, the same shape as the empty-queue path in `harc_queue_rt.h`: the
+// generated `run_<Test>()` prologue installs `HarcArithFatalScope`, whose
+// reporter logs a FATAL line, bumps the error count and sets the fatal flag,
+// so the run stops at the next scheduler tick with its log and trace intact.
+// The faulting expression itself yields a deterministic value (0, or the
+// wrapped dividend for `MIN / -1`) — never C++ undefined behaviour.
+//
+// The unchecked kernels (`harc_sdiv_u128`, `harc_wide_sdiv`, the `HarcWide`
+// `operator/`, ...) keep their documented zero-divisor policies; emitted code
+// reaches them only through these guards, after the fault cases are excluded.
+inline std::function<void(const char*)> harc_arith_fatal_reporter;
+
+// Backstop with no reporter installed (a unit test, or a caller outside a
+// generated run): there is no test context to fail through, so abort loudly
+// rather than continue with a silently wrong value.
+[[noreturn]] inline void harc_arith_fatal_abort(const char* message) {
+    std::fflush(stdout);
+    std::fprintf(stderr, "HARC-ERROR: %s\n", message);
+    std::fflush(stderr);
+    std::abort();
+}
+
+inline void harc_arith_fatal(const char* message) {
+    if (harc_arith_fatal_reporter) {
+        harc_arith_fatal_reporter(message);
+        return;
+    }
+    harc_arith_fatal_abort(message);
+}
+
+// Installs `report` as the arithmetic-fault reporter for its own lifetime.
+struct HarcArithFatalScope {
+    std::function<void(const char*)> previous;
+
+    explicit HarcArithFatalScope(std::function<void(const char*)> report)
+        : previous(std::move(harc_arith_fatal_reporter)) {
+        harc_arith_fatal_reporter = std::move(report);
+    }
+    ~HarcArithFatalScope() {
+        harc_arith_fatal_reporter = std::move(previous);
+    }
+    HarcArithFatalScope(const HarcArithFatalScope&) = delete;
+    HarcArithFatalScope& operator=(const HarcArithFatalScope&) = delete;
+};
+
+inline constexpr const char* harc_div_zero_message = "runtime arithmetic error: division by zero";
+inline constexpr const char* harc_mod_zero_message = "runtime arithmetic error: modulo by zero";
+inline constexpr const char* harc_div_overflow_message =
+    "runtime arithmetic error: signed division overflow (MIN / -1)";
+inline constexpr const char* harc_mod_overflow_message =
+    "runtime arithmetic error: signed modulo overflow (MIN % -1)";
+
+template<typename T>
+inline bool harc_value_is_zero(const T& value) {
+    if constexpr (is_harc_wide_v<T>) {
+        return harc_wide_is_zero(value);
+    } else {
+        return value == 0;
+    }
+}
+
+// Unsigned (or width-erased) division at any carrier tier: the operator the
+// emitter used to spell bare, behind a zero-divisor guard.
+template<typename A, typename B>
+inline auto harc_checked_div(const A& lhs, const B& rhs) -> decltype(lhs / rhs) {
+    if (harc_value_is_zero(rhs)) {
+        harc_arith_fatal(harc_div_zero_message);
+        return decltype(lhs / rhs){};
+    }
+    return lhs / rhs;
+}
+
+template<typename A, typename B>
+inline auto harc_checked_mod(const A& lhs, const B& rhs) -> decltype(lhs % rhs) {
+    if (harc_value_is_zero(rhs)) {
+        harc_arith_fatal(harc_mod_zero_message);
+        return decltype(lhs % rhs){};
+    }
+    return lhs % rhs;
+}
+
+// Signed <= 64-bit division. `width` is the operation's declared width; the
+// carrier holds the sign-extended value, so MIN is -(2^(width-1)).
+inline bool harc_is_smin_i64(int64_t value, unsigned width) {
+    if (width == 0 || width >= 64) return value == INT64_MIN;
+    return value == -(static_cast<int64_t>(1) << (width - 1));
+}
+
+inline int64_t harc_sdiv_i64(int64_t lhs, int64_t rhs, unsigned width) {
+    if (rhs == 0) {
+        harc_arith_fatal(harc_div_zero_message);
+        return 0;
+    }
+    if (rhs == -1 && harc_is_smin_i64(lhs, width)) {
+        harc_arith_fatal(harc_div_overflow_message);
+        return lhs;
+    }
+    return lhs / rhs;
+}
+
+inline int64_t harc_smod_i64(int64_t lhs, int64_t rhs, unsigned width) {
+    if (rhs == 0) {
+        harc_arith_fatal(harc_mod_zero_message);
+        return 0;
+    }
+    if (rhs == -1 && harc_is_smin_i64(lhs, width)) {
+        harc_arith_fatal(harc_mod_overflow_message);
+        return 0;
+    }
+    return lhs % rhs;
+}
+
+// Signed 65..128-bit division over the `_harc_u128` carrier.
+inline bool harc_is_smin_u128(_harc_u128 value, unsigned width) {
+    if (width == 0) return false;
+    return (value & harc_mask_u128(width)) == (static_cast<_harc_u128>(1) << (width - 1));
+}
+
+inline bool harc_is_minus_one_u128(_harc_u128 value, unsigned width) {
+    return width != 0 && (value & harc_mask_u128(width)) == harc_mask_u128(width);
+}
+
+inline _harc_u128 harc_sdiv_u128_checked(_harc_u128 lhs, _harc_u128 rhs, unsigned width) {
+    if ((rhs & harc_mask_u128(width)) == 0) {
+        harc_arith_fatal(harc_div_zero_message);
+        return 0;
+    }
+    if (harc_is_minus_one_u128(rhs, width) && harc_is_smin_u128(lhs, width)) {
+        harc_arith_fatal(harc_div_overflow_message);
+        return lhs & harc_mask_u128(width);
+    }
+    return harc_sdiv_u128(lhs, rhs, width);
+}
+
+inline _harc_u128 harc_smod_u128_checked(_harc_u128 lhs, _harc_u128 rhs, unsigned width) {
+    if ((rhs & harc_mask_u128(width)) == 0) {
+        harc_arith_fatal(harc_mod_zero_message);
+        return 0;
+    }
+    if (harc_is_minus_one_u128(rhs, width) && harc_is_smin_u128(lhs, width)) {
+        harc_arith_fatal(harc_mod_overflow_message);
+        return 0;
+    }
+    return harc_smod_u128(lhs, rhs, width);
+}
+
+// Signed > 128-bit division over `HarcWide<N>`.
+template<std::size_t N>
+inline bool harc_wide_is_smin(HarcWide<N> value, unsigned width) {
+    if (width == 0) return false;
+    value = harc_wide_mask_bits(value, width);
+    HarcWide<N> min;
+    harc_wide_set_bit(min, width - 1);
+    return value == min;
+}
+
+template<std::size_t N>
+inline bool harc_wide_is_minus_one(HarcWide<N> value, unsigned width) {
+    if (width == 0) return false;
+    value = harc_wide_mask_bits(value, width);
+    return value == harc_wide_mask_bits(~HarcWide<N>(), width);
+}
+
+template<std::size_t N>
+inline HarcWide<N> harc_wide_sdiv_checked(HarcWide<N> lhs, HarcWide<N> rhs, unsigned width) {
+    if (harc_wide_is_zero(harc_wide_mask_bits(rhs, width))) {
+        harc_arith_fatal(harc_div_zero_message);
+        return HarcWide<N>();
+    }
+    if (harc_wide_is_minus_one(rhs, width) && harc_wide_is_smin(lhs, width)) {
+        harc_arith_fatal(harc_div_overflow_message);
+        return harc_wide_mask_bits(lhs, width);
+    }
+    return harc_wide_sdiv(lhs, rhs, width);
+}
+
+template<std::size_t N>
+inline HarcWide<N> harc_wide_smod_checked(HarcWide<N> lhs, HarcWide<N> rhs, unsigned width) {
+    if (harc_wide_is_zero(harc_wide_mask_bits(rhs, width))) {
+        harc_arith_fatal(harc_mod_zero_message);
+        return HarcWide<N>();
+    }
+    if (harc_wide_is_minus_one(rhs, width) && harc_wide_is_smin(lhs, width)) {
+        harc_arith_fatal(harc_mod_overflow_message);
+        return HarcWide<N>();
+    }
+    return harc_wide_smod(lhs, rhs, width);
+}
+
+// Width-aware equality for one scalar record field: two values are equal iff
+// their low `width` bits are. The bits above a field's declared width are
+// carrier padding, and producers disagree about it (a sign-extending store
+// fills it with ones, a masking helper clears it), so a raw carrier `==`
+// could call two equal records unequal.
+template<typename T>
+inline bool harc_eq_width(const T& lhs, const T& rhs, unsigned width) {
+    if constexpr (is_harc_wide_v<T>) {
+        return harc_wide_mask_bits(lhs, width) == harc_wide_mask_bits(rhs, width);
+    } else {
+        const _harc_u128 mask = harc_mask_u128(width);
+        return (static_cast<_harc_u128>(lhs) & mask) == (static_cast<_harc_u128>(rhs) & mask);
+    }
+}
+
+template<typename T, std::size_t L>
+inline bool harc_eq_width(const std::array<T, L>& lhs, const std::array<T, L>& rhs, unsigned width) {
+    for (std::size_t i = 0; i < L; ++i) {
+        if (!harc_eq_width(lhs[i], rhs[i], width)) return false;
+    }
+    return true;
+}
+
+template<typename T>
+inline bool harc_eq_width(const std::vector<T>& lhs, const std::vector<T>& rhs, unsigned width) {
+    if (lhs.size() != rhs.size()) return false;
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        if (!harc_eq_width(lhs[i], rhs[i], width)) return false;
+    }
+    return true;
 }
 
 template<std::size_t N>

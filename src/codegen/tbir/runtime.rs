@@ -2089,6 +2089,16 @@ pub(super) fn log_helpers_and_seed(out: &mut String, qualified_clock_wait: bool)
         ctx.errors++;
         _fatal = true;
     });
+    // Runtime arithmetic faults (division/modulo by zero, signed MIN / -1)
+    // fail through the same FATAL path. The test stops at its next yield;
+    // until then later faults (a loop dividing by the same zero) are not
+    // re-reported once the run is already fatal.
+    harc_rt::HarcArithFatalScope _arith_fatal_scope([&](const char* message) {
+        if (_fatal) return;
+        harc_rt::log::harc_log_line(log_ctx.sim_log, &trace, cycle_count, "FATAL", message);
+        ctx.errors++;
+        _fatal = true;
+    });
 
     sim_log_line("INFO", "seed=%llu", (long long)harc_rng.state);
 

@@ -34,11 +34,13 @@ covergroup ExprCov @(posedge dut.clk)
         bins
             neg_one = {-1}
         end bins
-    // An `as uint<N>` cast is not the `.resize<N>()` method: it stays an
-    // unsigned zero-extend even over a signed operand, so the 0xF nibble
-    // samples 15, never -1.
+    // An `as uint<N>` cast is the low N bits of the operand's two's-
+    // complement value: the 0xF nibble is -1 as a `sint<4>`, sign-extends,
+    // and samples 255 as a `uint<8>` — unsigned, so never -1, and not the
+    // zero-extended 15.
     cp_unsigned_cast_of_signed : cover (dut.count_out[3:0] as sint<4>) as uint<8>
         bins
+            all_ones = {255}
             fifteen = {15}
             neg_one = {-1}
         end bins
@@ -125,7 +127,8 @@ impl CovExprTargetsTest for CovExprTargetsTb
         assert cov.cp_signed_nibble.neg_one > 0 else fail("signed-nibble sext bin hole")
         assert cov.cp_signed_resize_widen.neg_one > 0 else fail("signed resize widen bin hole")
         assert cov.cp_signed_resize_narrow.neg_one > 0 else fail("signed resize narrow bin hole")
-        assert cov.cp_unsigned_cast_of_signed.fifteen > 0 else fail("unsigned cast of signed bin hole")
+        assert cov.cp_unsigned_cast_of_signed.all_ones > 0 else fail("unsigned cast of signed bin hole")
+        assert cov.cp_unsigned_cast_of_signed.fifteen == 0 else fail("unsigned cast of signed zero-extended to 15")
         assert cov.cp_unsigned_cast_of_signed.neg_one == 0 else fail("unsigned cast of signed sampled -1")
         assert cov.cp_low_pair.zero > 0 else fail("low-pair zero bin hole")
         assert cov.cp_low_pair.one > 0 else fail("low-pair one bin hole")

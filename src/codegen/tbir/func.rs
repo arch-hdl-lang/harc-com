@@ -22,7 +22,7 @@
 
 use super::expr::{
     bounded_count_expr_cpp, comp_base_cpp_subst_cx, escape_c, expr_cpp, expr_is_signed,
-    expr_static_width, fmt_arg_cpp, helper_cpp_name, lane_index_cpp, lane_width, local_cpp_name,
+    expr_static_width, fmt_args_cpp, helper_cpp_name, lane_index_cpp, lane_width, local_cpp_name,
     local_ir_type, owner_tb, port_read, port_signal, required_testbench_receiver,
     scalar_assignment_expr_cpp, truthy_expr_cpp, wide_words_over_128, BusAdapterRenderBindings,
     CallableRenderBindings, ECx, RuntimeCellRenderBinding, TestbenchBusAdapterPlan,
@@ -2502,6 +2502,16 @@ fn scalar_sink_expr_cpp(
             if expr_is_signed(cx, value)
                 && expr_static_width(cx, value)
                     .is_some_and(|source| source < target && (target <= 128 || source > 64)) =>
+        {
+            scalar_assignment_expr_cpp(cx, value, &ty)
+        }
+        // A width-erased 64-bit host value widened into a signed carrier
+        // wider than 64 bits sign-extends from bit 63, as it does into any
+        // `sint<N>` of 64 bits or fewer (see `scalar_assignment_expr_cpp`).
+        Some(ty @ IrType::SInt(Some(target)))
+            if target > 64
+                && !matches!(value, Expr::Literal { .. } | Expr::WideLiteral(_))
+                && expr_static_width(cx, value).is_none() =>
         {
             scalar_assignment_expr_cpp(cx, value, &ty)
         }
@@ -8522,13 +8532,14 @@ fn emit_log_call(
     depth: usize,
 ) -> Result<(), EmitError> {
     let pad = INDENT.repeat(depth);
+    let (fmt, rendered_args) = fmt_args_cpp(cx, args)?;
     match file {
         Some(p) => {
             write!(
                 out,
                 "{pad}sim_logf_line(log_ctx.file(\"{}\"), \"{sev}\", \"{}\"",
                 escape_c(p),
-                escape_c(&args.fmt)
+                escape_c(&fmt)
             )
             .ok();
         }
@@ -8536,13 +8547,12 @@ fn emit_log_call(
             write!(
                 out,
                 "{pad}sim_log_line(\"{sev}\", \"{}\"",
-                escape_c(&args.fmt)
+                escape_c(&fmt)
             )
             .ok();
         }
     }
-    for a in &args.args {
-        let rendered = fmt_arg_cpp(cx, a)?;
+    for rendered in rendered_args {
         write!(out, ", {rendered}").ok();
     }
     writeln!(out, ");").ok();

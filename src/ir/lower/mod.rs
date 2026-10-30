@@ -476,6 +476,69 @@ fn const_operand_width(e: &crate::ast::Expr, consts: &HashMap<String, ConstVal>)
     }
 }
 
+/// The `W`-bit value of a 64-bit pattern: masked, or sign-extended from bit
+/// `W - 1` when `signed`.
+fn normalize_const_bits(bits: u64, width: u32, signed: bool) -> u64 {
+    if width >= 64 {
+        bits
+    } else if signed {
+        let shift = 64 - width;
+        (((bits << shift) as i64) >> shift) as u64
+    } else {
+        bits & ((1u64 << width) - 1)
+    }
+}
+
+/// The exact declared width of a constant shift's left operand, by the
+/// runtime rule (`shift_declared_width` in `codegen/tbir/expr.rs`): a typed
+/// constant, an `as` cast, `~` of one, `& | ^` of them (a width-less
+/// literal takes the other side's width), or a nested shift. A literal, or
+/// arithmetic, has none (it shifts in the 64-bit domain, like a
+/// width-erased runtime value).
+fn const_shift_declared_width(
+    e: &crate::ast::Expr,
+    consts: &HashMap<String, ConstVal>,
+) -> Option<u32> {
+    let is_int = |e: &crate::ast::Expr| {
+        let mut e = e;
+        while let ExprKind::Paren(inner) = &*e.kind {
+            e = inner;
+        }
+        matches!(&*e.kind, ExprKind::Int(_))
+    };
+    match &*e.kind {
+        ExprKind::Paren(inner) => const_shift_declared_width(inner, consts),
+        ExprKind::Cast { ty, .. } => exprs::cast_relabel_width(ty),
+        ExprKind::Unary {
+            op: crate::ast::UnaryOp::BitNot,
+            expr,
+        } => const_shift_declared_width(expr, consts),
+        ExprKind::Binary {
+            op: crate::ast::BinaryOp::Shl | crate::ast::BinaryOp::Shr,
+            lhs,
+            ..
+        } => const_shift_declared_width(lhs, consts),
+        ExprKind::Binary {
+            op: crate::ast::BinaryOp::BitAnd | crate::ast::BinaryOp::BitOr | crate::ast::BinaryOp::BitXor,
+            lhs,
+            rhs,
+        } => match (is_int(lhs), is_int(rhs)) {
+            (true, true) => None,
+            (true, false) => const_shift_declared_width(rhs, consts),
+            (false, true) => const_shift_declared_width(lhs, consts),
+            (false, false) => Some(
+                const_shift_declared_width(lhs, consts)?
+                    .max(const_shift_declared_width(rhs, consts)?),
+            ),
+        },
+        ExprKind::Ident(id) => match &consts.get(&id.name)?.provenance {
+            ConstProvenance::Typed(IrType::UInt(Some(w)) | IrType::SInt(Some(w))) => Some(*w),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Const-fold a file-scope `const` initializer expression, resolving
 /// identifiers against `consts` (earlier `const` values and enum-
 /// variant indices, both in source order; `self_name` is the constant
@@ -897,21 +960,22 @@ fn fold_const_inner(
                 id.name
             ))),
         },
-        // `expr as uint<W>` / `as sint<W>` / `as bits<W>` (W ≤ 64) is a
-        // signedness relabel with the value unchanged — the same
-        // semantics the runtime lowering gives casts (`cast_relabel_width`)
-        // and v1's `((uint64_t)(expr))` emission at 64-bit rank.
+        // `expr as uint<W>` / `as sint<W>` / `as bits<W>` (W ≤ 64) is the
+        // `W`-bit value of the operand's bit pattern — the same semantics
+        // the runtime lowering gives casts (`cast_relabel_width`): `as
+        // uint<W>` keeps the low `W` bits, `as sint<W>` keeps them and
+        // sign-extends from bit `W - 1`.
         ExprKind::Cast { expr, ty } => {
-            // The runtime relabel helper accepts widths up to 128, but
-            // the const fold's value domain is 64-bit — gate at 64 so
-            // the accepted subset matches the documented one.
-            if !exprs::cast_relabel_width(ty).is_some_and(|w| w <= 64) {
+            // The runtime cast accepts wider targets, but the const fold's
+            // value domain is 64-bit — gate at 64 so the accepted subset
+            // matches the documented one.
+            let Some(width) = exprs::cast_relabel_width(ty).filter(|w| *w <= 64) else {
                 return Err(ConstFoldErr::Unsupported(
                     "`as` casts outside scalar uint/sint/bits (≤ 64 bits) in a \
                      constant expression"
                         .into(),
                 ));
-            }
+            };
             let v = fold_const_inner(expr, consts, self_name, helpers, call_stack)?;
             let signed = matches!(
                 ty,
@@ -920,7 +984,7 @@ fn fold_const_inner(
                     ..
                 }
             );
-            Ok(ConstVal::untyped(v.bits, signed))
+            Ok(ConstVal::untyped(normalize_const_bits(v.bits, width, signed), signed))
         }
         ExprKind::Unary { op, expr } => {
             let v = fold_const_inner(expr, consts, self_name, helpers, call_stack)?;
@@ -1003,9 +1067,19 @@ fn fold_const_inner(
                 signed: v.signed,
                 boolean: v.is_boolean_kind(),
             };
+            // A shift keeps its left operand's declared width (the runtime
+            // rule): a `<<` whose left operand is a typed constant or a cast
+            // of `W < 64` bits drops the bits shifted past `W`.
+            let shl_width = matches!(op, BinaryOp::Shl)
+                .then(|| const_shift_declared_width(lhs, consts))
+                .flatten()
+                .filter(|w| *w < 64);
             match numeric_semantics::fold_binary(*op, scalar(&a), scalar(&b), wrap_width) {
                 Ok(v) => Ok(ConstVal {
-                    bits: v.bits,
+                    bits: match shl_width {
+                        Some(w) => normalize_const_bits(v.bits, w, v.signed),
+                        None => v.bits,
+                    },
                     signed: v.signed,
                     provenance: if v.boolean {
                         ConstProvenance::UntypedBool

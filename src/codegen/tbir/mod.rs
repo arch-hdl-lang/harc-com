@@ -1669,6 +1669,33 @@ pub(super) fn common_record_declaration(
     record_pack_helpers(out, r, records);
 }
 
+/// Structural `==` over a record's fields. A scalar `uint<N>` / `sint<N>`
+/// field (or a `Vec` / list of them) compares its low `N` bits only: the
+/// bits above the declared width are carrier padding that different
+/// producers fill differently (a sign-extending store sets them, a masking
+/// helper clears them), so a raw carrier `==` could call two equal records
+/// unequal. Nested records recurse through their own `operator==`.
+fn record_eq_body(r: &ir::RecordSchema) -> String {
+    r.fields
+        .iter()
+        .map(|f| {
+            fn leaf_width(ty: &ir::IrType) -> Option<u32> {
+                match ty {
+                    ir::IrType::UInt(Some(w)) | ir::IrType::SInt(Some(w)) => Some(*w),
+                    ir::IrType::Seq(elem) | ir::IrType::FixedVec { elem, .. } => leaf_width(elem),
+                    _ => None,
+                }
+            }
+            let scalar_width = leaf_width(&f.ty);
+            match scalar_width {
+                Some(w) => format!("harc_rt::harc_eq_width(a.{0}, b.{0}, {w})", f.name),
+                None => format!("a.{0} == b.{0}", f.name),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" && ")
+}
+
 pub(super) fn common_record_definitions(out: &mut String, r: &ir::RecordSchema) {
     if r.fields.is_empty() {
         writeln!(
@@ -1678,12 +1705,7 @@ pub(super) fn common_record_definitions(out: &mut String, r: &ir::RecordSchema) 
         )
         .ok();
     } else {
-        let eq = r
-            .fields
-            .iter()
-            .map(|f| format!("a.{0} == b.{0}", f.name))
-            .collect::<Vec<_>>()
-            .join(" && ");
+        let eq = record_eq_body(r);
         writeln!(
             out,
             "bool operator==(const {0}& a, const {0}& b) {{ return {eq}; }}",
@@ -1761,12 +1783,7 @@ fn record_struct(out: &mut String, r: &ir::RecordSchema, records: &[ir::RecordSc
         )
         .ok();
     } else {
-        let eq = r
-            .fields
-            .iter()
-            .map(|f| format!("a.{0} == b.{0}", f.name))
-            .collect::<Vec<_>>()
-            .join(" && ");
+        let eq = record_eq_body(r);
         writeln!(
             out,
             "inline bool operator==(const {0}& a, const {0}& b) {{ return {eq}; }}",

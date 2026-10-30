@@ -12,7 +12,7 @@ function gray_to_binary_ref(g: uint<4>) -> uint<4>
     let b2 : uint<1> = b3 ^ ((g >> 2) & 1)
     let b1 : uint<1> = b2 ^ ((g >> 1) & 1)
     let b0 : uint<1> = b1 ^ (g & 1)
-    return (b3 << 3) | (b2 << 2) | (b1 << 1) | b0
+    return (b3.zext<4>() << 3) | (b2.zext<4>() << 2) | (b1.zext<4>() << 1) | b0.zext<4>()
 end function gray_to_binary_ref
 
 testbench GrayToBinaryTestTb

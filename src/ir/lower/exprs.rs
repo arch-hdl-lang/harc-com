@@ -2173,39 +2173,33 @@ impl FuncBuilder<'_> {
                 V1Status::Rejects,
             )),
             ExprKind::Cast { expr, ty } => {
-                // `e as uint<W>` / `as sint<W>` / `as bits<W>` (W ≤ 64)
-                // is a width relabel: v1 emits `((uint64_t)(e))` (the
-                // C type for every width ≤ 64 is the same 64-bit
-                // integer), so the value is unchanged in the IR's
-                // uint64 local model. The annotation still feeds the
-                // width-method receiver inference (done on the AST at
-                // the call site). Anything else stays rejected.
+                // `e as uint<W>` / `as sint<W>` / `as bits<W>` produces the
+                // `W`-bit value of `e`'s two's-complement bit pattern, at
+                // every width and in every direction: `as uint<W>` keeps the
+                // low `W` bits (a mask), `as sint<W>` keeps the low `W` bits
+                // and sign-extends from bit `W - 1`. So `sint<8>(-1) as
+                // uint<16>` is 65535 and `uint<8>(0xFC) as sint<8>` is -4 —
+                // the same value a declared `uint<W>` / `sint<W>` local
+                // holding that bit pattern has. (This used to be a carrier
+                // relabel that left the 64-bit host value unchanged, so the
+                // result compared, printed and assigned with the source's
+                // sign instead of the target's.)
                 if cast_relabel_width(ty).is_some() {
                     let width = cast_relabel_width(ty).expect("checked above");
-                    let kind = match ty {
+                    let signed = matches!(
+                        ty,
                         TypeExpr::Builtin {
                             name: BuiltinTy::SInt | BuiltinTy::SIntCap,
                             ..
-                        } => WidthCastKind::Sext,
-                        _ => WidthCastKind::Zext,
-                    };
-                    // An explicit `as sint<W>` is a signedness relabel, not
-                    // a sign extension: it must preserve the 64-bit value
-                    // even when the source expression has a narrower
-                    // declared width. Keep the target width as the source
-                    // width metadata so TBIR can select signed operators
-                    // without applying a value-changing extension.
-                    let src_width = if matches!(kind, WidthCastKind::Sext) {
-                        Some(width)
+                        }
+                    );
+                    // `Sext` from a `W`-bit source to `W` bits is exactly
+                    // "take the low W bits, sign-extend from bit W - 1";
+                    // `Trunc` to `W` is the unsigned mask.
+                    let (kind, src_width) = if signed {
+                        (WidthCastKind::Sext, Some(width))
                     } else {
-                        // An explicit `as uint<W>` is a carrier relabel,
-                        // not a value-changing zero-extension. Keep its
-                        // source width unknown so TB-IR emits the same
-                        // plain cast shape as native code. A later explicit
-                        // `.zext<N>()` around this cast gets its own source
-                        // width from the AST receiver and normalizes the
-                        // relabelled carrier at that operation boundary.
-                        None
+                        (WidthCastKind::Trunc, None)
                     };
                     let inner = self.lower_expr(expr)?;
                     if matches!(self.expr_type(&inner), Some(IrType::FixedVec { .. })) {
@@ -6738,10 +6732,59 @@ pub(crate) fn check_literal_vec_index_bounds(
         return Ok(());
     }
     Err(LowerError::Invalid(format!(
-        "element index {value} is out of range for `Vec` record field \
-         `{dotted}` of length {len} (valid indices are 0..={})",
+        "element index {value} is out of range for `Vec` `{dotted}` of length {len} \
+         (valid indices are 0..={})",
         len.saturating_sub(1)
     )))
+}
+
+/// Source-level spelling of a fixed-vector (or scalar) type, for
+/// diagnostics: `Vec<uint<8>, 2>`.
+pub(crate) fn fixed_vec_type_spelling(ty: &IrType) -> String {
+    match ty {
+        IrType::UInt(Some(w)) => format!("uint<{w}>"),
+        IrType::SInt(Some(w)) => format!("sint<{w}>"),
+        IrType::Bool => "bool".to_string(),
+        IrType::FixedVec { elem, len } => {
+            format!("Vec<{}, {len}>", fixed_vec_type_spelling(elem))
+        }
+        other => crate::ir::display::ir_type_str(other),
+    }
+}
+
+/// `declared Vec<uint<8>, 2> but <source> is Vec<uint<16>, 2> (element
+/// types differ: uint<8> vs uint<16>)` — names the actual source and says
+/// what differs, outermost first.
+pub(crate) fn fixed_vec_mismatch_detail(declared: &IrType, actual: &IrType, source: &str) -> String {
+    fn difference(declared: &IrType, actual: &IrType) -> Option<String> {
+        match (declared, actual) {
+            (
+                IrType::FixedVec { elem: de, len: dl },
+                IrType::FixedVec { elem: ae, len: al },
+            ) => {
+                if dl != al {
+                    Some(format!("lengths differ: {dl} vs {al}"))
+                } else {
+                    difference(de, ae)
+                }
+            }
+            (d, a) if d != a => Some(format!(
+                "element types differ: {} vs {}",
+                fixed_vec_type_spelling(d),
+                fixed_vec_type_spelling(a)
+            )),
+            _ => None,
+        }
+    }
+    let mut out = format!(
+        "declared `{}` but {source} is `{}`",
+        fixed_vec_type_spelling(declared),
+        fixed_vec_type_spelling(actual)
+    );
+    if let Some(diff) = difference(declared, actual) {
+        out.push_str(&format!(" ({diff})"));
+    }
+    out
 }
 
 pub(crate) fn check_literal_tb_vec_index_bounds(

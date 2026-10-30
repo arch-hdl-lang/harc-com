@@ -12,10 +12,10 @@
 // auto-generated `_top` shim.
 
 function bcd_ref(n: uint<8>) -> uint<12>
-    let ones      : uint<4> = n % 10
-    let tens      : uint<4> = (n / 10) % 10
-    let hundreds  : uint<4> = (n / 100) % 10
-    return (hundreds << 8) | (tens << 4) | ones
+    let ones      : uint<4> = (n % 10).trunc<4>()
+    let tens      : uint<4> = ((n / 10) % 10).trunc<4>()
+    let hundreds  : uint<4> = ((n / 100) % 10).trunc<4>()
+    return (hundreds.zext<12>() << 8) | (tens.zext<12>() << 4) | ones.zext<12>()
 end function bcd_ref
 
 testbench BinaryToBcdTestTb

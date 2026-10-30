@@ -67,7 +67,7 @@ struct CountCmd {
     uint64_t tag = 7;
     uint64_t expect = 0;
 };
-inline bool operator==(const CountCmd& a, const CountCmd& b) { return a.ticks == b.ticks && a.flag == b.flag && a.tag == b.tag && a.expect == b.expect; }
+inline bool operator==(const CountCmd& a, const CountCmd& b) { return harc_rt::harc_eq_width(a.ticks, b.ticks, 8) && a.flag == b.flag && harc_rt::harc_eq_width(a.tag, b.tag, 16) && harc_rt::harc_eq_width(a.expect, b.expect, 32); }
 inline bool operator!=(const CountCmd& a, const CountCmd& b) { return !(a == b); }
 
 static harc_rt::HarcWide<2> harc_pack_CountCmd(const CountCmd& value) {
@@ -236,6 +236,16 @@ int run_TransactionBasicTest(int argc, char** argv) {
     // verbatim by both codegens so the two traces stay diffable.
     harc_rt::HarcQueueFatalScope _queue_fatal_scope([&]() {
         sim_log_line("FATAL", "queue front/pop on an empty queue -- guard it with .empty()/.size(), or wait until the producer has pushed");
+        ctx.errors++;
+        _fatal = true;
+    });
+    // Runtime arithmetic faults (division/modulo by zero, signed MIN / -1)
+    // fail through the same FATAL path. The test stops at its next yield;
+    // until then later faults (a loop dividing by the same zero) are not
+    // re-reported once the run is already fatal.
+    harc_rt::HarcArithFatalScope _arith_fatal_scope([&](const char* message) {
+        if (_fatal) return;
+        harc_rt::log::harc_log_line(log_ctx.sim_log, &trace, cycle_count, "FATAL", message);
         ctx.errors++;
         _fatal = true;
     });

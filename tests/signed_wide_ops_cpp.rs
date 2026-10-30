@@ -62,12 +62,12 @@ fn signed_wide_operators_route_to_twos_complement_helpers() {
         "signed wide `<`/`<=`/`>`/`>=` must route to harc_wide_slt:\n{cpp}"
     );
     assert!(
-        cpp.contains("harc_wide_sdiv("),
-        "signed wide `/` must route to harc_wide_sdiv:\n{cpp}"
+        cpp.contains("harc_wide_sdiv_checked("),
+        "signed wide `/` must route to harc_wide_sdiv_checked (the zero/MIN-guarded harc_wide_sdiv):\n{cpp}"
     );
     assert!(
-        cpp.contains("harc_wide_smod("),
-        "signed wide `%` must route to harc_wide_smod:\n{cpp}"
+        cpp.contains("harc_wide_smod_checked("),
+        "signed wide `%` must route to harc_wide_smod_checked (the zero/MIN-guarded harc_wide_smod):\n{cpp}"
     );
 
     // 65..=128 tier → the `_u128` twins.
@@ -76,8 +76,8 @@ fn signed_wide_operators_route_to_twos_complement_helpers() {
         "signed 65..128-bit `<` must route to harc_slt_u128:\n{cpp}"
     );
     assert!(
-        cpp.contains("harc_sdiv_u128("),
-        "signed 65..128-bit `/` must route to harc_sdiv_u128:\n{cpp}"
+        cpp.contains("harc_sdiv_u128_checked("),
+        "signed 65..128-bit `/` must route to harc_sdiv_u128_checked (the zero/MIN-guarded harc_sdiv_u128):\n{cpp}"
     );
 
     // A SIGNED wide `==` is width-masked, not the raw carrier operator
