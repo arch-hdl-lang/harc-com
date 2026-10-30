@@ -8352,22 +8352,6 @@ impl LowerCtx {
     }
 }
 
-/// Fold an ADDRESS-like constant expression — an addrmap instance base
-/// or window size, a regblock register offset or reset value. These have
-/// no declared type to range-check against, only the standing
-/// requirement that the value is not negative.
-///
-/// This is the counterpart to `components::fold_field_default`, and the
-/// two differ in exactly the way their call sites do: a field default
-/// carries a `TypeExpr` and is checked against it, an address does not
-/// and is checked against zero instead.
-///
-/// A bare sized literal (`32'h18`) is a value-bearing literal here just as it
-/// is in a general scalar expression; reuse the shared parser and discard only
-/// the declared width because an address slot has no value type. Anything else
-/// that will not fold is `SilentlyMisLowers`, because v1 accepts it and yields
-/// ZERO. Pointing a user at v1 for `@ dut.count_out` would hand them a register
-/// at address 0.
 /// Fold a compile-time constant as a mathematical integer, keeping its
 /// sign: a negative fold is returned negative, a non-negative one as its
 /// unsigned value. Used where a negative constant is meaningful (a signed
@@ -8392,6 +8376,22 @@ pub(crate) fn fold_signed_const(
     })
 }
 
+/// Fold an ADDRESS-like constant expression — an addrmap instance base
+/// or window size, a regblock register offset or reset value. These have
+/// no declared type to range-check against, only the standing
+/// requirement that the value is not negative.
+///
+/// This is the counterpart to `components::fold_field_default`, and the
+/// two differ in exactly the way their call sites do: a field default
+/// carries a `TypeExpr` and is checked against it, an address does not
+/// and is checked against zero instead.
+///
+/// A bare sized literal (`32'h18`) is a value-bearing literal here just as it
+/// is in a general scalar expression; reuse the shared parser and discard only
+/// the declared width because an address slot has no value type. Anything else
+/// that will not fold is `SilentlyMisLowers`, because v1 accepts it and yields
+/// ZERO. Pointing a user at v1 for `@ dut.count_out` would hand them a register
+/// at address 0.
 pub(crate) fn fold_addr_const(
     e: &crate::ast::Expr,
     consts: &HashMap<String, ConstVal>,
