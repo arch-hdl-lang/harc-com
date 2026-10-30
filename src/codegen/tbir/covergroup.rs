@@ -258,7 +258,12 @@ fn cover_expr_signed(e: &Expr, widths: &CoverWidths<'_>) -> bool {
             kind: WidthCastKind::Sext,
             ..
         } => true,
-        Expr::WidthCast { .. } => false,
+        Expr::WidthCast {
+            kind,
+            src_width,
+            inner,
+            ..
+        } => late_signed_resize_source(*kind, *src_width, inner, widths).is_some(),
         Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
             matches!(ret, IrType::SInt(_))
         }
@@ -580,6 +585,23 @@ fn cover_unary_cpp(op: UnOp, inner: &Expr, widths: &CoverWidths<'_>) -> Result<S
         (UnOp::BitNot, Some(width)) if width > 64 => {
             format!("harc_rt::harc_trunc_u128(~((_harc_u128)({rendered})), {width})")
         }
+        // `BitNot` (unlike `BitNotHost`) is the declared-width complement:
+        // `~u` on a `uint<8>` is the 8-bit value `0xFF - u`, not the 64-bit
+        // host complement. An unsigned result keeps only its `width` bits;
+        // a signed one is the `sint<width>` VALUE, sign-filled into the
+        // `int64_t` carrier from bit `width - 1` (correct whether the
+        // operand arrived sign-filled or as the raw `width`-bit pattern).
+        (UnOp::BitNot, Some(width)) if width < 64 => {
+            if cover_expr_signed(inner, widths) {
+                let shift = 64 - width;
+                format!("((int64_t)(((int64_t)((uint64_t)(~({rendered})) << {shift})) >> {shift}))")
+            } else {
+                format!(
+                    "((uint64_t)(((uint64_t)(~({rendered}))) & 0x{:X}ULL))",
+                    (1u64 << width) - 1
+                )
+            }
+        }
         _ => format!("{}({rendered})", cover_un_op_cpp(op)),
     })
 }
@@ -815,6 +837,49 @@ fn cover_un_op_cpp(op: UnOp) -> &'static str {
     }
 }
 
+/// The source width of a coverpoint width cast. `src_width` is what
+/// lowering could read off the receiver. A hook parameter (`v`), its record
+/// field (`t.f`) or a DUT port has no type until the emitter binds it
+/// (`hook_types` / the DUT access plan), so fall back to the declared width
+/// the emitter can see — for those typed leaves only. A composite
+/// receiver's carrier width is an expression-typing question this sampler
+/// does not settle, so it keeps the unknown-source shapes. `as sint<N>`
+/// records `Some(N)` deliberately and is never overridden.
+fn cover_cast_source_width(
+    src_width: Option<u32>,
+    inner: &Expr,
+    widths: &CoverWidths<'_>,
+) -> Option<u32> {
+    src_width.or_else(|| match inner {
+        Expr::CovHookArg { .. } | Expr::CovHookParam { .. } | Expr::Port(_) => {
+            cover_expr_width(inner, widths)
+        }
+        _ => None,
+    })
+}
+
+/// `.resize<N>()` keeps a signed receiver's signedness, exactly as
+/// `lower_width_method` does procedurally. Lowering applies that rule
+/// itself (as a `Sext` shape) whenever it can see the receiver is signed;
+/// the receivers it cannot see — a `sint` hook parameter, a `sint` record
+/// field of one, a signed DUT port — reach the emitter as a `Resize` with
+/// no source width. `as uint<N>` / `as bits<N>` over an unknown source
+/// lower to `Trunc` (the same emitted shape), so `Resize { src_width: None }`
+/// is always the method. Returns the source width when the late signed
+/// shape applies.
+fn late_signed_resize_source(
+    kind: WidthCastKind,
+    src_width: Option<u32>,
+    inner: &Expr,
+    widths: &CoverWidths<'_>,
+) -> Option<u32> {
+    if kind != WidthCastKind::Resize || src_width.is_some() {
+        return None;
+    }
+    let sw = cover_cast_source_width(None, inner, widths)?;
+    cover_expr_signed(inner, widths).then_some(sw)
+}
+
 fn cover_width_cast_cpp(
     kind: WidthCastKind,
     width: u32,
@@ -822,7 +887,27 @@ fn cover_width_cast_cpp(
     inner: &Expr,
     widths: &CoverWidths<'_>,
 ) -> Result<String, EmitError> {
+    let effective_src = cover_cast_source_width(src_width, inner, widths);
+    if let Some(sw) = late_signed_resize_source(kind, src_width, inner, widths) {
+        let shaped = crate::ir::lower::covergroups::signed_resize(inner.clone(), width, sw);
+        return cover_expr_cpp(&shaped, widths);
+    }
+    // Lowering runs the direction check whenever it knows the receiver
+    // width; for a receiver only the emitter can size, run it here so
+    // `u.zext<8>()` on a `uint<16>` hook parameter is the same error as in
+    // procedural code instead of a silent truncation.
+    if let (None, Some(sw)) = (src_width, effective_src) {
+        if let Some(why) =
+            crate::ir::lower::covergroups::late_extension_direction_violation(kind, width, sw)
+        {
+            return Err(EmitError(format!("covergroup coverpoint {why}")));
+        }
+    }
     let e = cover_expr_cpp(inner, widths)?;
+    let src_width = match kind {
+        WidthCastKind::Zext | WidthCastKind::Sext => effective_src,
+        WidthCastKind::Trunc | WidthCastKind::Resize => src_width,
+    };
     if let Some(words) = super::wide_scalar_words(width) {
         return Ok(match kind {
             WidthCastKind::Trunc => {
@@ -860,9 +945,16 @@ fn cover_width_cast_cpp(
         }
     };
     let plain_cast = |e: &str| format!("(({c_unsigned})({e}))");
+    // Zero-extend from the SOURCE width, as procedural `width_cast_cpp`
+    // does: a signed source (`sint<8>` -1) lives sign-filled in an
+    // `int64_t` carrier, so a bare widening cast sampled 2^64-1, not 0xFF.
+    let zext_shape = |e: &str| match src_width {
+        Some(sw) => format!("(({c_unsigned})(harc_rt::harc_trunc_u128((_harc_u128)({e}), {sw})))"),
+        None => plain_cast(e),
+    };
     Ok(match kind {
         WidthCastKind::Trunc => trunc_shape(&e),
-        WidthCastKind::Zext => plain_cast(&e),
+        WidthCastKind::Zext => zext_shape(&e),
         WidthCastKind::Sext => match src_width {
             Some(sw) if sw < width => {
                 if width > 64 {
@@ -885,6 +977,99 @@ fn cover_width_cast_cpp(
     })
 }
 
+/// Bin membership for a sample wider than 128 bits. `_v` holds the
+/// canonical `target_width`-bit pattern (see `sample_body`). Each bound is
+/// brought to a common width — the wider of the target and the bound —
+/// as a masked `HarcWide` pattern, so only the runtime's homogeneous
+/// `HarcWide<N>` operators are used: `==` for exact values, unsigned `<`
+/// for an unsigned comparison, and `harc_wide_slt` at the common width
+/// when the sample and the bound are both signed (a signed sample against
+/// a decimal constant is a signed comparison, as at narrower widths).
+fn wide_bin_membership(
+    values: &[CovBinValue],
+    target: &Expr,
+    target_width: u32,
+    widths: &CoverWidths<'_>,
+) -> Result<String, EmitError> {
+    let target_signed = cover_expr_signed(target, widths);
+    // (lhs, rhs, common width, signed) for `_v` against one bound.
+    let operands = |b: &CovBinBound| -> Result<(String, String, u32, bool), EmitError> {
+        let (bound_width, bound_signed) = match b {
+            CovBinBound::Const(value) => (64, *value <= i64::MAX as u64),
+            CovBinBound::ConstSigned(_) => (64, true),
+            CovBinBound::Runtime(expr) => (
+                cover_expr_width(expr, widths).unwrap_or(64),
+                cover_expr_signed(expr, widths),
+            ),
+        };
+        let signed = target_signed && bound_signed;
+        let width = target_width.max(bound_width);
+        let words = width.div_ceil(32);
+        let masked = |value: String| format!("harc_rt::harc_wide_mask_bits({value}, {width})");
+        let lhs = if width == target_width {
+            "_v".to_string()
+        } else {
+            masked(cover_coerce_cpp(
+                "_v".to_string(),
+                Some(target_width),
+                width,
+                signed,
+            ))
+        };
+        let rhs = match b {
+            // The converting constructor zero-fills an unsigned operand and
+            // sign-fills a negative signed one across every word; masking
+            // to `width` then leaves the `width`-bit two's-complement
+            // pattern of the constant.
+            CovBinBound::Const(value) => {
+                masked(format!("harc_rt::HarcWide<{words}>((uint64_t){value}ULL)"))
+            }
+            CovBinBound::ConstSigned(value) if *value == i64::MIN => masked(format!(
+                "harc_rt::HarcWide<{words}>((int64_t)(-9223372036854775807LL - 1))"
+            )),
+            CovBinBound::ConstSigned(value) => {
+                masked(format!("harc_rt::HarcWide<{words}>((int64_t)({value}LL))"))
+            }
+            CovBinBound::Runtime(expr) => {
+                let rendered = cover_expr_cpp(expr, widths)?;
+                masked(cover_coerce_cpp(
+                    rendered,
+                    cover_expr_width(expr, widths),
+                    width,
+                    signed,
+                ))
+            }
+        };
+        Ok((lhs, rhs, width, signed))
+    };
+    let compare = |b: &CovBinBound, op: BinOp| -> Result<String, EmitError> {
+        let (lhs, rhs, width, signed) = operands(b)?;
+        Ok(match (op, signed) {
+            (BinOp::Eq, _) => format!("({lhs} == {rhs})"),
+            (BinOp::Ge, true) => format!("(!harc_rt::harc_wide_slt({lhs}, {rhs}, {width}))"),
+            (BinOp::Le, true) => format!("(!harc_rt::harc_wide_slt({rhs}, {lhs}, {width}))"),
+            (BinOp::Ge, false) => format!("({lhs} >= {rhs})"),
+            (BinOp::Le, false) => format!("({lhs} <= {rhs})"),
+            _ => unreachable!("bin membership compares with ==, >= or <="),
+        })
+    };
+    let mut parts = Vec::with_capacity(values.len());
+    for v in values {
+        parts.push(match v {
+            CovBinValue::Eq(x) => compare(x, BinOp::Eq)?,
+            CovBinValue::Range { lo, hi } => match (lo, hi) {
+                (Some(l), Some(h)) => {
+                    format!("({} && {})", compare(l, BinOp::Ge)?, compare(h, BinOp::Le)?)
+                }
+                (Some(l), None) => compare(l, BinOp::Ge)?,
+                (None, Some(h)) => compare(h, BinOp::Le)?,
+                (None, None) => "true".to_string(),
+            },
+        });
+    }
+    Ok(format!("({})", parts.join(" || ")))
+}
+
 fn bin_membership(
     values: &[CovBinValue],
     target: &Expr,
@@ -892,6 +1077,9 @@ fn bin_membership(
 ) -> Result<String, EmitError> {
     if values.is_empty() {
         return Ok("(false)".to_string());
+    }
+    if let Some(width) = cover_expr_width(target, widths).filter(|width| *width > 128) {
+        return wide_bin_membership(values, target, width, widths);
     }
     // Render one bin bound — an exact value or a range end, which are
     // the same thing here. A constant folds inline; a runtime bound is
@@ -1389,16 +1577,30 @@ fn sample_body(
     for p in &schema.points {
         writeln!(out, "{pad2}{{").ok();
         let target = cover_expr_cpp(&p.target, widths)?;
-        let sample_type = match (
-            cover_expr_signed(&p.target, widths),
-            cover_expr_width(&p.target, widths),
-        ) {
-            (true, Some(width)) if width > 64 && width <= 128 => "_harc_u128",
-            (true, _) => "int64_t",
-            (false, Some(width)) if width > 64 && width <= 128 => "_harc_u128",
-            (false, _) => "uint64_t",
-        };
-        writeln!(out, "{pad3}{sample_type} _v = ({sample_type})({target});").ok();
+        let target_width = cover_expr_width(&p.target, widths);
+        if let Some(words) = target_width.and_then(super::wide_scalar_words) {
+            // A sample wider than 128 bits is held at full width, as the
+            // canonical `width`-bit pattern (signed values are compared with
+            // `harc_wide_slt` against that same width in `bin_membership`).
+            // It used to be cast to a 64-bit scalar: an unsigned sample was
+            // silently reduced to its low 64 bits, and a signed one did not
+            // compile (`HarcWide` -> `int64_t` is ambiguous).
+            let width = target_width.expect("wide sample has a width");
+            let value = cover_coerce_cpp(target, Some(width), width, false);
+            writeln!(
+                out,
+                "{pad3}harc_rt::HarcWide<{words}> _v = harc_rt::harc_wide_mask_bits({value}, {width});"
+            )
+            .ok();
+        } else {
+            let sample_type = match (cover_expr_signed(&p.target, widths), target_width) {
+                (true, Some(width)) if width > 64 => "_harc_u128",
+                (true, _) => "int64_t",
+                (false, Some(width)) if width > 64 => "_harc_u128",
+                (false, _) => "uint64_t",
+            };
+            writeln!(out, "{pad3}{sample_type} _v = ({sample_type})({target});").ok();
+        }
         for (bin_idx, b) in p.bins.iter().enumerate() {
             let membership = bin_membership(&b.values, &p.target, widths)?;
             if !any_cross {

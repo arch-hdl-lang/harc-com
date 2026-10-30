@@ -1015,7 +1015,14 @@ on dut.error_irq
 end on
 ```
 
-`blocking` stalls the cycle while the solver returns. The keyword is mandatory whenever the constraint references runtime DUT state — the compiler detects this dependency and rejects un-annotated calls with a compile-time error pointing at the offending term. (Conservative dataflow analysis; false positives can be silenced by binding the runtime expression to a snapshot variable before the call.)
+`blocking` stalls the cycle while the solver returns. The keyword is mandatory whenever the constraint references runtime DUT state — the compiler detects this dependency and rejects un-annotated calls with a compile-time error pointing at the offending term. (Conservative dataflow analysis; false positives can be silenced by binding the runtime expression to a snapshot variable before the call.) A snapshot variable is a scalar local in scope at the call — a typed `let` or a method parameter (bind a `for` loop index to a `let` first): a queued `randomize ... with` may reference one, and the solve uses the value it holds when the `randomize` call executes — reassigning it afterwards affects only later calls.
+
+```
+let want : uint<8> = dut.count_out     // snapshot taken here
+randomize(t) with
+    t.len == want                      // queued: uses that snapshot
+end randomize
+```
 
 The default-queued model is what makes the cycle-based simulator (§10.1) keep its perf in the presence of a heavyweight SMT solver. Z3 calls in tight loops would otherwise dominate.
 
@@ -1112,6 +1119,10 @@ covergroup AxiOps @(posedge dut.axi_s.aclk)
     cross cp_burst, cp_len
 end covergroup AxiOps
 ```
+
+Coverpoint names are unique within a covergroup, and bin names are unique
+within a coverpoint (the same bin name may appear in different coverpoints);
+a repeated name is a compile error.
 
 The `@(...)` clause defines the semantic sample event for the covergroup.
 Clocked covergroups sample on the named edge:
@@ -2800,7 +2811,7 @@ Honest about what is not pinned down:
 - **Coverage-in-formal vs coverage-in-sim.** Cover-as-witness in formal vs coverage-as-percentage in sim are different beasts; the surface syntax pretends otherwise. A sharper unification is needed.
 - **Transaction recording for waves.** UCDB is fine for coverage; transaction-level wave annotation needs a format choice (FSDB has it natively; VCD doesn't).
 - **Cross-domain read latency in property surface syntax.** §7.5 makes `across` reads explicit, but a property like `req |=> across resp ##[1:8] done` has a synthesized 2-FF latency that should be reflected in the bound. Implicit (good ergonomics, surprising) vs explicit (verbose, predictable) is unsettled.
-- **Pre-computed `randomize` queues with constraint dependence on captured state.** When `with` references a `let`-bound snapshot of runtime state, the queue is still valid — but only until the snapshot is invalidated. The dataflow analysis is sound but the user-facing rule needs to be teachable in two sentences; not there yet.
+- **Pre-computed `randomize` queues with constraint dependence on captured state.** The user-facing rule is settled (§4.4): a queued `randomize ... with` that references a scalar snapshot (a typed `let` or a parameter) uses the value it holds at the call. Today's codegen solves at the call, so the rule holds trivially; the open part is the implementation — a pre-computing queue must invalidate or re-solve queued solutions when a referenced snapshot changes.
 - **Solver pool sizing.** Default queue depth (16) and pool worker count are both knobs. Auto-tuning from observed tseq consumption rate vs. per-call solver latency is the right answer; v1 ships with manual knobs.
 - **Sub-cycle async events on native.** Rare in pure-RTL TB but real (e.g., gate-level back-annotation, async reset deassertion alignment). v1 punts; they only work via SV+UVM transpile target. v2 candidate: a small "async event" subset that cycle-aligns to the next active edge with bounded-skew assertions.
 - **Lane divergence for SIMD batch CRV (v1.1).** `when`-subtype lane divergence has a clear path: group lanes by discriminator value, solve each group's variant subproblem independently, scatter results via AVX-512 lane masking. The remaining open question is `blocking randomize` divergence — when one lane stalls on a runtime-dependent solve and others don't, mask-and-stall is the natural answer but coverage attribution gets weird (does the stalled lane miss its sample window?). Needs prototyping.

@@ -5387,8 +5387,16 @@ end test BlockingRuntimeDepTest"#,
     );
 }
 
+/// LEGACY v1 BEHAVIOUR — NOT THE CURRENT LANGUAGE RULE. `cpp_tb::emit` is
+/// the deprecated v1 native emitter, which still rejects a scalar `let` in
+/// a queued `randomize ... with`. spec §4.4 (owner decision D13) supersedes
+/// that: a queued randomize captures any scalar local's value at the call.
+/// The TB-IR backend implements the current rule, pinned by
+/// `tests/cover_solver_value_e2e.rs::queued_randomize_captures_scalar_let_snapshots_at_each_call`
+/// and `tests/tbir_cover_solver_shapes.rs::queued_randomize_captures_scalar_snapshots`.
+/// v1 is not being fixed; this test only pins what it does today.
 #[test]
-fn blocking_randomize_snapshots_scalar_let_dependencies() {
+fn legacy_v1_queued_randomize_rejects_scalar_let_but_blocking_snapshots_it() {
     let queued = parse_source(
         r#"transaction T
     len : uint<8>

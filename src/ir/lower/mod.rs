@@ -44,7 +44,7 @@ mod bus;
 pub(crate) mod components;
 pub(crate) use components::endpoint_label;
 mod control;
-mod covergroups;
+pub(crate) mod covergroups;
 mod exprs;
 pub(crate) use exprs::cast_relabel_width;
 pub(crate) use exprs::parse_int_literal;

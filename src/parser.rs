@@ -1928,8 +1928,26 @@ impl Parser {
         };
         let inner_doc = self.consume_inner_doc();
         let mut items = Vec::new();
+        // A coverpoint name is the member a sampler, a report line and a
+        // `cov.<point>.<bin>` query all address it by; two points with one
+        // name are not two coverpoints but one ambiguous name (the C++
+        // backend used to emit a duplicate member and fail to build).
+        let mut seen_points: Vec<String> = Vec::new();
         while !self.check_end_keyword() {
-            items.push(self.parse_cover_item()?);
+            let item = self.parse_cover_item()?;
+            if let CoverItem::Point(point) = &item {
+                if seen_points.contains(&point.name.name) {
+                    return Err(CompileError::general(
+                        &format!(
+                            "duplicate coverpoint `{}` in covergroup `{}`",
+                            point.name.name, name.name
+                        ),
+                        point.name.span,
+                    ));
+                }
+                seen_points.push(point.name.name.clone());
+            }
+            items.push(item);
         }
         let end = self.expect_end(TokenKind::Covergroup, &name.name)?;
         Ok(CovergroupDecl {
@@ -1997,6 +2015,15 @@ impl Parser {
                     // as a bin name verbatim — its source form becomes the
                     // string identifier.
                     let bn = self.expect_bin_name()?;
+                    // Bin names are the coverpoint's members (`cov.cp.bin`,
+                    // report lines); a repeated one is ambiguous, and the
+                    // C++ backend used to emit a duplicate member for it.
+                    if bins.iter().any(|b: &CoverBin| b.name.name == bn.name) {
+                        return Err(CompileError::general(
+                            &format!("duplicate bin `{}` in coverpoint `{}`", bn.name, name.name),
+                            bn.span,
+                        ));
+                    }
                     self.expect(TokenKind::Eq)?;
                     let spec = self.parse_expr()?;
                     let span = bn.span.merge(spec.span);

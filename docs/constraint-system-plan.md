@@ -175,17 +175,27 @@ meaning of existing tests.
 ## Queued vs Blocking Randomize
 
 Queued randomize is the default v1 performance path: constraints that depend
-only on the randomize target, type-level metadata, enum constants, and
-compile-time constants are eligible for queued solving. Current codegen still
-solves immediately, but it enforces the queued dependency rule: queued
-`randomize` rejects constraints that read live runtime state and tells the user
-to use `blocking randomize`.
+only on the randomize target, type-level metadata, enum constants,
+compile-time constants and scalar local snapshots are eligible for queued
+solving. Current codegen still solves immediately, but it enforces the queued
+dependency rule: queued `randomize` rejects constraints that read live runtime
+state (DUT ports, non-target transaction fields, other field paths) and tells
+the user to use `blocking randomize` or to bind the value to a scalar `let`
+first.
+
+A typed scalar local in scope at the call — a `let` or a method parameter —
+is a snapshot variable (spec §4.4): both queued and blocking randomize use the
+value it holds when the `randomize` call executes. Reassigning it afterwards
+affects only later calls. A future
+pre-computing queue must preserve that rule (re-solve or invalidate queued
+solutions when a referenced snapshot changes); it may not reuse a solution
+computed from an older snapshot value.
 
 `blocking randomize` is required when constraints depend on current runtime
 state that cannot be safely precomputed. Current codegen snapshots supported
 runtime values into the immediate solver expression for:
 
-- scalar `let` dependencies,
+- scalar local dependencies (queued randomize too, see above),
 - non-target transaction fields,
 - DUT or other field paths,
 - runtime-dependent `dist` entries.
