@@ -69,10 +69,13 @@ fn assert_space(template: &str, hole: &str, substitutions: &[&str]) {
         return;
     };
     for substitution in substitutions {
+        // `@@W@@` is the substituted type's bit width, so a template can
+        // narrow a widened sum back to its own slot (`(w + 1).resize<@@W@@>()`).
+        let width = substitution.split(['<', '>']).nth(1).unwrap_or_default();
         assert_tbir_compiles(
             compiler,
             substitution,
-            &template.replace(hole, substitution),
+            &template.replace(hole, substitution).replace("@@W@@", width),
         );
     }
 }
@@ -112,7 +115,7 @@ end bus TlmMemBus
 transactor TlmMemTarget bound to TlmMemBus
     w : @@TY@@ default 1
     thread bus.read(addr: uint<8>)
-        w = w + 1
+        w = (w + 1).resize<@@W@@>()
         return 1
     end thread
 end transactor TlmMemTarget
@@ -145,7 +148,7 @@ end impl T"#,
         r#"transactor Src
     w : @@TY@@ default 1
     hookable bump(v: uint<8>)
-        w = w + 1
+        w = (w + 1).resize<@@W@@>()
     end bump
 end transactor Src
 testbench Tb
@@ -176,7 +179,7 @@ end testbench Tb
 impl T for Tb
     run
         let w : @@TY@@ = 1
-        w = w + 1
+        w = (w + 1).resize<@@W@@>()
         wait 1 cycle
     end run
 end impl T"#,
@@ -186,7 +189,7 @@ end impl T"#,
 end testbench Tb
 impl T for Tb
     run
-        w = w + 1
+        w = (w + 1).resize<@@W@@>()
         wait 1 cycle
     end run
 end impl T"#,
@@ -207,7 +210,7 @@ transactor WideSink
     observe : event<uint<1024>>
     seen : uint<32> default 0
     on observe(v)
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end on
 end transactor WideSink
 testbench Tb
@@ -238,7 +241,9 @@ fn nested_fixed_vector_component_fields_compile_at_every_leaf_width() {
     n : uint<1024> default 0
     hookable put(x: uint<8>)
         v[0][1] = 1
-        n = n + v[0][1]
+        if v[0][1] == 1
+            n = (n + 1).resize<1024>()
+        end if
     end put
 end scoreboard NestSb
 testbench Tb
@@ -278,7 +283,7 @@ end impl T"#;
         &[
             "        assert (a == 1) and (b == 1)",
             "        assert (a == 1) or (b == 1)",
-            "        s = a + a",
+            "        s = (a + a).resize<160>()",
             "        s = a / a",
             "        assert a < a + 1",
             "        s = a << 1",
@@ -286,8 +291,8 @@ end impl T"#;
             "        assert a == b",
             "        assert a != b",
             "        assert n < 8",
-            "        repeat n\n            s = s + 1\n        end repeat",
-            "        for i in 0 .. n\n            s = s + 1\n        end for",
+            "        repeat n\n            s = (s + 1).resize<160>()\n        end repeat",
+            "        for i in 0 .. n\n            s = (s + 1).resize<160>()\n        end for",
         ],
     );
 }
@@ -352,7 +357,7 @@ fn no_argument_event_handlers_compile_on_agent_and_env_hosts() {
     in_ev : event<uint<8>>
     seen : uint<32> default 0
     on in_ev()
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end on
 end {kind} Tagger
 testbench Tb

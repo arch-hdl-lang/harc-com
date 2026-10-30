@@ -48,7 +48,7 @@ impl FixedPriorityArbiterTest for FixedPriorityArbiterTestTb
             let expected = priority_grant(r)
             if dut.grant != expected
                 log(error, "MISMATCH req=${r:02x} grant=${dut.grant:02x} expected=${expected:02x}")
-                errors = errors + 1
+                errors = errors +% 1
             end if
         end for
         assert errors == 0

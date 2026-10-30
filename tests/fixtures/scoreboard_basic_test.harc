@@ -79,7 +79,7 @@ impl ScoreboardBasicTest for ScoreboardBasicTb
             // deliberately discarded (a host-side no-op in both backends).
             sb.expected.size()
             sb.expected.empty()
-            sb.writes = sb.writes + 1
+            sb.writes = (sb.writes + 1).trunc<32>()
 
             dut.en = 1
             for _ in 1 .. bump
@@ -89,7 +89,7 @@ impl ScoreboardBasicTest for ScoreboardBasicTb
             wait 1 cycle                   // let the last count settle
 
             let want = sb.expected.pop()
-            sb.reads = sb.reads + 1
+            sb.reads = (sb.reads + 1).trunc<32>()
             let got = dut.count_out
             assert got == want
                 else fail("run[${i}]: count_out=${got}, expected ${want}")

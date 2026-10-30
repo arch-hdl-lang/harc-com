@@ -66,7 +66,7 @@ impl ScoreboardDataQueueStructTest for ScoreboardDataQueueStructTb
             s.run_idx = i
             s.count = total
             sb.samples.push(s)
-            sb.writes = sb.writes + 1
+            sb.writes = (sb.writes + 1).trunc<32>()
 
             dut.en = 1
             for _ in 0 .. bump - 1         // inclusive range → `bump` cycles of en
@@ -78,7 +78,7 @@ impl ScoreboardDataQueueStructTest for ScoreboardDataQueueStructTb
             let want : Sample
             want = sb.samples.pop()
             _tb.last = want
-            sb.reads = sb.reads + 1
+            sb.reads = (sb.reads + 1).trunc<32>()
             let got = dut.count_out
             assert want.run_idx == i
                 else fail("run[${i}]: popped run_idx=${want.run_idx}, expected ${i}")

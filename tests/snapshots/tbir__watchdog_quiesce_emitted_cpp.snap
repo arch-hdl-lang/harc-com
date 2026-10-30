@@ -266,7 +266,7 @@ int run_WatchdogQuiesceTest(int argc, char** argv) {
         while (true) {
             switch (__bb) {
             case 0: {
-                self.seen = (self.seen + 1);
+                self.seen = ((uint64_t)(((uint64_t)((self.seen + 1)) & 0xFFFFFFFFULL)));
                 return;
                 break;
             }

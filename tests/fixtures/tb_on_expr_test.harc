@@ -22,7 +22,7 @@ testbench TbOnExprTb
     seen : uint<32> default 0
 
     on dut.count_out == 3
-        seen = seen + 1
+        seen = (seen + 1).trunc<32>()
     end on
 end testbench TbOnExprTb
 

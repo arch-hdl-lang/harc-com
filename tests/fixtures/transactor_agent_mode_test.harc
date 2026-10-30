@@ -66,11 +66,11 @@ transactor AxilXactor
     // condition holds. Present on BOTH active and passive
     // instances.
     on dut.axil_w_valid && dut.axil_w_ready
-        sb.writes = sb.writes + 1
+        sb.writes = (sb.writes + 1).trunc<32>()
     end on
 
     on dut.axil_r_valid && dut.axil_r_ready
-        sb.reads = sb.reads + 1
+        sb.reads = (sb.reads + 1).trunc<32>()
     end on
 
     // `when active` half — present only on active instances.

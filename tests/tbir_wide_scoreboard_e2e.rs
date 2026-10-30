@@ -39,15 +39,13 @@ impl WideScoreboardTest for Tb
         assert forward[200:200] else fail("mixed-width inferred local truncated")
         let widthless_mix = sb.wide + UPOS
         assert widthless_mix[200:200] else fail("widthless signed mix inferred too narrow")
-        let signed_mask_shift = (sb.wide & NEG) >> 1
-        assert signed_mask_shift[199:199] else fail("signed mask falsely narrowed wide shift")
         let chosen = false ? sb.mid : sb.wide
         assert chosen[200:200] else fail("ternary inferred local truncated")
         let flag = !sb.wide
         assert !flag else fail("logical-not inferred local is not bool")
         sb.wide = 240
         sb.odd = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
-        sb.odd = sb.odd + 1
+        sb.odd = (sb.odd + 1).trunc<200>()
         assert sb.odd == 0 else fail("non-word-aligned wide add did not wrap")
         sb.narrow = 1
         sb.narrow = (sb.wide & 0xFF) >> 4
@@ -56,17 +54,13 @@ impl WideScoreboardTest for Tb
         assert sb.narrow == 15 else fail("masked scalar=${sb.narrow}")
         assert queued == 15 else fail("masked queue=${queued}")
         sb.wide = sb.wide | sb.mid
-        sb.wide = (sb.mid + sb.wide) + 1
+        sb.wide = ((sb.mid + sb.wide) + 1).trunc<256>()
         assert sb.wide[7:0] == 241 else fail("wide add failed")
         assert sb.wide[71:64] == 2 else fail("reverse operand promotion failed")
-        sb.wide = sb.wide + -1
-        sb.wide = sb.wide + NEG
-        assert sb.wide[7:0] == 239 else fail("negative operand extension failed")
+        sb.wide = (sb.wide + -1).trunc<256>()
+        assert sb.wide[7:0] == 240 else fail("negative operand extension failed")
         sb.wide = 0
-        sb.wide = sb.wide + POS
-        assert sb.wide == 1 else fail("typed positive signed operand extension failed")
-        sb.wide = 0
-        sb.wide = sb.wide + UPOS
+        sb.wide = (sb.wide + UPOS).trunc<256>()
         assert sb.wide == 1 else fail("widthless positive signed operand extension failed")
         sb.wide = 0
         sb.wide = sb.wide + !0
@@ -148,6 +142,48 @@ fn verilator_present() -> bool {
          end-to-end test would have skipped itself and reported success"
     );
     present
+}
+
+/// The typed signed constants `NEG` / `POS` against a `uint<256>` field used
+/// to pin the mixed-carrier sign-extension of `sb.wide & NEG`,
+/// `sb.wide + NEG` and `sb.wide + POS`. Owner decision D1 (R16) makes each
+/// such sint/uint mix a compile-time error; the scenarios are kept here as
+/// rejections (an explicit `as` is the user's fix).
+#[test]
+fn tbir_mixed_signed_wide_scoreboard_operands_are_rejected() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let outdir = std::env::temp_dir().join(format!(
+        "harc_tbir_wide_scoreboard_mixed_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&outdir);
+    std::fs::create_dir_all(&outdir).expect("create temp outdir");
+    for (tag, statement) in [
+        ("mask", "let signed_mask_shift = (sb.wide & NEG) >> 1"),
+        ("neg", "sb.wide = sb.wide + NEG"),
+        ("pos", "sb.wide = sb.wide + POS"),
+    ] {
+        let source = outdir.join(format!("{tag}.harc"));
+        let src = TEST.replace(
+            "        sb.wide = 0x100000000000000000000000000000000000000000000000000\n",
+            &format!("        {statement}\n"),
+        );
+        assert_ne!(src, TEST, "anchor statement present");
+        std::fs::write(&source, src).expect("write HARC probe");
+        let output = Command::new(env!("CARGO_BIN_EXE_harc"))
+            .arg("dump-ir")
+            .arg(&source)
+            .current_dir(&root)
+            .output()
+            .expect("spawn harc dump-ir");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{tag}: mixed operand lowered");
+        assert!(
+            stderr.contains("mixes signed and unsigned operands"),
+            "{tag}: expected the mixed-signedness diagnostic:\n{stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&outdir);
 }
 
 #[test]

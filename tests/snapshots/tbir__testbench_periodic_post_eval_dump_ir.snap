@@ -50,7 +50,7 @@ fn fn1 comp_method_1 [kind=ComponentMethod(c1)]
     -> Return
 
   b2:
-    ComponentFieldWrite(self.mismatches, (self.mismatches + 1))
+    ComponentFieldWrite(self.mismatches, (self.mismatches + 1).trunc<32 from 33>())
     -> Jump(b1)
 
   b3:

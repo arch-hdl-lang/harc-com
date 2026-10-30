@@ -55,15 +55,15 @@ impl FirstBitTest for FirstBitTestTb
             wait 4 cycles
             if dut.Out_Found != 1
                 log(error, "i=${i} Out_Found=${dut.Out_Found}, expected 1")
-                errors = errors + 1
+                errors = errors +% 1
             end if
             if dut.Out_FirstBit != i
                 log(error, "i=${i} Out_FirstBit=${dut.Out_FirstBit:08x}, expected ${i:08x}")
-                errors = errors + 1
+                errors = errors +% 1
             end if
             if dut.Out_Valid != 1
                 log(error, "i=${i} Out_Valid=${dut.Out_Valid}, expected 1")
-                errors = errors + 1
+                errors = errors +% 1
             end if
         end for
         assert errors == 0

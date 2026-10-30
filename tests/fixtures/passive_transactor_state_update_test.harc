@@ -33,14 +33,14 @@ transactor CountPoker
     // (it would still execute on a passive instance), so it only mutates the
     // transactor's own always-on state.
     hookable bump()
-        count = count + 1
+        count = (count + 1).trunc<32>()
     end bump
 
     when active
         // Active-only surface: absent on a passive instance. May drive the
         // DUT because it never runs on a passive instance.
         hookable poke()
-            count = count + 100
+            count = (count + 100).trunc<32>()
             dut.en = 1
         end poke
     end when

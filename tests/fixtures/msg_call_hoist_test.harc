@@ -23,7 +23,7 @@ end domain SysDomain
 // function. (Pure helpers already lower fine in a message; hoisting is a
 // no-op for them, but they must keep working.)
 function inc(x: uint<8>) -> uint<8>
-    return x + 1
+    return (x + 1).trunc<8>()
 end function inc
 
 // Impure file-scope helper — reads the DUT, so it CFG-inlines at each
@@ -37,12 +37,12 @@ testbench MsgCallHoistTb
     calls : uint<8> default 0
     // Testbench method — CFG-inlined, must be hoisted out of a message.
     function dbl(x: uint<8>) -> uint<8>
-        return x + x
+        return (x + x).trunc<8>()
     end function dbl
 
     function bump(x: uint<8>) -> uint<8>
-        calls = calls + 1
-        return x + calls
+        calls = (calls + 1).trunc<8>()
+        return (x + calls).trunc<8>()
     end function bump
 end testbench MsgCallHoistTb
 

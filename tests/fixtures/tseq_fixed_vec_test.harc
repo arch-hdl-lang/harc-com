@@ -37,9 +37,9 @@ impl TseqFixedVecTest for TseqFixedVecTb
             assert row[0] == expected.data[0] else fail("yielded row[0] content/order mismatch")
             assert row[1] == expected.data[1] else fail("yielded row[1] content/order mismatch")
             assert row[2] == expected.data[2] else fail("yielded row[2] content/order mismatch")
-            expected.data[0] = expected.data[0] + 1
-            expected.data[1] = expected.data[1] + 1
-            expected.data[2] = expected.data[2] + 1
+            expected.data[0] = expected.data[0] +% 1
+            expected.data[1] = expected.data[1] +% 1
+            expected.data[2] = expected.data[2] +% 1
             count = count + 1
         end for
         assert count == 2 else fail("expected two rows, saw ${count}")

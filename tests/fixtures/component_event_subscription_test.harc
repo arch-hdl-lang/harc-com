@@ -33,7 +33,7 @@ impl ComponentEventSubscriptionTest for ComponentEventSubscriptionTb
         dut.rst = 0
 
         on env.source.obs(v)
-            seen = seen + v
+            seen = (seen + v).resize<32>()
         end on
 
         env.source.fire(-3)

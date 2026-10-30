@@ -9,7 +9,7 @@ struct Result
 end struct Result
 
 function add_values(a: uint<32>, b: uint<32>) -> uint<32>
-    return a + b
+    return (a + b).trunc<32>()
 end function add_values
 
 scoreboard QueueValues
@@ -23,7 +23,7 @@ agent CounterModel
     pending : queue<uint<8>>
     popped : uint<8> = 0
     function step(tag: uint<8>) -> uint<32>
-        value = value * 10 + tag
+        value = (value * 10 + tag).trunc<32>()
         return value
     end function step
     function peek() -> uint<32>
@@ -33,7 +33,7 @@ agent CounterModel
         return value
     end function latest_write_id
     function combine(a: uint<32>, b: uint<32>) -> uint<32>
-        return a * 1000 + b
+        return (a * 1000 + b).trunc<32>()
     end function combine
     function make(v: uint<32>) -> Result
         let r : Result
@@ -41,11 +41,11 @@ agent CounterModel
         return r
     end function make
     function current_instruction(event_id: uint<8>) -> Result
-        record_reads = record_reads + 1
+        record_reads = (record_reads + 1).trunc<32>()
         let r : Result
         r.opcode = event_id.trunc<4>()
         r.bytes[0] = event_id
-        r.bytes[1] = event_id + 1
+        r.bytes[1] = (event_id + 1).trunc<8>()
         return r
     end function current_instruction
     function enqueue(v: uint<8>)
@@ -76,10 +76,10 @@ agent Harness
         return step_param(inner, tag)
     end function step_param_from_inner
     function combine_model(snapshot: CounterModel, latest: uint<32>) -> uint<32>
-        return snapshot.peek() * 1000 + latest
+        return (snapshot.peek() * 1000 + latest).trunc<32>()
     end function combine_model
     function combine_result(snapshot: Result, latest: uint<32>) -> uint<32>
-        return snapshot.value * 1000 + latest
+        return (snapshot.value * 1000 + latest).trunc<32>()
     end function combine_result
     function ordered_component_value() -> uint<32>
         let seed = ordered_args.step(1)
@@ -113,7 +113,7 @@ agent Harness
         return inner.pending.size() + inner.pending.size()
     end function pending_size_twice
     function front_then_pop() -> uint<16>
-        return inner.pending.front().zext<16>() + inner.pending.pop().zext<16>()
+        return (inner.pending.front().zext<16>() + inner.pending.pop().zext<16>()).trunc<16>()
     end function front_then_pop
 end agent Harness
 
@@ -275,10 +275,10 @@ impl ComponentValueExpressionTest for ComponentValueTb
             harness.scalar = harness.inner.peek()
         end if
         assert harness.scalar == 6689 else fail("component call in if condition")
-        let loops : uint<8> = 0
+        let loops : uint<32> = 0
         while harness.inner.peek() < 66891
             harness.inner.step(1)
-            loops = loops + 1
+            loops = (loops + 1).trunc<32>()
         end while
         assert loops == 1 else fail("component call in while condition")
         assert harness.inner.peek() == 66891 else fail("component call in assertion")

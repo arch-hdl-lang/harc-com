@@ -53,7 +53,7 @@ fn hook_cov_src(params: &str, args: &str, points: &str, run: &str) -> String {
         r#"scoreboard Sink
     calls : uint<32> default 0
     hookable accept({params})
-        calls = calls + 1
+        calls = (calls + 1).resize<32>()
     end accept
 end scoreboard Sink
 

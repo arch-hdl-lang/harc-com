@@ -14,7 +14,7 @@ scoreboard Sink
     hookable accept(value: sint<8>, lo: sint<8>, hi: sint<8>, uvalue: uint<64>)
         assert value >= lo else fail("signed lower control")
         assert value <= hi else fail("signed upper control")
-        calls = calls + 1
+        calls = (calls + 1).resize<32>()
     end accept
 end scoreboard Sink
 

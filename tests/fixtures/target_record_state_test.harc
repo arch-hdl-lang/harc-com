@@ -59,8 +59,8 @@ transactor MemoryResponder bound to TlmMemBus
         last.addr = addr
         last.data = 256 + addr
         bundle.data[slot] = addr
-        bundle.matrix[slot][1] = addr + 2
-        bundle.kids[slot].value = addr + 1
+        bundle.matrix[slot][1] = addr +% 2
+        bundle.kids[slot].value = addr +% 1
         // Read subfields back inside the responder body.
         assert last.addr == addr
             else fail("responder: last.addr=${last.addr}, expected ${addr}")

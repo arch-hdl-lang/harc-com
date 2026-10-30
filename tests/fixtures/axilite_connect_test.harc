@@ -163,7 +163,7 @@ impl AxiLiteConnectTest for AxiLiteConnectTb
         for t in txns
             let exp = env.sb.expected.pop()
             if env.drv.last_read != exp
-                env.sb.errors = env.sb.errors + 1
+                env.sb.errors = (env.sb.errors + 1).trunc<32>()
             end if
         end for
         assert env.sb.errors > 0 || env.sb.expected.empty()

@@ -450,31 +450,30 @@ fn run_capture_fixture(tag: &str, src: &str) -> (bool, String) {
 }
 
 /// A signed 8-bit target compared against a captured UNSIGNED 8-bit record
-/// field follows the native usual arithmetic conversions (both promote to
-/// a signed `int`), so the comparison is signed. The captured operand's
-/// width used to be unknown to the solver renderer, which then picked an
-/// unsigned `ult`: `r.s < uc.u && r.s < 0` was UNSAT.
+/// field used to follow the native usual arithmetic conversions. Owner
+/// decision D1 (R16) makes the mix a compile-time error in a `with` block,
+/// so neither the comparison nor its UNSAT dual reaches the solver.
 #[test]
-fn native_mixed_signedness_capture_compares_as_promoted_int() {
+fn native_mixed_signedness_capture_is_rejected() {
     let (ok, log) = run_capture_fixture("mixed", MIXED_CAPTURE);
+    assert!(!ok, "mixed capture fixture unexpectedly compiled:\n{log}");
     assert!(
-        ok && log.contains("ALL TESTS PASSED") && log.contains("MIXED_OK"),
-        "mixed capture fixture failed:\n{log}"
+        log.contains("mixes signed and unsigned operands"),
+        "expected the mixed-signedness diagnostic:\n{log}"
     );
 }
 
-/// Dual: a signed 8-bit value can never exceed a captured unsigned 200,
-/// so the solve must be UNSAT. The unsigned comparison used to accept a
-/// negative `r.s` (its bit pattern is a large unsigned value).
+/// Dual of the above (`r.s > uc.u` with `uc.u = 200`): also rejected at
+/// compile time rather than solved under an implicit promotion rule.
 #[test]
-fn native_mixed_signedness_capture_rejects_impossible_bound() {
+fn native_mixed_signedness_capture_dual_is_rejected() {
     let (ok, log) = run_capture_fixture("mixed_dual", MIXED_CAPTURE_DUAL);
     assert!(
         !ok,
-        "a sint<8> greater than 200 unexpectedly solved:\n{log}"
+        "a sint<8> > uint<8> capture unexpectedly compiled:\n{log}"
     );
     assert!(
-        log.contains("constraint UNSAT"),
-        "expected UNSAT diagnostic:\n{log}"
+        log.contains("mixes signed and unsigned operands"),
+        "expected the mixed-signedness diagnostic:\n{log}"
     );
 }

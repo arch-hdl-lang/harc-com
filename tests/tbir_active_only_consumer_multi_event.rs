@@ -18,12 +18,12 @@ transactor T
     n    : uint<32> default 0
 
     on req1(v)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end on
 
     when active
         on req2(v)
-            n = n + 1
+            n = (n + 1).resize<32>()
         end on
     end when
 end transactor T

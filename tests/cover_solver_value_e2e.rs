@@ -99,7 +99,7 @@ end transaction Txn
 scoreboard Sink
     calls : uint<32> default 0
     hookable accept(t: Txn, v: sint<8>, u: uint<8>)
-        calls = calls + 1
+        calls = (calls + 1).resize<32>()
     end accept
 end scoreboard Sink
 
@@ -162,7 +162,7 @@ end transaction Txn
 scoreboard Sink
     calls : uint<32> default 0
     hookable accept(t: Txn, v: sint<8>)
-        calls = calls + 1
+        calls = (calls + 1).resize<32>()
     end accept
 end scoreboard Sink
 
@@ -226,7 +226,7 @@ fn coverpoint_bitnot_complements_within_the_operand_width() {
         r#"scoreboard Sink
     calls : uint<32> default 0
     hookable accept(u: uint<8>, s: sint<8>)
-        calls = calls + 1
+        calls = (calls + 1).resize<32>()
     end accept
 end scoreboard Sink
 
@@ -274,7 +274,7 @@ fn coverpoints_wider_than_128_bits_sample_at_full_width() {
         r#"scoreboard Sink
     calls : uint<32> default 0
     hookable accept(u: uint<200>, s: sint<200>, n: sint<8>)
-        calls = calls + 1
+        calls = (calls + 1).resize<32>()
     end accept
 end scoreboard Sink
 
@@ -304,9 +304,9 @@ end testbench Tb
 impl Test for Tb
     run
         let u : uint<200> = 1
-        u = (u << 150) + 1
+        u = ((u << 150) + 1).resize<200>()
         let s : sint<200> = 0
-        s = s - 1
+        s = (s - 1).resize<200>()
         let n : sint<8> = -1
         sink.accept(u, s, n)
         wait 1 cycle
@@ -409,12 +409,12 @@ test SignedDist
                 r.s dist { -2 :/ 100 }
             end randomize
             if r.s == -2
-                hits = hits + 1
+                hits = (hits + 1).resize<32>()
             end if
             let a : A
             randomize(a)
             if a.s == -3
-                ahits = ahits + 1
+                ahits = (ahits + 1).resize<32>()
             end if
         end repeat
         log(info, "hits=${hits} ahits=${ahits}")
@@ -584,7 +584,7 @@ fn coverpoint_width_methods_at_carrier_boundaries() {
         r#"scoreboard Sink
     calls : uint<32> default 0
     hookable accept(a: sint<64>, b: sint<63>, c: sint<128>, d: sint<129>, e: sint<65>, r65: uint<65>, r129: uint<129>, s128: sint<128>, s129: sint<129>, u63: uint<63>)
-        calls = calls + 1
+        calls = (calls + 1).resize<32>()
     end accept
 end scoreboard Sink
 
@@ -656,7 +656,7 @@ impl Test for Tb
         let e : sint<65> = -1
         let r65 : uint<65> = 0xFFFFFFFFFFFFFFFF
         let r129 : uint<129> = 1
-        r129 = (r129 << 128) - 1
+        r129 = ((r129 << 128) - 1).resize<129>()
         let s128 : sint<128> = -1
         let s129 : sint<129> = -1
         let u63 : uint<63> = 0

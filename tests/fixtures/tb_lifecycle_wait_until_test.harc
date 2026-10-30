@@ -27,7 +27,7 @@ testbench WaitUntilLifecycleTb
         wait until dut.count_out == expected + 2 timeout 8 cycles
             fail("shared lifecycle wait-until timed out")
         dut.en = 0
-        expected = expected + 2
+        expected = (expected + 2).trunc<32>()
         assert dut.count_out == expected
             else fail("wait-until check: count=${dut.count_out} exp=${expected}")
         log(info, "shared wait-until lifecycle passed")

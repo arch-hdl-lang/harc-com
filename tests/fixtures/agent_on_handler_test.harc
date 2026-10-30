@@ -26,7 +26,7 @@ agent Tagger
     last  : uint<8>  default 0
 
     on in_ev(t)
-        seen = seen + 1
+        seen = (seen + 1).trunc<32>()
         last = t
     end on
 end agent Tagger

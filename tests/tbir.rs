@@ -529,8 +529,8 @@ test T
     let dut : Top
     run
         let epoch : uint<32> = 100
-        let tail_index : uint<32> = epoch - SYSTEMATIC_COUNT
-        let signed_next : sint<8> = SIGNED_STEP + SIGNED_STEP
+        let tail_index : uint<32> = (epoch - SYSTEMATIC_COUNT).resize<32>()
+        let signed_next : sint<8> = (SIGNED_STEP + SIGNED_STEP).resize<8>()
         assert tail_index == 36 else fail("tail")
         assert signed_next == -4 else fail("signed")
     end run
@@ -543,7 +543,15 @@ end test T"#,
     let mut saw_unsigned = false;
     let mut saw_signed = false;
     for stmt in run.blocks.iter().flat_map(|block| &block.stmts) {
-        let ir::Stmt::Assign(_, ir::Expr::Binary(_, lhs, rhs)) = stmt else {
+        let ir::Stmt::Assign(_, value) = stmt else {
+            continue;
+        };
+        // The widened sum is narrowed by `.resize<N>()` (owner decision D2).
+        let mut value = value;
+        while let ir::Expr::WidthCast { inner, .. } = value {
+            value = inner;
+        }
+        let ir::Expr::Binary(_, lhs, rhs) = value else {
             continue;
         };
         for value in [lhs.as_ref(), rhs.as_ref()] {
@@ -579,9 +587,9 @@ const S : sint<16> = -8
 scoreboard Counts
     total : uint<32> default 0
     hookable exercise()
-        total = total + U
-        total = total - V
-        total = total * V
+        total = (total + U).resize<32>()
+        total = (total - V).resize<32>()
+        total = (total * V).resize<32>()
         total = total / V
         total = total % V
         total = total << V
@@ -812,7 +820,7 @@ end test T"#,
 #[test]
 fn pure_helper_calls_fold_in_const_initializers() {
     let src = r#"function add(a: uint<8>, b: uint<8>) -> uint<8>
-    return a + b
+    return a +% b
 end function add
 
 function twice(x: uint<8>) -> uint<8>
@@ -838,7 +846,7 @@ end test T"#;
         assert!(text.contains(folded), "missing `{folded}` in:\n{text}");
     }
 
-    let multi_stmt = src.replace("return a + b", "let sum = a + b\n    return sum");
+    let multi_stmt = src.replace("return a +% b", "let sum = a + b\n    return sum");
     let msg = assert_not_implemented(
         &lower_src(&multi_stmt).expect_err("multi-statement helpers remain outside const folding"),
         lower::V1Status::EmitsUncompilable,
@@ -1009,11 +1017,12 @@ end test T"#,
     );
 }
 
-/// Unsigned constants must retain uint64_t rank at use sites. Otherwise
-/// `sint`/`uint` mixed expressions lose C++'s usual-arithmetic conversion.
+/// A mixed `sint`/`uint` comparison of two typed constants used to pin
+/// C++'s usual-arithmetic conversion at the use site. Owner decision D1
+/// (R16) makes the mix a compile-time error; the user converts with `as`.
 #[test]
-fn const_mixed_signedness_use_preserves_usual_arithmetic_conversion() {
-    let cpp = emit_cpp_src(
+fn const_mixed_signedness_use_is_rejected() {
+    let error = lower_src(
         r#"const NEG : sint<8> = -1
 const ONE : uint<8> = 1
 
@@ -1023,10 +1032,11 @@ test T
         assert !(NEG < ONE) else fail("mixed")
     end run
 end test T"#,
-    );
+    )
+    .expect_err("a sint/uint comparison must not lower");
     assert!(
-        cpp.contains("((int64_t)(-1)) < ((uint64_t)(1))"),
-        "mixed signed/unsigned consts must retain C++ conversion rank; got:\n{cpp}"
+        error.to_string().contains("mixes signed and unsigned operands"),
+        "{error}"
     );
 }
 
@@ -1948,7 +1958,7 @@ end testbench ProbeTb
 impl ProbeTest for ProbeTb
     run
         let before : uint<32> = user.read_probe()
-        user.force_probe(before + 1)
+        user.force_probe(before +% 1)
         user.release_probe()
     end run
 end impl ProbeTest"#;
@@ -2019,7 +2029,7 @@ impl ProbeTest for ProbeTb
     run
         driver.dut = dut
         let before : uint<32> = driver.read_probe()
-        driver.force_probe(before + 1)
+        driver.force_probe(before +% 1)
         driver.release_probe()
     end run
 end impl ProbeTest"#;
@@ -3500,7 +3510,7 @@ end impl NarrowingTest
 
     let masked_write = read_types.replace(
         "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
-        "sb.narrow = (sb.wide & 0xFF) >> 4\n        sb.narrowq.push((sb.wide & 0xFF) >> 4)\n        let signed_a : sint<8> = -2\n        let signed_b : sint<8> = -1\n        sb.signed = signed_a & signed_b\n        sb.signedq.push(signed_a & signed_b)\n        sb.wide = sb.wide + 1",
+        "sb.narrow = (sb.wide & 0xFF) >> 4\n        sb.narrowq.push((sb.wide & 0xFF) >> 4)\n        let signed_a : sint<8> = -2\n        let signed_b : sint<8> = -1\n        sb.signed = signed_a & signed_b\n        sb.signedq.push(signed_a & signed_b)\n        sb.wide = (sb.wide + 1).resize<256>()",
     );
     let masked = lower_src(&masked_write).expect("a masked wide read can enter a narrow scalar");
     verify::verify_program(&masked).expect("the masked scalar write verifies");
@@ -3647,10 +3657,12 @@ end impl NarrowingTest
             "let wide_copy = sb.wide\n        assert wide_copy[207:193] == 128",
             statement,
         );
+        // A `sint` mask on a `uint` value is a mixed-signedness operator
+        // (owner decision D1), rejected before any narrowing is judged.
         let err = lower_src(&narrowing).expect_err("a signed mask cannot narrow a wide value");
         assert!(
-            err.to_string().contains("narrows"),
-            "signed masks retain the wide operand's bound: {err}"
+            err.to_string().contains("mixes signed and unsigned operands"),
+            "a signed mask on a wide unsigned value is rejected: {err}"
         );
     }
     let queue_narrowing = read_types.replace(
@@ -3809,7 +3821,7 @@ scoreboard Sink
     count : uint<32> default 0
 
     hookable accept(v: uint<8>)
-        count = count + 1
+        count = (count + 1).resize<32>()
     end accept
 end scoreboard Sink
 
@@ -3859,7 +3871,7 @@ transactor Relay
     count : uint<32> default 0
 
     hookable publish(v: uint<8>)
-        count = count + 1
+        count = (count + 1).resize<32>()
         emit observed(v)
     end publish
 
@@ -3872,7 +3884,7 @@ scoreboard Sink
     count : uint<32> default 0
 
     hookable accept(v: uint<8>)
-        count = count + v
+        count = (count + v).resize<32>()
     end accept
 end scoreboard Sink
 
@@ -3956,11 +3968,11 @@ transactor Relay
 
     when active
         hookable bump()
-            active_ticks = active_ticks + 1
+            active_ticks = (active_ticks + 1).resize<32>()
         end bump
 
         on 1 cycles
-            active_ticks = active_ticks + 1
+            active_ticks = (active_ticks + 1).resize<32>()
         end on
     end when
 end transactor Relay
@@ -4025,11 +4037,11 @@ transactor Relay
         ticks : uint<32> default 0
 
         hookable bump()
-            ticks = ticks + 1
+            ticks = (ticks + 1).resize<32>()
         end bump
 
         on 1 cycles
-            ticks = ticks + 1
+            ticks = (ticks + 1).resize<32>()
         end on
     end when
 end transactor Relay
@@ -4125,7 +4137,7 @@ end transactor Source
 scoreboard Sink
     count : uint<32> default 0
     hookable accept(v: uint<8>)
-        count = count + v
+        count = (count + v).resize<32>()
     end accept
 end scoreboard Sink
 
@@ -6063,12 +6075,12 @@ agent Mixed
     seen  : uint<32> default 0
 
     on in_ev(t)
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
         bump()
     end on
 
     hookable bump()
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end bump
 end agent Mixed
 
@@ -6184,7 +6196,7 @@ transactor LifecycleMonitor
     history : queue<LifeRec>
 
     hookable note_start(tag: uint<8>)
-        starts = starts + 1
+        starts = (starts + 1).resize<32>()
         let r : LifeRec
         r.tag = tag
         r.stamp = starts
@@ -6200,7 +6212,7 @@ end transactor LifecycleMonitor
 scoreboard LifeSink
     count : uint<32> default 0
     hookable accept(v: uint<8>)
-        count = count + 1
+        count = (count + 1).resize<32>()
     end accept
 end scoreboard LifeSink
 
@@ -6357,7 +6369,7 @@ fn active_mode_on_analysis_monitor_field_is_rejected() {
     // monitor classifier when an observation handler is also present.
     let reactive = passive_monitor_src(" active").replace(
         "end transactor LifecycleMonitor",
-        "    on 1 cycles\n        starts = starts + 1\n    end on\nend transactor LifecycleMonitor",
+        "    on 1 cycles\n        starts = (starts + 1).resize<32>()\n    end on\nend transactor LifecycleMonitor",
     );
     let err = lower_src(&reactive).expect_err("active periodic analysis monitor is invalid");
     let msg = assert_invalid(&err);
@@ -6376,7 +6388,7 @@ transactor ModeRelay
     published : uint<32> default 0
 
     hookable publish(v: uint<8>)
-        published = published + 1
+        published = (published + 1).resize<32>()
         emit observed(v)
     end publish
 
@@ -6385,7 +6397,7 @@ transactor ModeRelay
         aev    : out event<uint<8>>
 
         hookable activate()
-            acalls = acalls + 1
+            acalls = (acalls + 1).resize<32>()
             emit aev(1)
         end activate
     end when
@@ -6394,7 +6406,7 @@ end transactor ModeRelay
 scoreboard ModeSink
     count : uint<32> default 0
     hookable accept(v: uint<8>)
-        count = count + 1
+        count = (count + 1).resize<32>()
     end accept
 end scoreboard ModeSink
 "#
@@ -6523,7 +6535,7 @@ transactor Mon
     beats : uint<32> default 0
 
     on 1 cycles
-        beats = beats + 1
+        beats = (beats + 1).resize<32>()
     end on
 end transactor Mon
 
@@ -6586,7 +6598,7 @@ fn an_active_only_consumer_registers_only_when_active() {
         } else {
             ""
         };
-        let handler = "on req(v)\n            n = n + 1\n        end on";
+        let handler = "on req(v)\n            n = (n + 1).resize<32>()\n        end on";
         let body = if active_only {
             format!("    when active\n        {handler}\n    end when\n")
         } else {
@@ -6794,7 +6806,7 @@ fn scoreboard_method_testbench_field_lowers() {
 scoreboard Sb
     n : uint<32> default 0
     hookable bump()
-        n = n + 1
+        n = (n + 1).resize<32>()
     end bump
 end scoreboard Sb
 
@@ -6946,7 +6958,7 @@ test StructTest
     let dut : Top
     run
         let p : Pkt
-        p.count = p.count + 1
+        p.count = (p.count + 1).resize<16>()
         assert p.flag else fail("flag")
     end run
 end test StructTest
@@ -8433,7 +8445,7 @@ agent Outer
 
     function grab()
 BODY
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end function
 end agent Outer
 
@@ -8531,7 +8543,7 @@ agent Outer
     function grab()
         let b : Inner
 BODY
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end function
 end agent Outer
 
@@ -9304,7 +9316,7 @@ agent Src
 
     function take(b : Beat)
 {method}
-        n = n + 1
+        n = (n + 1).resize<32>()
     end function
 end agent Src
 
@@ -9768,7 +9780,7 @@ fn the_bound_to_arms_split_on_what_v1_does_with_the_clause() {
             "testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs",
             &format!(
                 "\n{kind} C\n    seen : uint<32> bound to AxilXactor default 0\n\n    \
-                 on 3 cycles\n        seen = seen + 1\n    end on\nend {kind} C\n\n\
+                 on 3 cycles\n        seen = (seen + 1).resize<32>()\n    end on\nend {kind} C\n\n\
                  testbench AxiLiteBoundMonTb\n    dut : AxiLiteRegs\n    c   : C"
             ),
         );
@@ -9850,7 +9862,7 @@ transactor Drv
         req : in event<uint<8>>
 
         on req(n)
-            fires = fires + n
+            fires = (fires + n).resize<8>()
 {poke}
         end on
     end when
@@ -9936,7 +9948,7 @@ transactor Drv
     fires : uint<8> default 0
 
     on bus.w.handshake(d)
-        fires = fires + 1
+        fires = (fires + 1).resize<8>()
     end on
 end transactor Drv
 
@@ -9973,8 +9985,8 @@ end impl T"#
     let hs = "    on bus.w.handshake(d)\n        sb.written.push(d)\n    end on";
     assert_eq!(bound_src.matches(hs).count(), 1, "unique anchor");
     for to in [
-        "    on bus.w.settle(d)\n        sb.errors = sb.errors + 1\n    end on",
-        "    on bus.handshake(d)\n        sb.errors = sb.errors + 1\n    end on",
+        "    on bus.w.settle(d)\n        sb.errors = (sb.errors + 1).resize<32>()\n    end on",
+        "    on bus.handshake(d)\n        sb.errors = (sb.errors + 1).resize<32>()\n    end on",
     ] {
         let err = lower_with_stdlib_bus_src(&bound_src.replace(hs, to)).unwrap_err();
         let msg = err.to_string();
@@ -10104,7 +10116,7 @@ end impl T"#
     for from in ["    on bus.w.handshake(d)\n        sb.written.push(d)\n    end on"] {
         assert_eq!(bound.matches(from).count(), 1, "unique anchor");
         for to in [
-            "    on bus.w.handshake()\n        sb.errors = sb.errors + 1\n    end on",
+            "    on bus.w.handshake()\n        sb.errors = (sb.errors + 1).resize<32>()\n    end on",
             "    on bus.w.handshake(d, e)\n        sb.written.push(d)\n    end on",
         ] {
             let src = bound.replace(from, to);
@@ -10216,11 +10228,11 @@ agent Src
     seen : uint<32> default 0
 
     function takes(x: uint<8>)
-        seen = seen + x
+        seen = (seen + x).resize<32>()
     end function
 
     function takesr(t: Beat)
-        seen = seen + t.v
+        seen = (seen + t.v).resize<32>()
     end function
 end agent Src
 
@@ -10289,7 +10301,7 @@ agent Src
     seen : uint<32> default 0
 
     function takes(x: uint<8>) -> uint<8>
-        seen = seen + x
+        seen = (seen + x).resize<32>()
         return x
     end function
 
@@ -10300,7 +10312,7 @@ agent Src
     end function
 
     function robs(t: Beat)
-        seen = seen + t.v
+        seen = (seen + t.v).resize<32>()
     end function
 end agent Src
 
@@ -10608,10 +10620,10 @@ end transaction Beat
 agent Src
     seen : uint<32> default 0
     function two(a: uint<8>, b: uint<8>)
-        seen = seen + a + b
+        seen = (seen + a + b).resize<32>()
     end function
     function tworec(a: uint<8>, t: Beat)
-        seen = seen + a + t.v
+        seen = (seen + a + t.v).resize<32>()
     end function
 end agent Src
 
@@ -10818,7 +10830,7 @@ agent Src
     function fire()
         let b : Beat
         emit obs(b)
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end function
 end agent Src
 
@@ -11081,12 +11093,12 @@ testbench Tb
     n   : uint<32> default 0
 
     function tf(t: Beat) -> uint<8>
-        n = n + 1
+        n = (n + 1).resize<32>()
         return t.v
     end function tf
 
     function ts(x: uint<8>) -> uint<8>
-        n = n + x
+        n = (n + x).resize<32>()
         return x
     end function ts
 end testbench Tb
@@ -11244,16 +11256,16 @@ end scoreboard Sb
 agent Sink
     n : uint<32> default 0
     function fsc(x: uint<8>)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end function
     function fseq(s: TSeq<Beat>)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end function
     function fseqs(s: TSeq<uint<8>>)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end function
     function fseqw(s: TSeq<uint<32>>)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end function
 end agent Sink
 
@@ -11370,7 +11382,7 @@ agent Sink
         return s
     end function
     function fseq(s: TSeq<Beat>)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end function
 end agent Sink
 
@@ -11949,10 +11961,10 @@ end scoreboard Sb
 agent Src
     n : uint<32> default 0
     function obs(t: Beat)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end function
     function obo(t: Other)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end function
 end agent Src
 
@@ -12046,7 +12058,7 @@ fn a_connect_endpoint_may_name_the_owners_own_port() {
         )
         .replacen(
             "    connect",
-            "    hookable own_sink(v: uint<8>)\n        seen = seen + 1\n    end own_sink\n\n    connect",
+            "    hookable own_sink(v: uint<8>)\n        seen = (seen + 1).resize<32>()\n    end own_sink\n\n    connect",
             1,
         )
         .replacen(
@@ -12118,7 +12130,7 @@ end domain SysDomain
 agent Prod
     n : uint<32> default 0
     function bump(v: uint<8>)
-        n = n + v
+        n = (n + v).resize<32>()
     end function
 end agent Prod
 
@@ -12374,7 +12386,7 @@ impl T for Tb
         model.q.push(3)
         let fronts = q.front() + sb.q.front() + model.q.front()
         assert fronts == 6 else fail("queue-front sum")
-        let total = q.pop() + sb.q.pop() + model.q.pop()
+        let total = (q.pop() + sb.q.pop() + model.q.pop()).resize<32>()
         assert total == 6 else fail("nested queue-pop sum")
     end run
 end impl T
@@ -13232,7 +13244,7 @@ transactor TlmMemTarget bound to TlmMemBus
     n : uint<32> default 0
 {item}
     thread bus.read(addr: uint<8>)
-        n = n + 1
+        n = (n + 1).resize<32>()
         return 1
     end thread
 end transactor TlmMemTarget
@@ -13258,11 +13270,11 @@ end impl T
         target(item)
             .replace(
                 "    thread bus.read(addr: uint<8>)
-        n = n + 1
+        n = (n + 1).resize<32>()
         return 1
     end thread",
                 "    hookable poke()
-        n = n + 1
+        n = (n + 1).resize<32>()
     end poke",
             )
             .replace("TlmMemTarget passive", "TlmMemTarget active")
@@ -13348,7 +13360,7 @@ fn a_component_scope_apply_is_dropped_by_v1_without_a_false_escape_hatch() {
             r#"{keyword} Worker
     n : uint<8> default 0
     hookable bump()
-        n = n + 1
+        n = (n + 1).resize<8>()
     end bump
 end {keyword} Worker
 
@@ -13413,7 +13425,7 @@ transactor TlmMemTarget bound to TlmMemBus
     n : uint<32> default 0
 {field}
     thread bus.read(addr: uint<8>)
-        n = n + 1
+        n = (n + 1).resize<32>()
         return 1
     end thread
 end transactor TlmMemTarget
@@ -13611,7 +13623,7 @@ transactor Poker
 
     when active
         hookable poke()
-            n = n + 1
+            n = (n + 1).resize<32>()
         end poke
     end when
 end transactor Poker
@@ -13642,7 +13654,7 @@ transactor AxilHelper bound to BusAxiLite
     v : Vec<uint<8>, 4>
 
     hookable poke()
-        n = n + 1
+        n = (n + 1).resize<32>()
     end poke
 end transactor AxilHelper
 
@@ -17986,14 +17998,14 @@ end test T"#
 
     // The five shapes the routing predicate excludes. None of them may
     // reach the subscription arms — each is claimed elsewhere first.
-    lower_src(&agent("3 cycles", "seen = seen + 1")).expect("a periodic handler lowers");
+    lower_src(&agent("3 cycles", "seen = (seen + 1).resize<32>()")).expect("a periodic handler lowers");
     for (trigger, elsewhere) in [
         ("clk", "the unresolved name `clk`"),
         ("tagger.in_ev(t)", "transactor/method call `.in_ev(...)`"),
         ("other(t)", "helper call `other(...)`"),
         ("nosuch(t)", "helper call `nosuch(...)`"),
     ] {
-        let msg = match lower_src(&agent(trigger, "seen = seen + 1")) {
+        let msg = match lower_src(&agent(trigger, "seen = (seen + 1).resize<32>()")) {
             Ok(_) => panic!("`on {trigger}` unexpectedly lowered"),
             Err(e) => format!("{e:?}"),
         };
@@ -18007,7 +18019,7 @@ end test T"#
     // payload to a synthesized name the body never reads and lowers the
     // handler like the one-arg form (see
     // `a_no_arg_event_handler_lowers_like_the_one_arg_form`).
-    let none = agent("in_ev()", "seen = seen + 1");
+    let none = agent("in_ev()", "seen = (seen + 1).resize<32>()");
     lower_src(&none).expect("a no-payload `on <event>()` handler lowers");
     let v1 = cpp_tb::emit(&merged_src(&none)).expect("v1 emits");
     assert!(
@@ -18021,7 +18033,7 @@ end test T"#
     // Give `u` something else to bind to and v1 compiles and runs to a
     // value the source never asked for, which is the worse one and so
     // the arm's label.
-    for body in ["seen = seen + 1", "seen = seen + u"] {
+    for body in ["seen = (seen + 1).resize<32>()", "seen = (seen + u).resize<32>()"] {
         let two = agent("in_ev(t, u)", body);
         assert_not_implemented(
             &lower_src(&two).unwrap_err(),
@@ -18047,7 +18059,7 @@ agent Tagger
     seen  : uint<32> default 0
 {extra_field}
     on in_ev(t, u)
-        seen = seen + u
+        seen = (seen + u).resize<32>()
     end on
 end agent Tagger
 
@@ -18074,9 +18086,9 @@ end test T"#
         );
         let v1 = cpp_tb::emit(&merged_src(&src)).expect("v1 emits");
         let resolves_to = if field_shadow {
-            "tagger.seen + tagger.u;".to_string()
+            "tagger.seen + tagger.u)".to_string()
         } else {
-            format!("tagger.seen + {};", v1_const_symbol(&v1, "u"))
+            format!("tagger.seen + {})", v1_const_symbol(&v1, "u"))
         };
         assert!(
             v1.contains(&resolves_to),
@@ -18085,11 +18097,11 @@ end test T"#
     }
     // …and the one-argument control really does bind the name, so the
     // difference above is the dropped parameter and nothing else.
-    let one = agent("in_ev(t)", "seen = seen + t");
+    let one = agent("in_ev(t)", "seen = (seen + t).resize<32>()");
     lower_src(&one).expect("the control lowers");
     assert_eq!(
         cpp_tb::emit(&merged_src(&one)).expect("v1 emits"),
-        cpp_tb::emit(&merged_src(&agent("in_ev(t, u)", "seen = seen + t"))).expect("v1 emits"),
+        cpp_tb::emit(&merged_src(&agent("in_ev(t, u)", "seen = (seen + t).resize<32>()"))).expect("v1 emits"),
         "the extra parameter leaves no trace in v1's output"
     );
 }
@@ -19071,7 +19083,7 @@ function read_addr(d: Top, addr: uint<3>) -> uint<8>
 end function read_addr
 
 function double_it(x: uint<8>) -> uint<8>
-    return x + x
+    return (x + x).resize<8>()
 end function double_it
 
 test HelperMixTest
@@ -19725,7 +19737,7 @@ function fact(n: uint<8>) -> uint<32>
     if n <= 1
         return 1
     end if
-    return n * fact(n - 1)
+    return n *% fact(n -% 1)
 end function fact
 
 test RecTest
@@ -19744,7 +19756,7 @@ end test RecTest
         "the prototype must precede the body so the self-call resolves; got:\n{cpp}"
     );
     assert!(
-        cpp.contains("harc_helper_fact((n - 1))"),
+        cpp.contains("harc_helper_fact(((uint64_t)(((uint64_t)((n - 1)) & 0xFFULL))))"),
         "the self-call must emit as a real call; got:\n{cpp}"
     );
 
@@ -19755,7 +19767,7 @@ function ping(x: uint<8>) -> uint<8>
     if x == 0
         return 0
     end if
-    return pong(x - 1)
+    return pong(x -% 1)
 end function ping
 
 function pong(x: uint<8>) -> uint<8>
@@ -21143,7 +21155,7 @@ testbench WideFmtTb
     calls : uint<8> default 0
 
     function bump(x: uint<8>) -> uint<8>
-        calls = calls + 1
+        calls = (calls + 1).resize<8>()
         return x
     end function bump
 end testbench WideFmtTb
@@ -23527,10 +23539,10 @@ transactor IdentityXt
     dut : Top
     when active
         hookable first(value: uint<16>) -> uint<16>
-            return value + 1
+            return (value + 1).resize<16>()
         end first
         hookable second(value: uint<16>) -> uint<16>
-            return value + 2
+            return (value + 2).resize<16>()
         end second
     end when
 end transactor IdentityXt
@@ -26588,7 +26600,7 @@ transactor Mon
     last : uint<32> default 0
 
     hookable observe()
-        samples = samples + 1
+        samples = (samples + 1).resize<32>()
         last = dut.count
     end observe
 end transactor Mon
@@ -27112,7 +27124,7 @@ testbench LogicalTb
         let first = fork mem.read_ooo(addr)
         let second = fork mem.read_ooo(addr + 1)
         join_all
-        return first + second
+        return (first + second).resize<32>()
     end function forked
 end testbench LogicalTb
 
@@ -28024,7 +28036,7 @@ end bus MemBus
 transactor MemTarget bound to MemBus
     read_count : uint<32> default 0
     thread bus.read(addr: uint<8>)
-        read_count = read_count + 1
+        read_count = (read_count + 1).resize<32>()
         return 256 + addr
     end thread
 end transactor MemTarget
@@ -28081,8 +28093,8 @@ end impl TestB
     let cpp = tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
         .expect("both target actors emit from the shared body");
     assert!(
-        cpp.contains("target.read_count = (target.read_count + 1);")
-            && cpp.contains("responder.read_count = (responder.read_count + 1);"),
+        cpp.contains("target.read_count = ((uint64_t)(((uint64_t)((target.read_count + 1)) & 0xFFFFFFFFULL)));")
+            && cpp.contains("responder.read_count = ((uint64_t)(((uint64_t)((responder.read_count + 1)) & 0xFFFFFFFFULL)));"),
         "each actor must bind the shared state access to its own receiver:\n{cpp}"
     );
 
@@ -28106,7 +28118,7 @@ end impl TestB
     let cpp = tbir::emit(&prog, &merged_src(src), &cpp_tb::EmitOpts::default())
         .expect("actor receiver overrides a stale baked state name");
     assert!(
-        cpp.contains("responder.read_count = (responder.read_count + 1);"),
+        cpp.contains("responder.read_count = ((uint64_t)(((uint64_t)((responder.read_count + 1)) & 0xFFFFFFFFULL)));"),
         "the second actor must override the corrupted first-actor receiver:\n{cpp}"
     );
 }
@@ -28738,8 +28750,8 @@ end function seed
 test RuntimePromotedLetTest
     let dut : Top
     let first : uint<32> = seed()
-    let middle : uint<32> = first + 1
-    let observed : uint<32> = middle + 1
+    let middle : uint<32> = (first + 1).resize<32>()
+    let observed : uint<32> = (middle + 1).resize<32>()
 
     run
         wait 1 cycle
@@ -28757,10 +28769,10 @@ end test RuntimePromotedLetTest"#;
         .find("first = harc_helper_seed()")
         .expect("first local initializes");
     let middle = cpp
-        .find("middle = (first + 1)")
+        .find("((first + 1))")
         .expect("middle local initializes");
     let observed = cpp
-        .find("_tb.observed = (middle + 1)")
+        .find("_tb.observed = ((uint64_t)(((uint64_t)((middle + 1))")
         .expect("promoted field initializes at runtime");
     assert!(
         first < middle && middle < observed,
@@ -28769,7 +28781,7 @@ end test RuntimePromotedLetTest"#;
     assert!(cpp.contains("uint64_t observed = 0;"), "{cpp}");
 
     let untyped = src.replace(
-        "let observed : uint<32> = middle + 1",
+        "let observed : uint<32> = (middle + 1).resize<32>()",
         "let observed = middle + 1",
     );
     let untyped_prog = lower_src(&untyped).expect("untyped runtime initializer type is inferred");
@@ -28781,7 +28793,9 @@ end test RuntimePromotedLetTest"#;
             .iter()
             .find(|field| field.name == "observed")
             .map(|field| &field.ty),
-        Some(&ir::IrType::UInt(Some(32)))
+        // The untyped promoted let infers the ARCH result width (owner
+        // decision D2): `middle + 1` on a `uint<32>` is `uint<33>`.
+        Some(&ir::IrType::UInt(Some(33)))
     );
     let untyped_cpp = emit_cpp_src(&untyped);
     assert!(
@@ -28794,7 +28808,7 @@ end test RuntimePromotedLetTest"#;
     );
 
     let helper_result = src.replace(
-        "let observed : uint<32> = middle + 1",
+        "let observed : uint<32> = (middle + 1).resize<32>()",
         "let observed = seed()",
     );
     let helper_prog =
@@ -28810,7 +28824,7 @@ end test RuntimePromotedLetTest"#;
     );
 
     let port_init = src.replace(
-        "let observed : uint<32> = middle + 1",
+        "let observed : uint<32> = (middle + 1).resize<32>()",
         "let observed = dut.count_out",
     );
     let port_prog = lower_src(&port_init).expect("an untyped promoted DUT read lowers");
@@ -28837,7 +28851,7 @@ end test RuntimePromotedLetTest"#;
     );
 
     let compound_port = src.replace(
-        "let observed : uint<32> = middle + 1",
+        "let observed : uint<32> = (middle + 1).resize<32>()",
         "let observed = dut.count_out + 1",
     );
     let compound_prog = lower_src(&compound_port)
@@ -28866,7 +28880,7 @@ end test RuntimePromotedLetTest"#;
 
     for initializer in ["-4'd1", "~4'd0", "~(middle + 4'd0)"] {
         let sized_unary = src.replace(
-            "let observed : uint<32> = middle + 1",
+            "let observed : uint<32> = (middle + 1).resize<32>()",
             &format!("let observed = {initializer}"),
         );
         let sized_prog =
@@ -28888,7 +28902,7 @@ end test RuntimePromotedLetTest"#;
     let mixed_width = src
         .replace("let first : uint<32> = seed()", "let first : uint = seed()")
         .replace(
-            "let observed : uint<32> = middle + 1",
+            "let observed : uint<32> = (middle + 1).resize<32>()",
             "let observed = first + middle",
         );
     let mixed_prog = lower_src(&mixed_width).expect("mixed widthless and fixed operands lower");
@@ -28904,7 +28918,7 @@ end test RuntimePromotedLetTest"#;
     );
 
     let narrowing = src.replace(
-        "let observed : uint<32> = middle + 1",
+        "let observed : uint<32> = (middle + 1).resize<32>()",
         "let observed : uint<8> = first",
     );
     let msg = lower_src(&narrowing)
@@ -28916,7 +28930,7 @@ end test RuntimePromotedLetTest"#;
     );
 
     let signedness = src.replace(
-        "let observed : uint<32> = middle + 1",
+        "let observed : uint<32> = (middle + 1).resize<32>()",
         "let observed : sint<32> = first",
     );
     let msg = lower_src(&signedness)
@@ -28978,12 +28992,12 @@ testbench Tb
     function seed(v: uint<8>)
         cur.value = v
         cur.data[0] = v
-        cur.data[1] = v + 1
+        cur.data[1] = (v + 1).trunc<8>()
     end function seed
 
     function bump()
-        _tb.cur.value = cur.value + 1
-        _tb.cur.data[1] = _tb.cur.data[1] + 1
+        _tb.cur.value = (cur.value + 1).resize<8>()
+        _tb.cur.data[1] = (_tb.cur.data[1] + 1).trunc<8>()
     end function bump
 
     function mirror(t: Txn) -> uint<8>
@@ -29052,7 +29066,7 @@ end impl TbRecordFieldTest
     assert!(
         cpp.contains("Tb_seed")
             && cpp.contains("_tb.cur.value = v;")
-            && cpp.contains("_tb.cur.value = (_tb.cur.value + 1);"),
+            && cpp.contains("_tb.cur.value = ((uint64_t)(((uint64_t)((_tb.cur.value + 1)) & 0xFFULL)));"),
         "canonical methods should mutate the shared record object:\n{cpp}"
     );
     assert!(
@@ -29138,7 +29152,7 @@ testbench Tb
     count : uint<32> default 0
 
     function bump()
-        count = count + 1
+        count = (count + 1).resize<32>()
     end function bump
 end testbench Tb
 
@@ -29151,7 +29165,7 @@ end impl TbScalarFieldTest
 "#;
     let cpp = emit_cpp_src(src);
     assert!(
-        cpp.contains("_tb.count = (_tb.count + 1);") && cpp.contains("if (!((_tb.count == 1)))"),
+        cpp.contains("_tb.count = ((uint64_t)(((uint64_t)((_tb.count + 1)) & 0xFFFFFFFFULL)));") && cpp.contains("if (!((_tb.count == 1)))"),
         "bare scalar testbench field should lower through _tb host state:\n{cpp}"
     );
 }
@@ -29209,7 +29223,7 @@ end testbench Tb
 
 impl TbRecordHookShadowTest for Tb
     on drv.observe pre
-        _tb.cur.value = cur.value + 1
+        _tb.cur.value = (cur.value + 1).resize<8>()
     end on
 
     run
@@ -29226,7 +29240,7 @@ end impl TbRecordHookShadowTest
         "hook parameter should remain first and be renamed away from shared cur:\n{cpp}"
     );
     assert!(
-        cpp.contains("cur.value = (cur_2.value + 1);"),
+        cpp.contains("cur.value = ((uint64_t)(((uint64_t)((cur_2.value + 1)) & 0xFFULL)));"),
         "_tb.cur should resolve to the shared record while bare cur resolves to the hook param:\n{cpp}"
     );
 }
@@ -29339,8 +29353,20 @@ end test T"#;
             .iter()
             .filter(|cast| **cast == (ir::WidthCastKind::Sext, 129, Some(65)))
             .count(),
-        5,
-        "direct, compound, inferred, nested, and masked sext receivers must retain 65-bit metadata: {casts:?}"
+        4,
+        "direct, compound, nested, and masked sext receivers must retain 65-bit metadata \
+         (a signed sum past 64 bits is not sign-extended in its carrier, so a cast keeps the \
+         operand width): {casts:?}"
+    );
+    // The untyped `inferred = n + z` local is itself a `sint<66>` (owner
+    // decision D2), so its cast reads 66 declared bits.
+    assert_eq!(
+        casts
+            .iter()
+            .filter(|cast| **cast == (ir::WidthCastKind::Sext, 129, Some(66)))
+            .count(),
+        1,
+        "the inferred local carries its 66-bit sum type: {casts:?}"
     );
     assert_eq!(
         casts
@@ -29353,10 +29379,10 @@ end test T"#;
     assert_eq!(
         casts
             .iter()
-            .filter(|cast| **cast == (ir::WidthCastKind::Zext, 16, Some(8)))
+            .filter(|cast| **cast == (ir::WidthCastKind::Zext, 16, Some(9)))
             .count(),
         1,
-        "compound zext receiver must retain 8-bit metadata: {casts:?}"
+        "compound zext receiver must carry the 9-bit sum: {casts:?}"
     );
     assert!(casts.contains(&(ir::WidthCastKind::Sext, 129, Some(65))), "{casts:?}");
     assert!(casts.contains(&(ir::WidthCastKind::Trunc, 16, Some(65))), "{casts:?}");
@@ -31039,7 +31065,7 @@ fn testbench_cycle_trigger_on_handler_lowers() {
     dut : Top
     hit : uint<32> default 0
     on dut.count_out == 7
-        hit = hit + 1
+        hit = (hit + 1).resize<32>()
     end on
 end testbench TbCyc
 
@@ -31627,7 +31653,7 @@ fn ordered_argument_consumers_share_the_typed_snapshot_seam() {
 end transaction Beat
 
 function helper_combine(first: uint<32>, second: uint<32>) -> uint<32>
-    return first * 1000 + second
+    return (first * 1000 + second).resize<32>()
 end function helper_combine
 
 extern function extern_combine(first: uint<32>, second: uint<32>) -> uint<32>
@@ -31635,7 +31661,7 @@ extern function extern_combine(first: uint<32>, second: uint<32>) -> uint<32>
 agent Cell
     value : uint<32> default 0
     function step(tag: uint<8>) -> uint<32>
-        value = value * 10 + tag
+        value = (value * 10 + tag).resize<32>()
         return value
     end function step
     function peek() -> uint<32>
@@ -31645,10 +31671,10 @@ end agent Cell
 
 agent Sink
     function take(snapshot: Cell, latest: uint<32>) -> uint<32>
-        return snapshot.peek() * 1000 + latest
+        return (snapshot.peek() * 1000 + latest).resize<32>()
     end function take
     function take_record(snapshot: Beat, latest: uint<32>) -> uint<32>
-        return snapshot.value * 1000 + latest
+        return (snapshot.value * 1000 + latest).resize<32>()
     end function take_record
 end agent Sink
 
@@ -31671,14 +31697,14 @@ transactor Driver
     dut : Top
     when active
         hookable take(first: uint<32>, latest: uint<32>) -> uint<32>
-            return first * 1000 + latest
+            return (first * 1000 + latest).resize<32>()
         end take
     end when
 end transactor Driver
 
 tseq Make(first: uint<32>, second: uint<32>) -> TSeq<Beat>
     let beat : Beat
-    beat.value = first + second
+    beat.value = (first + second).resize<32>()
     yield beat
 end tseq Make
 
@@ -32646,7 +32672,7 @@ impl HookLetShadowTest for HookShadowTb
     let acc : uint<32> = 0
 
     on drv.send post
-        acc = acc + t.value
+        acc = (acc + t.value).resize<32>()
         if t.value == 7
             let acc = 99
             log(info, "inner acc=${acc}")
@@ -35526,7 +35552,7 @@ end test T"#;
     when active
         on pulse(value)
             wait 1 cycle
-            ticks = ticks + value
+            ticks = (ticks + value).resize<8>()
         end on
     end when
 end transactor Relay
@@ -36013,7 +36039,7 @@ fn sync_timed_wait_reserves_its_state_and_covers_both_body_emitters() {
     hits : uint<32> default 0
     function watch()
         wait until hits == 1 timeout 5 cycles
-        hits = hits + 1
+        hits = (hits + 1).resize<32>()
     end function watch
 end scoreboard Sb
 
@@ -38019,7 +38045,7 @@ end transactor Src
 scoreboard Sink
     seen : uint<32> default 0
     hookable take(v: uint<8>)
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end take
 end scoreboard Sink
 
@@ -38185,7 +38211,7 @@ end impl T"#
     for (sink, method, want) in [
         (
             "two",
-            "    hookable two(a: uint<8>, b: uint<8>)\n        seen = seen + 1\n    end two",
+            "    hookable two(a: uint<8>, b: uint<8>)\n        seen = (seen + 1).resize<32>()\n    end two",
             "with 2 parameters",
         ),
         (
@@ -38688,7 +38714,7 @@ end transactor Src
 scoreboard Sink
     seen : uint<32> default 0
     hookable take(v: uint<8>)
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end take
 end scoreboard Sink
 
@@ -39575,7 +39601,7 @@ testbench CycTb
     d : CycDrv passive
     hit : uint<32> default 0
     on d.idle(2) == true
-        hit = hit + 1
+        hit = (hit + 1).resize<32>()
     end on
 end testbench CycTb
 
@@ -43351,7 +43377,7 @@ transactor TlmMemTarget bound to TlmMemBus
         last : Beat
         in_ev : in event<uint<8>>
         on in_ev(v)
-            active_only = active_only + v
+            active_only = (active_only + v).resize<32>()
         end on
     end when
 end transactor TlmMemTarget
@@ -43371,7 +43397,7 @@ end impl T
 
     for (body, field) in [
         (
-            "active_only = active_only + 1\n        return active_only + addr",
+            "active_only = (active_only + 1).resize<32>()\n        return active_only + addr",
             "active_only",
         ),
         ("pending.push(addr)\n        return addr", "pending"),
@@ -43752,10 +43778,10 @@ agent Watcher
     seen : uint<32> default 0
     ev   : event<RegOp>
     hookable note(t: RegOp)
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end note
     function plain(t: RegOp)
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end function plain
 end agent Watcher
 
@@ -44782,7 +44808,7 @@ KINDWORD TaggerDECL
     limit : uint<32> default LIMIT
 
     on in_ev(t)
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end on
 end KINDWORD Tagger
 
@@ -44889,7 +44915,7 @@ end impl ParamTest
             format!(
                 "const N = 9\n{}",
                 mk("Tagger #(N: int = 3)", "Tagger #(4)", limit)
-                    .replace("seen = seen + 1", &format!("seen = seen + {body}"))
+                    .replace("seen = (seen + 1).resize<32>()", &format!("seen = (seen + {body}).resize<32>()"))
             )
         };
         let line_of = |out: &str, needle: &str| {
@@ -44930,7 +44956,7 @@ end impl ParamTest
         // identical use, so `#(4)` changed nothing about the value used.
         let no_param = format!(
             "const N = 9\n{}",
-            mk("Tagger", "Tagger", "7").replace("seen = seen + 1", "seen = seen + N")
+            mk("Tagger", "Tagger", "7").replace("seen = (seen + 1).resize<32>()", "seen = (seen + N).resize<32>()")
         );
         lower_src(&no_param)
             .unwrap_or_else(|e| panic!("{kind}: the const-only form lowers: {e:?}"));
@@ -46738,7 +46764,7 @@ fn a_statement_position_hook_is_judged_by_resolution_not_shape() {
         fixture.replacen(
             ANCHOR,
             &format!(
-                "{ANCHOR}\n        on {path} pre\n            pre_count = pre_count + 1\n\
+                "{ANCHOR}\n        on {path} pre\n            pre_count = (pre_count + 1).resize<32>()\n\
                  \x20       end on"
             ),
             1,
@@ -46803,8 +46829,8 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
     let base = fixture("tlm_target_thread_if_test.harc");
     const THREAD: &str = "    thread bus.read(addr: uint<8>)";
     assert!(base.contains(THREAD), "fixture shape changed");
-    let hookable = "    hookable ping(v: uint<8>)\n        prep_acc = prep_acc + v\n    end ping\n";
-    let periodic = "    on 5 cycles\n        prep_acc = prep_acc + 1\n    end on\n";
+    let hookable = "    hookable ping(v: uint<8>)\n        prep_acc = (prep_acc + v).resize<32>()\n    end ping\n";
+    let periodic = "    on 5 cycles\n        prep_acc = (prep_acc + 1).resize<32>()\n    end on\n";
 
     // The initiator form needs the target thread GONE: a transactor
     // carrying both is caught by the mixing check ahead of these arms.
@@ -46864,7 +46890,7 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
         let v1 =
             cpp_tb::emit(&merged_src(&src)).unwrap_or_else(|e| panic!("{what}: v1 emits: {e}"));
         assert!(
-            v1.contains("_period = (int64_t)(5);") && v1.contains("prep_acc + 1;"),
+            v1.contains("_period = (int64_t)(5);") && v1.contains("prep_acc + 1)"),
             "{what}: v1 must emit the periodic body"
         );
 
@@ -46979,7 +47005,7 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
     // the three arms. Each row below is the same source as one of the
     // positive rows above with only the TRIGGER changed, so what moves
     // it is the gate and nothing else.
-    let non_periodic = "    on read_count > 0\n        prep_acc = prep_acc + 1\n    end on\n";
+    let non_periodic = "    on read_count > 0\n        prep_acc = (prep_acc + 1).resize<32>()\n    end on\n";
     // Every row routes the non-periodic handler to component IR. The target
     // row additionally retains its responder in transactor IR and joins both
     // views at the bound instance; the two initiator rows need only the
@@ -47519,7 +47545,7 @@ end impl T"#,
             }
         )
     };
-    let hookable = "    hookable take(v: uint<8>)\n        seen = seen + 1\n    end take";
+    let hookable = "    hookable take(v: uint<8>)\n        seen = (seen + 1).resize<32>()\n    end take";
     let dst = |payload: &str| {
         format!("transactor Dst\n    incoming : event<{payload}>\nend transactor Dst\n")
     };
@@ -47531,7 +47557,7 @@ end impl T"#,
     for (what, sink_decl, target, extra, want) in [
         (
             "plain function",
-            "    function plain(v: uint<8>)\n        seen = seen + 1\n    end function plain",
+            "    function plain(v: uint<8>)\n        seen = (seen + 1).resize<32>()\n    end function plain",
             "sink.plain",
             "".to_string(),
             "not `hookable`",
@@ -47545,7 +47571,7 @@ end impl T"#,
         ),
         (
             "method payload mismatch, record",
-            "    hookable take(v: Beat)\n        seen = seen + 1\n    end take",
+            "    hookable take(v: Beat)\n        seen = (seen + 1).resize<32>()\n    end take",
             "sink.take",
             "".to_string(),
             "payload mismatch",
@@ -47570,7 +47596,7 @@ end impl T"#,
     for (what, sink_decl, target, extra) in [
         (
             "method sink",
-            "    hookable take(v: sint<8>)\n        seen = seen + 1\n    end take",
+            "    hookable take(v: sint<8>)\n        seen = (seen + 1).resize<32>()\n    end take",
             "sink.take",
             "".to_string(),
         ),
@@ -47858,7 +47884,7 @@ transactor Consumer
     when active
         req : in event<uint<8>>
         on req(n)
-            seen = seen + n
+            seen = (seen + n).resize<32>()
         end on
     end when
 end transactor Consumer
@@ -47929,7 +47955,7 @@ transactor Consumer
     seen : uint<32> default 0
 
     on req(n)
-        seen = seen + n
+        seen = (seen + n).resize<32>()
     end on
 end transactor Consumer
 
@@ -48016,7 +48042,7 @@ impl SpTest for SpTb
 
     run
         on {on} cycles
-            n = n + 1
+            n = (n + 1).resize<32>()
         end on
         wait 8 cycles
         assert n > 0 else fail("n=${{n}}")
@@ -48306,11 +48332,11 @@ end domain SysDomain
 agent Calc
     acc : uint<32> default 0
     hookable add(v: uint<8>) -> uint<32>
-        acc = acc + v
+        acc = (acc + v).resize<32>()
         return acc
     end add
     hookable noret(v: uint<8>)
-        acc = acc + v
+        acc = (acc + v).resize<32>()
     end noret
 end agent Calc
 
@@ -48398,7 +48424,7 @@ end agent Model
 scoreboard Obs
     seen : uint<32> default 0
     function observe(a: uint<8>, m: Model)
-        seen = seen + a
+        seen = (seen + a).resize<32>()
     end function observe
 end scoreboard Obs
 
@@ -48411,8 +48437,8 @@ test PTest
     end run
 end test PTest"#;
     let param = param.replacen(
-        "        seen = seen + a",
-        "        let r : uint<32> = m.nosuch(a)\n        seen = seen + r",
+        "        seen = (seen + a).resize<32>()",
+        "        let r : uint<32> = m.nosuch(a)\n        seen = (seen + r).resize<32>()",
         1,
     );
     let msg = assert_invalid(&lower_src(&param).unwrap_err());
@@ -48619,7 +48645,7 @@ impl SubTest for SubTb
 
     run
         on {on}(v)
-            seen = seen + v
+            seen = (seen + v).resize<32>()
         end on
         emit ch(3)
         wait 1 cycle
@@ -50379,7 +50405,7 @@ end impl UnknownField
 fn persistent_nested_fixed_vector_lengths_fold_constants() {
     let src = r#"
 const INNER : uint<8> = 1 + 1
-const OUTER : uint<8> = INNER + 1
+const OUTER : uint<8> = (INNER as uint<8>) +% 1
 
 transactor NestedState
     dut : Top
@@ -50969,7 +50995,7 @@ fn a_wide_scalar_field_keeps_its_width_at_every_field_emitter() {
         // 3. The component struct (an unbound transactor as a member).
         let comp = format!(
             "transactor Src\n    w : uint<{width}> default 1\n\
-             \n    hookable bump(v: uint<8>)\n        w = w + 1\n    end bump\nend transactor Src\n\
+             \n    hookable bump(v: uint<8>)\n        w = (w + 1).resize<{width}>()\n    end bump\nend transactor Src\n\
              \ntestbench Tb\n    dut : Top\n    src : Src passive\nend testbench Tb\n\
              \nimpl T for Tb\n    run\n        src.bump(1)\n    end run\nend impl T\n"
         );
@@ -50983,7 +51009,7 @@ fn a_wide_scalar_field_keeps_its_width_at_every_field_emitter() {
             "bus TlmMemBus\n    tlm_method read(addr: uint<8>) -> uint<32>: blocking;\n\
              end bus TlmMemBus\n\
              \ntransactor TlmMemTarget bound to TlmMemBus\n    w : uint<{width}> default 1\n\
-             \n    thread bus.read(addr: uint<8>)\n        w = w + 1\n        return 1\n\
+             \n    thread bus.read(addr: uint<8>)\n        w = (w + 1).resize<{width}>()\n        return 1\n\
              \n    end thread\nend transactor TlmMemTarget\n\
              \ntestbench Tb\n    dut : TlmReadInitiator\nend testbench Tb\n\
              \nimpl T for Tb\n    let mem : TlmMemBus = bind dut\n\
@@ -51230,13 +51256,13 @@ fn a_wide_component_field_write_is_checked_for_width_and_signedness() {
          agent Tagger\n    \
              in_ev : event<uint<8>>\n    \
              seen  : uint<32> default 0\n\n    \
-             on in_ev(t)\n        seen = seen + t\n    end on\n\
+             on in_ev(t)\n        seen = (seen + t).resize<32>()\n    end on\n\
          end agent Tagger\n\n\
          test T\n    let dut : Top\n    let tagger : Tagger\n    clock clk = SysDomain\n    \
              run\n        wait 2 cycles\n        emit tagger.in_ev(1)\n        \
                  wait 2 cycles\n    end run\n\
          end test T\n";
-    lower_src(counter).expect("`seen = seen + t` on an event payload param stays legal");
+    lower_src(counter).expect("`seen = (seen + t` on an event payload param stays legal).resize<32>()");
 }
 
 /// A fixed-vector ELEMENT wider than 64 bits keeps its width in the
@@ -51257,7 +51283,7 @@ fn a_wide_fixed_vector_element_keeps_its_width() {
 
     hookable bump(x: uint<8>)
         v[0] = 1
-        n = n + 1
+        n = (n + 1).resize<32>()
     end bump
 end transactor SrcV
 
@@ -51317,7 +51343,7 @@ fn a_wide_event_payload_keeps_its_width() {
     n  : uint<32> default 0
 
     hookable bump(v: uint<8>)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end bump
 end transactor SrcE
 
@@ -51516,7 +51542,7 @@ fn a_connect_between_two_scalar_event_widths_still_lowers() {
     observed : out event<{src}>
     n : uint<32> default 0
     hookable publish(v: uint<8>)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end publish
 end transactor SrcT
 
@@ -51524,7 +51550,7 @@ transactor RelayT
     inev : event<{sink}>
     m : uint<32> default 0
     hookable poke(v: uint<8>)
-        m = m + 1
+        m = (m + 1).resize<32>()
     end poke
 end transactor RelayT
 
@@ -51553,7 +51579,7 @@ end test ConnTest
     observed : out event<{src}>
     n : uint<32> default 0
     hookable publish(v: uint<8>)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end publish
 end transactor SrcTb
 
@@ -51561,7 +51587,7 @@ transactor RelayTb
     inev : event<{sink}>
     m : uint<32> default 0
     hookable poke(v: uint<8>)
-        m = m + 1
+        m = (m + 1).resize<32>()
     end poke
 end transactor RelayTb
 
@@ -51644,7 +51670,7 @@ fn a_connect_that_narrows_its_payload_is_refused() {
     observed : out event<{src}>
     n : uint<32> default 0
     hookable publish(v: uint<8>)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end publish
 end transactor SrcW
 
@@ -51652,7 +51678,7 @@ transactor RelayW
     inev : event<{sink}>
     m : uint<32> default 0
     hookable poke(v: uint<8>)
-        m = m + 1
+        m = (m + 1).resize<32>()
     end poke
 end transactor RelayW
 
@@ -51685,7 +51711,7 @@ end test NarrowTest
     observed : out event<{src}>
     n : uint<32> default 0
     hookable publish(v: uint<8>)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end publish
 end transactor SrcWTb
 
@@ -51693,7 +51719,7 @@ transactor RelayWTb
     inev : event<{sink}>
     m : uint<32> default 0
     hookable poke(v: uint<8>)
-        m = m + 1
+        m = (m + 1).resize<32>()
     end poke
 end transactor RelayWTb
 
@@ -51785,7 +51811,7 @@ fn the_ir_dump_names_an_event_payloads_exact_type() {
     n : uint<32> default 0
 
     hookable publish(v: uint<8>)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end publish
 end transactor DumpSrc
 
@@ -51882,14 +51908,14 @@ fn the_verifier_backstops_the_connect_payload_width_rule() {
     observed : out event<uint<8>>
     n : uint<32> default 0
     hookable publish(v: uint<8>)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end publish
 end transactor BackstopSrc
 
 scoreboard BackstopSb
     seen : uint<32> default 0
     hookable observe(v: uint<8>)
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end observe
 end scoreboard BackstopSb
 
@@ -51915,7 +51941,7 @@ end impl BackstopTest
     observed : out event<uint<8>>
     n : uint<32> default 0
     hookable publish(v: uint<8>)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end publish
 end transactor BackstopSrc2
 
@@ -51923,7 +51949,7 @@ transactor BackstopRelay
     inev : event<uint<8>>
     m : uint<32> default 0
     hookable poke(v: uint<8>)
-        m = m + 1
+        m = (m + 1).resize<32>()
     end poke
 end transactor BackstopRelay
 
@@ -51956,7 +51982,7 @@ end transactor BackstopEnvSrc
 scoreboard BackstopEnvSb
     seen : uint<32> default 0
     hookable observe(v: uint<8>)
-        seen = seen + v
+        seen = (seen + v).resize<32>()
     end observe
 end scoreboard BackstopEnvSb
 
@@ -52109,7 +52135,7 @@ fn a_nested_fixed_vector_component_field_matches_v1() {
             r#"scoreboard Sb
     v : Vec<Vec<{elem}, 2>, 2>
     n : uint<1024> default 0
-    hookable put(x: uint<8>)
+    hookable put(x: {elem})
         {body}
     end put
 end scoreboard Sb
@@ -52135,7 +52161,13 @@ end impl T"#
             "std::array<std::array<harc_rt::HarcWide<32>, 2>, 2> v{};",
         ),
     ] {
-        let src = prog(elem, "v[0][1] = x\n        n = n + v[0][1]");
+        // The hook parameter has the leaf's own type and the leaf is read
+        // in a comparison with it, so every leaf class (`sint<8>`
+        // included) stays a legal program under the mixed-signedness rule.
+        let src = prog(
+            elem,
+            "v[0][1] = x\n        if v[0][1] == x\n            n = (n + 1).resize<1024>()\n        end if",
+        );
         let cpp = emit_cpp_src(&src);
         assert!(
             cpp.contains(member),
@@ -52167,7 +52199,7 @@ end impl T"#
     // the element-type resolvers descending on `inner_index`.)
     let dump = format!(
         "{}",
-        lower_src(&prog("uint<8>", "v[0][1] = x\n        n = n + v[0][1]"))
+        lower_src(&prog("uint<8>", "v[0][1] = x\n        n = (n + v[0][1]).resize<1024>()"))
             .expect("nested read/write lowers")
     );
     assert!(
@@ -52248,7 +52280,7 @@ fn a_dut_port_in_a_nested_vector_inner_index_lowers_and_emits() {
     v : Vec<Vec<uint<8>, 2>, 2>
     n : uint<32> default 0
     hookable put(x: uint<8>)
-        n = n + 1
+        n = (n + 1).resize<32>()
     end put
 end scoreboard Sb
 testbench Tb
@@ -53046,7 +53078,7 @@ fn a_no_arg_event_handler_lowers_like_the_one_arg_form() {
     in_ev : event<uint<8>>
     seen  : uint<32> default 0
     on in_ev({arg})
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end on
 end {kind} Tagger
 testbench Tb
@@ -53144,7 +53176,7 @@ fn the_no_arg_handler_payload_never_shadows_a_field() {
     _v : uint<8> default 7
     seen : uint<32> default 0
     on ev()
-        seen = seen + _v
+        seen = (seen + _v).resize<32>()
     end on
 end agent Ag
 testbench Tb
@@ -53225,7 +53257,7 @@ testbench Tb
     seen : uint<32> default 0
     v : uint<8> default 99
     on src.observed(v)
-        seen = seen + v
+        seen = (seen + v).resize<32>()
     end on
 end testbench Tb
 
@@ -53249,8 +53281,12 @@ end impl T"#;
                     stmt,
                     ir::Stmt::TbFieldWrite {
                         field,
-                        value: ir::Expr::Binary(_, _, rhs),
-                    } if field == "seen" && matches!(&**rhs, ir::Expr::Local(local) if local.0 == 0)
+                        value: ir::Expr::WidthCast { inner, .. },
+                    } if field == "seen" && matches!(
+                        &**inner,
+                        ir::Expr::Binary(_, _, rhs)
+                            if matches!(&**rhs, ir::Expr::Local(local) if local.0 == 0)
+                    )
                 )
             })
         }),
@@ -53448,7 +53484,7 @@ end testbench Tb
 
 impl T for Tb
     run
-        state.count = state.count + 1
+        state.count = (state.count + 1).resize<32>()
         assert state.count == 2 else fail("state")
     end run
 end impl T"#;
@@ -53591,7 +53627,7 @@ end struct Beat
         b.p = x
         {body}
         assert got.p == x else fail("record vector read/write failed")
-        n = n + 1
+        n = (n + 1).resize<32>()
     end put
 end {kind} Sb
 testbench Tb
@@ -53669,7 +53705,7 @@ fn fixed_vector_event_payloads_lower_verify_and_emit() {
 
     on incoming(values)
         emit forwarded(values)
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end on
 end agent Sink
 
@@ -53969,7 +54005,7 @@ agent Sink
 
     on incoming(payload)
         emit forwarded(payload)
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end on
 end agent Sink
 
@@ -54329,13 +54365,13 @@ fn a_le64_component_field_write_is_checked_without_manufactured_widths() {
 
     // Lowers: a payload param carries its declared width, so
     // `seen(uint<32>) + t(uint<8>)` is 32-bit — no narrowing.
-    lower_src(&src("    seen : uint<32> default 0", "seen = seen + t"))
-        .expect("`seen = seen + t` on a payload param must lower");
+    lower_src(&src("    seen : uint<32> default 0", "seen = (seen + t).resize<32>()"))
+        .expect("`seen = (seen + t` on a payload param must lower).resize<32>()");
 
     // Lowers: a widthless `const` manufactures a 64-bit width, which the
     // check must NOT treat as a real narrowing.
-    lower_src(&src("    seen : uint<32> default 0", "seen = seen + N"))
-        .expect("`seen = seen + N` for a widthless const must lower");
+    lower_src(&src("    seen : uint<32> default 0", "seen = (seen + N).resize<32>()"))
+        .expect("`seen = (seen + N` for a widthless const must lower).resize<32>()");
 
     // Refuses: a DECLARED wider width into a narrower ≤64-bit field is a
     // genuine narrowing. This is the case the >64 bound used to let
@@ -54597,7 +54633,7 @@ fn passive_unbound_transactors_keep_state_and_hide_active_only_methods() {
     count : uint<32> default 7
     when active
         hookable poke()
-            count = count + 1
+            count = (count + 1).resize<32>()
         end poke
     end when
 end transactor Poker
@@ -54645,7 +54681,7 @@ end test T"#
     count : uint<32> default 7
     when active
         hookable poke()
-            count = count + 1
+            count = (count + 1).resize<32>()
         end poke
     end when
 end transactor Plain
@@ -55751,7 +55787,7 @@ fn structural_binding_diagnostics_do_not_advertise_broken_v1() {
     let unbound_handshake = r#"agent Monitor
     seen : uint<32> default 0
     on bus.req.handshake(value)
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end on
 end agent Monitor
 testbench Tb
@@ -55779,7 +55815,7 @@ end transactor Source
 scoreboard Sink
     seen : uint<32> default 0
     hookable take(value: uint<8>)
-        seen = seen + 1
+        seen = (seen + 1).resize<32>()
     end take
 end scoreboard Sink
 testbench Tb
@@ -56298,6 +56334,10 @@ end test CaptureFenceTest
 
 #[test]
 fn blocking_randomize_constant_precedence_matches_signedness() {
+    // The file-scope `LIMIT : uint<8>` wins over the `sint<64>` local of the
+    // same name, so the clause mixes a `sint<8>` field with a `uint<8>`
+    // constant: a compile-time error under owner decision D1 (R16). The
+    // "right is unsigned" half proves the constant, not the local, won.
     let src = r#"
 const LIMIT : uint<8> = 128
 transaction Req
@@ -56315,21 +56355,18 @@ test CaptureConstTest
     end run
 end test CaptureConstTest
 "#;
-    let merged = merged_src(src);
-    let prog = lower::lower_program(&merged).expect("lowers");
-    let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).expect("emits");
-    let plain = merged_src(&src.replace("        let LIMIT : sint<64> = -1\n", ""));
-    let plain_prog = lower::lower_program(&plain).unwrap();
-    let plain_cpp = tbir::emit(&plain_prog, &plain, &cpp_tb::EmitOpts::default()).unwrap();
-    let clauses = |text: &str| text.lines().filter(|line| line.contains("_s.add(") && !line.contains("_pref_")).map(str::trim).map(str::to_owned).collect::<Vec<_>>();
-    assert_eq!(clauses(&cpp), clauses(&plain_cpp), "local collision must not change constant value or comparison shape");
-    assert!(!cpp.contains("(uint64_t)(LIMIT)"), "constant wins over runtime capture: {cpp}");
+    let error = lower::lower_program(&merged_src(src)).expect_err("mixed constraint rejected");
+    let text = error.to_string();
+    assert!(text.contains("mixes signed and unsigned operands"), "{text}");
+    assert!(text.contains("right is unsigned"), "constant wins over the local: {text}");
 }
 
 
 #[test]
-fn blocking_randomize_scalar_width_controls_mixed_rank_comparison() {
-    for (field, binding, signed) in [("uint<32>", "sint<64>", true), ("sint<32>", "uint<8>", true), ("sint<8>", "uint<32>", false)] {
+fn blocking_randomize_mixed_rank_comparison_is_rejected() {
+    // These pairs used to pick a signed or unsigned Z3 comparison by
+    // declared width; every sint/uint mix is now a compile-time error.
+    for (field, binding) in [("uint<32>", "sint<64>"), ("sint<32>", "uint<8>"), ("sint<8>", "uint<32>")] {
         let src = format!(r#"
 transaction Req
     x : {field}
@@ -56346,10 +56383,11 @@ test RankTest
     end run
 end test RankTest
 "#);
-        let merged = merged_src(&src);
-        let prog = lower::lower_program(&merged).unwrap();
-        let cpp = tbir::emit(&prog, &merged, &cpp_tb::EmitOpts::default()).unwrap();
-        assert_eq!(cpp.lines().any(|line| line.contains("z3::ult(_z_x") && line.contains("(lim)")), !signed, "{field}/{binding}: {cpp}");
+        let error = lower::lower_program(&merged_src(&src)).expect_err("mixed constraint rejected");
+        assert!(
+            error.to_string().contains("mixes signed and unsigned operands"),
+            "{field}/{binding}: {error}"
+        );
     }
 }
 

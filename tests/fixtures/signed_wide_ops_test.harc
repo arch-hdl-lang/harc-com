@@ -29,7 +29,7 @@ impl SignedWideOpsTest for SignedWideTb
         assert a100 > -100 else fail("sint100 compare vs negative literal")
         let q100 : sint<100> = a100 / b100
         assert q100 < 0 else fail("sint100 sdiv keeps sign")
-        let z100 : sint<100> = 0 - q100
+        let z100 : sint<100> = -q100
         assert z100 == 2 else fail("sint100 -(a/b) == 2")
         let r100 : sint<100> = a100 % b100
         assert r100 < 0 else fail("sint100 smod keeps sign")
@@ -40,7 +40,7 @@ impl SignedWideOpsTest for SignedWideTb
         assert a256 < b256 else fail("sint256 slt")
         assert a256 < 0 else fail("sint256 sign")
         let q256 : sint<256> = a256 / b256
-        let neg_q : sint<256> = 0 - q256
+        let neg_q : sint<256> = -q256
         assert neg_q > 0 else fail("sint256 sdiv sign: -(neg/pos) > 0")
         assert (a256 >> 1) < 0 else fail("sint256 arithmetic shift keeps sign")
 
@@ -51,7 +51,7 @@ impl SignedWideOpsTest for SignedWideTb
         assert !(w < n) else fail("mixed-width signed !(w < n)")
         assert !(n < w) else fail("mixed-width signed !(n < w)")
         let one256 : sint<256> = 1
-        let big : sint<256> = 0 - (one256 << 200)
+        let big : sint<256> = -(one256 << 200)
         assert big < n else fail("mixed-width signed: very negative < -5")
 
         // Width-method receiver metadata must survive compound expressions,
@@ -101,8 +101,10 @@ impl SignedWideOpsTest for SignedWideTb
         let inferred8 = source8 + zero8
         let inferred8_zext : uint<16> = inferred8.zext<16>()
         assert direct8 == 255 else fail("direct zext<16> lost signed8 source")
-        assert compound8 == 255 else fail("compound zext<16> lost signed8 source")
-        assert inferred8_zext == 255 else fail("inferred zext<16> lost signed8 source")
+        // `source8 + zero8` is a `sint<9>` (spec §2.4 result widths), so
+        // zero-extending it keeps its 9-bit pattern: -1 is 0x1FF.
+        assert compound8 == 511 else fail("compound zext<16> lost signed8 source")
+        assert inferred8_zext == 511 else fail("inferred zext<16> lost signed8 source")
 
         // --- mixed signed scalar arithmetic (narrower sign-extends) ---
         let q65 : sint<65> = -8 / 3

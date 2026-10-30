@@ -65,7 +65,7 @@ fn fn0 run_WideCastTest [kind=Run, owner=tb0]
     AssertCheck { cond: (%chained == 255), on_fail: "chained sext<128>.trunc<8>: got 0x%02llx", %chained }
     Assign(%pwr_a, 20015998343868)
     Assign(%pwr_b, 48879)
-    Assign(%product, (%pwr_a.zext<256 from 48>() * %pwr_b.zext<256 from 16>()))
+    Assign(%product, (%pwr_a.zext<256 from 48>() * %pwr_b.zext<256 from 16>()).trunc<256 from 512>())
     Assign(%product_low, %product.trunc<64 from 256>())
     AssertCheck { cond: (%product_low == 978361983049923972), on_fail: "zext<256> multiply: got 0x%016llx", %product_low }
     Assign(%all256, 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff)
@@ -82,7 +82,7 @@ fn fn0 run_WideCastTest [kind=Run, owner=tb0]
     AssertCheck { cond: (%resized130 == 16045690984503111693), on_fail: "resize widen/narrow changed the value" }
     Assign(%max130, 0x00000003ffffffffffffffffffffffffffffffff)
     Assign(%one130, 1)
-    Assign(%dirty130, (%max130 + %one130))
+    Assign(%dirty130, (%max130 + %one130).trunc<130 from 131>())
     Assign(%normalized_zext, %dirty130.zext<256 from 130>())
     Assign(%normalized_resize, %dirty130.resize<256 from 130>())
     Assign(%normalized_sext, %dirty130.sext<130 from 130>())

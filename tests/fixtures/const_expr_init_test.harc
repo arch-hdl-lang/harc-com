@@ -17,7 +17,7 @@ const FLAG_A : uint<32> = 1 << 0
 const FLAG_B : uint<32> = 1 << 5
 const ENABLED_FLAGS : uint<32> = FLAG_A | FLAG_B
 const ENTRY_COUNT : uint<32> = 16
-const LAST_ENTRY  : uint<32> = ENTRY_COUNT - 1
+const LAST_ENTRY  : uint<32> = (ENTRY_COUNT as uint<32>) -% 1
 
 // #521: signed constants evaluate with declared signedness — `>>` is
 // an arithmetic shift and `/` truncates toward zero, exactly as v1's

@@ -35,11 +35,11 @@ function preserve_before(before: uint<8>, observed: bool) -> uint<8>
 end function preserve_before
 
 function combine_snapshot(before: LazySnapshot, observed: uint<32>) -> uint<32>
-    return before.value * 1000 + observed
+    return (before.value * 1000 + observed).trunc<32>()
 end function combine_snapshot
 
 function combine_scalar(before: uint<32>, observed: uint<32>) -> uint<32>
-    return before * 1000 + observed
+    return (before * 1000 + observed).trunc<32>()
 end function combine_scalar
 
 testbench LazyImpureHelperTb
@@ -49,7 +49,7 @@ testbench LazyImpureHelperTb
     shared_scalar : uint<32> default 0
 
     function bump() -> bool
-        calls = calls + 1
+        calls = (calls + 1).trunc<8>()
         return true
     end function bump
 

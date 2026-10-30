@@ -7520,7 +7520,7 @@ test A
     let user : ProbeUser
     run
         let before : uint<32> = user.read_probe()
-        user.force_probe(before + 1)
+        user.force_probe(before +% 1)
         user.release_probe()
     end run
 end test A
@@ -7645,7 +7645,7 @@ test A
     run
         user.chip = dut
         let before : uint<32> = user.read_probe()
-        user.force_probe(before + 1)
+        user.force_probe(before +% 1)
         user.release_probe()
     end run
 end test A
@@ -10855,7 +10855,7 @@ end test T"#,
 #[test]
 fn derived_signed_and_boolean_constants_reach_both_constraint_paths() {
     let src = r#"const BASE : uint<8> = 2
-const LIMIT : uint<8> = BASE + 3
+const LIMIT : uint<8> = (BASE as uint<8>) +% 3
 const NEG : sint<8> = -1
 const ENABLE : bool = LIMIT == 5
 

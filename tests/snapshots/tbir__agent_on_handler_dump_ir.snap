@@ -18,7 +18,7 @@ fn fn0 comp_on_0 [kind=ComponentMethod(c0)]
   entry = b0
 
   b0:
-    ComponentFieldWrite(self.seen, (self.seen + 1))
+    ComponentFieldWrite(self.seen, (self.seen + 1).trunc<32 from 33>())
     ComponentFieldWrite(self.last, %t)
     -> Return
 

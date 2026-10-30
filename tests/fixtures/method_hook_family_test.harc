@@ -9,7 +9,7 @@ agent MethodHookWatcher
     calls : uint<32> default 0
 
     hookable note(v: sint<8>)
-        calls = calls + 1
+        calls = (calls + 1).trunc<32>()
     end note
 end agent MethodHookWatcher
 
@@ -17,7 +17,7 @@ scoreboard MethodHookSink
     total : sint<32> default 0
 
     hookable add(v: sint<8>)
-        total = total + v
+        total = (total + v).resize<32>()
     end add
 end scoreboard MethodHookSink
 
@@ -49,19 +49,19 @@ impl MethodHookFamilyTest for MethodHookFamilyTb
     clock clk = SysDomain
 
     on env.watcher.note pre
-        static_sum = static_sum + v
+        static_sum = (static_sum + v).resize<32>()
     end on
 
     on env.watcher.note pre
-        registration_order = registration_order * 10 + 1
+        registration_order = (registration_order * 10 + 1).trunc<64>()
     end on
 
     on env.watcher.note pre
-        registration_order = registration_order * 10 + 2
+        registration_order = (registration_order * 10 + 2).trunc<64>()
     end on
 
     on drv.ping post
-        drv_post_hits = drv_post_hits + 1
+        drv_post_hits = (drv_post_hits + 1).trunc<32>()
     end on
 
     run
@@ -78,12 +78,12 @@ impl MethodHookFamilyTest for MethodHookFamilyTb
         // reference, as v1's local `[&]` closure does.
         let local_bias : sint<32> = 4
         on env.watcher.note post
-            dynamic_sum = dynamic_sum + v + local_bias
-            local_bias = local_bias + 1
+            dynamic_sum = (dynamic_sum + v + local_bias).resize<32>()
+            local_bias = (local_bias + 1).resize<32>()
             env.sink.add(v)
         end on
         on env.watcher.note pre
-            registration_order = registration_order * 10 + 3
+            registration_order = (registration_order * 10 + 3).trunc<64>()
         end on
         env.watcher.note(5)
         // This v1-only fixture uses component-type-scoped hook vectors, so a

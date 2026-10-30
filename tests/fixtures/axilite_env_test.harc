@@ -123,7 +123,7 @@ impl AxiLiteEnvTest for AxiLiteEnvTb
             let got = env.drv.axil_read(t.addr)
             let exp = env.sb.expected.pop()
             if got != exp
-                env.sb.errors = env.sb.errors + 1
+                env.sb.errors = (env.sb.errors + 1).trunc<32>()
             end if
         end for
         assert env.sb.errors == 0

@@ -32,7 +32,7 @@ impl GrayToBinaryTest for GrayToBinaryTestTb
             let expected = gray_to_binary_ref(g)
             if dut.binary_out != expected
                 log(error, "MISMATCH g=${g:1x} got=${dut.binary_out:1x} expected=${expected:1x}")
-                errors = errors + 1
+                errors = errors +% 1
             end if
         end for
 

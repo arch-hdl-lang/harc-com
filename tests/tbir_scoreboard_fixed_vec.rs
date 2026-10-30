@@ -24,7 +24,7 @@ impl Check for Tb
         let item : uint<32> = a.pending.pop()
         assert item == 42 else fail("queue value")
         assert b.pending.empty() else fail("queue isolation")
-        a.writes = a.writes + 1
+        a.writes = (a.writes + 1).resize<32>()
         for i in 0 .. 31
             assert a.regs[i] == i + 1 else fail("a lane")
             assert b.regs[i] == 100 + i else fail("b lane")

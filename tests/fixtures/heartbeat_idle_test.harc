@@ -41,7 +41,7 @@ agent Producer
     on in_ev(t)
         // Body intentionally simple — the `_last_in_cycle` bump at
         // entry is what matters here, not the body content.
-        seen = seen + 1
+        seen = (seen + 1).trunc<32>()
     end on
 end agent Producer
 

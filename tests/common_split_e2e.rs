@@ -1449,11 +1449,11 @@ transactor Drv
 end transactor Drv
 
 function inner(x: uint<8>) -> uint<8>
-    return x + 1
+    return (x + 1).resize<8>()
 end function inner
 
 function outer(x: uint<8>) -> uint<8>
-    return inner(x) * 2
+    return (inner(x) * 2).resize<8>()
 end function outer
 
 test TCompose

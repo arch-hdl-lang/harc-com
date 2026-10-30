@@ -172,26 +172,26 @@ impl ApbHistoryTest for ApbHistoryTb
         reset_history()
         let errors : uint<32> = 0
 
-        errors = errors + check_read(0, 0)
-        errors = errors + check_read(1, 0)
-        errors = errors + check_read(2, 0)
+        errors = errors +% check_read(0, 0)
+        errors = errors +% check_read(1, 0)
+        errors = errors +% check_read(2, 0)
 
         // Valid APB writes mask reserved bits.
         apb_write(0, 0xFF, false)
-        errors = errors + check_read(0, 0x0F)
+        errors = errors +% check_read(0, 0x0F)
         apb_write(1, 0xFF, false)
-        errors = errors + check_read(1, 0x7F)
+        errors = errors +% check_read(1, 0x7F)
 
         // Gated APB write: pclk_gated stays low, so the control register
         // should retain its prior value.
         apb_write(0, 0x00, true)
-        errors = errors + check_read(0, 0x0F)
+        errors = errors +% check_read(0, 0x0F)
 
         // Invalid APB access drives the error/interrupt path and returns zero.
         apb_write(9, 0x55, false)
         assert dut.pslverr == 1 else fail("invalid write did not assert pslverr")
         assert dut.interrupt_error == 1 else fail("invalid write did not assert interrupt_error")
-        errors = errors + check_read(9, 0)
+        errors = errors +% check_read(9, 0)
 
         // Clear error through a valid transaction.
         apb_write(0, 0x00, false)
@@ -199,32 +199,32 @@ impl ApbHistoryTest for ApbHistoryTb
 
         // No-update history event.
         pulse_history()
-        errors = errors + check_read(2, 0)
+        errors = errors +% check_read(2, 0)
 
         // Normal predict-valid shifts in alternating directions.
         apb_write(0, 0x01, false)
         pulse_history()
-        errors = errors + check_read(2, 0)
+        errors = errors +% check_read(2, 0)
         apb_write(0, 0x03, false)
         pulse_history()
-        errors = errors + check_read(2, 1)
+        errors = errors +% check_read(2, 1)
         pulse_history()
-        errors = errors + check_read(2, 3)
+        errors = errors +% check_read(2, 3)
         apb_write(0, 0x01, false)
         pulse_history()
-        errors = errors + check_read(2, 6)
+        errors = errors +% check_read(2, 6)
 
         // Mispredict restore path has priority over predict_valid.
         let restored : uint<8> = set_history_by_mispredict(0x55, true)
-        errors = errors + check_read(2, restored)
+        errors = errors +% check_read(2, restored)
 
         // Force full and empty edge conditions.
         let full_val : uint<8> = set_history_by_mispredict(0x7F, true)
-        errors = errors + check_read(2, full_val)
+        errors = errors +% check_read(2, full_val)
         assert dut.history_full == 1 else fail("history_full low after 0xff restore")
         assert dut.interrupt_full == 1 else fail("interrupt_full low after 0xff restore")
         let empty_val : uint<8> = set_history_by_mispredict(0x00, false)
-        errors = errors + check_read(2, empty_val)
+        errors = errors +% check_read(2, empty_val)
         assert dut.history_empty == 1 else fail("history_empty low after 0x00 restore")
 
         // Solver-backed random control/train combinations, including priority

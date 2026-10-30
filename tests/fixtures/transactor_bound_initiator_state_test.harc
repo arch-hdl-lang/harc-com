@@ -45,7 +45,7 @@ transactor AxilHelper bound to BusAxiLite
             // Cache the readback into per-instance state before
             // returning it.
             last_read = r.data
-            read_count = read_count + 1
+            read_count = read_count +% 1
             return r.data
         end read
     end when
