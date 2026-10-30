@@ -826,22 +826,32 @@ fn lower_point_target(
                         ..
                     }
                 );
+                let src_width = if signed {
+                    Some(width)
+                } else {
+                    cover_infer_expr_width(group, point, expr, consts, hook_params)?
+                };
                 return Ok(Expr::WidthCast {
                     // Like the general expression path, `as sint<W>` is
                     // a signedness relabel rather than a value-changing
                     // sign extension. `Sext` carries the signed marker;
                     // `src_width = W` prevents the emitter from filling.
-                    kind: if signed {
-                        WidthCastKind::Sext
-                    } else {
-                        WidthCastKind::Resize
+                    //
+                    // `as uint<W>` / `as bits<W>` keeps the low `W` bits.
+                    // With no inferable source width that is the emitter's
+                    // mask-to-`W` shape for both `Trunc` and `Resize`; it is
+                    // recorded as `Trunc` so a `Resize` with no source width
+                    // always means the `.resize<N>()` METHOD, whose
+                    // signedness the emitter settles once hook-parameter
+                    // and DUT-port types are bound (`late_signed_resize_source`
+                    // in `codegen/tbir/covergroup.rs`).
+                    kind: match (signed, src_width) {
+                        (true, _) => WidthCastKind::Sext,
+                        (false, Some(_)) => WidthCastKind::Resize,
+                        (false, None) => WidthCastKind::Trunc,
                     },
                     width,
-                    src_width: if signed {
-                        Some(width)
-                    } else {
-                        cover_infer_expr_width(group, point, expr, consts, hook_params)?
-                    },
+                    src_width,
                     inner: Box::new(inner),
                 });
             }
@@ -1036,8 +1046,13 @@ fn lower_point_target(
                         // reinterpret the low `N` bits as a `sint<N>`
                         // value (sign-filled into the 64-bit carrier below
                         // 64 bits). Only the METHOD does this — `as uint<N>`
-                        // / `as bits<N>` lower to an unsigned `Resize`
-                        // elsewhere and stay unsigned.
+                        // / `as bits<N>` lower to an unsigned `Resize` (or
+                        // `Trunc`, source unknown) elsewhere and stay
+                        // unsigned. A receiver whose type only the emitter
+                        // knows (a hook parameter, its record field, a DUT
+                        // port) has no source width here; it stays a
+                        // `Resize { src_width: None }` and the emitter
+                        // applies this same shape once the type is bound.
                         if let (WidthCastKind::Resize, Some(sw)) = (kind, src_width) {
                             if cover_lowered_signed(&inner) {
                                 return Ok(signed_resize(inner, width, sw));
@@ -1063,11 +1078,11 @@ fn lower_point_target(
 }
 
 /// Whether a lowered coverpoint operand is a signed value, judged from the
-/// IR alone (the emitter's `cover_expr_signed` also consults hook-param
-/// and DUT-access types; an operand that only those make signed — a bare
-/// `sint` hook param — has no statically known width here either, so a
-/// `.resize<N>()` over it keeps the unsigned shape, as procedural code does
-/// for an unknown source width).
+/// IR alone. The emitter's `cover_expr_signed` also consults hook-param
+/// and DUT-access types; an operand that only those make signed — a `sint`
+/// hook param or record field — has no statically known width here either,
+/// so its `.resize<N>()` is left as `Resize { src_width: None }` and the
+/// emitter (`late_signed_resize_source`) gives it the signed shape below.
 fn cover_lowered_signed(e: &Expr) -> bool {
     use crate::ir::BinOp;
     match e {
@@ -1098,8 +1113,25 @@ fn cover_lowered_signed(e: &Expr) -> bool {
     }
 }
 
+/// The width-method direction rule (`.zext<N>()` / `.sext<N>()` must not
+/// narrow) for a receiver whose width only the emitter knows — a hook
+/// parameter, its record field, a DUT port. Same rule and wording as
+/// procedural code and `cover_width_arg`.
+pub(crate) fn late_extension_direction_violation(
+    kind: WidthCastKind,
+    width: u32,
+    src_width: u32,
+) -> Option<String> {
+    let method = match kind {
+        WidthCastKind::Zext => "zext",
+        WidthCastKind::Sext => "sext",
+        WidthCastKind::Trunc | WidthCastKind::Resize => return None,
+    };
+    super::exprs::width_method_violation(method, width, Some(src_width))
+}
+
 /// The signed-source `.resize<N>()` shape, identical to the procedural one.
-fn signed_resize(inner: Expr, width: u32, sw: u32) -> Expr {
+pub(crate) fn signed_resize(inner: Expr, width: u32, sw: u32) -> Expr {
     let inner = if width < sw {
         let low = Expr::WidthCast {
             kind: WidthCastKind::Trunc,

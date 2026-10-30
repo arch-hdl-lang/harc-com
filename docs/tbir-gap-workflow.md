@@ -204,9 +204,15 @@ shared IR primitive, and equivalence fixture. Then:
 
 Composed wide cover expressions are complete: scalar widths now flow through
 unary, binary, and ternary cover expressions, and the sampler coerces mixed
-operands to `_harc_u128` or `HarcWide<N>` before applying the operator. A direct
-coverpoint sample intentionally observes the low 64 bits, matching v1's sample
-storage, while wide intermediates retain their width until that boundary.
+operands to `_harc_u128` or `HarcWide<N>` before applying the operator. A
+coverpoint sample is held at its full width: `uint64_t`/`int64_t` up to 64
+bits, `_harc_u128` for 65..128 bits, and above 128 bits a `HarcWide<N>` (`N` is
+the count of 32-bit words, `ceil(width / 32)`) holding the canonical width-bit
+pattern masked with `harc_wide_mask_bits`, whose bins compare with `==`,
+unsigned `<=`/`>=` or `harc_wide_slt` at the common width of the sample and the
+bound. (v1 stored
+every sample in a 64-bit scalar, so a direct v1 sample observed only the low 64
+bits; TB-IR no longer does.)
 Known-width wrapping cover arithmetic lowers through the same explicit
 `WidthCast::Trunc` representation as general expressions. The self-checking
 fixture runs under both emitters and trace-diffs wide add, bit-not, ternary, and

@@ -2894,11 +2894,17 @@ impl TbirRandomizeEmitter {
                 {
                     return;
                 }
+                // A scalar field of a local record `let` (not the target) is a
+                // snapshot, like a scalar `let` (spec §4.4): queued and
+                // blocking randomize both read it when the call executes.
+                if self.captured_scalar_field_info(expr, target_root).is_some() {
+                    return;
+                }
                 if let ExprKind::Ident(root) = &*target.kind {
                     if !blocking && target_root.is_some_and(|expected| root.name != expected) {
                         let path = format!("{}.{}", root.name, name.name);
                         self.errors.push(format!(
-                            "queued randomize({ty}) constraint references runtime state `{path}`; use `blocking randomize` once runtime-dependent constraint lowering is supported"
+                            "queued randomize({ty}) constraint references runtime state `{path}`; use `blocking randomize`, or bind the value to a local `let` before the call (its value is captured when `randomize` runs)"
                         ));
                     }
                 }
@@ -2919,16 +2925,9 @@ impl TbirRandomizeEmitter {
                         id.name
                     ));
                 }
-                if !blocking
-                    && !field_info.contains_key(&id.name)
-                    && !self.enum_variants.contains_key(&id.name)
-                    && self.let_widths.contains_key(&id.name)
-                {
-                    self.errors.push(format!(
-                        "queued randomize({ty}) constraint references runtime state `{}`; use `blocking randomize` once runtime-dependent constraint lowering is supported",
-                        id.name
-                    ));
-                }
+                // A scalar `let` is a snapshot variable (spec §4.4): queued
+                // and blocking randomize both capture its value at the call,
+                // so it is not live runtime state and needs no `blocking`.
             }
             ExprKind::Index { target, index } => {
                 self.validate_randomize_constraint_dependencies(
@@ -4621,9 +4620,16 @@ impl TbirRandomizeEmitter {
                         f.name
                     ));
                 }
+                // `harc_prefer_dist` draws an `int64_t`. A signed field keeps
+                // that value (and its sign) in the same `int64_t` carrier as
+                // the other signed preference branches below: the auto-cover
+                // point arrays for a signed field are `int64_t[]`, and the
+                // seeded clause sign-extends the preference into the solver
+                // vector. Relabelling it `uint64_t` broke both.
+                let pref_ty = if f.signed { "int64_t" } else { "uint64_t" };
                 write!(
                     self.out,
-                    "uint64_t _pref_{cache_tag}_{} = (uint64_t)harc_rt::random::harc_prefer_dist(_harc_rt_seed, {}, {{",
+                    "{pref_ty} _pref_{cache_tag}_{} = ({pref_ty})harc_rt::random::harc_prefer_dist(_harc_rt_seed, {}, {{",
                     c_name, pref_idx
                 )
                 .ok();
@@ -5794,20 +5800,20 @@ impl TbirRandomizeEmitter {
                     }
                     return;
                 }
-                if blocking {
-                    if let Some(binding) = self.let_widths.get(&id.name) {
-                        if binding.width == 1 && !binding.signed {
-                            let name = &self.scalar_bindings[&id.name];
-                            write!(self.out, "_ctx.bool_val(({}) != 0)", name).ok();
-                        } else {
-                            self.errors.push(format!(
-                                "the scalar `{}` is a value, not a condition, so it cannot be a constraint on its own",
-                                id.name
-                            ));
-                            write!(self.out, "_ctx.bool_val(true)").ok();
-                        }
-                        return;
+                // A scalar `let` is a snapshot captured at the call under
+                // both queued and blocking randomize (spec §4.4).
+                if let Some(binding) = self.let_widths.get(&id.name) {
+                    if binding.width == 1 && !binding.signed {
+                        let name = &self.scalar_bindings[&id.name];
+                        write!(self.out, "_ctx.bool_val(({}) != 0)", name).ok();
+                    } else {
+                        self.errors.push(format!(
+                            "the scalar `{}` is a value, not a condition, so it cannot be a constraint on its own",
+                            id.name
+                        ));
+                        write!(self.out, "_ctx.bool_val(true)").ok();
                     }
+                    return;
                 }
             }
             ExprKind::Field { .. } => {
@@ -5825,7 +5831,8 @@ impl TbirRandomizeEmitter {
                             self.reject_non_flag_field(&field);
                         }
                         return;
-                    } else if blocking
+                    } else if (blocking
+                        || self.captured_scalar_field_info(e, target_root).is_some())
                         && target_root
                             .zip(expr_field_root(e).as_deref())
                             .is_some_and(|(target, root)| root != target)
@@ -6317,11 +6324,15 @@ impl TbirRandomizeEmitter {
                         } else {
                             write!(self.out, "_z_{}", c_ident(&field)).ok();
                         }
-                    } else if blocking
+                    } else if (blocking
+                        || self.captured_scalar_field_info(e, target_root).is_some())
                         && target_root
                             .zip(expr_field_root(e).as_deref())
                             .is_some_and(|(target, root)| root != target)
                     {
+                        // Blocking captures any non-target field path; queued
+                        // captures a local record `let`'s scalar field
+                        // (spec §4.4 snapshot), read when the call executes.
                         if let Some((captured_signed, captured_width)) = self
                             .captured_scalar_field_info(e, target_root)
                             .map(|info| (info.signed, info.width))
@@ -6427,12 +6438,32 @@ impl TbirRandomizeEmitter {
                         )
                         .ok();
                     }
-                } else if blocking && self.let_widths.contains_key(&id.name) {
+                } else if self.let_widths.contains_key(&id.name) {
+                    // Snapshot `let`: captured at the call, queued or blocking.
                     let binding = self.scalar_bindings.get(&id.name).unwrap_or(&id.name);
+                    let let_width = self.let_widths[&id.name];
                     if width <= 64 {
                         write!(self.out, "_ctx.bv_val((uint64_t)({}), {})", binding, width).ok();
+                    } else if let_width.signed {
+                        // A wider-than-64 solver vector (some field of the
+                        // target exceeds 64 bits): sign-extend a `sint` let
+                        // from its declared width, like a captured field.
+                        write!(
+                            self.out,
+                            "harc_z3_bv_signed_value(_ctx, {}, {}, {})",
+                            binding, let_width.width, width
+                        )
+                        .ok();
                     } else {
-                        write!(self.out, "harc_z3_bv_value(_ctx, {}, {})", binding, width).ok();
+                        // Unsigned and `bool` lets (wide lets are rejected
+                        // above) go through one unambiguous `uint64_t`
+                        // overload; a bare `bool` matches several.
+                        write!(
+                            self.out,
+                            "harc_z3_bv_value(_ctx, (uint64_t)({}), {})",
+                            binding, width
+                        )
+                        .ok();
                     }
                 } else {
                     self.errors
