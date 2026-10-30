@@ -1441,7 +1441,7 @@ transactor Drv
     stamp : uint<8> = 0
     hookable send(t: RegOp)
         stamp = t.addr
-    end hookable
+    end send
     watchdog
         period 50 cycles
         max_idle 100000 cycles
@@ -1570,7 +1570,7 @@ transactor A
     when active
         function ping()
             dut.d = 1
-        end ping
+        end function ping
     end when
 end transactor A
 
@@ -1579,7 +1579,7 @@ transactor A_1
     when active
         function ping()
             dut.d = 2
-        end ping
+        end function ping
     end when
 end transactor A_1
 
@@ -1594,7 +1594,7 @@ transactor Foo_bar
     when active
         function ping()
             dut.d = 4
-        end ping
+        end function ping
     end when
 end transactor Foo_bar
 
@@ -1603,7 +1603,7 @@ transactor PlainDriver
     when active
         function drive(value: uint<8>)
             dut.d = value
-        end drive
+        end function drive
     end when
 end transactor PlainDriver
 

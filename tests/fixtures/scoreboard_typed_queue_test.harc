@@ -15,7 +15,7 @@ scoreboard GlobalScoreboard
         err.got = got
         err.expected = expected
         errors.push(err)
-    end record_error
+    end function record_error
 end scoreboard GlobalScoreboard
 
 transactor Checker

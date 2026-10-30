@@ -91,7 +91,7 @@ harc sim --sv dut.sv suite.harc --top Top --cpp-split tests --cpp-split-group-si
 | `--outdir <dir>` | Output directory for generated C++, runtime headers, build outputs, logs, coverage, and waves. Default: `harc_sim_build/`. |
 | `--emit-only` | Emit generated artifacts but do not compile or run. |
 | `--seed <N>` | PRNG seed for `randomize()` calls. Default: `$HARC_SEED`, else `1`. |
-| `--sim-arg <arg>` | Extra argument for the generated simulation binary, for example a plusarg. Repeatable. |
+| `--sim-arg <arg>` | Extra argument for the generated simulation binary, for example a plusarg. Repeatable. Verilator (`--sv`) path only: on the ARCH backend (`--dut`, including `--check-backends`) `arch sim` owns the binary's command line, so `--sim-arg` is rejected with an error rather than dropped; use `--test <name>` to select a test. |
 | `--mt` | Run bound-driver/bound-monitor coroutine actors on dedicated OS threads with dual-barrier sync. Default is cooperative single-thread execution, which is typically faster on current fixtures. |
 
 ## Coverage, reference models, and Z3

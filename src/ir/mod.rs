@@ -508,6 +508,10 @@ pub struct RegFieldSchema {
     pub bit_pos: u32,
     /// Field width in bits (derived from the field type).
     pub bit_width: u32,
+    /// The field type is `sint<N>` / `SInt<N>`: a read sign-extends the
+    /// extracted bits and yields `sint<N>`. A write stores the value's
+    /// low `N` bits, i.e. the two's-complement pattern.
+    pub signed: bool,
     /// Field access policy (the field's own, defaulting to the
     /// register's policy when the field decl omits an `access` clause).
     pub access: RegAccess,

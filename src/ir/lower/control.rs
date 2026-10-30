@@ -146,8 +146,9 @@ impl FuncBuilder<'_> {
         let lo_signed = self.range_bound_requires_signed(lo, &lo_ir);
         let var = self.declare(&f.var.name);
         self.push(Stmt::Assign(var, lo_ir));
-        // Upper bound — evaluated once; stash non-trivial expressions
-        // in a synthesized local so the header re-reads a pure value.
+        // Upper bound — evaluated once, on loop entry: snapshot it (even a
+        // bare local the body may reassign) into a synthesized local so
+        // the header re-reads a fixed value.
         let hi_ir = self.lower_expr_no_ports(hi)?;
         self.validate_numeric_expr(&hi_ir, "range upper bound")?;
         let signed_range = lo_signed || self.range_bound_requires_signed(hi, &hi_ir);
@@ -391,8 +392,7 @@ impl FuncBuilder<'_> {
     ) -> Result<(), LowerError> {
         self.push_scope();
         // Snapshot each selector into its own temp, UNCONDITIONALLY: a
-        // bare `Expr::Local` is what `stash_if_impure` would leave in
-        // place, and a local is exactly what the body can reassign
+        // local is exactly what the body can reassign
         // (`for x in t.entries[k].data … k = k + 1`). Copying the value
         // once is what pins the container for the whole loop.
         let mid_indices = chain
@@ -1108,8 +1108,11 @@ impl FuncBuilder<'_> {
         Ok(())
     }
 
-    /// Stash a non-trivial expression into a synthesized local so it is
-    /// evaluated exactly once (loop bounds).
+    /// Snapshot a loop bound into a synthesized local so it is evaluated
+    /// exactly once, on loop entry. Only literals are left in place: a
+    /// bare local must be copied too, because the body can reassign it
+    /// (`for i in 0 .. n … n = 0`) and the header would otherwise re-read
+    /// the new value every iteration.
     fn stash_if_impure(&mut self, e: Expr) -> Expr {
         self.stash_if_impure_with_fallback(e, IrType::Unknown)
     }
@@ -1121,12 +1124,12 @@ impl FuncBuilder<'_> {
                 .unwrap_or(false)
     }
 
-    /// Stash a non-trivial expression while preserving its known type. A
+    /// Snapshot a loop bound while preserving its known type. A
     /// numeric range supplies signedness for an otherwise unknown bound so a
     /// cached negative upper bound cannot become an unsigned `uint64_t`.
     fn stash_if_impure_with_fallback(&mut self, e: Expr, fallback: IrType) -> Expr {
         match e {
-            Expr::Literal { .. } | Expr::Local(_) => e,
+            Expr::Literal { .. } => e,
             other => {
                 let t = self.fresh_temp();
                 let ty = self

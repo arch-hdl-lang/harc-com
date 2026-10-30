@@ -38,12 +38,12 @@ testbench MsgCallHoistTb
     // Testbench method — CFG-inlined, must be hoisted out of a message.
     function dbl(x: uint<8>) -> uint<8>
         return x + x
-    end dbl
+    end function dbl
 
     function bump(x: uint<8>) -> uint<8>
         calls = calls + 1
         return x + calls
-    end bump
+    end function bump
 end testbench MsgCallHoistTb
 
 impl MsgCallHoistTest for MsgCallHoistTb

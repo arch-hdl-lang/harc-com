@@ -231,6 +231,7 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
             uint64_t bump = 0; (void)bump;
             uint64_t queued = 0; (void)queued;
             uint64_t _anon = 0; (void)_anon;
+            uint64_t __t0 = 0; (void)__t0;
             uint64_t want = 0; (void)want;
             uint64_t got = 0; (void)got;
             int __bb = 0;
@@ -286,6 +287,7 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                     _tb.sb.writes = (_tb.sb.writes + 1);
                     harc_rt::harc_assign(dut->en, 1);
                     _anon = 1;
+                    __t0 = bump;
                     __bb = 6;
                     break;
                 }
@@ -302,7 +304,7 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                     break;
                 }
                 case 6: {
-                    if ((_anon <= bump)) { __bb = 7; } else { __bb = 9; }
+                    if ((_anon <= __t0)) { __bb = 7; } else { __bb = 9; }
                     break;
                 }
                 case 7: {
@@ -311,7 +313,7 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                     break;
                 }
                 case 8: {
-                    if ((_anon == bump)) { __bb = 9; } else { __bb = 11; }
+                    if ((_anon == __t0)) { __bb = 9; } else { __bb = 11; }
                     break;
                 }
                 case 9: {

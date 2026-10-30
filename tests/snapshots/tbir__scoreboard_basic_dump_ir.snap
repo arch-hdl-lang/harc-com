@@ -14,8 +14,9 @@ fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
     %3 bump : unknown
     %4 queued : uint<32>
     %5 _anon : unknown
-    %6 want : uint<32>
-    %7 got : unknown
+    %6 __t0 : unknown
+    %7 want : uint<32>
+    %8 got : unknown
   entry = b0
 
   b0:
@@ -48,6 +49,7 @@ fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
     ScoreboardOp(sb0.sb, writes = (ScoreboardQuery(sb0.sb.writes) + 1))
     DutWrite(dut.en, 1)
     Assign(%_anon, 1)
+    Assign(%__t0, %bump)
     -> Jump(b6)
 
   b4:
@@ -58,13 +60,13 @@ fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
     -> Return
 
   b6:
-    -> Branch((%_anon <= %bump), b7, b9)
+    -> Branch((%_anon <= %__t0), b7, b9)
 
   b7:
     -> WaitCycles(1, b10)
 
   b8:
-    -> Branch((%_anon == %bump), b9, b11)
+    -> Branch((%_anon == %__t0), b9, b11)
 
   b9:
     DutWrite(dut.en, 0)

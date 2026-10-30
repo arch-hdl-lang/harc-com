@@ -21,11 +21,11 @@ impl TbirBackendSmokeTest for TbirBackendSmokeTb
         // Gave DIFFERENT VALUES under the two backends (harc#551). The
         // slice's width, not the source's, is what sign-extends.
         //   0xABCD >> 4 = 0xABC, & 0xFF = 0xBC — bit 7 set, so
-        //   sext<16> fills ones: 0xFFBC.
+        //   sext<16> fills ones: 0xFFBC, the sint<16> value -68.
         let w16 : uint<16> = 0xABCD
         let slice_se = w16[11:4].sext<16>()
-        assert slice_se == 0xFFBC
-            else fail("sext<16> of w16[11:4] (0xBC): got 0x${slice_se:04x}, want 0xFFBC")
+        assert slice_se == -68
+            else fail("sext<16> of w16[11:4] (0xBC): got ${slice_se}, want -68 (0xFFBC)")
 
         // Positive slice: bit 7 clear, so sext must NOT fill.
         //   0xABCD >> 0 = 0xCD... use [10:4] = 0x3C, 7 bits, top bit clear.

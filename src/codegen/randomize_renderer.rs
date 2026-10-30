@@ -5316,8 +5316,15 @@ impl TbirRandomizeEmitter {
                 }
                 self.let_widths.get(&id.name).map(|binding| binding.width)
             }
+            // Same lookup order as `constraint_expr_signedness` and the
+            // value emitter: a target field first, then a captured record
+            // field. Without the captured fallback the operand's width was
+            // unknown, so `solver_binary_is_signed` saw a signed target
+            // field beside an "unsigned of unknown width" capture and chose
+            // an unsigned comparison (`r.s < uc.u` with `r.s = -1` UNSAT).
             ExprKind::Field { .. } => expr_field_path(e, target_root)
                 .and_then(|field| field_info.get(&field))
+                .or_else(|| self.captured_scalar_field_info(e, target_root))
                 .map(txn_field_solver_width),
             // `items[i]` — a list element has the list's element width.
             // A `foreach` clause is unrolled into exactly this shape, so

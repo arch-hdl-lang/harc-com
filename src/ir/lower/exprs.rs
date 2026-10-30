@@ -5719,6 +5719,55 @@ impl FuncBuilder<'_> {
                 "`.{kind_name}<N>()` is not defined for `String` values"
             )));
         }
+        // `.resize<N>()` keeps the receiver's signedness (ARCH emits
+        // `N'($signed(x))` for a signed base type): a signed source
+        // sign-extends when widening and the result is `sint<N>`. Reuse
+        // the `Sext` node so every width class (≤64, 65..128, >128) takes
+        // the one sign-extension emission. An equal-width `Sext` is the
+        // signed identity; a narrowing one truncates first and then
+        // reinterprets the low `N` bits as a `sint<N>` value. Unsigned sources and
+        // sources of unknown width keep the zero-extend / truncate
+        // `Resize` node.
+        if kind == WidthCastKind::Resize {
+            let source_signed = matches!(
+                self.expr_type(&inner)
+                    .or_else(|| self.scalar_assignment_type(&inner)),
+                Some(IrType::SInt(_))
+            );
+            if let (true, Some(sw)) = (source_signed, src_width) {
+                let inner = if width < sw {
+                    let low = Expr::WidthCast {
+                        kind: WidthCastKind::Trunc,
+                        width,
+                        src_width: Some(sw),
+                        inner: Box::new(inner),
+                    };
+                    // Below 64 bits the kept `N` bits must be sign-filled
+                    // into the `int64_t` carrier (a 64-bit `Sext` from
+                    // `N`) before the `sint<N>` relabel, so
+                    // `sint<16>(0x0180).resize<8>()` is -128. At 65+ bits
+                    // the masked pattern already is the `sint<N>` value.
+                    if width < 64 {
+                        Expr::WidthCast {
+                            kind: WidthCastKind::Sext,
+                            width: 64,
+                            src_width: Some(width),
+                            inner: Box::new(low),
+                        }
+                    } else {
+                        low
+                    }
+                } else {
+                    inner
+                };
+                return Ok(Expr::WidthCast {
+                    kind: WidthCastKind::Sext,
+                    width,
+                    src_width: Some(sw.min(width)),
+                    inner: Box::new(inner),
+                });
+            }
+        }
         Ok(Expr::WidthCast {
             kind,
             width,

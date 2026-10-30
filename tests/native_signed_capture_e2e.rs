@@ -378,3 +378,103 @@ fn native_signed_capture_compares_captured_fields_as_signed() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("ALL TESTS PASSED"));
 }
+
+const MIXED_CAPTURE: &str = r#"
+transaction UCap
+    u : uint<8>
+end transaction UCap
+transaction Req
+    s : sint<8>
+end transaction Req
+test MixedCapture
+    let dut : Top
+    run
+        let uc : UCap
+        uc.u = 5
+        let r : Req
+        blocking randomize(r) with
+            r.s < uc.u
+            r.s < 0
+        end randomize
+        assert r.s < 0 else fail("expected negative r.s")
+        log(info, "MIXED_OK r.s=${r.s}")
+    end run
+end test MixedCapture
+"#;
+
+const MIXED_CAPTURE_DUAL: &str = r#"
+transaction UCap
+    u : uint<8>
+end transaction UCap
+transaction Req
+    s : sint<8>
+end transaction Req
+test MixedCaptureDual
+    let dut : Top
+    run
+        let uc : UCap
+        uc.u = 200
+        let r : Req
+        blocking randomize(r) with
+            r.s > uc.u
+        end randomize
+        log(info, "DUAL_RESULT r.s=${r.s}")
+    end run
+end test MixedCaptureDual
+"#;
+
+fn run_capture_fixture(tag: &str, src: &str) -> (bool, String) {
+    let outdir = std::env::temp_dir().join(format!(
+        "harc_native_signed_capture_{tag}_{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&outdir);
+    fs::create_dir_all(&outdir).expect("create output directory");
+    let source = outdir.join(format!("{tag}.harc"));
+    fs::write(&source, src).expect("write fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_harc"))
+        .args(["sim", "--sv"])
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/dut/top_counter.sv"))
+        .arg(&source)
+        .args(["--top", "Top", "--jobs", "2", "--outdir"])
+        .arg(&outdir)
+        .env("HARC_NO_LEARN", "1")
+        .output()
+        .expect("run fixture");
+    let log = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output.status.success(), log)
+}
+
+/// A signed 8-bit target compared against a captured UNSIGNED 8-bit record
+/// field follows the native usual arithmetic conversions (both promote to
+/// a signed `int`), so the comparison is signed. The captured operand's
+/// width used to be unknown to the solver renderer, which then picked an
+/// unsigned `ult`: `r.s < uc.u && r.s < 0` was UNSAT.
+#[test]
+fn native_mixed_signedness_capture_compares_as_promoted_int() {
+    let (ok, log) = run_capture_fixture("mixed", MIXED_CAPTURE);
+    assert!(
+        ok && log.contains("ALL TESTS PASSED") && log.contains("MIXED_OK"),
+        "mixed capture fixture failed:\n{log}"
+    );
+}
+
+/// Dual: a signed 8-bit value can never exceed a captured unsigned 200,
+/// so the solve must be UNSAT. The unsigned comparison used to accept a
+/// negative `r.s` (its bit pattern is a large unsigned value).
+#[test]
+fn native_mixed_signedness_capture_rejects_impossible_bound() {
+    let (ok, log) = run_capture_fixture("mixed_dual", MIXED_CAPTURE_DUAL);
+    assert!(
+        !ok,
+        "a sint<8> greater than 200 unexpectedly solved:\n{log}"
+    );
+    assert!(
+        log.contains("constraint UNSAT"),
+        "expected UNSAT diagnostic:\n{log}"
+    );
+}

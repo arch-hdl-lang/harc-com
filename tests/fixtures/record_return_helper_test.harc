@@ -17,13 +17,13 @@ testbench RecordReturnTb
         let result : Result
         result.value = value
         return result
-    end make_result
+    end function make_result
 
     function bump(r: Result) -> Result
         let out : Result
         out.value = r.value + 1
         return out
-    end bump
+    end function bump
 end testbench RecordReturnTb
 
 impl RecordReturnTest for RecordReturnTb

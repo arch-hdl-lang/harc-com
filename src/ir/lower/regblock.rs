@@ -140,10 +140,41 @@ pub(crate) fn lower_regblock(
                     fld.bit_pos
                 )));
             }
+            let field_signed = field_is_signed(&fld.ty);
             let field_reset = match &fld.reset {
                 None => None,
                 Some(rv) => match &*rv.kind {
                     ExprKind::Bool(b) => Some(*b as u64),
+                    // A `sint<N>` field's reset is a VALUE of that type:
+                    // it must lie in [-2^(N-1), 2^(N-1)) and is stored as
+                    // its N-bit two's-complement pattern.
+                    _ if field_signed => {
+                        let value = super::fold_signed_const(
+                            rv,
+                            consts,
+                            &format!(
+                                "reset value on regblock `{name}` register `{rname}` field `{fname}`"
+                            ),
+                        )?;
+                        let min = -(1i128 << (bit_width - 1));
+                        let max = (1i128 << (bit_width - 1)) - 1;
+                        if value < min || value > max {
+                            let hint = if value > max && value < (1i128 << bit_width) {
+                                format!(
+                                    "; to store the bit pattern {value:#X}, write {}",
+                                    value - (1i128 << bit_width)
+                                )
+                            } else {
+                                String::new()
+                            };
+                            return Err(LowerError::Invalid(format!(
+                                "the reset value on regblock `{name}` register `{rname}` field \
+                                 `{fname}` is {value}, which is outside the range of its signed \
+                                 {bit_width}-bit type [{min}, {max}]{hint}"
+                            )));
+                        }
+                        Some((value as u64) & field_mask(bit_width))
+                    }
                     _ => Some(super::fold_addr_const(
                         rv,
                         consts,
@@ -170,6 +201,7 @@ pub(crate) fn lower_regblock(
                 name: fname.clone(),
                 bit_pos: fld.bit_pos,
                 bit_width,
+                signed: field_signed,
                 access: lower_access(fld.access),
             });
         }
@@ -287,6 +319,17 @@ fn field_bit_width(t: &crate::ast::TypeExpr) -> u32 {
         },
         _ => 1,
     }
+}
+
+/// A `sint<N>` / `SInt<N>` field reads back sign-extended.
+fn field_is_signed(t: &crate::ast::TypeExpr) -> bool {
+    matches!(
+        t,
+        crate::ast::TypeExpr::Builtin {
+            name: crate::ast::BuiltinTy::SInt | crate::ast::BuiltinTy::SIntCap,
+            ..
+        }
+    )
 }
 
 fn lower_access(a: AstRegAccess) -> RegAccess {
@@ -516,8 +559,6 @@ impl super::FuncBuilder<'_> {
         reg: &RegRegisterSchema,
         fld: &RegFieldSchema,
     ) -> Expr {
-        let mask = field_mask(fld.bit_width);
-        let pos = fld.bit_pos as u64;
         let word = if fld.access.reads_from_bus() {
             Expr::RegRead {
                 mirror,
@@ -535,7 +576,7 @@ impl super::FuncBuilder<'_> {
                 index: None,
             }
         };
-        bin(BinOp::BitAnd, bin(BinOp::Shr, word, lit(pos)), lit(mask))
+        field_extract_expr(word, fld)
     }
 
     /// Lower a field read in a general EXPRESSION position (assert
@@ -1505,10 +1546,32 @@ impl super::FuncBuilder<'_> {
     }
 }
 
+/// `(word >> POS) & MASK`, and for a signed field the sign extension of
+/// those `N` bits typed `sint<N>`: a 64-bit `.sext<64>()` fills the
+/// carrier from bit `N-1`, then the same relabel an `as sint<N>` cast
+/// lowers to types it at the field's width without changing the value.
 fn field_extract_expr(word: Expr, fld: &RegFieldSchema) -> Expr {
     let mask = field_mask(fld.bit_width);
     let pos = fld.bit_pos as u64;
-    bin(BinOp::BitAnd, bin(BinOp::Shr, word, lit(pos)), lit(mask))
+    let bits = bin(BinOp::BitAnd, bin(BinOp::Shr, word, lit(pos)), lit(mask));
+    if !fld.signed {
+        return bits;
+    }
+    let mut value = bits;
+    if fld.bit_width < 64 {
+        value = Expr::WidthCast {
+            kind: ir::WidthCastKind::Sext,
+            width: 64,
+            src_width: Some(fld.bit_width),
+            inner: Box::new(value),
+        };
+    }
+    Expr::WidthCast {
+        kind: ir::WidthCastKind::Sext,
+        width: fld.bit_width,
+        src_width: Some(fld.bit_width),
+        inner: Box::new(value),
+    }
 }
 
 fn mirror_field_expr(mirror: ir::LocalId, field: &str) -> Expr {

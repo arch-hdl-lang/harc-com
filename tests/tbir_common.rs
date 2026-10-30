@@ -729,7 +729,7 @@ transactor TinyDriver bound to TinyBus
             bus.req.valid = 1
             wait 1 cycle
             bus.req.valid = 0
-        end drive_raw
+        end function drive_raw
 
         hookable drive(value: uint<8>)
             drive_raw(value)
@@ -3933,7 +3933,7 @@ fn one_test_idle_edit_preserves_interface_and_unrelated_capsule() {
     when active
         function drive(value: uint<8>)
             dut.d = value
-        end drive
+        end function drive
     end when
 end transactor PlainDriver
 
@@ -4792,7 +4792,7 @@ transactor AlphaLocal
     when active
         function touch()
             value = value + 1
-        end touch
+        end function touch
     end when
 end transactor AlphaLocal
 
@@ -4802,7 +4802,7 @@ transactor BetaLocal
     when active
         function touch()
             value = value + 1
-        end touch
+        end function touch
     end when
 end transactor BetaLocal
 
@@ -4883,7 +4883,7 @@ fn common_capsule_supports_test_local_component_values() {
     end on
     function set(value_in: uint<8>)
         value = value_in
-    end set
+    end function set
     hookable get() -> uint<8>
         return value
     end get

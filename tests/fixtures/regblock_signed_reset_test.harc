@@ -1,0 +1,55 @@
+// Signed regblock field resets: a sint<N> field's reset is a value in
+// [-2^(N-1), 2^(N-1)) stored as its N-bit two's-complement pattern and
+// read back sign-extended. Unsigned field resets are unchanged.
+
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            bus.aw.addr = addr
+            bus.aw.valid = 1
+            bus.w.send(data, 15)
+            bus.aw.valid = 0
+            wait 1 cycle
+        end write
+
+        hookable read(addr: uint<8>) -> uint<32>
+            bus.ar.addr = addr
+            bus.ar.valid = 1
+            let r = bus.r.recv()
+            bus.ar.valid = 0
+            wait 1 cycle
+            return r.data
+        end read
+    end when
+end transactor AxilHelper
+
+regblock SRegs via AxilHelper width 32
+    register R @ 0x00 access wo
+        field F : sint<4> @ 0 reset -2 access wo
+        field M : sint<4> @ 4 reset -8 access wo
+        field P : SInt<8> @ 8 reset 127 access wo
+        field U : uint<4> @ 16 reset 0xE access wo
+    end register R
+end regblock SRegs
+
+testbench SFieldTb
+    dut : AxiLiteRegs
+end testbench SFieldTb
+
+impl SFieldTest for SFieldTb
+    let axil   : BusAxiLite = bind dut
+    let helper : AxilHelper active = bind axil
+    let regs   : SRegs = bind helper
+
+    run
+        assert regs.R.F == -2 else fail("F reset read ${regs.R.F}")
+        assert regs.R.M == -8 else fail("M reset read ${regs.R.M}")
+        assert regs.R.P == 127 else fail("P reset read ${regs.R.P}")
+        assert regs.R.U == 14 else fail("U reset read ${regs.R.U}")
+        let word = regs.R
+        assert word == 0xE7F8E else fail("reset word ${word}")
+        log(info, "SIGNED_RESET_OK")
+    end run
+end impl SFieldTest

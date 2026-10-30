@@ -254,7 +254,11 @@ fn cover_expr_signed(e: &Expr, widths: &CoverWidths<'_>) -> bool {
         Expr::Ternary(_, then_expr, else_expr) => {
             cover_expr_signed(then_expr, widths) && cover_expr_signed(else_expr, widths)
         }
-        Expr::WidthCast { kind, .. } => matches!(kind, WidthCastKind::Sext),
+        Expr::WidthCast {
+            kind: WidthCastKind::Sext,
+            ..
+        } => true,
+        Expr::WidthCast { .. } => false,
         Expr::Call(CallTarget::Helper { ret, .. } | CallTarget::ExternFn { ret, .. }, _) => {
             matches!(ret, IrType::SInt(_))
         }
@@ -864,15 +868,10 @@ fn cover_width_cast_cpp(
                 if width > 64 {
                     format!("harc_rt::harc_sext_u128((_harc_u128)({e}), {sw}, {width})")
                 } else {
+                    // A sign-extended `sint<N>` value at every N ≤ 64, as
+                    // in procedural code (not the masked N-bit pattern).
                     let shift = 64 - sw;
-                    if width == 64 {
-                        format!("((int64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}))")
-                    } else {
-                        format!(
-                            "((uint64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}) & 0x{:X}ULL)",
-                            mask(width)
-                        )
-                    }
+                    format!("((int64_t)(((int64_t)((uint64_t)({e}) << {shift})) >> {shift}))")
                 }
             }
             _ if width <= 64 => format!("((int64_t)((uint64_t)({e})))"),

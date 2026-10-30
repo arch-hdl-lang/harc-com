@@ -37,7 +37,7 @@ testbench LazyMessageTb
     function bump(x: uint<8>) -> uint<8>
         calls = calls + 1
         return x + calls
-    end bump
+    end function bump
 end testbench LazyMessageTb
 
 impl LazyMessageCallsFailTest for LazyMessageTb

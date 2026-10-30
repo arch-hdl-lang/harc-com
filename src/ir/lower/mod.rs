@@ -8352,6 +8352,30 @@ impl LowerCtx {
     }
 }
 
+/// Fold a compile-time constant as a mathematical integer, keeping its
+/// sign: a negative fold is returned negative, a non-negative one as its
+/// unsigned value. Used where a negative constant is meaningful (a signed
+/// regblock field's reset), unlike [`fold_addr_const`].
+pub(crate) fn fold_signed_const(
+    e: &crate::ast::Expr,
+    consts: &HashMap<String, ConstVal>,
+    what: &str,
+) -> Result<i128, LowerError> {
+    let v = fold_const(e, consts, "").map_err(|err| match err {
+        ConstFoldErr::Unsupported(detail) => not_implemented(
+            &format!("a non-constant {what}"),
+            detail,
+            V1Status::SilentlyMisLowers,
+        ),
+        ConstFoldErr::Invalid(detail) => LowerError::Invalid(format!("the {what}: {detail}")),
+    })?;
+    Ok(if v.is_negative() {
+        v.as_i64() as i128
+    } else {
+        v.bits as i128
+    })
+}
+
 /// Fold an ADDRESS-like constant expression — an addrmap instance base
 /// or window size, a regblock register offset or reset value. These have
 /// no declared type to range-check against, only the standing

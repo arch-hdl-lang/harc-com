@@ -50,7 +50,7 @@ transactor MshrXactor
             dut.fill_valid = 0
             dut.fill_id = 0
             dut.dequeue_ready = 0
-        end init
+        end init_dut
 
         // Drive a single allocate request for one cycle and capture the
         // assigned id.

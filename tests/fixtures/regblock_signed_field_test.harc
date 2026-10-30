@@ -1,0 +1,103 @@
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            bus.aw.addr = addr
+            bus.aw.valid = 1
+            bus.w.send(data, 15)
+            bus.aw.valid = 0
+            wait 1 cycle
+        end write
+
+        hookable read(addr: uint<8>) -> uint<32>
+            bus.ar.addr = addr
+            bus.ar.valid = 1
+            let r = bus.r.recv()
+            bus.ar.valid = 0
+            wait 1 cycle
+            return r.data
+        end read
+    end when
+end transactor AxilHelper
+
+regblock SRegs via AxilHelper width 32
+    register R @ 0x00 access wo
+        field F : sint<4> @ 0 access wo
+        field G : uint<4> @ 4 access wo
+        field H : SInt<8> @ 8 access wo
+    end register R
+    register SA @ 0x18 reset 0 access rw
+        field LO : uint<8> @ 0 access rw
+        field S : sint<8> @ 8 access rw
+    end register SA
+end regblock SRegs
+
+testbench SFieldTb
+    dut : AxiLiteRegs
+end testbench SFieldTb
+
+impl SFieldTest for SFieldTb
+    let axil   : BusAxiLite = bind dut
+    let helper : AxilHelper active = bind axil
+    let regs   : SRegs = bind helper
+
+    run
+        dut.rst = 1
+        axil.aw.valid = 0
+        axil.w.valid = 0
+        axil.b.ready = 1
+        axil.ar.valid = 0
+        axil.r.ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Mirror-only (wo) fields.
+        regs.record_write(0x00, 0x80FF)
+        let v = regs.R.F
+        let neg : sint<4> = -1
+        assert v == -1 else fail("let-bound sint<4> field read ${v}, expected -1")
+        assert v == neg else fail("field read differs from a sint<4> -1 local")
+        assert regs.R.F < 0 else fail("sint<4> field 0xF read as ${regs.R.F}")
+        assert regs.R.F == -1 else fail("sint<4> field expression read ${regs.R.F}")
+        assert regs.R.G == 15 else fail("uint<4> control read ${regs.R.G}, expected 15")
+        assert regs.R.H == -128 else fail("SInt<8> field 0x80 read ${regs.R.H}")
+        assert regs.R.H < 0 else fail("SInt<8> field 0x80 not negative")
+
+        regs.record_write(0x00, 0x7F07)
+        assert regs.R.F == 7 else fail("positive sint<4> field read ${regs.R.F}")
+        assert regs.R.F > 0 else fail("positive sint<4> field not positive")
+        assert regs.R.H == 127 else fail("positive SInt<8> field read ${regs.R.H}")
+
+        // A negative write stores the field's two's-complement pattern
+        // and leaves neighbouring fields alone.
+        regs.R.F = -2
+        assert regs.R.F == -2 else fail("sint<4> field after -2 write read ${regs.R.F}")
+        assert regs.R.G == 0 else fail("neighbour G clobbered: ${regs.R.G}")
+        assert regs.R.H == 127 else fail("neighbour H clobbered: ${regs.R.H}")
+        let word = regs.R
+        assert word == 0x7F0E else fail("register word after -2 write: ${word}")
+
+        // Bus-read (rw) fields: the frontdoor readback sign-extends too.
+        regs.SA.LO = 0xFF
+        regs.SA.S = -3
+        let s = regs.SA.S
+        assert s == -3 else fail("rw sint<8> field let read ${s}, expected -3")
+        assert regs.SA.S < 0 else fail("rw sint<8> field not negative")
+        assert regs.SA.LO == 255 else fail("rw uint<8> control read ${regs.SA.LO}")
+        let sa = regs.SA
+        assert sa == 0xFDFF else fail("rw register word ${sa}, expected 0xFDFF")
+        log(info, "SIGNED_FIELD_OK")
+    end run
+end impl SFieldTest

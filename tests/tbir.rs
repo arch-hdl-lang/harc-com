@@ -2193,11 +2193,11 @@ fn recovered_message_lowering_does_not_mask_a_later_assignment_diagnostic() {
 
     function read() -> uint<8>
         return value
-    end read
+    end function read
 
     function check_value()
         assert true else fail("value=${read()}")
-    end check_value
+    end function check_value
 end agent MessageModel"#,
     )
     .unwrap();
@@ -2220,7 +2220,7 @@ testbench CopyTb
 
     function reset()
         destination = holder.leaf
-    end reset
+    end function reset
 end testbench CopyTb"#;
     let testbench = harc::parser::parse_source_named("copy_tb.harc", testbench_source).unwrap();
     let test = harc::parser::parse_source_named(
@@ -3691,7 +3691,7 @@ end transactor Source
 
 scoreboard Sink
     function accept(v: uint<8>)
-    end accept
+    end function accept
 end scoreboard Sink
 
 env E
@@ -3728,7 +3728,7 @@ end test T
     // parameter and the program behaves as written (built and run:
     // count=2 sum=8). TBIR now accepts and emits the same bridge.
     let mismatched_payload = non_hookable.replace(
-        "function accept(v: uint<8>)\n    end accept",
+        "function accept(v: uint<8>)\n    end function accept",
         "hookable accept(v: sint<8>)\n    end accept",
     );
     let prog = lower_src(&mismatched_payload).expect("TBIR lowers the sign conversion");
@@ -4333,7 +4333,7 @@ testbench QueueTb
 
     function enqueue(v: uint<32>)
         pending.push(v)
-    end enqueue
+    end function enqueue
 
     check
         assert pending.size() == 1
@@ -8072,7 +8072,7 @@ transactor Drv
         hookable get() -> uint<8>
             wait 1 cycle
             return 7
-        end hookable
+        end get
 {method}
     end when
 end transactor Drv
@@ -8248,7 +8248,7 @@ transactor Drv
         hookable step(n : uint<8>)
             dut.en = 1
             wait 1 cycle
-        end hookable
+        end step
     end when
 end transactor Drv
 
@@ -9012,7 +9012,7 @@ transactor Drv
         hookable step(n : uint<8>)
             dut.en = 1
             wait 1 cycle
-        end hookable
+        end step
     end when
 end transactor Drv
 
@@ -9707,7 +9707,7 @@ fn the_bound_to_arms_split_on_what_v1_does_with_the_clause() {
             "\n{kind} Watcher bound to BusAxiLite\n    hits : uint<32> default 0\n\n    \
              hookable poke(v: uint<32>)\n        bus.aw.addr = v\n        \
              bus.aw.valid = 1\n        bus.w.send(v, 15)\n        bus.aw.valid = 0\n    \
-             end hookable\nend {kind} Watcher\n\n"
+             end poke\nend {kind} Watcher\n\n"
         );
         let with_decl = sub(
             &base,
@@ -10225,7 +10225,7 @@ transactor Drv
         hookable step(n: uint<8>)
             dut.en = 1
             wait 1 cycle
-        end hookable
+        end step
     end when
 end transactor Drv
 
@@ -10412,7 +10412,7 @@ testbench Tb
         let result : Beat
         result.v = value
         return result
-    end make_result
+    end function make_result
 end testbench Tb
 
 impl T for Tb
@@ -10615,7 +10615,7 @@ transactor Drv
         hookable step2(m: uint<8>, n: uint<8>)
             dut.en = m
             wait 1 cycle
-        end hookable
+        end step2
     end when
 end transactor Drv
 
@@ -10669,18 +10669,18 @@ transactor Drv
         hookable step2(m: uint<8>, n: uint<8>)
             dut.en = m + n
             wait 1 cycle
-        end hookable
+        end step2
 
         hookable step2r(m: uint<8>, t: Beat)
             dut.en = m + t.v
             wait 1 cycle
-        end hookable
+        end step2r
 
         hookable outer(k: uint<8>)
             let b : Beat
 {body}
             wait 1 cycle
-        end hookable
+        end outer
     end when
 end transactor Drv
 
@@ -11077,12 +11077,12 @@ testbench Tb
     function tf(t: Beat) -> uint<8>
         n = n + 1
         return t.v
-    end tf
+    end function tf
 
     function ts(x: uint<8>) -> uint<8>
         n = n + x
         return x
-    end ts
+    end function ts
 end testbench Tb
 
 impl T for Tb
@@ -11141,19 +11141,19 @@ transactor Drv
         hookable inner(t: Beat)
             dut.en = t.v
             wait 1 cycle
-        end hookable
+        end inner
 
         hookable innersc(k: uint<8>)
             dut.en = k
             wait 1 cycle
-        end hookable
+        end innersc
 
         hookable outer(n: uint<8>)
             let b : Beat
             let o : Other
 {body}
             wait 1 cycle
-        end hookable
+        end outer
     end when
 end transactor Drv
 
@@ -11258,7 +11258,7 @@ testbench Tb
 
     function tseqf(s: TSeq<Beat>) -> uint<8>
         return 1
-    end tseqf
+    end function tseqf
 end testbench Tb
 
 impl T for Tb
@@ -11374,7 +11374,7 @@ testbench Tb
 
     function passthru(s: TSeq<Beat>) -> TSeq<Beat>
         return s
-    end passthru
+    end function passthru
 end testbench Tb
 
 impl T for Tb
@@ -11467,7 +11467,7 @@ transactor Drv
         hookable dispatch(txns: TSeq<Beat>)
             dut.en = 1
             wait 1 cycle
-        end hookable
+        end dispatch
     end when
 end transactor Drv
 
@@ -12040,7 +12040,7 @@ fn a_connect_endpoint_may_name_the_owners_own_port() {
         )
         .replacen(
             "    connect",
-            "    hookable own_sink(v: uint<8>)\n        seen = seen + 1\n    end hookable\n\n    connect",
+            "    hookable own_sink(v: uint<8>)\n        seen = seen + 1\n    end own_sink\n\n    connect",
             1,
         )
         .replacen(
@@ -17692,7 +17692,7 @@ transactor Drv
         hookable step(n : uint<8>)
 {body}
             wait 1 cycle
-        end hookable
+        end step
     end when
 end transactor Drv
 
@@ -17800,7 +17800,7 @@ transactor Drv
             dut.en = 1
             other.en = 1
             wait 1 cycle
-        end hookable
+        end step
     end when
 end transactor Drv
 
@@ -18219,7 +18219,7 @@ testbench Tb
     m   : Model
     function peek(d: Top) -> uint<32>
         return d.count_out
-    end peek
+    end function peek
 end testbench Tb
 
 impl T for Tb
@@ -24403,7 +24403,7 @@ testbench XtTb
 
     function apply_pulse(n: uint<32>)
         xt.pulse(n)
-    end apply_pulse
+    end function apply_pulse
 end testbench XtTb
 
 impl XtHelperWrapperTest for XtTb
@@ -28973,20 +28973,20 @@ testbench Tb
         cur.value = v
         cur.data[0] = v
         cur.data[1] = v + 1
-    end seed
+    end function seed
 
     function bump()
         _tb.cur.value = cur.value + 1
         _tb.cur.data[1] = _tb.cur.data[1] + 1
-    end bump
+    end function bump
 
     function mirror(t: Txn) -> uint<8>
         return t.data[1]
-    end mirror
+    end function mirror
 
     function check_mirror()
         assert mirror(cur) == 8 else fail("bare cur data=${cur.data[1]}")
-    end check_mirror
+    end function check_mirror
 end testbench Tb
 
 impl TbRecordFieldTest for Tb
@@ -29106,11 +29106,11 @@ testbench Tb
 
     function seed()
         cur.value = 1
-    end seed
+    end function seed
 
     function call_helper()
         illegal_call(dut)
-    end call_helper
+    end function call_helper
 end testbench Tb
 
 impl TbNestedHelperFenceTest for Tb
@@ -29133,7 +29133,7 @@ testbench Tb
 
     function bump()
         count = count + 1
-    end bump
+    end function bump
 end testbench Tb
 
 impl TbScalarFieldTest for Tb
@@ -32969,7 +32969,7 @@ end test T"#
         ),
         (
             format!(
-                "transactor Driver\n    dut : Top\n    when active\n        hookable take16(value: uint<16>)\n            log(info, \"value=${{value}}\")\n        end hookable\n    end when\nend transactor Driver\n\ntestbench Tb\n    dut : Top\n    drv : Driver active\nend testbench Tb\n\n{helper}\nimpl T for Tb\n    run\n        drv.dut = dut\n        drv.take16(wide_value())\n    end run\nend impl T"
+                "transactor Driver\n    dut : Top\n    when active\n        hookable take16(value: uint<16>)\n            log(info, \"value=${{value}}\")\n        end take16\n    end when\nend transactor Driver\n\ntestbench Tb\n    dut : Top\n    drv : Driver active\nend testbench Tb\n\n{helper}\nimpl T for Tb\n    run\n        drv.dut = dut\n        drv.take16(wide_value())\n    end run\nend impl T"
             ),
             "parameter `value` of `Driver.take16`",
         ),
@@ -35108,7 +35108,7 @@ end impl T"#,
     dut : Top
     function Delay()
         wait 1 cycle
-    end Delay
+    end function Delay
     on dut.rst == 1
         Delay()
     end on
@@ -35127,7 +35127,7 @@ end impl T"#,
             r#"agent Worker
     function Delay()
         wait 1 cycle
-    end Delay
+    end function Delay
     on 1 cycles
         Delay()
     end on
@@ -35370,7 +35370,7 @@ end test T"#;
     pulse : out event<uint<8>>
     function send()
         emit pulse(1)
-    end send
+    end function send
 end agent Child
 
 env Parent
@@ -35408,7 +35408,7 @@ end test T"#;
     pulse : out event<uint<8>>
     function send()
         emit pulse(1)
-    end send
+    end function send
 end agent Source
 
 scoreboard Sink
@@ -43742,7 +43742,7 @@ agent Watcher
     end note
     function plain(t: RegOp)
         seen = seen + 1
-    end plain
+    end function plain
 end agent Watcher
 
 env Holder
@@ -47517,7 +47517,7 @@ end impl T"#,
     for (what, sink_decl, target, extra, want) in [
         (
             "plain function",
-            "    function plain(v: uint<8>)\n        seen = seen + 1\n    end plain",
+            "    function plain(v: uint<8>)\n        seen = seen + 1\n    end function plain",
             "sink.plain",
             "".to_string(),
             "not `hookable`",
@@ -48385,7 +48385,7 @@ scoreboard Obs
     seen : uint<32> default 0
     function observe(a: uint<8>, m: Model)
         seen = seen + a
-    end observe
+    end function observe
 end scoreboard Obs
 
 test PTest
@@ -49817,7 +49817,7 @@ transactor Tap
     observed : out event<uint<8>>
     hookable ping()
         emit observed(3)
-    end hookable
+    end ping
 end transactor Tap
 
 env Holder
@@ -56434,4 +56434,29 @@ end test CapturedFieldConditionTest
     let error = tbir::emit(&program, &merged, &cpp_tb::EmitOpts::default())
         .expect_err("captured numeric fields cannot be bare conditions");
     assert!(error.0.contains("value, not a condition"), "{error}");
+}
+
+/// Covergroup cast targets accept the capitalised `UInt<N>` / `SInt<N>`
+/// spellings exactly like `uint<N>` / `sint<N>`: both the cast-width and
+/// the literal-width helpers used to match only the lowercase builtins,
+/// so `cover (dut.count_out as UInt<4>)` was refused as an unsupported
+/// target expression.
+#[test]
+fn coverpoint_casts_accept_capitalised_integer_types() {
+    let cov = fixture("cov_expr_targets_test.harc");
+    const CP: &str = "cover dut.count_out[3:0]\n";
+    assert!(cov.contains(CP), "cov fixture shape changed");
+    let point = |t: &str| cov.replacen(CP, &format!("cover {t}\n"), 1);
+    for (lower, upper) in [
+        ("(dut.count_out as uint<4>)", "(dut.count_out as UInt<4>)"),
+        ("(dut.count_out as sint<4>)", "(dut.count_out as SInt<4>)"),
+        (
+            "(dut.count_out[3:0] as uint<4>) +% (1 as uint<4>)",
+            "(dut.count_out[3:0] as UInt<4>) +% (1 as UInt<4>)",
+        ),
+    ] {
+        let want = emit_cpp_src(&point(lower));
+        let got = emit_cpp_src(&point(upper));
+        assert_eq!(got, want, "`{upper}` must lower like `{lower}`");
+    }
 }

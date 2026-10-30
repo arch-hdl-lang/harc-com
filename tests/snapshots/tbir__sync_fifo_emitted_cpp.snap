@@ -170,7 +170,9 @@ int run_SyncFifoTest(int argc, char** argv) {
 
     unsigned __int128 now_ps = 0;
     auto eval_clocks_until = [&](unsigned __int128 t_ps) {
-        if (t_ps <= now_ps) return;
+        // Like the clocked scheduler, time does not advance once a fatal
+        // has been raised (spec §7.7).
+        if (t_ps <= now_ps || _fatal) return;
         now_ps = t_ps;
         dut->eval();
         _harc_trace_dump_at(now_ps, "", (uint64_t)cycle_count);

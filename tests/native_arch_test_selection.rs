@@ -80,3 +80,95 @@ fn arch_suite_runs_the_selected_test() {
         "only the selected test may run:\n{log}"
     );
 }
+
+/// `--sim-arg` cannot reach the simulation binary on the ARCH backend
+/// (`arch sim` owns its argv), so it is refused up front instead of being
+/// silently dropped. ARCH-free: `--arch-bin` names a path that does not
+/// exist, so reaching the launcher would fail with a different error.
+#[test]
+fn arch_backend_rejects_sim_args_before_launching() {
+    let dir = std::env::temp_dir().join(format!("harc_arch_sim_arg_{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let tb = dir.join("select.harc");
+    fs::write(
+        &tb,
+        SUITE
+            .replace("${A_BODY}", "wait 1 cycle")
+            .replace("${B_BODY}", "wait 1 cycle"),
+    )
+    .unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new(env!("CARGO_BIN_EXE_harc"))
+        .args(["sim", "--dut"])
+        .arg(root.join("tests/dut/top_counter.arch"))
+        .args(["--top", "Top", "--arch-bin"])
+        .arg(dir.join("no-such-arch"))
+        .args(["--sim-arg", "+TEST=B_second"])
+        .arg("--outdir")
+        .arg(dir.join("build"))
+        .arg(&tb)
+        .env("HARC_NO_LEARN", "1")
+        .env("ARCH_NO_LEARN", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let emitted = dir.join("build").exists();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(!output.status.success(), "--sim-arg on --dut must fail");
+    assert!(
+        stderr.contains("--sim-arg is not supported on the ARCH backend")
+            && stderr.contains("--test <name>"),
+        "unexpected diagnostic:\n{stderr}"
+    );
+    assert!(!emitted, "nothing may be emitted before the refusal");
+}
+
+/// `--check-backends` runs an ARCH leg too, so `--sim-arg` is refused there
+/// as well — before the per-backend output directories are created.
+#[test]
+fn check_backends_rejects_sim_args_before_creating_outdirs() {
+    let dir = std::env::temp_dir().join(format!(
+        "harc_check_backends_sim_arg_{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let tb = dir.join("select.harc");
+    fs::write(
+        &tb,
+        SUITE
+            .replace("${A_BODY}", "wait 1 cycle")
+            .replace("${B_BODY}", "wait 1 cycle"),
+    )
+    .unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new(env!("CARGO_BIN_EXE_harc"))
+        .args(["sim", "--check-backends", "--dut"])
+        .arg(root.join("tests/dut/top_counter.arch"))
+        .arg("--sv")
+        .arg(root.join("tests/dut/top_counter.sv"))
+        .args(["--top", "Top", "--arch-bin"])
+        .arg(dir.join("no-such-arch"))
+        .args(["--sim-arg", "+TEST=B_second"])
+        .arg("--outdir")
+        .arg(dir.join("build"))
+        .arg(&tb)
+        .env("HARC_NO_LEARN", "1")
+        .env("ARCH_NO_LEARN", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let created = dir.join("build").exists();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        !output.status.success(),
+        "--sim-arg on --check-backends must fail"
+    );
+    assert!(
+        stderr.contains("--sim-arg is not supported on the ARCH backend"),
+        "unexpected diagnostic:\n{stderr}"
+    );
+    assert!(
+        !created,
+        "no output directory may be created before the refusal"
+    );
+}

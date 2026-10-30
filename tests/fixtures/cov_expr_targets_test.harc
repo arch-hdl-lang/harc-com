@@ -20,9 +20,27 @@ covergroup ExprCov @(posedge dut.clk)
             run_even = {2}
             run_odd = {3}
         end bins
+    // `.sext<N>()` and a signed `.resize<N>()` sample signed VALUES, as in
+    // procedural code: a 0xF nibble sign-extends to -1, not 255.
     cp_signed_nibble : cover dut.count_out[3:0].sext<8>()
         bins
-            neg_one = {255}
+            neg_one = {-1}
+        end bins
+    cp_signed_resize_widen : cover (dut.count_out[3:0] as sint<4>).resize<16>()
+        bins
+            neg_one = {-1}
+        end bins
+    cp_signed_resize_narrow : cover dut.count_out[3:0].sext<8>().resize<4>()
+        bins
+            neg_one = {-1}
+        end bins
+    // An `as uint<N>` cast is not the `.resize<N>()` method: it stays an
+    // unsigned zero-extend even over a signed operand, so the 0xF nibble
+    // samples 15, never -1.
+    cp_unsigned_cast_of_signed : cover (dut.count_out[3:0] as sint<4>) as uint<8>
+        bins
+            fifteen = {15}
+            neg_one = {-1}
         end bins
     cp_low_pair : cover dut.count_out[3:0].trunc<2>()
         bins
@@ -105,6 +123,10 @@ impl CovExprTargetsTest for CovExprTargetsTb
         assert cov.cp_activity.run_even > 0 else fail("run-even bin hole")
         assert cov.cp_activity.run_odd > 0 else fail("run-odd bin hole")
         assert cov.cp_signed_nibble.neg_one > 0 else fail("signed-nibble sext bin hole")
+        assert cov.cp_signed_resize_widen.neg_one > 0 else fail("signed resize widen bin hole")
+        assert cov.cp_signed_resize_narrow.neg_one > 0 else fail("signed resize narrow bin hole")
+        assert cov.cp_unsigned_cast_of_signed.fifteen > 0 else fail("unsigned cast of signed bin hole")
+        assert cov.cp_unsigned_cast_of_signed.neg_one == 0 else fail("unsigned cast of signed sampled -1")
         assert cov.cp_low_pair.zero > 0 else fail("low-pair zero bin hole")
         assert cov.cp_low_pair.one > 0 else fail("low-pair one bin hole")
         assert cov.cp_low_pair.two > 0 else fail("low-pair two bin hole")

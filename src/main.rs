@@ -344,7 +344,8 @@ enum Cmd {
         jobs: Option<u32>,
         /// Additional argument for the generated simulation binary
         /// (e.g. `+plusarg=value`). Repeatable. Forwarded verbatim
-        /// after the `--test` selector.
+        /// after the `--test` selector. Verilator (`--sv`) path only;
+        /// rejected on the ARCH backend (`--dut`).
         #[arg(long = "sim-arg")]
         sim_args: Vec<String>,
         /// Run the test under BOTH backends (Verilator from `--sv` and
@@ -2765,6 +2766,9 @@ fn cmd_sim(
              (use --check-backends to run under both backends)"
         ));
     }
+    if sv.is_empty() {
+        reject_arch_backend_sim_args(&waves.sim_args)?;
+    }
     if !dut.is_empty() && split.mode == CppSplit::Tests {
         return Err(miette::miette!(
             "--cpp-split tests is currently supported only with --sv / Verilator builds"
@@ -3876,6 +3880,9 @@ fn cmd_sim_check_backends(
             "--check-backends requires BOTH --dut <file.arch> and --sv <file.sv>"
         ));
     }
+    // The ARCH leg cannot forward --sim-arg; refuse before creating any
+    // output directory (its inner `cmd_sim` would refuse only afterwards).
+    reject_arch_backend_sim_args(&waves.sim_args)?;
     // Both backends emit the testbench through the SAME codegen so the diff
     // isolates DUT-backend divergence (ARCH sim vs Verilator), not emitter
     // differences. Defaults to the global default (tbir); `--codegen v1`
@@ -4065,6 +4072,27 @@ fn is_executable_file(path: &Path) -> bool {
 fn is_system_arch_utility(path: &Path) -> bool {
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     canonical == Path::new("/usr/bin/arch") || canonical == Path::new("/bin/arch")
+}
+
+/// `--sim-arg` is forwarded to the simulation binary only on the Verilator
+/// (`--sv`) path. On the ARCH backend `arch sim` owns the binary's argv, so
+/// the arguments would be silently dropped; refuse them before anything is
+/// emitted or launched.
+fn reject_arch_backend_sim_args(sim_args: &[String]) -> Result<()> {
+    if sim_args.is_empty() {
+        return Ok(());
+    }
+    Err(miette::miette!(
+        "--sim-arg is not supported on the ARCH backend (`--dut`): `arch sim` \
+         owns the simulation binary's command line, so {} would be dropped. \
+         To select a test, use --test <name>; to pass simulator arguments, \
+         run on the Verilator path (--sv)",
+        sim_args
+            .iter()
+            .map(|arg| format!("`{arg}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 /// `arch sim` owns the binary's argv, so the suite dispatcher learns the
@@ -4784,5 +4812,19 @@ mod tests {
         let mut unselected = Command::new("arch");
         forward_arch_test_selection(&mut unselected, None);
         assert_eq!(harc_test(&unselected), None);
+    }
+
+    #[test]
+    fn arch_sim_rejects_sim_args_instead_of_dropping_them() {
+        assert!(reject_arch_backend_sim_args(&[]).is_ok());
+        let err = reject_arch_backend_sim_args(&["+TEST=B_second".to_string()])
+            .expect_err("ARCH backend cannot forward --sim-arg");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--sim-arg is not supported on the ARCH backend")
+                && msg.contains("`+TEST=B_second`")
+                && msg.contains("--test <name>"),
+            "{msg}"
+        );
     }
 }

@@ -25,7 +25,7 @@ scoreboard Collector
         s.got = g
         s.exp = e
         samples.push(s)
-    end push_sample
+    end function push_sample
 end scoreboard Collector
 
 // Consumer-side checker: counts mismatches between sampled DUT outputs.
@@ -38,7 +38,7 @@ scoreboard Auditor
         if g != e
             mismatches = mismatches + 1
         end if
-    end audit
+    end function audit
 end scoreboard Auditor
 
 testbench TbReactive
