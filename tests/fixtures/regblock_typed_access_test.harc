@@ -1,0 +1,149 @@
+// Regblock value typing:
+//  * `let x = regs.REG.FIELD` binds a local of the field's type, so a
+//    `sint<N>` field read compares, shifts and divides as signed; a `let`
+//    annotation is honoured (widening allowed, narrowing / signedness
+//    changes rejected — see native_ral_typed_access_e2e.rs).
+//  * field widths spelled as a hex literal, a `const` or a constant
+//    expression are their real width, not one bit.
+//  * a frontdoor register write is masked to the register width, like
+//    `record_write`, and a register read is a `uint<width>` value.
+//  * signed field resets accept sized literals and the most negative
+//    `sint<64>` literal.
+
+use BusAxiLite
+
+const W : uint<32> = 32'h8
+
+transactor AxilHelper bound to BusAxiLite
+    when active
+        hookable write(addr: uint<8>, data: uint<64>)
+            bus.aw.addr = addr
+            bus.aw.valid = 1
+            bus.w.send(data.trunc<32>(), 15)
+            bus.aw.valid = 0
+            wait 1 cycle
+        end write
+
+        hookable read(addr: uint<8>) -> uint<32>
+            bus.ar.addr = addr
+            bus.ar.valid = 1
+            let r = bus.r.recv()
+            bus.ar.valid = 0
+            wait 1 cycle
+            return r.data
+        end read
+    end when
+end transactor AxilHelper
+
+regblock TRegs via AxilHelper width 32
+    register R @ 0x00 access wo
+        field F : sint<4> @ 0 access wo
+        field G : uint<4> @ 4 access wo
+        field CW : uint<W> @ 8 access wo
+        field HX : uint<0x4> @ 16 access wo
+        field EX : uint<2 + 2> @ 20 access wo
+    end register R
+    register SA @ 0x18 reset 0 access rw
+        field LO : uint<8> @ 0 access rw
+        field S : sint<8> @ 8 access rw
+    end register SA
+    register N @ 0x04 width 12 access wo
+    register LEN @ 0x28 access rw
+    register LEN12 @ 0x28 width 12 access rw
+    register Z @ 0x08 width 64 access wo
+        field M : sint<64> @ 0 reset -9223372036854775808 access wo
+    end register Z
+    register K @ 0x0C access wo
+        field KP : sint<4> @ 0 reset 4'h3 access wo
+        field KN : sint<4> @ 4 reset -4'h2 access wo
+    end register K
+end regblock TRegs
+
+testbench TTb
+    dut : AxiLiteRegs
+end testbench TTb
+
+impl TypedAccessTest for TTb
+    let axil   : BusAxiLite = bind dut
+    let helper : AxilHelper active = bind axil
+    let regs   : TRegs = bind helper
+
+    run
+        dut.rst = 1
+        axil.aw.valid = 0
+        axil.w.valid = 0
+        axil.b.ready = 1
+        axil.ar.valid = 0
+        axil.r.ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // Mirror-only signed field bound by `let`: signed semantics.
+        regs.record_write(0x00, 0xE)
+        let e = regs.R.F
+        assert e == -2 else fail("let-bound sint<4> field read ${e}, expected -2")
+        assert e < 0 else fail("let-bound sint<4> field -2 is not < 0")
+        assert e >> 1 == -1 else fail("let-bound sint<4> field -2 >> 1 = ${e >> 1}")
+        assert e / 2 == -1 else fail("let-bound sint<4> field -2 / 2 = ${e / 2}")
+        let wide : sint<8> = regs.R.F
+        assert wide == -2 else fail("sint<8>-annotated field read ${wide}")
+        assert wide < 0 else fail("sint<8>-annotated field read not negative")
+        let g : uint<8> = regs.R.G
+        assert g == 0 else fail("uint<8>-annotated field read ${g}")
+
+        // Bus-read signed field bound by `let`.
+        regs.SA.LO = 0xFF
+        regs.SA.S = -3
+        let s = regs.SA.S
+        assert s < 0 else fail("rw let-bound sint<8> field ${s} is not < 0")
+        assert s / 3 == -1 else fail("rw let-bound sint<8> field -3 / 3 = ${s / 3}")
+
+        // Constant field widths are real widths.
+        regs.record_write(0x00, 0xABCDEF)
+        assert regs.R.CW == 0xCD else fail("uint<W> field read ${regs.R.CW}, expected 0xCD")
+        assert regs.R.HX == 0xB else fail("uint<0x4> field read ${regs.R.HX}, expected 0xB")
+        assert regs.R.EX == 0xA else fail("uint<2 + 2> field read ${regs.R.EX}, expected 0xA")
+        let cw = regs.R.CW
+        assert cw == 0xCD else fail("let-bound uint<W> field read ${cw}")
+
+        // Frontdoor writes are masked to the register width.
+        regs.N = 0xFFFF
+        let n = regs.N
+        assert n == 0xFFF else fail("12-bit register holds ${n} after a 0xFFFF write")
+        let big : uint<32> = 0x12345
+        regs.N = big
+        assert regs.N == 0x345 else fail("12-bit register holds ${regs.N} after 0x12345")
+
+        // A register read is a uint<width> value: a 12-bit register read
+        // through a 32-bit `read` helper is masked to 12 bits and fits a
+        // `uint<12>` local. (LEN and LEN12 alias the same DUT register.)
+        regs.LEN = 0xABCD
+        let len12 : uint<12> = regs.LEN12
+        assert len12 == 0xBCD else fail("12-bit register read ${len12}, expected 0xBCD")
+        // The inline (non-`let`) read and its mirror prediction agree.
+        let inl : uint<32> = 0
+        inl = regs.LEN12
+        assert inl == 0xBCD else fail("inline 12-bit register read ${inl}, expected 0xBCD")
+        assert regs.LEN12 == 0xBCD else fail("condition 12-bit register read mismatch")
+        let len_all = regs.LEN
+        assert len_all == 0xABCD else fail("32-bit register read ${len_all}")
+
+        // Signed resets: sized literals and the sint<64> minimum.
+        assert regs.K.KP == 3 else fail("sint<4> reset 4'h3 read ${regs.K.KP}")
+        assert regs.K.KN == -2 else fail("sint<4> reset -4'h2 read ${regs.K.KN}")
+        assert regs.Z.M < 0 else fail("sint<64> minimum reset read ${regs.Z.M}")
+        assert regs.Z.M == -9223372036854775807 - 1 else fail("sint<64> minimum reset read ${regs.Z.M}")
+        log(info, "TYPED_ACCESS_OK")
+    end run
+end impl TypedAccessTest

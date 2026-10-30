@@ -863,7 +863,23 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                     method.function,
                 )?;
                 args.push(offset.to_string());
-                format!("({name}.{field} = {helper_ty}_read({}))", args.join(", "))
+                let call = format!("{helper_ty}_read({})", args.join(", "));
+                // A register read is a `uint<W>` value of the register's
+                // own width: a helper whose `read` returns any other type is
+                // masked to `W` bits before the mirror prediction stores it,
+                // exactly as the `let`-bound read path does, so an inline
+                // read and a `let` read of the same register agree.
+                let register_ty =
+                    record_path_type(cx, local.ty.clone(), std::iter::once(field));
+                let call = match register_ty {
+                    Some(crate::ir::IrType::UInt(Some(width)))
+                        if width < 64 && method.ret_ty != register_ty =>
+                    {
+                        format!("(({call}) & {:#x}ULL)", (1u64 << width) - 1)
+                    }
+                    _ => call,
+                };
+                format!("({name}.{field} = {call})")
             } else {
                 format!("{name}.{field}")
             }

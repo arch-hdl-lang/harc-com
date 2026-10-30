@@ -18,6 +18,10 @@ component_value_expression_test | Top      | top_counter.sv         |
 lazy_impure_helper_test | Top              | top_counter.sv         |
 lazy_transactor_value_test | Top            | top_counter.sv         |
 signed_host_state_test  | Top            | top_counter.sv         |
+wide_signed_default_test | Top           | top_counter.sv         |
+wide_testbench_default_test | Top        | top_counter.sv         |
+component_value_argument_test | Top      | top_counter.sv         |
+component_local_field_test | Top         | top_counter.sv         |
 signed_state_field_test | TlmReadInitiatorRuntimeLen | TlmReadInitiatorRuntimeLen.sv |
 msg_call_hoist_test     | Top            | top_counter.sv         |
 log_paths_test          | Top            | top_counter.sv         |
@@ -115,6 +119,8 @@ regblock_direct_bus_test | TlmMemory     | TlmMemory.sv           |
 regblock_fields_test    | AxiLiteRegs    | AxiLiteRegs.sv         |
 regblock_signed_field_test | AxiLiteRegs | AxiLiteRegs.sv |
 regblock_signed_reset_test | AxiLiteRegs | AxiLiteRegs.sv |
+regblock_typed_access_test | AxiLiteRegs | AxiLiteRegs.sv |
+addrmap_typed_read_let_test | AxiLiteRegs | AxiLiteRegs.sv |
 regblock_access_test    | AxiLiteRegs    | AxiLiteRegs.sv         |
 regblock_bitbash_test   | AxiLiteRegs    | AxiLiteRegs.sv         |
 regblock_addrmap_test   | AxiLiteRegs    | AxiLiteRegs.sv         |

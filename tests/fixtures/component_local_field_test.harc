@@ -1,0 +1,51 @@
+// Field read/write through a component held in a local: a component
+// declared inside `run`, a sub-component of one, and a component-typed
+// method parameter. Before the fix only method calls on such
+// a value lowered; `z.v` was "field access on a non-DUT value" and `z.v = 3`
+// "a target that is neither a DUT port nor a local".
+
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+agent Cell
+    v : uint<8> default 0
+    s : sint<8> default -1
+end agent Cell
+
+agent Holder
+    c : Cell
+end agent Holder
+
+agent Reader
+    seen : uint<8> default 0
+    hookable take(src : Cell)
+        seen = src.v
+        src.v = 99
+    end take
+end agent Reader
+
+test ComponentLocalFieldTest
+    let dut : Top
+    let a : Cell
+    let r : Reader
+    clock clk = SysDomain
+    run
+        let z : Cell
+        assert z.v == 0 else fail("run-local default read ${z.v}")
+        assert z.s < 0 else fail("run-local signed default read ${z.s}")
+        z.v = 3
+        let y : uint<8> = z.v
+        assert y == 3 else fail("run-local field write/read ${y}")
+        log(info, "z.v=${z.v}")
+        let h : Holder
+        h.c.v = 7
+        assert h.c.v == 7 else fail("run-local sub-component field ${h.c.v}")
+        a.v = 42
+        r.take(a)
+        assert r.seen == 42 else fail("parameter field read ${r.seen}")
+        assert a.v == 42 else fail("by-value parameter write leaked: ${a.v}")
+        log(info, "COMPONENT_LOCAL_FIELD_OK")
+        wait 1 cycle
+    end run
+end test ComponentLocalFieldTest

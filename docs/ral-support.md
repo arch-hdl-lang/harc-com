@@ -169,6 +169,12 @@ end register
 Reset values are part of the decl and form the initial mirror state. Width
 is checked against the declared field type at compile time.
 
+A field's width is any compile-time constant: a decimal or hex literal, a
+`const` name or a constant expression (`uint<8>`, `uint<0x8>`, `uint<W>`,
+`uint<2 + 2>` with `const W : uint<32> = 8` all declare an 8- or 4-bit
+field). A width that does not fold to a constant is a compile error; it is
+never silently treated as one bit.
+
 When a register declares both a whole-register `reset` and field resets, the
 whole-register value supplies the baseline for bits without a field reset, and
 each declared field reset overlays its own bit range in source order. A field
@@ -188,9 +194,36 @@ A signed field's `reset` is likewise a value of its type: it must lie in
 `[-2^(N-1), 2^(N-1))` and is stored as its `N`-bit two's-complement pattern
 (`field F : sint<4> @ 0 reset -2` resets those bits to `0xE` and reads back
 `-2`). A value outside that range is a compile error — including a positive
-bit pattern such as `reset 0xE` on a `sint<4>`, for which the diagnostic
-names the signed value to write (`-2`). Unsigned field resets keep the
-`0 ..= 2^N - 1` range.
+bit pattern such as `reset 0xE` (or `reset 4'hE`) on a `sint<4>`, for which
+the diagnostic names the signed value to write (`-2`), and `reset true` on a
+`sint<1>` (`true` is 1, outside `[-1, 0]`). The reset may be any constant:
+a sized literal (`reset 4'h3`, `reset -4'h2`) and the `sint<64>` minimum
+written as a literal (`reset -9223372036854775808`) are accepted. Unsigned
+field resets keep the `0 ..= 2^N - 1` range.
+
+A `let` bound from a register or field read has the read's type, exactly as
+a typed `let` from any other value would:
+
+```harc
+let e = regs.R.F              // sint<4> field: e is a sint<4>; e < 0, e >> 1 are signed
+let w : sint<8> = regs.R.F    // widening: fine
+let u : uint<4> = regs.R.F    // compile error: signedness must match
+let n : uint<2> = regs.R.G    // compile error on a uint<4> field: narrows
+let r : uint<8> = regs.R      // compile error on a 32-bit register: narrows
+```
+
+A field read is `uint<N>` / `sint<N>` for a field of `N` bits. A register
+read is `uint<W>` for a register of width `W`, mirror-only or bus-read alike:
+when the `via` helper's `read` returns a different type (a `-> uint<32>`
+helper behind a `width 12` register), the returned value is masked to the
+register's `W` bits, and that masked value is also what the read-side mirror
+prediction stores — for a `let`-bound read and an inline one (`y = regs.N`,
+`assert regs.N == ...`) alike. So `let b : uint<12> = regs.N` on a 12-bit
+register is accepted. `regs.record_read(addr)`
+is `uint<W>` for the register a constant address names (the widest
+register's width for a runtime address); unannotated it stays a widthless
+`uint` as before. The same rules apply to the addrmap spellings
+(`chip.inst.REG[.FIELD]`).
 
 ### 3.2 Passive record API + per-register write callbacks  *(shipped, Phase 1f)*
 
@@ -496,6 +529,24 @@ whose declaration provides blocking TLM methods with the same ABI: a void
 uses the scheduler-aware TLM call path and performs the same write-side mirror
 update and read-side prediction as the helper route. See the existing
 `axilite_regs_full_test` and `regblock_*` fixtures for both conventions.
+
+**Frontdoor write width.** A frontdoor register write (`regs.REG = v`,
+`chip.inst.REG = v`) is masked to the register's `width` before it updates
+the mirror and before it is sent to the bus, exactly as `record_write`
+masks: on a `width 12` register, `regs.N = 0xFFFF` stores and writes
+`0xFFF`. Field writes were already confined to the field's bits.
+
+**Helper parameter types.** The frontdoor passes the register offset as the
+first parameter of the helper's (or, for `via <Bus>`, the bus's `tlm_method`)
+`read`/`write` and the register value — a `uint<W>` for a register
+of width `W`, since a frontdoor write masks to the register width — as
+`write`'s second parameter. Both are checked against the parameters' declared
+types from the declarations alone, whatever value a particular write passes:
+a register at `@ 0x118` behind `write(addr: uint<8>, ...)`, a 32-bit register
+behind `data: uint<31>`, a `width 64` register behind `data: uint<32>`, or a
+`sint` data parameter is a compile error that names the register, the helper
+(or bus `tlm_method`) and the parameter (widen the parameter or make it unsigned, or move/narrow
+the register).
 
 Addrmap frontdoors still require the helper-transactor form. Automatically
 deriving protocol-specific accessors from a `bound to <Bus>` declaration that

@@ -1276,6 +1276,10 @@ impl FuncBuilder<'_> {
                     .position(|candidate| candidate.name == name)
                     .map(|index| crate::ir::ComponentId(index as u32))
             }) {
+                super::components::reject_component_generic_args(
+                    l.ty.as_ref(),
+                    &format!("`let {}`", l.name.name),
+                )?;
                 if let Some(value) = &l.value {
                     if mode.is_some() {
                         return Err(LowerError::Invalid(format!(
@@ -1536,20 +1540,27 @@ impl FuncBuilder<'_> {
                 return Ok(());
             }
         }
+        // RAL reads type their local like any typed `let`: the annotation,
+        // checked against the read's value type, or that value type.
+        let ral_dest = super::regblock::RalLetDest {
+            name: &l.name.name,
+            declared: declared_scalar_ty.clone(),
+            declared_width,
+        };
         // RAL passive record read: `let v = regs.record_read(addr)`.
-        if self.try_lower_record_read_let(&l.name.name, value)? {
+        if self.try_lower_record_read_let(&ral_dest, value)? {
             return Ok(());
         }
         // RAL frontdoor register-level read: `let v = regs.NAME`.
-        if self.try_lower_regblock_read_let(&l.name.name, value)? {
+        if self.try_lower_regblock_read_let(&ral_dest, value)? {
             return Ok(());
         }
         // RAL frontdoor field-level read: `let v = regs.REG.FIELD`.
-        if self.try_lower_regblock_subfield_read_let(&l.name.name, value)? {
+        if self.try_lower_regblock_subfield_read_let(&ral_dest, value)? {
             return Ok(());
         }
         // RAL addrmap read: `let v = chip.inst.REG[.FIELD]`.
-        if self.try_lower_addrmap_read_let(&l.name.name, value)? {
+        if self.try_lower_addrmap_read_let(&ral_dest, value)? {
             return Ok(());
         }
         // Any other regblock-binding access in `let`-RHS position
@@ -7325,7 +7336,7 @@ fn fmt_arg_type_is_scalar(ty: &IrType) -> bool {
 }
 
 fn parse_fmt_capture(capture: &str) -> Result<AstExpr, LowerError> {
-    crate::parser::parse_expr_fragment(capture).map_err(|_| {
+    crate::parser::parse_expr_fragment_unanchored(capture).map_err(|_| {
         LowerError::Invalid(format!(
             "`${{{capture}}}` is not an expression; an interpolation holds one complete expression, optionally followed by `:` and a format spec"
         ))

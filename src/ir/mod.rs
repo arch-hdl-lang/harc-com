@@ -753,9 +753,9 @@ pub struct RecordFieldSchema {
     /// field or a dynamic `list<T>`. The element type/width is carried in
     /// `ty`; lists are distinguished by `IrType::Seq(T)`.
     pub vec_len: Option<usize>,
-    /// Declared `default <lit>` value (int/bool literals only), or
-    /// `None` for the type-appropriate zero — same fallback as v1.
-    pub default: Option<u64>,
+    /// Declared `default` value, or `None` for the type-appropriate zero —
+    /// same fallback as v1.
+    pub default: Option<ScalarDefault>,
     /// `!` prefix — pinned during randomization. Inert until the
     /// randomize slice lands; carried for the constraint seam.
     pub non_random: bool,
@@ -833,12 +833,66 @@ pub enum ScoreboardFieldKind {
     Queue { elem: QueueElem },
 }
 
-/// Width-preserving initializer for persistent scoreboard scalar state.
-#[derive(Debug, Clone)]
-pub enum ScoreboardScalarDefault {
+/// Width-preserving initializer for a persistent scalar field (component,
+/// scoreboard, transactor-state, record and testbench fields).
+///
+/// `Narrow(v)` is the field's value `v` (a 64-bit pattern read with the
+/// field's signedness for a field of at most 64 bits; for a wider field
+/// lowering only produces `Narrow` for `0 ..= 2^63 - 1`). `Wide(words)` is
+/// the full value of a field wider than 64 bits as LSB-first 32-bit words,
+/// exactly as many as the field's carrier holds (4 for `_harc_u128`,
+/// `ceil(W / 32)` for `HarcWide`), two's-complement sign-extended across all
+/// of them for a negative signed value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScalarDefault {
     Narrow(u64),
     /// LSB-first 32-bit words, matching `Expr::WideLiteral`.
     Wide(Vec<u32>),
+}
+
+/// The scoreboard spelling the default type was introduced under.
+pub type ScoreboardScalarDefault = ScalarDefault;
+
+impl ScalarDefault {
+    /// The value as a 64-bit pattern: the `Narrow` value, or the low two
+    /// words of a `Wide` one. Only meaningful for fields of at most 64 bits.
+    pub fn low_u64(&self) -> u64 {
+        match self {
+            ScalarDefault::Narrow(v) => *v,
+            ScalarDefault::Wide(words) => {
+                let lo = words.first().copied().unwrap_or(0) as u64;
+                let hi = words.get(1).copied().unwrap_or(0) as u64;
+                lo | (hi << 32)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ScalarDefault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScalarDefault::Narrow(v) => write!(f, "{v}"),
+            ScalarDefault::Wide(words) => {
+                write!(f, "0x")?;
+                let significant = words
+                    .iter()
+                    .rposition(|w| *w != 0)
+                    .map_or(1, |top| top + 1)
+                    .min(words.len());
+                if significant == 0 {
+                    return write!(f, "0");
+                }
+                for (i, w) in words[..significant].iter().rev().enumerate() {
+                    if i == 0 {
+                        write!(f, "{w:x}")?;
+                    } else {
+                        write!(f, "{w:08x}")?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// The element type of a `queue<T>` field: an exact scalar IR type, a
@@ -1466,7 +1520,7 @@ pub struct FixedVecSchema {
 #[derive(Debug, Clone)]
 pub enum ComponentFieldKind {
     /// `count : uint<32> default 0` — a scalar host counter.
-    Scalar { ty: IrType, default: u64 },
+    Scalar { ty: IrType, default: ScalarDefault },
     /// `words : Vec<uint<64>, 4>` — fixed, by-value component state.
     FixedVec(FixedVecSchema),
     /// `current : Sample` — a value-record held as persistent host-side
@@ -2045,8 +2099,8 @@ pub struct RegblockBinding {
 pub struct TbScalarFieldSchema {
     pub name: String,
     pub ty: IrType,
-    /// Declared `default <lit>` value, or 0 (v1's fallback).
-    pub default: u64,
+    /// Declared `default` value, or 0 (v1's fallback).
+    pub default: ScalarDefault,
 }
 
 /// One testbench-owned FIFO (`pending : queue<uint<32>>` or
@@ -2080,7 +2134,7 @@ pub struct StateFieldSchema {
 pub enum StateFieldKind {
     /// `read_count : uint<32> default 0` — a scalar host counter/latch.
     /// `default` is the declared initializer literal (0 fallback).
-    Scalar { ty: IrType, default: u64 },
+    Scalar { ty: IrType, default: ScalarDefault },
     /// `pending : queue<uint<32>>` / `pending : queue<Record>` — a FIFO
     /// whose element is an exact scalar type through 1024 bits or a
     /// value-record. Manipulated through the state-queue ops

@@ -1,6 +1,5 @@
 ---
 source: tests/tbir.rs
-assertion_line: 2517
 expression: "format!(\"{prog}\")"
 ---
 tb-ir program
@@ -52,7 +51,7 @@ fn fn2 run_RegblockSubsetTest [kind=Run, owner=tb0]
     %0 regs : record(r0)
     %1 src : uint<32>
     %2 st : uint<32>
-    %3 cmd : unknown
+    %3 cmd : uint<32>
   entry = b0
 
   b0:

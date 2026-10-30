@@ -307,7 +307,7 @@ impl super::FuncBuilder<'_> {
     /// when `value` is an addrmap access (and lowers it).
     pub(crate) fn try_lower_addrmap_read_let(
         &mut self,
-        dest_name: &str,
+        dest: &super::regblock::RalLetDest<'_>,
         value: &crate::ast::Expr,
     ) -> Result<bool, LowerError> {
         if let Some((mirror_key, helper_field, reg, fld)) = self.as_addrmap_subfield(value) {
@@ -316,9 +316,13 @@ impl super::FuncBuilder<'_> {
                     "addrmap mirror `{mirror_key}` is not in scope at its field-read site"
                 )));
             };
-            let helper_ty = self.regblock_helper_type_pub(&helper_field, "read", 1)?;
+            let helper_ty = self.regblock_helper_type_pub(&helper_field, "read", &reg)?;
             let extract = self.field_read_expr(mirror, &helper_ty, &reg, &fld);
-            let id = self.declare(dest_name);
+            let id = self.declare_ral_read_local(
+                dest,
+                Some(super::regblock::field_value_type(&fld)),
+                &format!("register field `{}`", ast_path_text(value)),
+            )?;
             self.push(crate::ir::Stmt::Assign(id, extract));
             return Ok(true);
         }
@@ -328,7 +332,8 @@ impl super::FuncBuilder<'_> {
                     "addrmap mirror `{mirror_key}` is not in scope at its read site"
                 )));
             };
-            self.lower_reg_read_let(mirror, &helper_field, dest_name, &reg)?;
+            let what = format!("register `{}`", ast_path_text(value));
+            self.lower_reg_read_let(mirror, &helper_field, dest, &reg, &what)?;
             return Ok(true);
         }
         Ok(false)
@@ -348,7 +353,7 @@ impl super::FuncBuilder<'_> {
                     "addrmap mirror `{mirror_key}` is not in scope at its field-read site"
                 )));
             };
-            let helper_ty = self.regblock_helper_type_pub(&helper_field, "read", 1)?;
+            let helper_ty = self.regblock_helper_type_pub(&helper_field, "read", &reg)?;
             return Ok(Some(self.field_read_expr(mirror, &helper_ty, &reg, &fld)));
         }
         if let Some((mirror_key, helper_field, reg)) = self.as_addrmap_register(e) {
@@ -357,7 +362,7 @@ impl super::FuncBuilder<'_> {
                     "addrmap mirror `{mirror_key}` is not in scope at its read site"
                 )));
             };
-            let helper_ty = self.regblock_helper_type_pub(&helper_field, "read", 1)?;
+            let helper_ty = self.regblock_helper_type_pub(&helper_field, "read", &reg)?;
             return Ok(Some(self.reg_read_expr(mirror, &helper_ty, &reg)));
         }
         Ok(None)
@@ -501,4 +506,12 @@ impl super::FuncBuilder<'_> {
             V1Status::EmitsUncompilable,
         ))
     }
+}
+
+/// The source spelling of an addrmap access (`chip.mm2s.SA.S`) for a
+/// diagnostic; the mirror local's name is an internal mangling.
+fn ast_path_text(e: &crate::ast::Expr) -> String {
+    let mut out = String::new();
+    crate::pretty::print_expr(&mut out, e);
+    out
 }

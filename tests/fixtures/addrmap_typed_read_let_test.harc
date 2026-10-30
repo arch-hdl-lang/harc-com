@@ -1,0 +1,85 @@
+// Addrmap `let` reads bind a local of the field's type: a `sint<N>` field
+// read through `chip.inst.REG.FIELD` compares and divides as signed, both
+// from a bus-read (rw) field and from a mirror-only (wo) field.
+
+use BusAxiLite
+
+transactor AxilHelper bound to BusAxiLite
+    when active
+        hookable write(addr: uint<8>, data: uint<32>)
+            bus.aw.addr = addr
+            bus.aw.valid = 1
+            bus.w.send(data, 15)
+            bus.aw.valid = 0
+            wait 1 cycle
+        end write
+
+        hookable read(addr: uint<8>) -> uint<32>
+            bus.ar.addr = addr
+            bus.ar.valid = 1
+            let r = bus.r.recv()
+            bus.ar.valid = 0
+            wait 1 cycle
+            return r.data
+        end read
+    end when
+end transactor AxilHelper
+
+regblock DmaChan via AxilHelper width 32
+    register SA @ 0x18 access rw
+        field LO : uint<8> @ 0 access rw
+        field S : sint<8> @ 8 access rw
+    end register SA
+    register K @ 0x08 access wo
+        field KS : sint<4> @ 4 reset -3 access wo
+    end register K
+end regblock DmaChan
+
+addrmap Soc via AxilHelper
+    instance mm2s : DmaChan @ 0x00 size 0x30
+    instance s2mm : DmaChan @ 0x30 size 0x30
+end addrmap Soc
+
+testbench AmTb
+    dut : AxiLiteRegs
+end testbench AmTb
+
+impl AmTypedLetTest for AmTb
+    let axil   : BusAxiLite = bind dut
+    let helper : AxilHelper active = bind axil
+    let chip   : Soc = bind helper
+
+    run
+        dut.rst = 1
+        axil.aw.valid = 0
+        axil.w.valid = 0
+        axil.b.ready = 1
+        axil.ar.valid = 0
+        axil.r.ready = 1
+        dut.mm2s_done = 0
+        dut.mm2s_halted = 1
+        dut.mm2s_idle = 1
+        dut.s2mm_done = 0
+        dut.s2mm_halted = 1
+        dut.s2mm_idle = 1
+        dut.mm2s_sg_done = 0
+        dut.s2mm_sg_done = 0
+        dut.mm2s_sg_active = 0
+        dut.s2mm_sg_active = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        let k = chip.s2mm.K.KS
+        assert k < 0 else fail("wo let-bound sint<4> field ${k} is not < 0")
+        assert k == -3 else fail("wo let-bound sint<4> field read ${k}, expected -3")
+        chip.mm2s.SA = 0
+        chip.mm2s.SA.S = -100
+        let s = chip.mm2s.SA.S
+        assert s < 0 else fail("rw let-bound sint<8> field ${s} is not < 0")
+        assert s / 4 == -25 else fail("rw let-bound sint<8> field -100 / 4 = ${s / 4}")
+        let wide : sint<16> = chip.mm2s.SA.S
+        assert wide == -100 else fail("sint<16>-annotated field read ${wide}")
+        log(info, "ADDRMAP_TYPED_LET_OK")
+    end run
+end impl AmTypedLetTest

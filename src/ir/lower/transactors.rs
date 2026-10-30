@@ -2087,8 +2087,8 @@ fn lower_state_field(
     // anything else silently degrades to `= 0` — a `default 1 + 1`
     // state field starts at 0, not 2.
     let default = match &f.default {
-        None => 0,
-        Some(d) => super::components::fold_field_default(
+        None => crate::ir::ScalarDefault::Narrow(0),
+        Some(d) => super::components::fold_field_default_full(
             d,
             Some(&f.ty),
             &record_ctx.const_vals(),

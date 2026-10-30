@@ -1,0 +1,29 @@
+// A `default` on a testbench field wider than 64 bits is carried at the
+// field's full width (2^63 on a sint<65>, 2^64 on a uint<200>, a negative
+// sint<200>); the default slot used to be a `u64`.
+
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+testbench WideTb
+    dut : Top
+    h : sint<65> default 0x8000_0000_0000_0000
+    big : uint<200> default 0x1_0000_0000_0000_0000
+    neg : sint<200> default -7
+    m1 : sint<65> default -1
+end testbench WideTb
+
+impl WideTestbenchDefaultTest for WideTb
+    clock clk = SysDomain
+    run
+        assert h > 0 else fail("sint<65> testbench default 2^63 is not positive")
+        assert h - 0x7FFF_FFFF_FFFF_FFFF == 1 else fail("sint<65> testbench default is not 2^63")
+        assert big - 1 == 0xFFFF_FFFF_FFFF_FFFF else fail("uint<200> testbench default is not 2^64")
+        assert neg < 0 else fail("sint<200> testbench default -7 is not negative")
+        assert neg + 7 == 0 else fail("sint<200> testbench default is not -7")
+        assert m1 < 0 else fail("sint<65> testbench default -1 is not negative")
+        log(info, "WIDE_TESTBENCH_DEFAULT_OK")
+        wait 1 cycle
+    end run
+end impl WideTestbenchDefaultTest

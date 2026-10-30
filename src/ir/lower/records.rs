@@ -552,16 +552,29 @@ fn lower_record_field(
     let default = match &f.default {
         None => None,
         Some(d) => Some(match &*d.kind {
-            ExprKind::Int(s) => super::exprs::parse_int_literal(s)
-                .or_else(|| super::exprs::parse_sized_int_literal(s))
-                .ok_or_else(|| record_default_literal(kind, owner, fname, s))?,
-            ExprKind::Bool(b) => *b as u64,
-            _ => super::components::fold_field_default(
+            // A field wider than 64 bits carries its full-width default
+            // (`sint<65> default -1`, `uint<200> default 0x1_0000_..._0000`)
+            // through the shared full-width folder.
+            _ if matches!(ty, IrType::UInt(Some(w)) | IrType::SInt(Some(w)) if w > 64) => {
+                super::components::fold_field_default_full(
+                    d,
+                    Some(&f.ty),
+                    consts,
+                    &format!("{kind} field `{owner}.{fname}`"),
+                )?
+            }
+            ExprKind::Int(s) => crate::ir::ScalarDefault::Narrow(
+                super::exprs::parse_int_literal(s)
+                    .or_else(|| super::exprs::parse_sized_int_literal(s))
+                    .ok_or_else(|| record_default_literal(kind, owner, fname, s))?,
+            ),
+            ExprKind::Bool(b) => crate::ir::ScalarDefault::Narrow(*b as u64),
+            _ => crate::ir::ScalarDefault::Narrow(super::components::fold_field_default(
                 d,
                 Some(&f.ty),
                 consts,
                 &format!("{kind} field `{owner}.{fname}`"),
-            )?,
+            )?),
         }),
     };
     let mut attr_src = Vec::with_capacity(f.attrs.len());

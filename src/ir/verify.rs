@@ -788,13 +788,34 @@ fn verify_scoreboard_scalar_schema(
             ),
         });
     }
-    let default_valid = match default {
-        // The default is only ever folded to zero for a wide field
-        // (source lowering rejects a non-zero wide default), and zero is
-        // in range for every width and sign, so the only bound worth
-        // checking is on the narrow signed/unsigned cases below.
-        crate::ir::ScoreboardScalarDefault::Narrow(value) => match ty {
+    if scalar_default_valid(ty, default) == Some(false) {
+        errs.push(VerifyError::BadProgramRef {
+            what: format!("{what} has invalid scalar default {default:?} for {ty:?}"),
+        });
+    }
+}
+
+/// Whether a persistent scalar field's `ScalarDefault` is a value of its
+/// declared type. Shared by every schema that carries one (component,
+/// scoreboard, transactor state, record, testbench). `None` for a field type
+/// this rule does not judge (an aggregate or `String` slot).
+///
+/// * `Narrow(v)` on a field of at most 64 bits is the 64-bit pattern read
+///   with the field's signedness, and must lie in the field's range.
+/// * `Narrow(v)` on a field wider than 64 bits is rendered as an unsigned
+///   decimal into the wide carrier, so it must be a non-negative value below
+///   2^63 (lowering uses `Wide` for anything else).
+/// * `Wide(words)` is checked by [`wide_default_valid`].
+fn scalar_default_valid(ty: &IrType, default: &crate::ir::ScalarDefault) -> Option<bool> {
+    if !matches!(ty, IrType::Bool | IrType::UInt(_) | IrType::SInt(_)) {
+        return None;
+    }
+    Some(match default {
+        crate::ir::ScalarDefault::Narrow(value) => match ty {
             IrType::Bool => *value <= 1,
+            IrType::UInt(Some(width)) | IrType::SInt(Some(width)) if *width > 64 => {
+                *value <= i64::MAX as u64
+            }
             IrType::UInt(Some(width)) if *width < 64 => *value < (1u64 << width),
             IrType::UInt(_) => true,
             IrType::SInt(Some(width)) if (1..64).contains(width) => {
@@ -802,20 +823,23 @@ fn verify_scoreboard_scalar_schema(
                 let limit = 1i64 << (*width - 1);
                 (-limit..limit).contains(&signed)
             }
-            // 64-bit and wider signed, and widthless: a zero default is
-            // always representable; a wider non-zero default cannot
-            // reach here (lowering folds absent/zero only).
-            IrType::SInt(Some(64)) | IrType::SInt(None) => true,
-            IrType::SInt(Some(_)) => *value == 0,
+            // `sint<64>` and widthless signed: every 64-bit pattern is a value.
+            IrType::SInt(_) => true,
             _ => false,
         },
-        crate::ir::ScoreboardScalarDefault::Wide(words) => {
-            !words.is_empty()
-                && words.last().is_some_and(|word| *word != 0)
-                && matches!(ty, IrType::UInt(Some(width)) if wide_literal_bits(words) > 64 && wide_literal_bits(words) <= *width)
-        }
-    };
-    if !default_valid {
+        crate::ir::ScalarDefault::Wide(words) => wide_default_valid(ty, words),
+    })
+}
+
+/// Report a component / record / transactor-state / testbench scalar
+/// default that is not a value of its field's type.
+fn check_scalar_default(
+    ty: &IrType,
+    default: &crate::ir::ScalarDefault,
+    what: &str,
+    errs: &mut Vec<VerifyError>,
+) {
+    if scalar_default_valid(ty, default) == Some(false) {
         errs.push(VerifyError::BadProgramRef {
             what: format!("{what} has invalid scalar default {default:?} for {ty:?}"),
         });
@@ -1171,6 +1195,9 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
         let mut names = std::collections::HashSet::new();
         for field in &record.fields {
             let what = format!("record r{ri} `{}` field `{}`", record.name, field.name);
+            if let (Some(default), None) = (&field.default, field.vec_len) {
+                check_scalar_default(&field.ty, default, &what, &mut errs);
+            }
             if !names.insert(field.name.as_str()) {
                 errs.push(VerifyError::BadProgramRef {
                     what: format!(
@@ -1718,6 +1745,14 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
             });
         }
         for field in &component.fields {
+            if let ComponentFieldKind::Scalar { ty, default } = &field.kind {
+                check_scalar_default(
+                    ty,
+                    default,
+                    &format!("component c{ci} field `{}`", field.name),
+                    &mut errs,
+                );
+            }
             if let ComponentFieldKind::Event { payload } = &field.kind {
                 if let Err(detail) = verify_event_payload_ref(prog, payload) {
                     errs.push(VerifyError::BadProgramRef {
@@ -1955,6 +1990,14 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
     // tables directly off these links.
     for (xi, x) in prog.transactors.iter().enumerate() {
         for field in &x.state_fields {
+            if let StateFieldKind::Scalar { ty, default } = &field.kind {
+                check_scalar_default(
+                    ty,
+                    default,
+                    &format!("transactor x{xi} state field `{}`", field.name),
+                    &mut errs,
+                );
+            }
             match &field.kind {
                 StateFieldKind::Scalar { ty, .. } if ir_type_contains_string(ty) => {
                     errs.push(VerifyError::BadProgramRef {
@@ -2328,6 +2371,12 @@ pub fn verify_program(prog: &TbProgram) -> Result<(), Vec<VerifyError>> {
         for field in &tb.state_fields {
             let name = match field {
                 TbStateFieldSchema::Scalar(field) => {
+                    check_scalar_default(
+                        &field.ty,
+                        &field.default,
+                        &format!("tb{ti} scalar field `{}`", field.name),
+                        &mut errs,
+                    );
                     if ir_type_contains_string(&field.ty) {
                         errs.push(VerifyError::BadProgramRef {
                             what: format!(
@@ -4258,13 +4307,45 @@ impl Checker<'_> {
                     resolve_testbench_component_path(self.prog, tb, path)
                 }
             }
-            ComponentBase::Local(local) => Err(format!(
-                "component field uses local base %{}; only method calls may use local component values",
-                local.0
-            )),
-            ComponentBase::LocalPath { .. } => Err(
-                "component field uses a whole-value local copy path".to_string(),
-            ),
+            // A component local (run-local instance, by-value copy or
+            // component-typed parameter), optionally through `Sub` fields.
+            ComponentBase::Local(local) | ComponentBase::LocalPath { local, .. } => {
+                let path: &[String] = match base {
+                    ComponentBase::LocalPath { path, .. } => path,
+                    _ => &[],
+                };
+                let Some(IrType::Component(mut cid)) =
+                    self.func.locals.get(local.index()).map(|l| l.ty.clone())
+                else {
+                    return Err(format!(
+                        "component field base %{} is not a component-typed local",
+                        local.0
+                    ));
+                };
+                for segment in path {
+                    let schema = self
+                        .prog
+                        .components
+                        .get(cid.index())
+                        .ok_or_else(|| format!("component c{} does not resolve", cid.0))?;
+                    cid = match schema.field(segment) {
+                        Some(ComponentFieldSchema {
+                            kind: ComponentFieldKind::Sub { component, .. },
+                            ..
+                        }) => *component,
+                        _ => {
+                            return Err(format!(
+                                "local path segment `{segment}` is not a sub-component"
+                            ))
+                        }
+                    };
+                }
+                self.prog
+                    .components
+                    .get(cid.index())
+                    .map(|_| cid)
+                    .ok_or_else(|| format!("component c{} does not resolve", cid.0))
+            }
         }
     }
 
@@ -10884,6 +10965,30 @@ fn fixed_vec_abi_compatible(expected: &IrType, actual: &IrType) -> bool {
         return false;
     };
     expected_len == actual_len && expected_class == actual_class
+}
+
+/// A `ScalarDefault::Wide` fills its field's carrier exactly (4 words for
+/// `_harc_u128`, `ceil(W / 32)` for `HarcWide`), and its value fits the
+/// declared width: an unsigned value in `W` bits, a signed one as a
+/// `W`-bit two's-complement value sign-extended across the carrier.
+fn wide_default_valid(ty: &IrType, words: &[u32]) -> bool {
+    let (width, signed) = match ty {
+        IrType::UInt(Some(w)) if *w > 64 => (*w, false),
+        IrType::SInt(Some(w)) if *w > 64 => (*w, true),
+        _ => return false,
+    };
+    let carrier = if width <= 128 { 4 } else { width.div_ceil(32) as usize };
+    if words.len() != carrier {
+        return false;
+    }
+    let bit = |i: u32| words[(i / 32) as usize] >> (i % 32) & 1;
+    let total = carrier as u32 * 32;
+    if signed {
+        let sign = bit(width - 1);
+        (width..total).all(|i| bit(i) == sign)
+    } else {
+        (width..total).all(|i| bit(i) == 0)
+    }
 }
 
 fn wide_literal_bits(words: &[u32]) -> u32 {

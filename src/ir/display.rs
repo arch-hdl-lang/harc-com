@@ -168,9 +168,9 @@ impl Display for TbProgram {
                     if fld.non_random { "!" } else { "" },
                     fld.name,
                 )?;
-                if let Some(d) = fld.default {
+                if let Some(d) = &fld.default {
                     if fld.ty == IrType::Bool {
-                        write!(f, " default {}", d != 0)?;
+                        write!(f, " default {}", d.low_u64() != 0)?;
                     } else {
                         write!(f, " default {d}")?;
                     }

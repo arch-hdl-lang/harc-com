@@ -1,0 +1,76 @@
+// A component-typed parameter accepts every whole-component value a
+// `let v : T = <path>` copy accepts: a test-scope instance (`x`), a
+// sub-component of a test-scope instance (`h0.c`), a sub-component of a
+// run-local instance (`z.c`), and a self sub-component path inside a method
+// (`h.c`). The bare test-scope form used to be "an unresolved name" and the
+// sub-paths "field access on a non-DUT value".
+
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+agent Cell
+    v : uint<8> default 0
+    hookable set(n : uint<8>)
+        v = n
+    end set
+    hookable get() -> uint<8>
+        return v
+    end get
+end agent Cell
+
+agent Holder
+    c : Cell
+    hookable take(src : Cell)
+        c = src
+    end take
+    hookable get() -> uint<8>
+        return c.get()
+    end get
+    hookable put(n : uint<8>)
+        c.set(n)
+    end put
+end agent Holder
+
+agent Nest
+    h : Holder
+    dst : Cell
+    hookable take(src : Cell)
+        dst = src
+    end take
+    hookable prime(n : uint<8>)
+        h.put(n)
+    end prime
+    hookable go()
+        take(h.c)
+    end go
+    hookable got() -> uint<8>
+        return dst.get()
+    end got
+end agent Nest
+
+test ComponentValueArgumentTest
+    let dut : Top
+    let x : Cell
+    let h0 : Holder
+    let h : Holder
+    let n : Nest
+    clock clk = SysDomain
+    run
+        x.set(11)
+        h.take(x)
+        assert h.get() == 11 else fail("test-scope component argument: ${h.get()}")
+        h0.c.set(22)
+        h.take(h0.c)
+        assert h.get() == 22 else fail("test-scope sub-component argument: ${h.get()}")
+        let z : Holder
+        z.put(33)
+        h.take(z.c)
+        assert h.get() == 33 else fail("run-local sub-component argument: ${h.get()}")
+        n.prime(44)
+        n.go()
+        assert n.got() == 44 else fail("self sub-component path argument: ${n.got()}")
+        log(info, "COMPONENT_VALUE_ARGUMENT_OK")
+        wait 1 cycle
+    end run
+end test ComponentValueArgumentTest

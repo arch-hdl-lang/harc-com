@@ -65,6 +65,38 @@ pub(crate) struct RegblockBindingCtx {
     pub registers: Vec<RegRegisterSchema>,
 }
 
+/// The destination of a RAL `let` read (`let x [: T] = regs.REG[.FIELD]`,
+/// `chip.inst.REG[.FIELD]`, `regs.record_read(addr)`): the source name and
+/// the scalar type annotation, if any, as the generic `let` path computes
+/// them.
+pub(crate) struct RalLetDest<'a> {
+    pub name: &'a str,
+    pub declared: Option<IrType>,
+    pub declared_width: Option<u32>,
+}
+
+/// The value type of a field read: `sint<N>` fields read back
+/// sign-extended as `sint<N>`, every other field as `uint<N>`.
+pub(crate) fn field_value_type(fld: &RegFieldSchema) -> IrType {
+    if fld.signed {
+        IrType::SInt(Some(fld.bit_width))
+    } else {
+        IrType::UInt(Some(fld.bit_width))
+    }
+}
+
+fn scalar_type_name(ty: &IrType) -> String {
+    match ty {
+        IrType::UInt(Some(w)) => format!("uint<{w}>"),
+        IrType::SInt(Some(w)) => format!("sint<{w}>"),
+        IrType::UInt(None) => "uint".to_string(),
+        IrType::SInt(None) => "sint".to_string(),
+        IrType::Bool => "bool".to_string(),
+        IrType::String => "String".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
 /// Lower one `regblock` declaration into its synthetic mirror record
 /// plus a `RegblockSchema`. The caller pushes the record into
 /// `TbProgram::records` (id `record`) and the schema into
@@ -121,7 +153,11 @@ pub(crate) fn lower_regblock(
                     "regblock `{name}` register `{rname}` declares field `{fname}` more than once"
                 )));
             }
-            let bit_width = field_bit_width(&fld.ty);
+            let bit_width = field_bit_width(
+                &fld.ty,
+                consts,
+                &format!("width of regblock `{name}` register `{rname}` field `{fname}`"),
+            )?;
             if bit_width == 0 {
                 // Same value-model violation as the register width
                 // above, and v1 is worse here than merely unchecked: it
@@ -144,7 +180,11 @@ pub(crate) fn lower_regblock(
             let field_reset = match &fld.reset {
                 None => None,
                 Some(rv) => match &*rv.kind {
-                    ExprKind::Bool(b) => Some(*b as u64),
+                    // An unsigned field takes `true`/`false` as 1/0. A
+                    // signed one does NOT skip the range check below:
+                    // `reset true` on a `sint<1>` is 1, outside [-1, 0],
+                    // and used to be accepted as the pattern 0b1 (= -1).
+                    ExprKind::Bool(b) if !field_signed => Some(*b as u64),
                     // A `sint<N>` field's reset is a VALUE of that type:
                     // it must lie in [-2^(N-1), 2^(N-1)) and is stored as
                     // its N-bit two's-complement pattern.
@@ -264,7 +304,7 @@ pub(crate) fn lower_regblock(
             ty: IrType::UInt(Some(width)),
             vec_len: None,
             default: (reset.is_some() || has_explicit_field_reset)
-                .then_some(mirror_default),
+                .then_some(ir::ScalarDefault::Narrow(mirror_default)),
             non_random: false,
             attr_src: Vec::new(),
         });
@@ -294,30 +334,49 @@ pub(crate) fn lower_regblock(
     Ok((record_schema, schema))
 }
 
-/// Field bit-width from its type, mirroring v1's `field_bit_width`:
-/// `bit`/`bool` → 1; `uint<N>`/`sint<N>`/`bits<N>` → N; any other shape
-/// → 1 (the conservative single-bit fallback v1 also uses, e.g. for an
-/// unparameterized or enum-typed field). Width is folded only from a
-/// plain integer literal type-arg — the corpus uses literals exclusively.
-fn field_bit_width(t: &crate::ast::TypeExpr) -> u32 {
+/// Field bit-width from its type: `bit`/`bool` → 1; `uint<N>`/`sint<N>`/
+/// `bits<N>` → N, where N is any compile-time constant expression (a
+/// decimal or hex literal, a `const` name, `2 + 2`, ...) folded through
+/// the file's constant table. Any other shape (an unparameterized or
+/// enum-typed field) keeps v1's conservative single-bit fallback.
+///
+/// The width argument used to be read only when it was a plain decimal
+/// literal and silently fell back to 1 otherwise, so `uint<0x8>`,
+/// `uint<W>` and `uint<2+2>` all became one-bit fields: reads returned
+/// bit 0 and writes dropped the rest, with no diagnostic. A width that
+/// does not fold is now a precise error instead.
+fn field_bit_width(
+    t: &crate::ast::TypeExpr,
+    consts: &HashMap<String, super::ConstVal>,
+    what: &str,
+) -> Result<u32, LowerError> {
     use crate::ast::{BuiltinTy, TypeArg, TypeExpr};
     let TypeExpr::Builtin { name, args, .. } = t else {
-        return 1;
+        return Ok(1);
     };
     match name {
-        BuiltinTy::Bit | BuiltinTy::Bool | BuiltinTy::BoolLower => 1,
+        BuiltinTy::Bit | BuiltinTy::Bool | BuiltinTy::BoolLower => Ok(1),
         BuiltinTy::UInt
         | BuiltinTy::SInt
         | BuiltinTy::UIntCap
         | BuiltinTy::SIntCap
-        | BuiltinTy::Bits => match args.first() {
-            Some(TypeArg::Expr(e)) => match &*e.kind {
-                ExprKind::Int(s) => s.replace('_', "").parse::<u32>().unwrap_or(1),
-                _ => 1,
-            },
-            _ => 1,
-        },
-        _ => 1,
+        | BuiltinTy::Bits => {
+            let width_expr = match args.as_slice() {
+                [TypeArg::Expr(e)] => e,
+                _ => {
+                    return Err(LowerError::Invalid(format!(
+                        "the {what} must be a single constant width argument, as in `uint<8>`"
+                    )))
+                }
+            };
+            let w = super::fold_addr_const(width_expr, consts, what)?;
+            u32::try_from(w).map_err(|_| {
+                LowerError::Invalid(format!(
+                    "the {what} is {w}, which exceeds every register width (at most 64)"
+                ))
+            })
+        }
+        _ => Ok(1),
     }
 }
 
@@ -341,6 +400,82 @@ fn lower_access(a: AstRegAccess) -> RegAccess {
 }
 
 impl super::FuncBuilder<'_> {
+    /// Declare the local a RAL `let` read binds, typed like any other
+    /// typed `let`: the annotation when there is one, otherwise the value
+    /// type of what was read (`source`). An annotation is held to the same
+    /// directional rule a typed `let` follows: signedness must match and
+    /// the declaration must not be narrower than the value.
+    ///
+    /// These reads return from inside the `try_*_read_let` helpers, so the
+    /// generic `let` path's typing never ran on them: the local was
+    /// declared untyped (a `uint64_t`), which made a `sint<N>` field read
+    /// compare and shift as unsigned (`e < 0` false for `e = -2`), and a
+    /// `: uint<2>` annotation was dropped in silence.
+    pub(crate) fn declare_ral_read_local(
+        &mut self,
+        dest: &RalLetDest<'_>,
+        source: Option<IrType>,
+        what: &str,
+    ) -> Result<ir::LocalId, LowerError> {
+        if let (Some(declared), Some(source)) = (dest.declared.as_ref(), source.as_ref()) {
+            let name = dest.name;
+            let mismatch = match (declared, source) {
+                (
+                    IrType::UInt(Some(dw)) | IrType::SInt(Some(dw)),
+                    IrType::UInt(Some(sw)) | IrType::SInt(Some(sw)),
+                ) => {
+                    let d_signed = matches!(declared, IrType::SInt(_));
+                    let s_signed = matches!(source, IrType::SInt(_));
+                    if d_signed != s_signed {
+                        Some(format!(
+                            "`let {name}` is declared {}, but {what} is a {} value. Signedness \
+                             must match — declare `{name}` as `{}`, or relabel the value \
+                             explicitly with `as {}<{sw}>` in a separate step.",
+                            scalar_type_name(declared),
+                            scalar_type_name(source),
+                            scalar_type_name(source),
+                            if d_signed { "sint" } else { "uint" },
+                        ))
+                    } else if sw > dw {
+                        Some(format!(
+                            "`let {name}` is declared {}, but {what} is a {} value, so the \
+                             initialization narrows. Widths must not shrink implicitly — \
+                             widen the declaration to {sw} bits, or use `.trunc<{dw}>()` in a \
+                             separate step to narrow explicitly.",
+                            scalar_type_name(declared),
+                            scalar_type_name(source),
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                (IrType::Bool, IrType::UInt(Some(1))) => None,
+                (IrType::UInt(None) | IrType::SInt(None), _) => None,
+                _ if declared == source => None,
+                _ => Some(format!(
+                    "`let {name}` is declared {}, which cannot hold {what} (a {} value)",
+                    scalar_type_name(declared),
+                    scalar_type_name(source),
+                )),
+            };
+            if let Some(msg) = mismatch {
+                return Err(LowerError::Invalid(msg));
+            }
+        }
+        let id = self.declare(dest.name);
+        let width = dest.declared_width.or(match &source {
+            Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w))) => Some(*w),
+            _ => None,
+        });
+        if let Some(ty) = dest.declared.clone().or(source) {
+            self.set_local_type(id, ty);
+        }
+        if let Some(w) = width {
+            self.let_widths.insert(id, w);
+        }
+        Ok(id)
+    }
+
     /// `regs.NAME = value` register-level frontdoor write. Returns
     /// `Ok(true)` when `target` is a register write on a regblock
     /// binding (and lowers it), `Ok(false)` when `target` is not a
@@ -404,10 +539,34 @@ impl super::FuncBuilder<'_> {
         // for 'operator&' (operand types are 'Beat' and 'int')", from
         // BOTH backends.
         self.reject_record_into_scalar(&v, "a register field")?;
+        // The register is `width` bits wide: mask the written value to it
+        // before it reaches the mirror or the bus, exactly as
+        // `record_write` does. Unmasked, a 12-bit register's `uint<12>`
+        // mirror cell held all 16 bits of `regs.N = 0xFFFF` and read them
+        // back, while `record_write(off, 0xFFFF)` on the same register
+        // stored 0xFFF (docs/ral-support.md §7.4, "Frontdoor write width").
+        // The masked value is a `uint<width>` by construction (an `as
+        // uint<width>` relabel of the masked bits), which is the type the
+        // helper's data parameter is held to.
+        let v = match v {
+            Expr::Literal {
+                value,
+                ty: IrType::Unknown,
+            } => lit(value & field_mask(reg.width)),
+            v => {
+                let masked = if reg.width >= 64 {
+                    v
+                } else {
+                    bin(BinOp::BitAnd, v, lit(field_mask(reg.width)))
+                };
+                as_register_value(masked, reg.width)
+            }
+        };
         let writes_bus = reg.access.writes_to_bus();
         let v = if writes_bus && !matches!(v, Expr::Local(_) | Expr::Literal { .. }) {
             // Bind to a temp so the same value feeds both uses.
             let t = self.fresh_temp();
+            self.set_local_type(t, IrType::UInt(Some(reg.width)));
             self.push(Stmt::Assign(t, v));
             Expr::Local(t)
         } else {
@@ -422,7 +581,7 @@ impl super::FuncBuilder<'_> {
             value: v.clone(),
         });
         if writes_bus {
-            let call = self.regblock_call(helper_field, "write", vec![lit(reg.offset), v])?;
+            let call = self.regblock_call(helper_field, "write", vec![lit(reg.offset), v], reg)?;
             self.push_regblock_frontdoor_call(None, call);
         }
         Ok(true)
@@ -514,7 +673,8 @@ impl super::FuncBuilder<'_> {
                 mid_indices: Vec::new(),
                 index: None,
             };
-            let call = self.regblock_call(helper_field, "write", vec![lit(reg.offset), word])?;
+            let call =
+                self.regblock_call(helper_field, "write", vec![lit(reg.offset), word], reg)?;
             self.push_regblock_frontdoor_call(None, call);
         }
         Ok(true)
@@ -525,7 +685,7 @@ impl super::FuncBuilder<'_> {
     /// field read on a regblock binding.
     pub(crate) fn try_lower_regblock_subfield_read_let(
         &mut self,
-        dest_name: &str,
+        dest: &RalLetDest<'_>,
         value: &crate::ast::Expr,
     ) -> Result<bool, LowerError> {
         let Some((binding, reg, fld)) = self.as_regblock_subfield(value) else {
@@ -543,7 +703,11 @@ impl super::FuncBuilder<'_> {
             mirror_field_expr(mirror, &reg.name)
         };
         let extract = field_extract_expr(word, &fld);
-        let id = self.declare(dest_name);
+        let id = self.declare_ral_read_local(
+            dest,
+            Some(field_value_type(&fld)),
+            &format!("register field `{binding}.{}.{}`", reg.name, fld.name),
+        )?;
         self.push(Stmt::Assign(id, extract));
         Ok(true)
     }
@@ -704,11 +868,12 @@ impl super::FuncBuilder<'_> {
                     &bctx.helper_field,
                     "write",
                     vec![lit(reg.offset), lit(pat)],
+                    reg,
                 )?;
                 self.push_regblock_frontdoor_call(None, wcall);
                 // got = Helper.read(off)
                 let rcall =
-                    self.regblock_call(&bctx.helper_field, "read", vec![lit(reg.offset)])?;
+                    self.regblock_call(&bctx.helper_field, "read", vec![lit(reg.offset)], reg)?;
                 let got = self.fresh_temp();
                 if let Some(ty) = self.transactor_call_ret_ty(&rcall) {
                     self.set_local_type(got, ty);
@@ -792,7 +957,11 @@ impl super::FuncBuilder<'_> {
         let resets: Vec<(String, u64)> = record
             .fields
             .iter()
-            .map(|field| (field.name.clone(), field.default.unwrap_or(0)))
+            .map(|field| {
+                // Mirror cells are at most 64 bits wide.
+                let value = field.default.as_ref().map_or(0, ir::ScalarDefault::low_u64);
+                (field.name.clone(), value)
+            })
             .collect();
         for (field, value) in resets {
             self.push(Stmt::RecordFieldWrite {
@@ -817,7 +986,7 @@ impl super::FuncBuilder<'_> {
     /// predict). WO: mirror read only (no bus traffic).
     pub(crate) fn try_lower_regblock_read_let(
         &mut self,
-        dest_name: &str,
+        dest: &RalLetDest<'_>,
         value: &crate::ast::Expr,
     ) -> Result<bool, LowerError> {
         let Some((binding, reg)) = self.as_regblock_register(value) else {
@@ -835,7 +1004,8 @@ impl super::FuncBuilder<'_> {
                 "regblock binding `{binding}` is not in scope at its read site"
             )));
         };
-        self.lower_reg_read_let(mirror, &bctx.helper_field, dest_name, &reg)?;
+        let what = format!("register `{binding}.{}`", reg.name);
+        self.lower_reg_read_let(mirror, &bctx.helper_field, dest, &reg, &what)?;
         Ok(true)
     }
 
@@ -847,17 +1017,29 @@ impl super::FuncBuilder<'_> {
         &mut self,
         mirror: ir::LocalId,
         helper_field: &str,
-        dest_name: &str,
+        dest: &RalLetDest<'_>,
         reg: &RegRegisterSchema,
+        what: &str,
     ) -> Result<(), LowerError> {
         if reg.access.reads_from_bus() {
-            let call = self.regblock_call(helper_field, "read", vec![lit(reg.offset)])?;
-            let id = self.declare(dest_name);
-            if let Some(ty) = self.transactor_call_ret_ty(&call) {
-                self.set_local_type(id, ty);
-            }
-            self.push_regblock_frontdoor_call(Some(id), call);
-            // Read-side mirror predict: store the bus-returned value.
+            let call = self.regblock_call(helper_field, "read", vec![lit(reg.offset)], reg)?;
+            // A register read is a `uint<width>` value — the register's own
+            // width, matching the masked frontdoor write. A helper whose
+            // `read` returns a different type has its result masked and
+            // relabeled to the register width; a `uint<width>` result is
+            // taken as is.
+            let register_ty = IrType::UInt(Some(reg.width));
+            let id = if self.transactor_call_ret_ty(&call).as_ref() == Some(&register_ty) {
+                let id = self.declare_ral_read_local(dest, Some(register_ty), what)?;
+                self.push_regblock_frontdoor_call(Some(id), call);
+                id
+            } else {
+                let value = self.register_read_value(call, reg);
+                let id = self.declare_ral_read_local(dest, Some(register_ty), what)?;
+                self.push(Stmt::Assign(id, Expr::Local(value)));
+                id
+            };
+            // Read-side mirror predict: store the register value.
             self.push(Stmt::RecordFieldWrite {
                 local: mirror,
                 field: reg.name.clone(),
@@ -868,7 +1050,8 @@ impl super::FuncBuilder<'_> {
             });
         } else {
             // WO — serve from the mirror without bus traffic.
-            let id = self.declare(dest_name);
+            let id =
+                self.declare_ral_read_local(dest, Some(IrType::UInt(Some(reg.width))), what)?;
             self.push(Stmt::Assign(
                 id,
                 Expr::RecordField {
@@ -933,24 +1116,46 @@ impl super::FuncBuilder<'_> {
             });
         }
         if self.ctx.bus_bindings.contains_key(helper_field) {
-            let call = self.regblock_call(helper_field, "read", vec![lit(reg.offset)])?;
-            let temp = self.fresh_temp();
-            if let Some(ty) = self.transactor_call_ret_ty(&call) {
-                self.set_local_type(temp, ty);
-            }
-            self.push_regblock_frontdoor_call(Some(temp), call);
+            let call = self.regblock_call(helper_field, "read", vec![lit(reg.offset)], reg)?;
+            let value = self.register_read_value(call, reg);
             self.push(Stmt::RecordFieldWrite {
                 local: mirror,
                 field: reg.name.clone(),
                 path: Vec::new(),
                 mid_indices: Vec::new(),
                 index: None,
-                value: Expr::Local(temp),
+                value: Expr::Local(value),
             });
-            return Ok(Expr::Local(temp));
+            return Ok(Expr::Local(value));
         }
-        let helper_ty = self.regblock_helper_type(helper_field, "read", 1)?;
+        let helper_ty = self.regblock_helper_type(helper_field, "read", 1, reg)?;
         Ok(self.reg_read_expr(mirror, &helper_ty, reg))
+    }
+
+    /// Issue a frontdoor `read` call into a temp and return a local holding
+    /// the register's `uint<width>` value: the call's own temp when the
+    /// helper returns exactly that type, otherwise a second temp holding the
+    /// result masked to the register width and relabeled `uint<width>`.
+    fn register_read_value(&mut self, call: Expr, reg: &RegRegisterSchema) -> ir::LocalId {
+        let register_ty = IrType::UInt(Some(reg.width));
+        let ret = self.transactor_call_ret_ty(&call);
+        let raw = self.fresh_temp();
+        if let Some(ty) = ret.clone() {
+            self.set_local_type(raw, ty);
+        }
+        self.push_regblock_frontdoor_call(Some(raw), call);
+        if ret.as_ref() == Some(&register_ty) {
+            return raw;
+        }
+        let masked = if reg.width >= 64 {
+            Expr::Local(raw)
+        } else {
+            bin(BinOp::BitAnd, Expr::Local(raw), lit(field_mask(reg.width)))
+        };
+        let value = self.fresh_temp();
+        self.set_local_type(value, register_ty);
+        self.push(Stmt::Assign(value, as_register_value(masked, reg.width)));
+        value
     }
 
     /// Whether this source access will materialize a scheduler statement.
@@ -1003,19 +1208,21 @@ impl super::FuncBuilder<'_> {
         &self,
         helper_field: &str,
         method: &str,
-        arity: usize,
+        reg: &RegRegisterSchema,
     ) -> Result<String, LowerError> {
-        self.regblock_helper_type(helper_field, method, arity)
+        self.regblock_helper_type(helper_field, method, 1, reg)
     }
 
     /// Resolve a regblock `via` helper field to its transactor TYPE name,
-    /// validating the named method exists at `arity`. Shared by the
-    /// statement call-edge path and the expression-position `RegRead`.
+    /// validating the named method exists at `arity`, and that register
+    /// `reg`'s offset and value fit its parameters' declared types. Shared
+    /// by the statement call-edge path and the expression-position `RegRead`.
     fn regblock_helper_type(
         &self,
         helper_field: &str,
         method: &str,
         arity: usize,
+        reg: &RegRegisterSchema,
     ) -> Result<String, LowerError> {
         let Some(&xid) = self.ctx.transactor_fields.get(helper_field) else {
             return Err(LowerError::Invalid(format!(
@@ -1037,7 +1244,70 @@ impl super::FuncBuilder<'_> {
                 m.param_names.len(),
             )));
         }
+        self.check_regblock_helper_args(
+            &format!("helper `{}` method", schema.name),
+            method,
+            &m.param_names,
+            &m.param_tys,
+            arity,
+            reg,
+        )?;
         Ok(schema.name.clone())
+    }
+
+    /// Hold each frontdoor argument to the `via` helper parameter it
+    /// binds, at the declaration level: the register offset (a `uint` of
+    /// its own magnitude) to the address parameter, and the register value
+    /// — a `uint<width>` by construction, since a frontdoor write masks to
+    /// the register width — to the data parameter. The frontdoor builds
+    /// these calls itself, so nothing upstream type-checked them: a
+    /// register at 0x118 behind an `addr: uint<8>` helper, or a 32-bit
+    /// register behind `data: uint<31>`, reached the TB-IR verifier as an
+    /// internal error, or (when the written value's type was not known)
+    /// was not checked at all and the bus received a truncated value.
+    ///
+    /// `helper` names the receiver for the diagnostic (`helper `H` method`
+    /// for a transactor helper, `bus `B` tlm_method` for a direct bus);
+    /// `param_names` / `param_tys` are the method's declared parameters.
+    fn check_regblock_helper_args(
+        &self,
+        helper: &str,
+        method: &str,
+        param_names: &[String],
+        param_tys: &[IrType],
+        arity: usize,
+        reg: &RegRegisterSchema,
+    ) -> Result<(), LowerError> {
+        for (index, expected) in param_tys.iter().take(arity).enumerate() {
+            let (actual, role, hint) = match index {
+                0 => (
+                    IrType::UInt(Some((64 - reg.offset.leading_zeros()).max(1))),
+                    format!("its offset {:#x}", reg.offset),
+                    "Widen the helper's address parameter, or move the register to an \
+                     offset that fits it.",
+                ),
+                _ => (
+                    IrType::UInt(Some(reg.width)),
+                    "its value".to_string(),
+                    "Declare the helper's data parameter as an unsigned type at least as \
+                     wide as the register, or narrow the register's `width`.",
+                ),
+            };
+            if crate::ir::verify::assign_compatible(expected, &actual) {
+                continue;
+            }
+            let pname = param_names.get(index).map(String::as_str).unwrap_or("?");
+            return Err(LowerError::Invalid(format!(
+                "register `{}` cannot use regblock `via` {helper} `{method}`: it \
+                 declares parameter {} `{pname}` as {}, but the frontdoor passes {role} as a \
+                 {}. {hint}",
+                reg.name,
+                index + 1,
+                scalar_type_name(expected),
+                scalar_type_name(&actual),
+            )));
+        }
+        Ok(())
     }
 
     /// `Some((binding, register))` when `e` is a two-level
@@ -1185,7 +1455,7 @@ impl super::FuncBuilder<'_> {
     /// source-ordered decoder whose unmatched result is zero.
     pub(crate) fn try_lower_record_read_let(
         &mut self,
-        dest_name: &str,
+        dest: &RalLetDest<'_>,
         value: &crate::ast::Expr,
     ) -> Result<bool, LowerError> {
         let Some((binding, name, args)) = self.as_record_api_call(value) else {
@@ -1224,9 +1494,29 @@ impl super::FuncBuilder<'_> {
                 "regblock binding `{binding}` is not in scope at its record_read site"
             )));
         };
-        let id = self.declare(dest_name);
-        self.set_local_type(id, IrType::UInt(None));
-        let Some(addr_val) = self.const_eval_index(call_arg(&args[0])) else {
+        // An unannotated local keeps the widthless `uint` it always had.
+        // An annotated one is checked against the decoded mirror cell,
+        // which is at most as wide as the widest register (a constant
+        // address names one register exactly).
+        let const_addr = self.const_eval_index(call_arg(&args[0]));
+        let source = dest.declared.as_ref().and_then(|_| {
+            let regs = &self.ctx.regblock_bindings[&binding].registers;
+            const_addr
+                .and_then(|a| regs.iter().find(|r| r.offset == a))
+                .map(|r| r.width)
+                .or_else(|| regs.iter().map(|r| r.width).max())
+                .map(|w| IrType::UInt(Some(w)))
+        });
+        let id = self.declare_ral_read_local(
+            &RalLetDest {
+                name: dest.name,
+                declared: dest.declared.clone().or(Some(IrType::UInt(None))),
+                declared_width: dest.declared_width,
+            },
+            source,
+            &format!("`{binding}.record_read(...)`"),
+        )?;
+        let Some(addr_val) = const_addr else {
             let addr = self.lower_expr_no_ports(call_arg(&args[0]))?;
             if self.record_api_non_scalar(&addr) {
                 return Err(not_implemented(
@@ -1438,6 +1728,7 @@ impl super::FuncBuilder<'_> {
         helper_field: &str,
         method: &str,
         args: Vec<Expr>,
+        reg: &RegRegisterSchema,
     ) -> Result<Expr, LowerError> {
         if let Some(&xid) = self.ctx.transactor_fields.get(helper_field) {
             let schema = &self.ctx.transactors[xid.index()];
@@ -1456,6 +1747,14 @@ impl super::FuncBuilder<'_> {
                     args.len()
                 )));
             }
+            self.check_regblock_helper_args(
+                &format!("helper `{}` method", schema.name),
+                method,
+                &m.param_names,
+                &m.param_tys,
+                args.len(),
+                reg,
+            )?;
             return Ok(Expr::Call(
                 ir::CallTarget::TransactorMethod {
                     bus_field: helper_field.to_string(),
@@ -1493,6 +1792,22 @@ impl super::FuncBuilder<'_> {
                 args.len()
             )));
         }
+        // The same declaration-level check as the transactor helper: a
+        // mismatch here reached the TB-IR verifier as an internal error.
+        let param_names: Vec<String> = m.args.iter().map(|(name, _)| name.name.clone()).collect();
+        let param_tys: Vec<IrType> = m
+            .args
+            .iter()
+            .map(|(_, ty)| super::helpers::ir_type_of(Some(ty)))
+            .collect();
+        self.check_regblock_helper_args(
+            &format!("bus `{}` tlm_method", bus.name.name),
+            method,
+            &param_names,
+            &param_tys,
+            args.len(),
+            reg,
+        )?;
         let logical_bus = bus.name.name.clone();
         let target = match self.bus_origin(helper_field) {
             ir::PortOrigin::BusBinding { binding, field } => self
@@ -1570,6 +1885,17 @@ fn field_extract_expr(word: Expr, fld: &RegFieldSchema) -> Expr {
         kind: ir::WidthCastKind::Sext,
         width: fld.bit_width,
         src_width: Some(fld.bit_width),
+        inner: Box::new(value),
+    }
+}
+
+/// `value as uint<width>`: the relabel an explicit `as uint<W>` cast lowers
+/// to, which types a (masked) register value as the register's own width.
+fn as_register_value(value: Expr, width: u32) -> Expr {
+    Expr::WidthCast {
+        kind: ir::WidthCastKind::Zext,
+        width,
+        src_width: None,
         inner: Box::new(value),
     }
 }

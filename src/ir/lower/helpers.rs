@@ -758,10 +758,32 @@ impl FuncBuilder<'_> {
             .collect();
         let mut lowered = Vec::with_capacity(exprs.len());
         for (index, expr) in exprs.iter().enumerate() {
-            let mut value = if ports_allowed {
-                self.lower_expr(expr)?
+            // A component-typed parameter takes a whole component value. A
+            // component local lowers as an ordinary value below, but a
+            // test-scope component (`x`) or a sub-component path (`h0.c`,
+            // `h.c` inside a method) is not an expression value anywhere
+            // else, so it resolves here through the same resolver a
+            // `let v : T = <path>` copy uses. (It was reported as an
+            // unresolved name / a non-DUT field access.)
+            let component_arg = if matches!(expected[index], IrType::Component(_)) {
+                match self.component_copy_source(expr)? {
+                    Some((
+                        base @ (crate::ir::ComponentBase::Path(_)
+                        | crate::ir::ComponentBase::SelfField
+                        | crate::ir::ComponentBase::LocalPath { .. }),
+                        _,
+                    )) => {
+                        Some(Expr::ComponentValue { base })
+                    }
+                    _ => None,
+                }
             } else {
-                self.lower_expr_no_ports(expr)?
+                None
+            };
+            let mut value = match component_arg {
+                Some(value) => value,
+                None if ports_allowed => self.lower_expr(expr)?,
+                None => self.lower_expr_no_ports(expr)?,
             };
             let hint = match self.check_callable_argument(&value, &expected[index], &slots[index]) {
                 Ok(hint) => hint,
