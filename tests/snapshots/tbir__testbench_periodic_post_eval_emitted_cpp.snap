@@ -59,7 +59,7 @@ struct Sample {
     uint64_t got = 0;
     uint64_t exp = 0;
 };
-inline bool operator==(const Sample& a, const Sample& b) { return a.got == b.got && a.exp == b.exp; }
+inline bool operator==(const Sample& a, const Sample& b) { return harc_rt::harc_eq_width(a.got, b.got, 64) && harc_rt::harc_eq_width(a.exp, b.exp, 64); }
 inline bool operator!=(const Sample& a, const Sample& b) { return !(a == b); }
 
 static harc_rt::HarcWide<4> harc_pack_Sample(const Sample& value) {
@@ -242,6 +242,16 @@ int run_TbReactivePostEval(int argc, char** argv) {
         ctx.errors++;
         _fatal = true;
     });
+    // Runtime arithmetic faults (division/modulo by zero, signed MIN / -1)
+    // fail through the same FATAL path. The test stops at its next yield;
+    // until then later faults (a loop dividing by the same zero) are not
+    // re-reported once the run is already fatal.
+    harc_rt::HarcArithFatalScope _arith_fatal_scope([&](const char* message) {
+        if (_fatal) return;
+        harc_rt::log::harc_log_line(log_ctx.sim_log, &trace, cycle_count, "FATAL", message);
+        ctx.errors++;
+        _fatal = true;
+    });
 
     sim_log_line("INFO", "seed=%llu", (long long)harc_rng.state);
 
@@ -365,7 +375,7 @@ int run_TbReactivePostEval(int argc, char** argv) {
                         ctx.errors++;
                     }
                     if (!((auditor.last_got == 7))) {
-                        sim_log_line("FAIL", "last sampled dut_value=%lld, expected 7", harc_rt::harc_printf_ll(auditor.last_got));
+                        sim_log_line("FAIL", "last sampled dut_value=%llu, expected 7", harc_rt::harc_printf_ull(auditor.last_got));
                         ctx.errors++;
                     }
                     if (!((((uint64_t)collector.samples.size()) == 0))) {

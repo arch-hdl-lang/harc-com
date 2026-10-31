@@ -1669,9 +1669,20 @@ impl FuncBuilder<'_> {
             };
             if let Some(declared) = declared_fixed {
                 if &declared != ret {
+                    // Name what the value actually comes from: this path
+                    // also sees a plain vector local, not only a helper.
+                    let (what, source) = if matches!(
+                        &*super::exprs::unparen_expr(value).kind,
+                        ExprKind::Call { .. }
+                    ) {
+                        ("the helper return", "the helper returns a value that")
+                    } else {
+                        ("its initializer", "the initializer")
+                    };
                     return Err(LowerError::Invalid(format!(
-                        "`let {}` fixed-vector annotation does not match the helper return",
-                        l.name.name
+                        "`let {}` fixed-vector annotation does not match {what}: {}",
+                        l.name.name,
+                        super::exprs::fixed_vec_mismatch_detail(&declared, ret, source)
                     )));
                 }
             } else if l.ty.is_some() {
@@ -6643,8 +6654,13 @@ impl FuncBuilder<'_> {
             if let Some(declared) = declared_fixed {
                 if declared != ty {
                     return Err(LowerError::Invalid(format!(
-                        "`let {}` fixed-vector annotation does not match the testbench method return",
-                        l.name.name
+                        "`let {}` fixed-vector annotation does not match the testbench method return: {}",
+                        l.name.name,
+                        super::exprs::fixed_vec_mismatch_detail(
+                            &declared,
+                            &ty,
+                            "the method's return value"
+                        )
                     )));
                 }
             } else if l.ty.is_some() {

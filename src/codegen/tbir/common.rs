@@ -6290,6 +6290,20 @@ fn render_common_runtime_template(plan: &CommonCppPlan) -> Result<String, EmitEr
     writeln!(out, "{INDENT}{INDENT}ctx.errors++;").ok();
     writeln!(out, "{INDENT}{INDENT}ctx.fatal = true;").ok();
     writeln!(out, "{INDENT}}});").ok();
+    // Runtime arithmetic faults (division/modulo by zero, signed MIN / -1)
+    // fail through the same FATAL path as an empty-queue read. The test
+    // stops at its next yield; until then later faults are not re-reported
+    // once the run is already fatal.
+    writeln!(
+        out,
+        "{INDENT}harc_rt::HarcArithFatalScope arith_fatal_scope([&](const char* message) {{"
+    )
+    .ok();
+    writeln!(out, "{INDENT}{INDENT}if (ctx.fatal) return;").ok();
+    writeln!(out, "{INDENT}{INDENT}harc_rt::log::harc_log_line(ctx.log_ctx.sim_log, &ctx.trace, ctx.cycle_count, \"FATAL\", message);").ok();
+    writeln!(out, "{INDENT}{INDENT}ctx.errors++;").ok();
+    writeln!(out, "{INDENT}{INDENT}ctx.fatal = true;").ok();
+    writeln!(out, "{INDENT}}});").ok();
     writeln!(out).ok();
     writeln!(out, "{INDENT}ctx.scheduler.slots.push_back(&ctx.run_slot);").ok();
     writeln!(out, "{INDENT}void* run_state = test.create_state(ctx);").ok();

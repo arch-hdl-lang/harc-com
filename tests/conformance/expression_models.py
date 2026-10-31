@@ -78,8 +78,25 @@ def shape(e):
               max(a.width, b.width), a.boolean and b.boolean)
 
 
-def interpret(e, env, word=WORD):
-    """64-bit carrier semantics; `word=w` supplies typed-SMT BV semantics."""
+def normalize(bits, ty):
+    """The `ty.width`-bit value of a bit pattern, in a 64-bit carrier.
+
+    `as uint<W>` keeps the low W bits; `as sint<W>` also sign-extends from
+    bit W - 1 (spec section 2, runtime casts; the constant folder agrees).
+    """
+    low = bits & mask(ty.width)
+    if ty.signed and ty.width and low >> (ty.width - 1):
+        low -= 1 << ty.width
+    return low & mask(WORD)
+
+
+def interpret(e, env, word=WORD, legacy_casts=False):
+    """64-bit carrier semantics; `word=w` supplies typed-SMT BV semantics.
+
+    `legacy_casts` models the deprecated `--codegen v1` backend, whose casts
+    are carrier relabels that leave the 64-bit value unchanged. TB-IR (the
+    language) gives a cast the target-width value.
+    """
     ty = shape(e)
     if e.op == 'lit':
         return Value(e.data & mask(word), ty)
@@ -88,8 +105,11 @@ def interpret(e, env, word=WORD):
     if e.op == 'var':
         return Value(env[e.data[0]] & mask(word), ty)
     if e.op == 'cast':
-        return Value(interpret(e.args[0], env, word).bits, ty)
-    a = interpret(e.args[0], env, word)
+        inner = interpret(e.args[0], env, word, legacy_casts).bits
+        if legacy_casts or word != WORD:
+            return Value(inner, ty)
+        return Value(normalize(inner, ty), ty)
+    a = interpret(e.args[0], env, word, legacy_casts)
     # Laziness is part of the interpreter, including branches with no value.
     if e.op == '&&' and a.bits == 0:
         return Value(0, B)
@@ -97,12 +117,12 @@ def interpret(e, env, word=WORD):
         return Value(1, B)
     if e.op == '?:':
         chosen = e.args[1] if a.bits else e.args[2]
-        return Value(interpret(chosen, env, word).bits, ty)
+        return Value(interpret(chosen, env, word, legacy_casts).bits, ty)
     if e.op in ('neg', '~', '!'):
         value = {'neg': lambda: -a.number(word), '~': lambda: ~a.bits,
                  '!': lambda: int(a.bits == 0)}[e.op]()
     else:
-        b = interpret(e.args[1], env, word)
+        b = interpret(e.args[1], env, word, legacy_casts)
         signed = a.ty.signed and b.ty.signed
         x, y = (a.number(word), b.number(word)) if signed else (a.bits, b.bits)
         if e.op in ('/', '%'):
@@ -215,10 +235,13 @@ def generate_expressions(root, seed, expressions=None):
     expressions = trees(seed) if expressions is None else expressions
     environments = [dict(x=-7, y=3, u=5), dict(x=0, y=-2, u=0),
                     dict(x=7, y=1, u=15), dict(x=-1, y=0, u=1)]
-    constants, body, expected, cases = [], '', {}, []
+    constants, body, expected, expected_v1, cases = [], '', {}, {}, []
     for ei, e in enumerate(expressions):
         for vi, env in enumerate(environments):
             want = interpret(e, env)
+            # The deprecated v1 backend keeps relabel casts; it is checked
+            # against that model, the language (TB-IR) against `want`.
+            want_v1 = interpret(e, env, legacy_casts=True)
             for variant in range(2):
                 key = f'e{ei:03d}v{vi}p{variant}'
                 const_names, local_names = {}, {}
@@ -239,12 +262,14 @@ def generate_expressions(root, seed, expressions=None):
                     identity = key + context
                     expr = value if width == 1 else f'({value} as uint<64>)'
                     expected[identity] = [want.bits, width]
+                    expected_v1[identity] = [want_v1.bits, width]
                     body += observe(identity, expr, width)
                 cases.append({'id': key, 'tree': dataclasses.asdict(e), 'environment': env,
                               'source': runtime, 'expected': want.bits, 'width': width})
     assert expressions and len(expected) == len(expressions) * len(environments) * 4
     (root/'expressions.harc').write_text(''.join(constants) + test('Expressions', body))
     (root/'expression_expected.json').write_text(json.dumps(expected, indent=2))
+    (root/'expression_expected_v1.json').write_text(json.dumps(expected_v1, indent=2))
     (root/'expression_cases.json').write_text(json.dumps(cases, indent=2))
 
 
@@ -382,7 +407,7 @@ def generate_models(root):
                     p{p.id}.x == px
                     p{p.id}.y == py
                 end randomize
-                log(info, "MODEL_END {p.id} ${{ax}} ${{by}} ${{p{p.id}.x:016x}} ${{p{p.id}.y:016x}}")
+                log(info, "MODEL_END {p.id} ${{ax}} ${{by}} ${{(p{p.id}.x as uint<64>):016x}} ${{(p{p.id}.y as uint<64>):016x}}")
             end for
         end for
 '''
@@ -452,8 +477,9 @@ def compare_models(label, actual, expected):
 
 
 def native_expressions(root, harc, backends=('v1', 'tbir')):
-    expected = json.loads((root/'expression_expected.json').read_text())
     for backend in backends:
+        name = 'expression_expected_v1.json' if backend == 'v1' else 'expression_expected.json'
+        expected = json.loads((root/name).read_text())
         code, output = run([harc, 'sim', root/'expressions.harc', '--sv', root/'dut.sv', '--top', 'Top',
                             '--codegen', backend, '--seed', '1', '--jobs', '2', '--outdir', root/f'expressions_{backend}'], root, 240, env={**os.environ, 'HARC_NO_LEARN': '1'})
         (root/f'expressions_{backend}.log').write_text(output)
@@ -529,7 +555,7 @@ end transaction S8
             !((b.x < 0) != flag)
             flag
         end randomize
-        log(info, "RANK_END B ${b.x:016x}")
+        log(info, "RANK_END B ${(b.x as uint<64>):016x}")
         log(info, "RANK_BEGIN C")
         blocking randomize(c) with
             c.x == -1
@@ -558,7 +584,14 @@ end transaction S8
 def self_test():
     assert interpret(Node('/', (lit(-5), lit(3))), {}).number() == -1
     assert interpret(Node('%', (lit(-5), lit(3))), {}).number() == -2
-    assert interpret(cast(lit(-1), Ty(False, 8)), {}).bits == mask(64), 'cast relabel must not truncate'
+    # A cast is the target-width value: `-1 as uint<8>` is 255, `0xFC as
+    # sint<8>` is -4, `-1 as uint<64>` is all ones; only v1 relabels.
+    assert interpret(cast(lit(-1), Ty(False, 8)), {}).bits == 0xFF, 'uint cast must mask'
+    assert interpret(cast(lit(0xFC), Ty(True, 8)), {}).number() == -4, 'sint cast must sign-extend'
+    assert interpret(cast(lit(0x1FC), Ty(True, 8)), {}).number() == -4, 'narrowing sint cast'
+    assert interpret(cast(lit(-1), Ty(False, 64)), {}).bits == mask(64)
+    assert interpret(cast(lit(-1), Ty(False, 8)), {}, legacy_casts=True).bits == mask(64), \
+        'v1 cast relabel must not truncate'
     assert interpret(Node('+%', (cast(lit(255), Ty(False, 8)), cast(lit(1), Ty(False, 8)))), {}).bits == 0
     bad = Node('/', (lit(1), lit(0)))
     assert interpret(Node('?:', (Node('bool', data=True), lit(7), bad)), {}).bits == 7

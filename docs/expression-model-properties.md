@@ -23,7 +23,11 @@ shift counts are valid and left shifts use unsigned operands. Generated
 complements explicitly use uint64 operands: file constants complement the
 64-bit carrier, while TBIR runtime complement masks to declared width. Narrow
 complement is therefore outside this shared-context equivalence domain. Casts through
-64 bits follow the language's carrier-preserving relabel semantics. This suite
+64 bits produce the target-width value (`as uint<W>` keeps the low `W` bits,
+`as sint<W>` also sign-extends from bit `W - 1`), in runtime code and in file
+constants alike. The deprecated `--codegen v1` backend still relabels the
+64-bit carrier, so its run is checked against a separate relabel model
+(`expression_expected_v1.json`) generated from the same trees. This suite
 does not claim coverage of arbitrary wide arithmetic or undefined inputs.
 
 Model families cover equality, ordering, ordering partition, bitwise subset,
@@ -36,7 +40,8 @@ The chosen predicates have the same model set in both domains.
 
 Every native assignment is pinned by a blocking constraint using runtime loop
 locals. SAT results must preserve the full normalized 64-bit values of those
-pins. Missing queries, duplicates, unknown solver results, wrong field values,
+pins, observed as `(field as uint<64>)` (a hex capture of a narrow `sint`
+prints only its declared-width pattern). Missing queries, duplicates, unknown solver results, wrong field values,
 and either extra or missing models fail the test. Out-of-domain pins must be
 UNSAT. Native simulation deliberately reports excluded assignments as UNSAT;
 the harness requires all query markers and exact sets rather than treating a

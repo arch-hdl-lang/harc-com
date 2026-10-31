@@ -5,7 +5,6 @@ use crate::ir::{
     BinOp, CallTarget, Expr, FmtArg, FunctionId, PortRef, TbFunction, UnOp, WidthCastKind,
 };
 use std::collections::{BTreeSet, HashMap};
-use std::fmt::Write as _;
 
 #[derive(Clone, Debug)]
 pub(super) struct TestbenchComponentRenderBinding {
@@ -1192,8 +1191,26 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                 }
                 (a_cpp, b_cpp) = coerce_unsigned_wide_pair(cx, a, b, a_cpp, b_cpp);
             }
-            let shift_count = shift_count_cpp(cx, b, &b_cpp, a_width.unwrap_or(64));
-            let wide_shift_count = expr_static_width(cx, b).is_some_and(|width| width > 64);
+            // A shift does not widen: its result keeps the left operand's
+            // declared width W (ARCH / IEEE 1800 §11.6.1), so a count >= W
+            // shifts every bit out — `<<` and logical `>>` give 0, an
+            // arithmetic `>>` the sign fill — and a narrow `<<` drops the
+            // bits shifted past W. The > 64-bit tiers' helpers already mask
+            // to W. Below 64 bits W is used only when the left operand's
+            // width is exact (`shift_declared_width`); a width-erased or
+            // arithmetic left operand shifts in its 64-bit carrier.
+            let narrow_width = shift_declared_width(cx, a).filter(|w| *w < 64);
+            let shift_limit = match narrow_width {
+                Some(w) => w,
+                None => a_width.filter(|w| *w > 64).unwrap_or(64),
+            };
+            let shift_count = shift_count_cpp(cx, b, &b_cpp, shift_limit);
+            // A literal count below 64 cannot reach the saturation case, so
+            // the 64-bit tier keeps the plain C++ shift for it.
+            let small_literal_count = matches!(
+                &**b,
+                Expr::Literal { value, ty } if *value < 64 && !matches!(ty, crate::ir::IrType::SInt(_))
+            );
             match op {
                 BinOp::And => format!(
                     "({} && {})",
@@ -1213,13 +1230,20 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                     let width = a_width.unwrap();
                     format!("harc_rt::harc_shl_u128((_harc_u128)({a_cpp}), (uint64_t)({shift_count}), {width})")
                 }
-                BinOp::Shl if wide_shift_count => {
-                    let width = a_width.unwrap_or(64);
-                    format!(
-                        "((uint64_t)harc_rt::harc_shl_u128((_harc_u128)((uint64_t)({a_cpp})), {shift_count}, {width}))"
-                    )
+                BinOp::Shl if narrow_width.is_some() => {
+                    let width = narrow_width.expect("checked");
+                    if a_signed {
+                        format!("harc_rt::harc_shl_iw((int64_t)({a_cpp}), (uint64_t)({shift_count}), {width})")
+                    } else {
+                        format!("harc_rt::harc_shl_uw((uint64_t)({a_cpp}), (uint64_t)({shift_count}), {width})")
+                    }
                 }
-                BinOp::Shl => format!("(((uint64_t)({a_cpp})) << {shift_count})"),
+                BinOp::Shl if small_literal_count => {
+                    format!("(((uint64_t)({a_cpp})) << {shift_count})")
+                }
+                BinOp::Shl => format!(
+                    "harc_rt::harc_shl_u64((uint64_t)({a_cpp}), (uint64_t)({shift_count}))"
+                ),
                 BinOp::Shr if a_width.is_some_and(|w| w > 128) && a_signed => {
                     let width = a_width.unwrap();
                     format!("harc_rt::harc_wide_ashr(({a_cpp}), {shift_count}, {width})")
@@ -1238,30 +1262,57 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                     let width = a_width.unwrap();
                     format!("harc_rt::harc_shr_u128((_harc_u128)({a_cpp}), (uint64_t)({shift_count}), {width})")
                 }
-                BinOp::Shr if a_signed && wide_shift_count => {
-                    let width = a_width.unwrap_or(64);
-                    format!(
-                        "((int64_t)harc_rt::harc_ashr_u128((_harc_u128)((uint64_t)({a_cpp})), {shift_count}, {width}))"
-                    )
-                }
-                BinOp::Shr if wide_shift_count => {
-                    let width = a_width.unwrap_or(64);
-                    format!(
-                        "((uint64_t)harc_rt::harc_shr_u128((_harc_u128)((uint64_t)({a_cpp})), {shift_count}, {width}))"
-                    )
-                }
-                BinOp::Shr if a_signed => {
+                BinOp::Shr if a_signed && small_literal_count => {
                     format!("(((int64_t)({a_cpp})) >> {shift_count})")
                 }
-                BinOp::Shr => format!("(((uint64_t)({a_cpp})) >> {shift_count})"),
+                BinOp::Shr if small_literal_count => {
+                    format!("(((uint64_t)({a_cpp})) >> {shift_count})")
+                }
+                BinOp::Shr if narrow_width.is_some() => {
+                    let width = narrow_width.expect("checked");
+                    if a_signed {
+                        format!("harc_rt::harc_ashr_iw((int64_t)({a_cpp}), (uint64_t)({shift_count}), {width})")
+                    } else {
+                        format!("harc_rt::harc_shr_uw((uint64_t)({a_cpp}), (uint64_t)({shift_count}), {width})")
+                    }
+                }
+                BinOp::Shr if a_signed => format!(
+                    "harc_rt::harc_ashr_i64((int64_t)({a_cpp}), (uint64_t)({shift_count}))"
+                ),
+                BinOp::Shr => format!(
+                    "harc_rt::harc_shr_u64((uint64_t)({a_cpp}), (uint64_t)({shift_count}))"
+                ),
+                BinOp::Div | BinOp::Mod if a_signed && b_signed => {
+                    // Signed <= 64-bit (the wide tiers returned above):
+                    // fatal on a zero divisor and on MIN / -1 at the
+                    // operation's declared width. Like a shift, that width
+                    // is the dividend's only when the dividend's width is
+                    // exact (`shift_declared_width`) — widened by an exact
+                    // divisor's; a width-erased dividend (`(x + y) / m`)
+                    // divides in the 64-bit carrier, where only INT64_MIN
+                    // overflows.
+                    let width = shift_declared_width(cx, a)
+                        .map(|aw| aw.max(shift_declared_width(cx, b).unwrap_or(0)))
+                        .unwrap_or(64)
+                        .min(64);
+                    let helper = if matches!(op, BinOp::Div) {
+                        "harc_sdiv_i64"
+                    } else {
+                        "harc_smod_i64"
+                    };
+                    format!("harc_rt::{helper}((int64_t)({a_cpp}), (int64_t)({b_cpp}), {width})")
+                }
+                BinOp::Div => format!("harc_rt::harc_checked_div({a_cpp}, {b_cpp})"),
+                BinOp::Mod => format!("harc_rt::harc_checked_mod({a_cpp}, {b_cpp})"),
                 _ => format!("({a_cpp} {} {b_cpp})", bin_op_cpp(*op)),
             }
         }
         Expr::Unary(op, a) => {
             let width = expr_static_width(cx, a);
+            let signed = expr_is_signed(cx, a);
             let a = expr_cpp(cx, a)?;
             match op {
-                UnOp::BitNot => bit_not_cpp(&a, width),
+                UnOp::BitNot => bit_not_cpp(&a, width, signed),
                 UnOp::BitNotHost => format!("~({a})"),
                 UnOp::Neg if width.is_some_and(|w| w > 128) => {
                     let width = width.unwrap();
@@ -1916,7 +1967,15 @@ fn width_cast_cpp(
         WidthCastKind::Trunc => trunc_shape(&e),
         WidthCastKind::Zext => zext_shape(&e),
         WidthCastKind::Sext => match src_width {
-            Some(sw) if sw < width => {
+            // `sw == width` is the `as sint<W>` cast: take the low `W` bits
+            // and sign-extend from bit `W - 1` (a 64-bit tier value; the
+            // 65..128 tier masks to the declared width, which is the
+            // normalized representation every signed wide op reads).
+            Some(sw) if sw == width && width > 64 => {
+                format!("harc_rt::harc_trunc_u128((_harc_u128)({e}), {width})")
+            }
+            Some(64) if width == 64 => format!("((int64_t)((uint64_t)({e})))"),
+            Some(sw) if sw <= width => {
                 if width > 64 {
                     format!("harc_rt::harc_sext_u128((_harc_u128)({e}), {sw}, {width})")
                 } else {
@@ -1947,26 +2006,134 @@ fn width_cast_cpp(
     })
 }
 
-/// Render one pre-parsed `${...}` capture as a printf argument,
-/// mirroring v1's `emit_interp_arg` (long-long ABI or wide-hex helper).
-pub(super) fn fmt_arg_cpp(cx: &ECx<'_>, arg: &FmtArg) -> Result<String, EmitError> {
-    let inner = expr_cpp(cx, &arg.expr)?;
-    let mut out = String::new();
-    match arg.wide_hex {
-        Some((width, upper)) => {
-            let upper_str = if upper { "true" } else { "false" };
-            let helper = if width > 32 {
-                "harc_rt::HarcHexBufWide"
-            } else {
-                "harc_rt::HarcHexBuf128"
-            };
-            write!(out, "(const char*){helper}({inner}, {width}, {upper_str})").ok();
+/// Render a whole interpolated message: the printf format string and one
+/// rendered argument per `${...}` capture, mirroring v1's
+/// `emit_interp_arg` (long-long ABI or wide-hex helper) with two
+/// type-directed corrections:
+///
+/// - a decimal capture (`%lld`) of an UNSIGNED value of 64 bits or more
+///   prints as `%llu`, so a `uint<64>` at or above 2^63 reads as the
+///   unsigned number it is rather than a negative one;
+/// - a hex/octal capture of a SIGNED value of declared width `N` prints the
+///   `N`-bit two's-complement pattern, so `${s:x}` of a `sint<16>` holding
+///   -1 is `ffff`, not the 64-bit carrier's sixteen `f`s.
+///
+/// The conversion tokens are paired with the captures in order; a format
+/// string whose conversions do not line up one-to-one with the captures is
+/// emitted unchanged.
+pub(super) fn fmt_args_cpp(
+    cx: &ECx<'_>,
+    args: &crate::ir::FmtArgs,
+) -> Result<(String, Vec<String>), EmitError> {
+    let tokens = printf_conversion_spans(&args.fmt);
+    let aligned = tokens.len() == args.args.len();
+    let mut fmt = String::with_capacity(args.fmt.len());
+    let mut rendered = Vec::with_capacity(args.args.len());
+    let mut cursor = 0;
+    for (index, arg) in args.args.iter().enumerate() {
+        let span = aligned.then(|| tokens[index]);
+        let token = span.map(|(start, end)| &args.fmt[start..end]);
+        let (value, unsigned_decimal) = fmt_arg_value_cpp(cx, arg, token)?;
+        if let (true, Some((start, end))) = (unsigned_decimal, span) {
+            let token = &args.fmt[start..end];
+            fmt.push_str(&args.fmt[cursor..start]);
+            fmt.push_str(&token[..token.len() - 3]);
+            fmt.push_str("llu");
+            cursor = end;
         }
-        None => {
-            write!(out, "harc_rt::harc_printf_ll({inner})").ok();
-        }
+        rendered.push(value);
     }
-    Ok(out)
+    fmt.push_str(&args.fmt[cursor..]);
+    Ok((fmt, rendered))
+}
+
+/// Byte spans of the printf conversions in `fmt` (a `%%` escape is not a
+/// conversion).
+fn printf_conversion_spans(fmt: &str) -> Vec<(usize, usize)> {
+    let bytes = fmt.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        if bytes.get(i + 1) == Some(&b'%') {
+            i += 2;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+        while i < bytes.len() && matches!(bytes[i], b'l' | b'h' | b'z' | b'j' | b't') {
+            i += 1;
+        }
+        if i < bytes.len() {
+            i += 1;
+        }
+        spans.push((start, i));
+    }
+    spans
+}
+
+/// Render one capture. Returns the argument and whether its `%lld` token
+/// must become `%llu`.
+fn fmt_arg_value_cpp(
+    cx: &ECx<'_>,
+    arg: &FmtArg,
+    token: Option<&str>,
+) -> Result<(String, bool), EmitError> {
+    let inner = expr_cpp(cx, &arg.expr)?;
+    let is_literal = matches!(arg.expr, Expr::Literal { .. } | Expr::WideLiteral(_));
+    let width = if is_literal {
+        None
+    } else {
+        expr_static_width(cx, &arg.expr)
+    };
+    let signed = !is_literal && expr_is_signed(cx, &arg.expr);
+    // The declared-width bit pattern of a signed value, for the radix
+    // conversions that show bits rather than a number.
+    let signed_pattern = |inner: &str| -> String {
+        match width {
+            Some(w) if signed && w < 64 => {
+                format!("((uint64_t)(((uint64_t)({inner})) & 0x{:X}ULL))", (1u64 << w) - 1)
+            }
+            Some(64) if signed => format!("((uint64_t)({inner}))"),
+            Some(w) if signed && w <= 128 => {
+                format!("harc_rt::harc_trunc_u128((_harc_u128)({inner}), {w})")
+            }
+            Some(w) if signed => format!("harc_rt::harc_wide_mask_bits({inner}, {w})"),
+            _ => inner.to_string(),
+        }
+    };
+    if let Some((digits, upper)) = arg.wide_hex {
+        let upper_str = if upper { "true" } else { "false" };
+        let helper = if digits > 32 {
+            "harc_rt::HarcHexBufWide"
+        } else {
+            "harc_rt::HarcHexBuf128"
+        };
+        let value = signed_pattern(&inner);
+        return Ok((
+            format!("(const char*){helper}({value}, {digits}, {upper_str})"),
+            false,
+        ));
+    }
+    let unsigned_wide_decimal = token.is_some_and(|t| t.ends_with("lld"))
+        && !signed
+        && width.is_some_and(|w| w >= 64);
+    if unsigned_wide_decimal {
+        return Ok((format!("harc_rt::harc_printf_ull({inner})"), true));
+    }
+    match token.and_then(|t| t.chars().last()) {
+        Some('x' | 'X' | 'o') => Ok((
+            format!("harc_rt::harc_printf_ll({})", signed_pattern(&inner)),
+            false,
+        )),
+        _ => Ok((format!("harc_rt::harc_printf_ll({inner})"), false)),
+    }
 }
 
 fn bin_op_cpp(op: BinOp) -> &'static str {
@@ -2042,16 +2209,16 @@ fn signed_wide_binary_cpp(
     let (lt, div, rem) = if width > 128 {
         (
             format!("harc_rt::harc_wide_slt({a_cpp}, {b_cpp}, {width})"),
-            format!("harc_rt::harc_wide_sdiv({a_cpp}, {b_cpp}, {width})"),
-            format!("harc_rt::harc_wide_smod({a_cpp}, {b_cpp}, {width})"),
+            format!("harc_rt::harc_wide_sdiv_checked({a_cpp}, {b_cpp}, {width})"),
+            format!("harc_rt::harc_wide_smod_checked({a_cpp}, {b_cpp}, {width})"),
         )
     } else {
         let a_u = format!("(_harc_u128)({a_cpp})");
         let b_u = format!("(_harc_u128)({b_cpp})");
         (
             format!("harc_rt::harc_slt_u128({a_u}, {b_u}, {width})"),
-            format!("harc_rt::harc_sdiv_u128({a_u}, {b_u}, {width})"),
-            format!("harc_rt::harc_smod_u128({a_u}, {b_u}, {width})"),
+            format!("harc_rt::harc_sdiv_u128_checked({a_u}, {b_u}, {width})"),
+            format!("harc_rt::harc_smod_u128_checked({a_u}, {b_u}, {width})"),
         )
     };
     // `lt(x, y)` is `x < y`; the reversed and negated spellings give the
@@ -2333,6 +2500,18 @@ pub(super) fn scalar_assignment_expr_cpp(
         | Expr::Unary(UnOp::Not, _) => false,
         _ => expr_is_signed(cx, value),
     };
+    // A width-erased value (no static width: arithmetic over an untyped
+    // loop variable or `let`, say) lives in a 64-bit host carrier. Widened
+    // into a signed destination wider than 64 bits it sign-extends from
+    // bit 63, exactly as it would into a `sint<N>` of 64 bits or fewer
+    // (where the `int64_t` carrier already holds it sign-extended): `0 - i`
+    // with `i == 4` is -4 in a `sint<70>`, not 2^64 - 4.
+    let (source_width, source_signed) =
+        if matches!(destination, crate::ir::IrType::SInt(_)) && source_width.is_none() {
+            (Some(64), true)
+        } else {
+            (source_width, source_signed)
+        };
     if *target_width <= 128 {
         if *target_width > 64
             && source_signed
@@ -2382,6 +2561,52 @@ fn shift_lhs_width(cx: &ECx<'_>, lhs: &Expr) -> Option<u32> {
     expr_shift_width(cx, lhs)
 }
 
+/// The left operand's declared width when it is exact — the width the
+/// value is known to have, not an upper bound or a carrier width. A typed
+/// local, field, cast, width method or slice has one; so do `~`, bitwise
+/// `& | ^` of exact operands (width-less literals take the other side's
+/// width) and a nested shift. A bare DUT-port read is width-erased in HARC
+/// (spec §2, `+%`), and the result width of `+ - * / %` and unary `-` is not
+/// tracked here, so those shift in the 64-bit carrier. A `bool` is not a
+/// bit-vector operand.
+fn shift_declared_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
+    let is_untyped_literal =
+        |e: &Expr| matches!(e, Expr::Literal { ty: crate::ir::IrType::Unknown, .. });
+    match e {
+        Expr::Literal { ty, .. } => match ty {
+            crate::ir::IrType::UInt(Some(w)) | crate::ir::IrType::SInt(Some(w)) => Some(*w),
+            _ => None,
+        },
+        Expr::Port(_) | Expr::PortSnapshotLane { .. } => None,
+        Expr::Binary(BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor, a, b) => {
+            match (is_untyped_literal(a), is_untyped_literal(b)) {
+                (true, true) => None,
+                (true, false) => shift_declared_width(cx, b),
+                (false, true) => shift_declared_width(cx, a),
+                (false, false) => {
+                    let (aw, bw) = (shift_declared_width(cx, a)?, shift_declared_width(cx, b)?);
+                    Some(aw.max(bw))
+                }
+            }
+        }
+        Expr::Binary(BinOp::Shl | BinOp::Shr, a, _) => shift_declared_width(cx, a),
+        Expr::Binary(..) => None,
+        Expr::Unary(UnOp::BitNot, inner) => shift_declared_width(cx, inner),
+        Expr::Unary(..) => None,
+        Expr::Ternary(_, t, f) => {
+            let (tw, fw) = (shift_declared_width(cx, t)?, shift_declared_width(cx, f)?);
+            (tw == fw).then_some(tw)
+        }
+        Expr::BitSlice { hi, lo, .. } => Some(hi - lo + 1),
+        Expr::WidthCast { width, .. } => Some(*width),
+        Expr::Local(id) => match local_ir_type(cx, *id) {
+            Some(crate::ir::IrType::UInt(Some(w)) | crate::ir::IrType::SInt(Some(w))) => Some(*w),
+            _ => None,
+        },
+        _ => expr_static_width(cx, e),
+    }
+}
+
 fn shift_count_cpp(cx: &ECx<'_>, rhs: &Expr, rendered: &str, limit: u32) -> String {
     match expr_static_width(cx, rhs) {
         Some(width) if width > 128 => {
@@ -2402,8 +2627,12 @@ fn un_op_cpp(op: UnOp) -> &'static str {
     }
 }
 
-fn bit_not_cpp(e: &str, width: Option<u32>) -> String {
+fn bit_not_cpp(e: &str, width: Option<u32>, signed: bool) -> String {
     match width {
+        // A `sint<N>` (N < 64) is a sign-extended VALUE in its `int64_t`
+        // carrier, so the complement of that carrier is already the
+        // sign-extended N-bit complement: `~sint<8>(5)` is -6, not 250.
+        Some(w) if w < 64 && signed => format!("((int64_t)(~((int64_t)({e}))))"),
         Some(w) if w < 64 => {
             let mask = (1u64 << w) - 1;
             format!("((uint64_t)((~({e}) & 0x{mask:X}ULL)))")

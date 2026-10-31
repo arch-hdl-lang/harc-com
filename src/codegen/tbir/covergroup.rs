@@ -463,8 +463,16 @@ fn cover_binary_cpp(
         // and incorrectly perform an unshifted operation. v1 evaluates
         // <=64-bit cover shifts in its uint64_t/int64_t host carrier (so a
         // one-bit `en << 1` produces 2); wider values keep their HARC width.
+        // A shift keeps its left operand's declared width (spec §2). Below 64
+        // bits that width is used when it is exact — a cast, width method or
+        // slice; a DUT port read is width-erased and shifts in the 64-bit
+        // carrier, as in procedural code.
+        let narrow = matches!(lhs, Expr::WidthCast { .. } | Expr::BitSlice { .. })
+            .then_some(lhs_width)
+            .flatten()
+            .filter(|w| *w < 64);
         let lhs_width = lhs_width.unwrap_or(64);
-        let shift_width = lhs_width.max(64);
+        let shift_width = narrow.unwrap_or(lhs_width.max(64));
         let shift_count = match rhs_width {
             Some(width) if width > 128 => {
                 format!("harc_rt::harc_wide_shift_count(({rhs_cpp}), {shift_width})")
@@ -474,6 +482,18 @@ fn cover_binary_cpp(
             }
             _ => format!("harc_rt::harc_u64_shift_count((uint64_t)({rhs_cpp}), {shift_width})"),
         };
+        if let Some(width) = narrow {
+            let helper = match (op, lhs_signed) {
+                (BinOp::Shl, false) => "harc_shl_uw",
+                (BinOp::Shl, true) => "harc_shl_iw",
+                (_, false) => "harc_shr_uw",
+                (_, true) => "harc_ashr_iw",
+            };
+            let carrier = if lhs_signed { "int64_t" } else { "uint64_t" };
+            return Ok(format!(
+                "harc_rt::{helper}(({carrier})({lhs_cpp}), {shift_count}, {width})"
+            ));
+        }
         return Ok(match lhs_width {
             width if width > 128 => {
                 let lhs = cover_coerce_cpp(lhs_cpp, Some(width), width, lhs_signed);
@@ -530,16 +550,49 @@ fn cover_binary_cpp(
                 BinOp::Gt => less(&rhs_cpp, &lhs_cpp),
                 BinOp::Ge => format!("(!{})", less(&lhs_cpp, &rhs_cpp)),
                 BinOp::Div if width > 128 => {
-                    format!("harc_rt::harc_wide_sdiv({lhs_cpp}, {rhs_cpp}, {width})")
+                    format!("harc_rt::harc_wide_sdiv_checked({lhs_cpp}, {rhs_cpp}, {width})")
                 }
                 BinOp::Mod if width > 128 => {
-                    format!("harc_rt::harc_wide_smod({lhs_cpp}, {rhs_cpp}, {width})")
+                    format!("harc_rt::harc_wide_smod_checked({lhs_cpp}, {rhs_cpp}, {width})")
                 }
-                BinOp::Div => format!("harc_rt::harc_sdiv_u128({lhs_cpp}, {rhs_cpp}, {width})"),
-                BinOp::Mod => format!("harc_rt::harc_smod_u128({lhs_cpp}, {rhs_cpp}, {width})"),
+                BinOp::Div => format!("harc_rt::harc_sdiv_u128_checked({lhs_cpp}, {rhs_cpp}, {width})"),
+                BinOp::Mod => format!("harc_rt::harc_smod_u128_checked({lhs_cpp}, {rhs_cpp}, {width})"),
                 _ => format!("({lhs_cpp} {} {rhs_cpp})", cover_bin_op_cpp(op)),
             });
         }
+    }
+    // Division and modulo fault (zero divisor, signed MIN / -1) through the
+    // runtime's checked helpers, as in procedural code.
+    match op {
+        BinOp::Div | BinOp::Mod if common_signed => {
+            // The MIN / -1 width follows procedural code: the dividend's
+            // width when it is exact (a cast, width method or slice; a DUT
+            // port is width-erased), widened by an exact divisor's, else
+            // the 64-bit carrier. `cover_common_width` is NOT used here: it
+            // lets a known width stand in for an unknown one, which would
+            // fault on a width-erased dividend that merely equals the
+            // divisor width's MIN.
+            let exact = |e: &Expr, w: Option<u32>| {
+                matches!(e, Expr::WidthCast { .. } | Expr::BitSlice { .. })
+                    .then_some(w)
+                    .flatten()
+            };
+            let width = exact(lhs, lhs_width)
+                .map(|lw| lw.max(exact(rhs, rhs_width).unwrap_or(0)))
+                .unwrap_or(64)
+                .min(64);
+            let helper = if matches!(op, BinOp::Div) {
+                "harc_sdiv_i64"
+            } else {
+                "harc_smod_i64"
+            };
+            return Ok(format!(
+                "harc_rt::{helper}((int64_t)({lhs_cpp}), (int64_t)({rhs_cpp}), {width})"
+            ));
+        }
+        BinOp::Div => return Ok(format!("harc_rt::harc_checked_div({lhs_cpp}, {rhs_cpp})")),
+        BinOp::Mod => return Ok(format!("harc_rt::harc_checked_mod({lhs_cpp}, {rhs_cpp})")),
+        _ => {}
     }
     Ok(format!("({lhs_cpp} {} {rhs_cpp})", cover_bin_op_cpp(op)))
 }
@@ -956,7 +1009,14 @@ fn cover_width_cast_cpp(
         WidthCastKind::Trunc => trunc_shape(&e),
         WidthCastKind::Zext => zext_shape(&e),
         WidthCastKind::Sext => match src_width {
-            Some(sw) if sw < width => {
+            // `sw == width` is the `as sint<W>` cast: take the low `W` bits
+            // and sign-extend from bit `W - 1` (a 64-bit tier value; the
+            // 65..128 tier masks to the declared width, which is the
+            // normalized representation every signed wide op reads).
+            Some(sw) if sw == width && width > 64 => {
+                format!("harc_rt::harc_trunc_u128((_harc_u128)({e}), {width})")
+            }
+            Some(sw) if sw <= width => {
                 if width > 64 {
                     format!("harc_rt::harc_sext_u128((_harc_u128)({e}), {sw}, {width})")
                 } else {

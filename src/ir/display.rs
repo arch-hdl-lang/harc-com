@@ -642,6 +642,11 @@ fn kind_str(k: &FunctionKind) -> String {
     }
 }
 
+/// Debug spelling of an IR type (the `dump-ir` form).
+pub(crate) fn ir_type_str(t: &IrType) -> String {
+    type_str(t)
+}
+
 fn type_str(t: &IrType) -> String {
     match t {
         IrType::UInt(Some(w)) => format!("uint<{w}>"),

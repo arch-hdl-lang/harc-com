@@ -826,32 +826,22 @@ fn lower_point_target(
                         ..
                     }
                 );
-                let src_width = if signed {
-                    Some(width)
-                } else {
-                    cover_infer_expr_width(group, point, expr, consts, hook_params)?
-                };
                 return Ok(Expr::WidthCast {
-                    // Like the general expression path, `as sint<W>` is
-                    // a signedness relabel rather than a value-changing
-                    // sign extension. `Sext` carries the signed marker;
-                    // `src_width = W` prevents the emitter from filling.
-                    //
-                    // `as uint<W>` / `as bits<W>` keeps the low `W` bits.
-                    // With no inferable source width that is the emitter's
-                    // mask-to-`W` shape for both `Trunc` and `Resize`; it is
-                    // recorded as `Trunc` so a `Resize` with no source width
-                    // always means the `.resize<N>()` METHOD, whose
-                    // signedness the emitter settles once hook-parameter
-                    // and DUT-port types are bound (`late_signed_resize_source`
-                    // in `codegen/tbir/covergroup.rs`).
-                    kind: match (signed, src_width) {
-                        (true, _) => WidthCastKind::Sext,
-                        (false, Some(_)) => WidthCastKind::Resize,
-                        (false, None) => WidthCastKind::Trunc,
+                    // Like the general expression path, `as uint<W>` is
+                    // the low `W` bits of the operand (`Trunc`) and `as
+                    // sint<W>` additionally sign-extends from bit `W - 1`
+                    // (`Sext` from a `W`-bit source), in every direction.
+                    // A cast never lowers to `Resize`, so a `Resize` with no
+                    // source width still always means the `.resize<N>()`
+                    // METHOD (`late_signed_resize_source` in
+                    // `codegen/tbir/covergroup.rs`).
+                    kind: if signed {
+                        WidthCastKind::Sext
+                    } else {
+                        WidthCastKind::Trunc
                     },
                     width,
-                    src_width,
+                    src_width: if signed { Some(width) } else { None },
                     inner: Box::new(inner),
                 });
             }

@@ -734,7 +734,7 @@ end test T"#
 fn const_sint_reinterprets_high_bit_patterns() {
     let cpp = emit_cpp_src(
         r#"const ALL63 : sint<63> = 0xFFFFFFFFFFFFFFFF
-const CASTNEG : sint<8> = (0 - 1) as uint<8>
+const CASTNEG : sint<8> = 0xFF as sint<8>
 
 test T
     let dut : Top
@@ -748,6 +748,21 @@ end test T"#,
         cpp.contains("((int64_t)(-1))"),
         "sint reinterpretation must store -1; got:\n{cpp}"
     );
+    // `as uint<8>` is the 8-bit value (255), the same as at runtime, so it
+    // does not fit a `sint<8>` constant.
+    let err = lower_src(
+        r#"const CASTU : sint<8> = (0 - 1) as uint<8>
+
+test T
+    let dut : Top
+    run
+        assert CASTU == 0 else fail("x")
+    end run
+end test T"#,
+    )
+    .expect_err("an 8-bit unsigned 255 must not fit sint<8>");
+    let msg = assert_invalid(&err);
+    assert!(msg.contains("value 255 does not fit `sint<8>`"), "{msg}");
     // Positive patterns still range-check: 255 has no negative reading.
     let err = lower_src(
         r#"const BAD : sint<8> = 0xFF
@@ -945,7 +960,7 @@ test T
         assert NEG_MOD == 0 - 1 else fail("x")
         assert (NEG_ONE >> 1) == NEG_ONE else fail("direct-shr")
         assert ((NEG_ONE + 0) >> 1) == NEG_ONE else fail("nested-shr")
-        assert ((NEG_ONE as uint<8>) >> 1) == 9223372036854775807 else fail("cast-shr")
+        assert ((NEG_ONE as uint<8>) >> 1) == 127 else fail("cast-shr")
         assert (NEG_ONE.sext<64>() >> 1) == NEG_ONE else fail("sext-shr")
     end run
 end test T"#,
@@ -960,8 +975,8 @@ end test T"#,
         "signed const use sites must use arithmetic right shift; got:\n{cpp}"
     );
     assert!(
-        cpp.contains("((uint64_t)(((uint64_t)(((int64_t)(-1)))))) >> 1"),
-        "uint relabel casts must use logical right shift; got:\n{cpp}"
+        cpp.contains("((uint64_t)(((uint64_t)(((uint64_t)(((int64_t)(-1))) & 0xFFULL))))) >> 1"),
+        "a uint cast masks to its width and uses a logical right shift; got:\n{cpp}"
     );
     // The declared sint<8> source width reaches `.sext<64>()`, so the
     // emitter performs an explicit 8-to-64 sign extension before the

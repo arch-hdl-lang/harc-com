@@ -64,7 +64,7 @@ inline constexpr harc_rt::random::HarcRuntimeProblemTable _harc_runtime_random_p
 struct TinyTxn {
     uint64_t tag = 0;
 };
-inline bool operator==(const TinyTxn& a, const TinyTxn& b) { return a.tag == b.tag; }
+inline bool operator==(const TinyTxn& a, const TinyTxn& b) { return harc_rt::harc_eq_width(a.tag, b.tag, 8); }
 inline bool operator!=(const TinyTxn& a, const TinyTxn& b) { return !(a == b); }
 
 static harc_rt::HarcWide<1> harc_pack_TinyTxn(const TinyTxn& value) {
@@ -243,6 +243,16 @@ int run_WatchdogQuiesceTest(int argc, char** argv) {
         ctx.errors++;
         _fatal = true;
     });
+    // Runtime arithmetic faults (division/modulo by zero, signed MIN / -1)
+    // fail through the same FATAL path. The test stops at its next yield;
+    // until then later faults (a loop dividing by the same zero) are not
+    // re-reported once the run is already fatal.
+    harc_rt::HarcArithFatalScope _arith_fatal_scope([&](const char* message) {
+        if (_fatal) return;
+        harc_rt::log::harc_log_line(log_ctx.sim_log, &trace, cycle_count, "FATAL", message);
+        ctx.errors++;
+        _fatal = true;
+    });
 
     sim_log_line("INFO", "seed=%llu", (long long)harc_rng.state);
 
@@ -267,7 +277,7 @@ int run_WatchdogQuiesceTest(int argc, char** argv) {
         while (true) {
             switch (__bb) {
             case 0: {
-                sim_log_line("INFO", "[wdog %lld] producer seen=%lld", harc_rt::harc_printf_ll((uint64_t)cycle_count), harc_rt::harc_printf_ll(self.seen));
+                sim_log_line("INFO", "[wdog %llu] producer seen=%lld", harc_rt::harc_printf_ull((uint64_t)cycle_count), harc_rt::harc_printf_ll(self.seen));
                 return;
                 break;
             }
