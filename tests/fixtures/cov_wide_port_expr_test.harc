@@ -19,7 +19,17 @@ covergroup WidePortExprCov @(posedge dut.clk)
         bins
             fifteen = {15}
         end bins
-    cp_nested_narrow_shift : cover ((dut.data[0:0] << 1) == (2 as uint<200>))
+    // A narrow shift nested in a wide covergroup comparison. A shift keeps
+    // its left operand's declared width (spec section 2), so the 1-bit
+    // slice shifted left by 1 is always 0 — the comparison against a wide 0
+    // always holds. Widening the slice first keeps the shifted bit: the
+    // second point hits exactly when data[0] is set.
+    cp_nested_narrow_shift : cover ((dut.data[0:0] << 1) == (0 as uint<200>))
+        bins
+            hit = {1}
+            miss = {0}
+        end bins
+    cp_nested_widened_shift : cover ((dut.data[0:0].zext<2>() << 1) == (2 as uint<200>))
         bins
             hit = {1}
         end bins
@@ -45,6 +55,8 @@ impl WidePortExprTest for WidePortExprTb
         assert cov.cp_ternary.fifteen > 0 else fail("raw wide ternary hole")
         assert cov.cp_shift.fifteen > 0 else fail("raw wide shift hole")
         assert cov.cp_nested_narrow_shift.hit > 0 else fail("nested narrow shift hole")
+        assert cov.cp_nested_narrow_shift.miss == 0 else fail("nested narrow shift kept a bit past its width")
+        assert cov.cp_nested_widened_shift.hit > 0 else fail("nested widened shift hole")
         log(info, "raw wide cover assertions passed")
     end check
 end impl WidePortExprTest
