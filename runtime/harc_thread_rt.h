@@ -1599,47 +1599,26 @@ struct WaitCyclesAwaiter {
 // hits zero; `await_resume()` returns `true` for the former,
 // `false` for the latter.
 //
-// Short-circuit when pred is already true at entry: `await_ready`
-// returns true and the coroutine never suspends — matches the
-// existing polling-loop semantics where `pred-true-at-entry` doesn't
-// wait. The immediate-completion flags are per-awaiter (live in the
-// coroutine frame), not on the slot, so a zero-budget wait cannot consume
-// stale state left by an earlier suspended wait in the same coroutine.
+// Like the untimed `WaitUntilAwaiter`, it never short-circuits, even on
+// a predicate that is already true at entry: every `wait until` takes at
+// least one cycle (spec §7.9, consistent with ARCH's `wait until` state
+// boundary), so the first observation is at the next tick. A constant
+// zero budget is a compile error; a runtime budget below one is clamped
+// to one cycle, like other runtime cycle counts are clamped rather than
+// rejected.
 struct WaitUntilTimeoutAwaiter {
     std::function<bool()> pred;
     ThreadSlot* slot;
     uint32_t max_cycles;
-    bool ready_satisfied = false;
-    bool completed_immediately = false;
 
-    bool await_ready() noexcept {
-        if (pred && pred()) {
-            ready_satisfied = true;
-            completed_immediately = true;
-            return true;
-        }
-        // N == 0 + pred false: also short-circuit (immediate timeout).
-        // Same semantics as the existing polling-loop's
-        // `(cycle_count - start) < 0` guard skipping the loop body.
-        if (max_cycles == 0) {
-            ready_satisfied = false;
-            completed_immediately = true;
-            return true;
-        }
-        return false;
-    }
+    bool await_ready() noexcept { return false; }
     void await_suspend(std::coroutine_handle<>) noexcept {
         slot->kind = WaitKind::WaitUntilTimeout;
         slot->pred = std::move(pred);
-        slot->cycles_remaining = max_cycles;
+        slot->cycles_remaining = max_cycles == 0 ? 1 : max_cycles;
         slot->timed_out = false;
     }
-    bool await_resume() noexcept {
-        // Short-circuit paths are complete independently of the slot's
-        // timed_out state, which may describe a prior wait on this slot.
-        // Suspended paths use the scheduler's result for this wait.
-        return completed_immediately ? ready_satisfied : !slot->timed_out;
-    }
+    bool await_resume() noexcept { return !slot->timed_out; }
 };
 
 // Scheduler: one per test. Owns slot pointers; the slot lifetime is
@@ -1708,9 +1687,8 @@ struct ThreadScheduler {
                     }
                 } else {
                     // cycles_remaining was 0 at entry and pred didn't
-                    // fire — defensive; the awaiter's await_ready
-                    // short-circuits this case so we shouldn't reach
-                    // here in practice.
+                    // fire — defensive; the awaiter clamps the budget
+                    // to at least one cycle, so this is unreachable.
                     s->kind = WaitKind::Ready;
                     s->timed_out = true;
                 }
@@ -1774,11 +1752,7 @@ inline WaitCyclesAwaiter wait_cycles(ThreadSlot* s, uint32_t n)              { r
 inline WaitUntilTimeoutAwaiter wait_until_timeout(
     ThreadSlot* s, std::function<bool()> p, uint32_t n
 ) {
-    return {
-        std::move(p), s, n,
-        /*ready_satisfied=*/false,
-        /*completed_immediately=*/false,
-    };
+    return {std::move(p), s, n};
 }
 
 // Awaiter: `co_await harc_lifecycle_yield()` (#619 M4b).

@@ -101,9 +101,23 @@ pub(super) fn post_eval_services(out: &mut String, depth: usize, services: &str,
     writeln!(out, "{pad}if (!{services}.empty()) {dut}->eval();").ok();
 }
 
+/// One per-cycle checker pass, run at most once per primary cycle (spec
+/// §7.10). `_harc_checked_cycle` (a sibling of the `_checkers` registry)
+/// records the last cycle that had its pass; it starts at 0, so cycle 0
+/// never gets one. Every time advance (`eval_clocks_until_checked`, the
+/// synchronous `tick()`, the main loop) runs the pass for the cycle being
+/// left before its next primary rising edge, and the main loop runs it
+/// after each scheduler step; the stamp makes all of these idempotent, so
+/// a wait in any context — run body, helper, hook — neither skips nor
+/// repeats a cycle.
 pub(super) fn checker_callbacks(out: &mut String, depth: usize, checkers: &str) {
     let pad = INDENT.repeat(depth);
-    writeln!(out, "{pad}for (auto& _c : {checkers}) _c();").ok();
+    let owner = checkers.strip_suffix("_checkers").unwrap_or("");
+    writeln!(
+        out,
+        "{pad}if ({owner}cycle_count != {owner}_harc_checked_cycle) {{ {owner}_harc_checked_cycle = {owner}cycle_count; for (auto& _c : {checkers}) _c(); }}"
+    )
+    .ok();
 }
 
 pub(super) fn automatic_coverage_reports(out: &mut String, depth: usize, reports: &str) {
@@ -1826,6 +1840,7 @@ pub(super) fn context_struct(
     harc_rt::log::HarcLogContext log_ctx;
     harc_rt::random::HarcRng rng;
     std::vector<std::function<void()>> _checkers;
+    uint64_t _harc_checked_cycle = 0;
     std::vector<std::function<void()>> _post_eval_services;
     std::vector<std::function<void()>> _auto_cov_reports;
 "#,
@@ -1903,6 +1918,7 @@ pub(super) fn run_prologue(out: &mut String, test_name: &str, dut_type: &str, co
     auto& harc_rng = ctx.rng;
     auto harc_rng_next = [&]() { return harc_rng.next(); };
     auto& _checkers = ctx._checkers;
+    auto& _harc_checked_cycle = ctx._harc_checked_cycle;
     auto& _post_eval_services = ctx._post_eval_services;
     auto& _auto_cov_reports = ctx._auto_cov_reports;
 #if HARC_TRACE_ENABLED
@@ -2008,13 +2024,37 @@ pub(super) fn clocked_scheduler(out: &mut String, clocks: &[ClockSpec]) {
         }
     };
 
-    auto tick = [&]() {
-        unsigned __int128 target = now_ps + clocks_[0].half_period_ps * 2;
-        eval_clocks_until(target);
 "#,
     );
-    checker_callbacks(out, 2, "_checkers");
-    out.push_str("    };\n\n");
+    out.push_str(
+        r#"    // Every time advance that is not a scheduler step — the synchronous
+    // `tick()` of helpers and hooks, `wait <time>`, `wait N cycles on
+    // <clock>`, and the main loop itself — goes through here, so every
+    // primary cycle gets its checker pass exactly once, as in a run-body
+    // `wait N cycles` (spec §7.10): before a primary rising edge is
+    // evaluated, the cycle being left gets its pass unless it already had
+    // one. The cycle an advance ends in gets its pass from whatever runs
+    // next (normally the main loop, after the scheduler step).
+    auto eval_clocks_until_checked = [&](unsigned __int128 t_ps) {
+        while (now_ps < t_ps && !_fatal) {
+            unsigned __int128 next = t_ps;
+            for (auto& c : clocks_) if (c.next_edge_ps < next) next = c.next_edge_ps;
+            if (clocks_[0].next_edge_ps == next && clocks_[0].level == 0) {
+"#,
+    );
+    checker_callbacks(out, 4, "_checkers");
+    out.push_str(
+        r#"            }
+            eval_clocks_until(next);
+        }
+    };
+
+    auto tick = [&]() {
+        eval_clocks_until_checked(now_ps + clocks_[0].half_period_ps * 2);
+    };
+
+"#,
+    );
 }
 
 /// Single-clock backward-compat `tick` (no declared clocks).
@@ -2042,7 +2082,15 @@ pub(super) fn clockless_scheduler(out: &mut String) {
         _harc_eval_negedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)cycle_count);
         now_ps = (unsigned __int128)_trace_time;
-        _harc_eval_posedge(dut);
+"#,
+    );
+    // The pass for the cycle being left, unless it already had one, at
+    // the same point the main loop runs it: after the falling edge has
+    // settled combinational outputs, before the next rising edge. The
+    // cycle `tick()` ends in gets its pass from whatever runs next.
+    checker_callbacks(out, 2, "_checkers");
+    out.push_str(
+        r#"        _harc_eval_posedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)(cycle_count + 1));
         now_ps = (unsigned __int128)_trace_time;
         cycle_count++;
@@ -2053,8 +2101,12 @@ pub(super) fn clockless_scheduler(out: &mut String) {
         r#"        if (!_post_eval_services.empty()) { _harc_trace_dump_next("clk", (uint64_t)cycle_count); now_ps = (unsigned __int128)_trace_time; }
 "#,
     );
-    checker_callbacks(out, 2, "_checkers");
     out.push_str("    };\n\n");
+    // No primary clock: a wall-clock wait advances no cycles, so there is
+    // no per-cycle checker pass to run inside it.
+    out.push_str(
+        "    auto eval_clocks_until_checked = [&](unsigned __int128 t_ps) { eval_clocks_until(t_ps); };\n\n",
+    );
 }
 
 /// Log lambdas + seed line + scheduler declaration.
@@ -2311,7 +2363,7 @@ pub(super) fn drive_loop(
     _harc_trace_dump_at(now_ps, "", 0);
     while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {
         unsigned __int128 _target = now_ps + clocks_[0].half_period_ps * 2;
-        eval_clocks_until(_target);
+        eval_clocks_until_checked(_target);
 "#,
         );
         if mt && qualified_clock_wait {
@@ -2333,7 +2385,13 @@ pub(super) fn drive_loop(
     _harc_trace_dump_next("clk", (uint64_t)cycle_count);
     now_ps = (unsigned __int128)_trace_time;
     while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {
-        _harc_eval_posedge(dut);
+"#,
+        );
+        // Catch up a cycle a hook's wait (inside the previous pass) ended
+        // in without its pass; a no-op otherwise.
+        checker_callbacks(out, 2, "_checkers");
+        out.push_str(
+            r#"        _harc_eval_posedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)(cycle_count + 1));
         now_ps = (unsigned __int128)_trace_time;
         cycle_count++;

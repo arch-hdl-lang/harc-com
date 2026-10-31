@@ -13259,34 +13259,34 @@ end test StableB"#,
     let expected = vec![
         (
             "stable__suite_api.hpp".to_string(),
-            "33cae06798459244".to_string(),
+            "967cf49d522809b4".to_string(),
         ),
         (
             "stable__runtime.cpp".to_string(),
-            "18d900c9225961b0".to_string(),
+            "6fd73e29a9c7045c".to_string(),
         ),
         (
             "stable__test_StableA.cpp".to_string(),
-            "6479e885cdce5f6b".to_string(),
+            "c96939970b991d0b".to_string(),
         ),
         (
             "stable__test_StableB.cpp".to_string(),
-            "d8eb6c61bc308639".to_string(),
+            "16b67bd262af6a1d".to_string(),
         ),
         (
             "stable__registry.cpp".to_string(),
-            "a58328d1f6d7240a".to_string(),
+            "3ec5914303701e86".to_string(),
         ),
     ];
     assert_eq!(actual, expected);
-    assert_eq!(output.interface_abi, "993237967e19a0c0");
+    assert_eq!(output.interface_abi, "fc56a052e355fbcc");
     assert_eq!(output.build_profile, "f11cada50936fa42");
     assert_eq!(
         output
             .artifact_plan
             .render_manifest(&output.interface_abi, &output.build_profile)
             .expect("render stable manifest"),
-        "{\"schema_version\":1,\"interface_abi\":\"993237967e19a0c0\",\"build_profile\":\"f11cada50936fa42\",\"tests\":[\"StableA\",\"StableB\"],\"artifacts\":[\"stable__suite_api.hpp\",\"stable__runtime.cpp\",\"stable__test_StableA.cpp\",\"stable__test_StableB.cpp\",\"stable__registry.cpp\",\"harc_thread_rt.h\",\"harc_random_rt.h\",\"harc_queue_rt.h\",\"harc_trace_rt.h\",\"harc_log_rt.h\",\"harc_z3_rt.h\"]}\n"
+        "{\"schema_version\":1,\"interface_abi\":\"fc56a052e355fbcc\",\"build_profile\":\"f11cada50936fa42\",\"tests\":[\"StableA\",\"StableB\"],\"artifacts\":[\"stable__suite_api.hpp\",\"stable__runtime.cpp\",\"stable__test_StableA.cpp\",\"stable__test_StableB.cpp\",\"stable__registry.cpp\",\"harc_thread_rt.h\",\"harc_random_rt.h\",\"harc_queue_rt.h\",\"harc_trace_rt.h\",\"harc_log_rt.h\",\"harc_z3_rt.h\"]}\n"
     );
 }
 

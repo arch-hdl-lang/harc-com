@@ -149,7 +149,25 @@ impl FuncBuilder<'_> {
         // Upper bound — evaluated once, on loop entry: snapshot it (even a
         // bare local the body may reassign) into a synthesized local so
         // the header re-reads a fixed value.
-        let hi_ir = self.lower_expr_no_ports(hi)?;
+        //
+        // Both bounds resolve in the ENCLOSING scope (spec §7.4), like
+        // `lo` above: `for n in 0 .. n` reads the outer `n`. The loop
+        // variable is already declared (its `lo` assignment must precede
+        // any statements lowering `hi` emits, to keep `lo`-then-`hi`
+        // evaluation order), so hide its binding while `hi` resolves.
+        let hidden = self
+            .scopes
+            .last_mut()
+            .expect("scope stack never empty")
+            .remove(&f.var.name);
+        let hi_ir = self.lower_expr_no_ports(hi);
+        if let Some(id) = hidden {
+            self.scopes
+                .last_mut()
+                .expect("scope stack never empty")
+                .insert(f.var.name.clone(), id);
+        }
+        let hi_ir = hi_ir?;
         self.validate_numeric_expr(&hi_ir, "range upper bound")?;
         let signed_range = lo_signed || self.range_bound_requires_signed(hi, &hi_ir);
         if signed_range
@@ -461,9 +479,31 @@ impl FuncBuilder<'_> {
         ));
         let count_ir = self.lower_expr_no_ports(&r.count)?;
         self.validate_numeric_expr(&count_ir, "repeat count")?;
-        // Same synthesized `uint64_t` counter as `for`, same silent
-        // truncation, same v1 build failure.
-        let count_operand = self.stash_if_impure(count_ir);
+        // A negative repeat count (spec §7.4): a compile-time constant
+        // is rejected; a runtime negative count runs zero iterations.
+        if let Ok(value) = super::fold_const(&r.count, &self.ctx.consts, "") {
+            if value.is_negative() {
+                return Err(LowerError::Invalid(format!(
+                    "`repeat` count is the negative constant {}; a repeat count must be \
+                     non-negative",
+                    value.as_i64()
+                )));
+            }
+        }
+        // A signed count gets a signed counter so `0 < count` compares in
+        // the signed domain: a runtime negative count runs zero
+        // iterations instead of converting to a huge unsigned bound.
+        // Unsigned counts keep the synthesized `uint64_t` counter.
+        let signed_count = self.range_bound_requires_signed(&r.count, &count_ir);
+        if signed_count {
+            self.set_local_type(var, IrType::SInt(None));
+        }
+        let fallback = if signed_count {
+            IrType::SInt(None)
+        } else {
+            IrType::Unknown
+        };
+        let count_operand = self.stash_if_impure_with_fallback(count_ir, fallback);
         let cond = Expr::Binary(
             BinOp::Lt,
             Box::new(Expr::Local(var)),
@@ -747,6 +787,21 @@ impl FuncBuilder<'_> {
                 "wait until: at least one condition required".to_string(),
             ));
         }
+        if let Some(to) = timeout {
+            // Every `wait until` takes at least one cycle (spec §7.9), so
+            // a constant budget below one cycle can never be honoured:
+            // reject it. A runtime budget below one is clamped to one
+            // cycle at emission, like other runtime cycle counts.
+            if let Ok(value) = super::fold_const(&to.cycles, &self.ctx.consts, "") {
+                if value.is_negative() || value.bits == 0 {
+                    return Err(LowerError::Invalid(format!(
+                        "`wait until … timeout {} cycles`: the timeout must be at least 1 \
+                         cycle, because every `wait until` takes at least one cycle",
+                        value.as_i64()
+                    )));
+                }
+            }
+        }
         if conditions
             .iter()
             .any(|condition| self.expr_value_prelude_summary(condition).emits_statements())
@@ -794,6 +849,12 @@ impl FuncBuilder<'_> {
         // position, after the `for`/`repeat` counter and the cycle
         // count — an enumeration that said "two" for one round.
         let budget = self.fresh_temp();
+        // A signed budget keeps its sign in the snapshot, so a negative
+        // runtime budget clamps (to one cycle, like zero) instead of
+        // converting to a huge unsigned count.
+        if self.range_bound_requires_signed(&to.cycles, &cycles_ir) {
+            self.set_local_type(budget, IrType::SInt(None));
+        }
         self.push(Stmt::Assign(budget, cycles_ir));
 
         // Keep the user's header source until the timeout block exists.
@@ -907,13 +968,43 @@ impl FuncBuilder<'_> {
         let budget = if let Some(to) = timeout {
             let cycles = self.lower_expr_no_ports(&to.cycles)?;
             self.validate_numeric_expr(&cycles, "wait-until timeout count")?;
+            // A signed budget keeps its sign, so a negative runtime budget
+            // clamps like zero instead of becoming a huge unsigned count.
+            let budget_ty = if self.range_bound_requires_signed(&to.cycles, &cycles) {
+                IrType::SInt(None)
+            } else {
+                IrType::UInt(None)
+            };
             let original = self.fresh_temp();
-            self.set_local_type(original, IrType::UInt(None));
+            self.set_local_type(original, budget_ty.clone());
             self.push(Stmt::Assign(original, cycles));
+            // The first poll happens after the mandatory first cycle (see
+            // below), so `remaining` counts the cycles still allowed after
+            // it: `max(budget, 1) - 1`, written `budget - (budget > 0)` in
+            // the budget's own signedness. A runtime budget of zero or
+            // below therefore allows that one cycle only, as on the
+            // awaiter path (`remaining <= 0` times out after the poll).
             let remaining = self.fresh_temp();
-            self.set_local_type(remaining, IrType::UInt(None));
-            self.push(Stmt::Assign(remaining, Expr::Local(original)));
-            Some((original, remaining))
+            self.set_local_type(remaining, budget_ty.clone());
+            // Literals carry the budget's type so comparisons stay in its
+            // signedness (an untyped literal renders as `uint64_t`).
+            let zero = Expr::Literal {
+                value: 0,
+                ty: budget_ty.clone(),
+            };
+            self.push(Stmt::Assign(
+                remaining,
+                Expr::Binary(
+                    BinOp::Sub,
+                    Box::new(Expr::Local(original)),
+                    Box::new(Expr::Binary(
+                        BinOp::Gt,
+                        Box::new(Expr::Local(original)),
+                        Box::new(zero),
+                    )),
+                ),
+            ));
+            Some((original, remaining, budget_ty))
         } else {
             None
         };
@@ -937,7 +1028,14 @@ impl FuncBuilder<'_> {
                 src_text: crate::codegen::source_transform::expr_source_str(condition),
             });
         }
-        self.terminate(Terminator::Jump(poll));
+        // Every `wait until` takes at least one cycle, even when the
+        // predicate already holds (spec §7.9): the first poll is one
+        // cycle after the wait is reached.
+        if self.inline_frames.is_empty() {
+            self.terminate(Terminator::WaitCycles(lit(1), None, poll));
+        } else {
+            self.terminate(Terminator::WaitCyclesSync(lit(1), poll));
+        }
         self.start_block(poll);
         let identity = u64::from(matches!(mode, WaitMode::AllOf));
         for snapshot in &snapshots {
@@ -989,14 +1087,18 @@ impl FuncBuilder<'_> {
         }
 
         self.start_block(not_satisfied);
-        let timeout_block = if let Some((_, remaining)) = budget {
+        let timeout_block = if let Some((_, remaining, budget_ty)) = &budget {
+            let remaining = *remaining;
             let timed_out = self.new_block();
             let wait = self.new_block();
             self.terminate(Terminator::Branch(
                 Expr::Binary(
                     BinOp::Le,
                     Box::new(Expr::Local(remaining)),
-                    Box::new(lit(0)),
+                    Box::new(Expr::Literal {
+                        value: 0,
+                        ty: budget_ty.clone(),
+                    }),
                 ),
                 timed_out,
                 wait,
@@ -1025,7 +1127,7 @@ impl FuncBuilder<'_> {
             None
         };
 
-        if let (Some(to), Some(timeout_block), Some((budget, _))) =
+        if let (Some(to), Some(timeout_block), Some((budget, _, _))) =
             (timeout, timeout_block, budget)
         {
             self.start_block(timeout_block);
@@ -1108,15 +1210,6 @@ impl FuncBuilder<'_> {
         Ok(())
     }
 
-    /// Snapshot a loop bound into a synthesized local so it is evaluated
-    /// exactly once, on loop entry. Only literals are left in place: a
-    /// bare local must be copied too, because the body can reassign it
-    /// (`for i in 0 .. n … n = 0`) and the header would otherwise re-read
-    /// the new value every iteration.
-    fn stash_if_impure(&mut self, e: Expr) -> Expr {
-        self.stash_if_impure_with_fallback(e, IrType::Unknown)
-    }
-
     fn range_bound_requires_signed(&self, source: &AstExpr, lowered: &Expr) -> bool {
         matches!(self.expr_type(lowered), Some(IrType::SInt(_)))
             || super::fold_const(source, &self.ctx.consts, "")
@@ -1124,7 +1217,13 @@ impl FuncBuilder<'_> {
                 .unwrap_or(false)
     }
 
-    /// Snapshot a loop bound while preserving its known type. A
+    /// Snapshot a loop bound into a synthesized local so it is evaluated
+    /// exactly once, on loop entry. Only literals are left in place: a
+    /// bare local must be copied too, because the body can reassign it
+    /// (`for i in 0 .. n … n = 0`) and the header would otherwise re-read
+    /// the new value every iteration.
+    ///
+    /// The snapshot preserves the bound's known type. A
     /// numeric range supplies signedness for an otherwise unknown bound so a
     /// cached negative upper bound cannot become an unsigned `uint64_t`.
     fn stash_if_impure_with_fallback(&mut self, e: Expr, fallback: IrType) -> Expr {

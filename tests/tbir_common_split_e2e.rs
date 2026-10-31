@@ -5443,7 +5443,7 @@ fn tbir_common_method_timing_and_tseq_calls_match_self_contained() {
 
     let runtime = std::fs::read_to_string(common_out.join("method_timing__runtime.cpp"))
         .expect("read common runtime");
-    assert!(runtime.contains("harc_eval_clocks_until(ctx, ctx.now_ps + 1);"));
+    assert!(runtime.contains("harc_eval_clocks_until_checked(ctx, ctx.now_ps + 1);"));
     assert!(runtime.contains("harc_tseq_tick(ctx);"));
     assert!(runtime.contains("harc_tseq_PureValues("));
     assert!(runtime.contains("harc_tseq_TimedValues(ctx,"));

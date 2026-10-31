@@ -5732,6 +5732,8 @@ fn render_common_interface_template(plan: &CommonCppPlan) -> Result<String, Emit
     writeln!(out, "{INDENT}bool fatal = false;").ok();
     writeln!(out, "{INDENT}bool run_complete = false;").ok();
     writeln!(out, "{INDENT}uint64_t cycle_count = 0;").ok();
+    // Last cycle a checker pass ran for (see `checker_callbacks`).
+    writeln!(out, "{INDENT}uint64_t _harc_checked_cycle = 0;").ok();
     writeln!(out, "{INDENT}unsigned __int128 now_ps = 0;").ok();
     writeln!(out, "{INDENT}std::vector<HarcClockState> clocks;").ok();
     writeln!(out, "{INDENT}harc_rt::trace::HarcTraceWriter trace;").ok();
@@ -5871,6 +5873,11 @@ fn render_common_interface_template(plan: &CommonCppPlan) -> Result<String, Emit
     writeln!(
         out,
         "void harc_eval_clocks_until(HarcTestContext& ctx, unsigned __int128 target_ps);"
+    )
+    .ok();
+    writeln!(
+        out,
+        "void harc_eval_clocks_until_checked(HarcTestContext& ctx, unsigned __int128 target_ps);"
     )
     .ok();
     writeln!(
@@ -6404,6 +6411,9 @@ fn render_common_runtime_template(plan: &CommonCppPlan) -> Result<String, EmitEr
     )
     .ok();
     writeln!(out, "{INDENT}{INDENT}if (ctx.clocks.empty()) {{").ok();
+    // Catch up a cycle a hook's wait ended in without its pass (no-op
+    // otherwise; see `checker_callbacks`).
+    super::runtime::checker_callbacks(&mut out, 3, "ctx._checkers");
     writeln!(
         out,
         "{INDENT}{INDENT}{INDENT}harc_eval_clockless_edge(ctx, 1);"
@@ -6440,7 +6450,7 @@ fn render_common_runtime_template(plan: &CommonCppPlan) -> Result<String, EmitEr
     .ok();
     writeln!(
         out,
-        "{INDENT}{INDENT}{INDENT}harc_eval_clocks_until(ctx, target);"
+        "{INDENT}{INDENT}{INDENT}harc_eval_clocks_until_checked(ctx, target);"
     )
     .ok();
     if plan.mt {
@@ -6615,15 +6625,49 @@ fn emit_common_tseq_tick(out: &mut String, plan: &CommonCppPlan) {
     writeln!(out, "{INDENT}}}").ok();
     writeln!(out, "}}").ok();
     writeln!(out).ok();
+    // `wait <time>` / `wait N cycles on <clock>` advance time inline, with
+    // no scheduler yield, but still run the per-cycle checker pass for
+    // every primary cycle they span, exactly once per cycle, as a plain
+    // `wait N cycles` does (spec §7.10): before a primary rising edge is
+    // evaluated, the cycle being left gets its pass unless it already had
+    // one. The cycle the wait ends in gets its pass from whatever runs
+    // next (normally the main loop). Mirrors the default layout's
+    // `eval_clocks_until_checked`.
+    writeln!(
+        out,
+        "void harc_eval_clocks_until_checked(HarcTestContext& ctx, unsigned __int128 target_ps) {{"
+    )
+    .ok();
+    writeln!(
+        out,
+        "{INDENT}if (ctx.clocks.empty()) {{ harc_eval_clocks_until(ctx, target_ps); return; }}"
+    )
+    .ok();
+    writeln!(out, "{INDENT}while (ctx.now_ps < target_ps && !ctx.fatal) {{").ok();
+    writeln!(out, "{INDENT}{INDENT}unsigned __int128 next = target_ps;").ok();
+    writeln!(out, "{INDENT}{INDENT}for (auto& clock : ctx.clocks) if (clock.next_edge_ps < next) next = clock.next_edge_ps;").ok();
+    writeln!(
+        out,
+        "{INDENT}{INDENT}if (ctx.clocks[0].next_edge_ps == next && ctx.clocks[0].level == 0) {{"
+    )
+    .ok();
+    super::runtime::checker_callbacks(out, 3, "ctx._checkers");
+    writeln!(out, "{INDENT}{INDENT}}}").ok();
+    writeln!(out, "{INDENT}{INDENT}harc_eval_clocks_until(ctx, next);").ok();
+    writeln!(out, "{INDENT}}}").ok();
+    writeln!(out, "}}").ok();
+    writeln!(out).ok();
     writeln!(
         out,
         "bool harc_wait_clock_cycles(HarcTestContext& ctx, const char* name, long long cycles) {{"
     )
     .ok();
-    // Returns false when a fatal ended the wait with edges still owed
-    // (after the same checker pass as a completed wait); run and callable
-    // callers then abort instead of reaching their successor, while test
-    // hooks ignore the result (see `emit_local_qualified_clock_wait`).
+    // Returns false when a fatal ended the wait with edges still owed; run
+    // and callable callers then abort instead of reaching their successor,
+    // while test hooks ignore the result (see
+    // `emit_local_qualified_clock_wait`). The per-cycle checker passes run
+    // inside `harc_eval_clocks_until_checked`; the cycle the wait ends in
+    // gets its pass from the caller's next scheduler step.
     writeln!(out, "{INDENT}if (cycles <= 0) return true;").ok();
     writeln!(out, "{INDENT}size_t index = ctx.clocks.size();").ok();
     writeln!(out, "{INDENT}for (size_t i = 0; i < ctx.clocks.size(); ++i) if (std::strcmp(ctx.clocks[i].name, name) == 0) {{ index = i; break; }}").ok();
@@ -6647,7 +6691,7 @@ fn emit_common_tseq_tick(out: &mut String, plan: &CommonCppPlan) {
     )
     .ok();
     writeln!(out, "{INDENT}{INDENT}for (auto& clock : ctx.clocks) if (clock.next_edge_ps < next) next = clock.next_edge_ps;").ok();
-    writeln!(out, "{INDENT}{INDENT}harc_eval_clocks_until(ctx, next);").ok();
+    writeln!(out, "{INDENT}{INDENT}harc_eval_clocks_until_checked(ctx, next);").ok();
     writeln!(out, "{INDENT}{INDENT}uint64_t advanced = ctx.clocks[index].rising_count - before_rising;").ok();
     writeln!(out, "{INDENT}{INDENT}if (advanced > 0) remaining = advanced >= remaining ? 0 : remaining - advanced;").ok();
     writeln!(
@@ -6656,10 +6700,13 @@ fn emit_common_tseq_tick(out: &mut String, plan: &CommonCppPlan) {
     )
     .ok();
     writeln!(out, "{INDENT}}}").ok();
-    super::runtime::checker_callbacks(out, 1, "ctx._checkers");
     writeln!(out, "{INDENT}return remaining == 0;").ok();
     writeln!(out, "}}").ok();
     writeln!(out).ok();
+    // Synchronous one-cycle advance: like the default layout's `tick()`,
+    // the pass for the cycle being left runs first (unless it already
+    // had one) and the cycle it ends in gets its pass from whatever runs
+    // next, so helper/hook waits neither skip nor repeat a cycle.
     writeln!(out, "void harc_tseq_tick(HarcTestContext& ctx) {{").ok();
     writeln!(out, "{INDENT}if (ctx.clocks.empty()) {{").ok();
     writeln!(out, "{INDENT}{INDENT}harc_eval_clockless_edge(ctx, 0);").ok();
@@ -6668,6 +6715,9 @@ fn emit_common_tseq_tick(out: &mut String, plan: &CommonCppPlan) {
         "{INDENT}{INDENT}harc_trace_clockless_edge(ctx, (uint64_t)ctx.cycle_count);"
     )
     .ok();
+    // After the falling edge settles combinational outputs, as in the
+    // main loop; before the next rising edge.
+    super::runtime::checker_callbacks(out, 2, "ctx._checkers");
     writeln!(out, "{INDENT}{INDENT}harc_eval_clockless_edge(ctx, 1);").ok();
     writeln!(
         out,
@@ -6677,9 +6727,8 @@ fn emit_common_tseq_tick(out: &mut String, plan: &CommonCppPlan) {
     writeln!(out, "{INDENT}{INDENT}ctx.cycle_count++;").ok();
     super::runtime::post_eval_services(out, 2, "ctx._post_eval_services", "ctx.dut");
     writeln!(out, "{INDENT}}} else {{").ok();
-    writeln!(out, "{INDENT}{INDENT}harc_eval_clocks_until(ctx, ctx.now_ps + ctx.clocks[0].half_period_ps * 2);").ok();
+    writeln!(out, "{INDENT}{INDENT}harc_eval_clocks_until_checked(ctx, ctx.now_ps + ctx.clocks[0].half_period_ps * 2);").ok();
     writeln!(out, "{INDENT}}}").ok();
-    super::runtime::checker_callbacks(out, 1, "ctx._checkers");
     writeln!(out, "}}").ok();
     writeln!(out).ok();
 }

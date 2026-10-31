@@ -83,10 +83,17 @@ periods), and the core statement set — DUT port read/write,
 — the qualifier rides as an `Option<WaitClock>` on the `WaitCycles`
 terminator, resolved at lowering against the test's declared clocks;
 an unknown clock name is a structured lowering error listing the
-declared clocks, where v1 deferred it to emission. Emission mirrors
-v1's inline `eval_clocks_until` loop — no coroutine yield — so
-sub-primary-cycle precision and checker timing are identical),
-`wait until` (single, `all of`, and `any of`, optional timeout),
+declared clocks, where v1 deferred it to emission. Emission keeps
+v1's inline edge-by-edge time advance — no coroutine yield — so
+sub-primary-cycle precision is identical, but, deliberately unlike v1,
+it runs the per-cycle checker pass (`on N cycles`, `on <expr>`,
+watchdogs, concurrent checks) once for every primary cycle the wait
+spans, as a plain `wait N cycles` does; wall-clock waits do the same.
+This intentionally breaks v1 trace parity for such waits (spec §7.4,
+§7.10)),
+`wait until` (single, `all of`, and `any of`, optional timeout; every
+form takes at least one cycle, even when the predicate already holds —
+spec §7.9),
 `if`/`for`/`while`/`repeat`/`loop`/`break`/`continue`, covergroups
 with set-literal and range (`[a..b]`, inclusive, open bounds allowed)
 bins plus declared `cross` items, helper functions, `transaction`
