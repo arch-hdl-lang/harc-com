@@ -16,7 +16,7 @@ end testbench StatementPeriodicNamedTb
 
 impl StatementPeriodicNamedTest for StatementPeriodicNamedTb
     clock clk = SysDomain
-    let per = 2
+    let per : uint<64> = 2
 
     run
         dut.rst = 1

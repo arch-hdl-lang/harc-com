@@ -773,6 +773,15 @@ end transaction S8
             c.x < lim32_s
         end randomize
         log(info, "RANK_END C")
+        // Same-sign capture that excludes every model: x == 5 and x < 0
+        // over uint<32> is UNSAT (the solver still sees the capture).
+        let d : U32
+        log(info, "RANK_BEGIN D")
+        blocking randomize(d) with
+            d.x == 5
+            d.x < lim32
+        end randomize
+        log(info, "RANK_END D")
 """)
     (root/'capture_ranks.harc').write_text(source)
     # This newly supported TBIR capture boundary has mixed-rank contracts
@@ -782,14 +791,16 @@ end transaction S8
                         '--outdir', root/'capture_ranks'], root, 180,
                        env={**os.environ, 'HARC_NO_LEARN': '1'})
     (root/'capture_ranks.log').write_text(output)
-    # Explicit conversions: 0 < 0xffffffff, -1 < 255 and -1 < 0 all hold.
-    assert code == 0 and 'ALL TESTS PASSED' in output, output
-    for identity, unsat in [('A', False), ('B', False), ('C', False)]:
+    # Explicit conversions: 0 < 0xffffffff, -1 < 255 and -1 < 0 all hold;
+    # the same-sign D (5 < 0 over uint<32>) is UNSAT and fails the test.
+    assert code > 0 and 'ALL TESTS PASSED' not in output, output
+    for identity, unsat in [('A', False), ('B', False), ('C', False), ('D', True)]:
         segments = re.findall(rf'RANK_BEGIN {identity}\n(.*?)RANK_END {identity}', output, re.S)
         assert len(segments) == 1 and ('UNSAT' in segments[0]) == unsat, output
         assert 'unknown' not in segments[0].lower(), output
     assert 'RANK_END B ffffffffffffffff' in output, output
-    print('capture ranks/tbir: 3 explicitly converted runtime binding contracts', flush=True)
+    print('capture ranks/tbir: 3 explicitly converted runtime binding contracts, 1 same-sign UNSAT',
+          flush=True)
 
 
 def self_test():

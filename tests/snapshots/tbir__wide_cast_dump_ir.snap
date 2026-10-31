@@ -53,7 +53,7 @@ fn fn0 run_WideCastTest [kind=Run, owner=tb0]
     AssertCheck { cond: (%z128 == 16045690984503111693), on_fail: "zext<128>: low64=0x%016llx", %z128 }
     Assign(%s64, 18446744073709551615)
     Assign(%se128, %s64.sext<128 from 64>())
-    AssertCheck { cond: (%se128 == 0xffffffffffffffffffffffffffffffff), on_fail: "sext<128> of all-ones: low64=0x%016llx", %se128 }
+    AssertCheck { cond: (%se128.trunc<128>() == 0xffffffffffffffffffffffffffffffff), on_fail: "sext<128> of all-ones: low64=0x%016llx", %se128 }
     Assign(%p64, 9223372036854775807)
     Assign(%pe128, %p64.sext<128 from 64>())
     AssertCheck { cond: (%pe128 == 9223372036854775807), on_fail: "sext<128> of positive: low64=0x%016llx", %pe128 }
@@ -73,7 +73,7 @@ fn fn0 run_WideCastTest [kind=Run, owner=tb0]
     AssertCheck { cond: (%low130 == 0x00000003ffffffffffffffffffffffffffffffff), on_fail: "trunc<130> did not mask storage padding" }
     Assign(%neg9, 256)
     Assign(%neg130, %neg9.sext<130 from 9>())
-    AssertCheck { cond: (%neg130 == 0x00000003ffffffffffffffffffffffffffffff00), on_fail: "sext<130> did not fill through bit 129" }
+    AssertCheck { cond: (%neg130 == -256), on_fail: "sext<130> did not fill through bit 129" }
     Assign(%neg256, %neg130.sext<256 from 130>())
     Assign(%neg131, %neg256.trunc<131 from 256>())
     AssertCheck { cond: (%neg131 == 0x00000007ffffffffffffffffffffffffffffff00), on_fail: "HarcWide-source sext<256> lost the sign fill" }

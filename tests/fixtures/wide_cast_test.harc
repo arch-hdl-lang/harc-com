@@ -33,7 +33,7 @@ impl WideCastTest for WideCastTb
         // 0xFF..FF (all ones, MSB set) → sign-extends to all-ones 128.
         let s64 : uint<64> = 0xFFFFFFFFFFFFFFFF
         let se128 = s64.sext<128>()
-        assert se128 == 0xFFFFFFFFFFFFFFFF_FFFFFFFFFFFFFFFF
+        assert (se128 as uint<128>) == 0xFFFFFFFFFFFFFFFF_FFFFFFFFFFFFFFFF
             else fail("sext<128> of all-ones: low64=0x${se128:016x}")
 
         // Positive 64-bit source (MSB clear) → no high-bit fill.
@@ -76,7 +76,8 @@ impl WideCastTest for WideCastTb
         // ── chained sign extension with a HarcWide source ──────────────
         let neg9 : uint<9> = 0x100
         let neg130 : sint<130> = neg9.sext<130>()
-        assert neg130 == 0x3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00
+        // The sint<130> value of the all-ones-above-bit-8 pattern 0x3FF..F00.
+        assert neg130 == -256
             else fail("sext<130> did not fill through bit 129")
         let neg256 : sint<256> = neg130.sext<256>()
         let neg131 = neg256.trunc<131>()
@@ -89,8 +90,11 @@ impl WideCastTest for WideCastTb
         assert resized130 == 0xDEADBEEFCAFEF00D
             else fail("resize widen/narrow changed the value")
 
-        // Arithmetic in the word-array storage can set padding above the
-        // declared 130-bit logical width. Extensions must discard it.
+        // `max130 + one130` is a 131-bit result (spec §2.4), narrowed
+        // explicitly, so `dirty130` is a clean zero here; storage padding
+        // above a declared width can no longer be built from source. The
+        // extensions' padding normalization is pinned on raw storage in
+        // `tests/wide_cast_cpp.rs`; these assertions keep the source path.
         let max130 : uint<130> = 0x3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
         let one130 : uint<130> = 1
         let dirty130 : uint<130> = (max130 + one130).trunc<130>()

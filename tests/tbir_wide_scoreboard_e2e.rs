@@ -57,7 +57,7 @@ impl WideScoreboardTest for Tb
         sb.wide = ((sb.mid + sb.wide) + 1).trunc<256>()
         assert sb.wide[7:0] == 241 else fail("wide add failed")
         assert sb.wide[71:64] == 2 else fail("reverse operand promotion failed")
-        sb.wide = (sb.wide + -1).trunc<256>()
+        sb.wide = (sb.wide - 1).trunc<256>()
         assert sb.wide[7:0] == 240 else fail("negative operand extension failed")
         sb.wide = 0
         sb.wide = (sb.wide + UPOS).trunc<256>()
@@ -86,24 +86,24 @@ impl WideScoreboardTest for Tb
         assert (true ? sb.mid : sb.wide)
             else fail("bare reverse ternary truthiness failed")
         sb.wide = sb.wide >> (sb.wide & 0x7)
-        sb.narrow = 1 << (sb.wide & 0x7)
+        sb.narrow = (1 as uint<8>) << (sb.wide & 0x7)
         assert sb.narrow == 1 else fail("wide shift count conversion failed")
         sb.wide = 3
-        sb.narrow = 1 << sb.wide
+        sb.narrow = (1 as uint<8>) << sb.wide
         assert sb.narrow == 8 else fail("wide literal-lhs shift count clamped")
         sb.mid = 3
-        sb.narrow = 1 << sb.mid
+        sb.narrow = (1 as uint<8>) << sb.mid
         assert sb.narrow == 8 else fail("u128 literal-lhs shift count clamped")
         sb.wide = 65
         sb.scalar = sb.scalar << sb.wide
         assert sb.scalar == 0 else fail("wide count scalar shift was undefined")
-        sb.scalar = 1 << 0x100000000000000000000
+        sb.scalar = (1 as uint<64>) << 0x100000000000000000000
         assert sb.scalar == 0 else fail("wide literal shift count was undefined")
         assert 0x100000000000000000000000000000000
             else fail("wide literal truthiness failed")
-        sb.wide = -1
+        sb.wide = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
         assert sb.wide[255:192] == 0xFFFFFFFFFFFFFFFF
-            else fail("negative direct write did not sign-extend")
+            else fail("all-ones direct write did not fill the high word")
         sb.wide = 1
         assert sb.wide[255:64] == 0 else fail("positive direct write sign-extended")
         let negated = -sb.wide
@@ -162,6 +162,7 @@ fn tbir_mixed_signed_wide_scoreboard_operands_are_rejected() {
         ("mask", "let signed_mask_shift = (sb.wide & NEG) >> 1"),
         ("neg", "sb.wide = sb.wide + NEG"),
         ("pos", "sb.wide = sb.wide + POS"),
+        ("neg_literal", "sb.wide = (sb.wide + -1).trunc<256>()"),
     ] {
         let source = outdir.join(format!("{tag}.harc"));
         let src = TEST.replace(

@@ -507,11 +507,11 @@ impl SharedTypesA for SharedTypesTb
         let copied_values = CopyScalarValues(raw_values)
         let before = cycle_count
         let ys = ForwardTimed(6)
-        let pure_value = 0
+        let pure_value : uint<64> = 0
         for value in copied_values
             pure_value = value
         end for
-        let timed_value = 0
+        let timed_value : uint<64> = 0
         for value in ys
             timed_value = value
         end for
@@ -532,7 +532,7 @@ impl SharedTypesB for SharedTypesTb
     clock clk = CommonDomain
     run
         let values = PureValues(9)
-        let observed = 0
+        let observed : uint<64> = 0
         for value in values
             observed = value
         end for

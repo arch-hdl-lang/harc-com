@@ -67,8 +67,8 @@ transactor AxilXactor
             wait 2 cycles
 
             // Read phase
-            let val = 0
-            let saw = 0
+            let val : uint<32> = 0
+            let saw : uint<64> = 0
             dut.axil_ar_addr = t.addr
             dut.axil_ar_valid = 1
             for _ in 0 .. 9

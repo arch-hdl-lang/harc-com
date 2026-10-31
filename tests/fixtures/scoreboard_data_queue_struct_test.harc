@@ -57,7 +57,7 @@ impl ScoreboardDataQueueStructTest for ScoreboardDataQueueStructTb
         // Three runs; run i enables the counter for (i+1) more cycles.
         // Each run records a `Sample{run_idx, count}` snapshot, pushed
         // before advancing and popped back / verified after.
-        let total = 0
+        let total : uint<32> = 0
         for i in 0 .. 2                    // inclusive range → 3 runs (i = 0,1,2)
             let bump = i + 1               // 1, 2, 3 cycles of en
             total = total + bump

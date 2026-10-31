@@ -9,7 +9,7 @@ tb-ir program
 fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
   locals:
     %0 one : uint<256>
-    %1 total : unknown
+    %1 total : uint<32>
     %2 i : unknown
     %3 bump : unknown
     %4 queued : uint<32>

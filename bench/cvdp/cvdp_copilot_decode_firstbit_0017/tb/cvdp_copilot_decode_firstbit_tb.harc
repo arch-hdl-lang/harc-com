@@ -51,7 +51,7 @@ impl FirstBitTest for FirstBitTestTb
         dut.In_Valid = 1
         let errors : uint<32> = 0
         for i in 0 .. 31
-            dut.In_Data = 1 << i
+            dut.In_Data = (1 as uint<32>) << i
             wait 4 cycles
             if dut.Out_Found != 1
                 log(error, "i=${i} Out_Found=${dut.Out_Found}, expected 1")

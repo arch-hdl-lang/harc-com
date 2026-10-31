@@ -181,6 +181,8 @@ buf_mgr_sm_test         | BufMgrSm       | buf_mgr_sm.sv data_mem_sm.sv free_lis
 aes_cipher_top_test     | AesCipherTop   | aes_cipher_top.sv aes_key_expand_128.sv xtime.sv |
 wide_reg_test           | WideReg        | wide_reg.sv            |
 signed_wide_ops_test    | Top            | top_counter.sv         |
+arch_result_width_carry_test | Top        | top_counter.sv         |
+const_exact_width_test       | Top        | top_counter.sv         |
 ternary_signed_widening_c08_test | Top            | top_counter.sv         |
 signed_remainder_constraint_test | Top | top_counter.sv |
 signed_wide_ordering_v1_test | Top         | top_counter.sv         |

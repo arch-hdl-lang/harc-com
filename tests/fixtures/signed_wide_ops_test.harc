@@ -80,15 +80,16 @@ impl SignedWideOpsTest for SignedWideTb
         assert compound129_256 == -2
             else fail("compound sext<256> lost signed129 source")
 
-        // A direct masked expression retains its semantic operand width for
-        // width methods; an inferred local may use its narrowed assignment
-        // type, which is a separate and intentional case.
+        // `source65 & 0xFF` is an 8-bit unsigned value (a literal mask bounds
+        // `&`, spec: result widths of binary operators), and a width method
+        // sees its receiver's result width: the direct masked expression and
+        // the inferred local agree, both sign-extending from bit 7.
         let masked_sext : sint<129> = (source65 & 0xFF).sext<129>()
         let masked_trunc : uint<16> = (source65 & 0xFF).trunc<16>()
         let inferred_mask : uint<8> = source65 & 0xFF
         let inferred_mask_sext : sint<129> = inferred_mask.sext<129>()
-        assert masked_sext == 0xFE
-            else fail("masked direct sext changed semantic width")
+        assert masked_sext == -2
+            else fail("masked direct sext must extend from the 8-bit mask result")
         assert masked_trunc == 0xFE
             else fail("masked direct trunc changed semantic width")
         assert inferred_mask_sext == -2
@@ -103,8 +104,8 @@ impl SignedWideOpsTest for SignedWideTb
         assert direct8 == 255 else fail("direct zext<16> lost signed8 source")
         // `source8 + zero8` is a `sint<9>` (spec §2.4 result widths), so
         // zero-extending it keeps its 9-bit pattern: -1 is 0x1FF.
-        assert compound8 == 511 else fail("compound zext<16> lost signed8 source")
-        assert inferred8_zext == 511 else fail("inferred zext<16> lost signed8 source")
+        assert compound8 == 511 else fail("compound zext<16> must keep the 9-bit sum pattern")
+        assert inferred8_zext == 511 else fail("inferred zext<16> must keep the 9-bit sum pattern")
 
         // --- mixed signed scalar arithmetic (narrower sign-extends) ---
         let q65 : sint<65> = -8 / 3

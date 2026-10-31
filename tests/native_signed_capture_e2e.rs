@@ -477,3 +477,72 @@ fn native_mixed_signedness_capture_dual_is_rejected() {
         "expected the mixed-signedness diagnostic:\n{log}"
     );
 }
+
+/// The capture scenarios above with a capture of the target's signedness
+/// (the explicit form after the D1 rejection): a signed comparison against
+/// a captured `sint` field still solves, and its dual is still UNSAT.
+const SAME_SIGN_CAPTURE: &str = r#"
+transaction SCap
+    u : sint<16>
+end transaction SCap
+transaction Req
+    s : sint<8>
+end transaction Req
+test SameSignCapture
+    let dut : Top
+    run
+        let uc : SCap
+        uc.u = 5
+        let r : Req
+        blocking randomize(r) with
+            r.s < uc.u
+            r.s < 0
+        end randomize
+        assert r.s < 0 else fail("expected negative r.s")
+        log(info, "SAME_SIGN_OK r.s=${r.s}")
+    end run
+end test SameSignCapture
+"#;
+
+const SAME_SIGN_CAPTURE_DUAL: &str = r#"
+transaction SCap
+    u : sint<16>
+end transaction SCap
+transaction Req
+    s : sint<8>
+end transaction Req
+test SameSignCaptureDual
+    let dut : Top
+    run
+        let uc : SCap
+        uc.u = 200
+        let r : Req
+        blocking randomize(r) with
+            r.s > uc.u
+        end randomize
+        log(info, "DUAL_RESULT r.s=${r.s}")
+    end run
+end test SameSignCaptureDual
+"#;
+
+#[test]
+fn native_same_sign_capture_compares_signed() {
+    let (ok, log) = run_capture_fixture("same_sign", SAME_SIGN_CAPTURE);
+    assert!(
+        ok && log.contains("ALL TESTS PASSED") && log.contains("SAME_SIGN_OK"),
+        "same-sign capture fixture failed:\n{log}"
+    );
+}
+
+#[test]
+fn native_same_sign_capture_rejects_impossible_bound() {
+    let (ok, log) = run_capture_fixture("same_sign_dual", SAME_SIGN_CAPTURE_DUAL);
+    assert!(
+        !ok,
+        "a sint<8> greater than 200 unexpectedly solved:\n{log}"
+    );
+    assert!(
+        log.contains("constraint UNSAT"),
+        "expected UNSAT diagnostic:\n{log}"
+    );
+}

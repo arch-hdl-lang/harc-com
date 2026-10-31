@@ -69,6 +69,16 @@ transaction NegativeConstant
 end transaction NegativeConstant
 "#;
 
+/// The unsatisfiable intent of `NEGATIVE_CONSTANT` written without a sign
+/// mix: no `uint` is below zero.
+const BELOW_ZERO: &str = r#"
+transaction BelowZero
+    x : uint<8>
+    keep x == 0
+    keep x < 0
+end transaction BelowZero
+"#;
+
 /// `CONSTS` + one transaction + a test that randomizes it.
 fn program(decl: &str, txn: &str) -> String {
     format!(
@@ -128,15 +138,91 @@ fn native_mixed_signedness_constraints_are_rejected() {
 
 #[test]
 fn native_negative_untyped_constant_is_not_false_sat() {
-    // An untyped constant has no declared signedness, so `x < NEGATIVE_UNTYPED`
-    // is not a mixed-signedness error; the solver still must not report SAT.
+    // A NEGATIVE untyped constant is a signed value (owner decision, R16
+    // review), so `x < NEGATIVE_UNTYPED` on a `uint` is the mixed-signedness
+    // error rather than a constraint the solver could falsely satisfy.
     let (ok, log) = sim(
         "negative_const",
         &program(NEGATIVE_CONSTANT, "NegativeConstant"),
     );
-    assert!(!ok, "negative uint constraint unexpectedly solved: {log}");
+    assert!(!ok, "negative uint constraint unexpectedly compiled: {log}");
+    assert!(
+        log.contains("mixes signed and unsigned operands"),
+        "expected the mixed-signedness diagnostic: {log}"
+    );
+    // The same unsatisfiable intent without the mix still reaches the
+    // solver, which must not report SAT.
+    let (ok, log) = sim("below_zero", &program(BELOW_ZERO, "BelowZero"));
+    assert!(!ok, "`uint < 0` constraint unexpectedly solved: {log}");
     assert!(
         log.contains("UNSAT"),
         "expected solver UNSAT diagnostic: {log}"
     );
+}
+
+/// The same four scenarios written with operands of one signedness (the
+/// explicit-conversion form a user writes after the D1 rejection), so the
+/// native solver's comparison and arithmetic rendering and the runtime
+/// checks on the solved values stay covered.
+const SAME_SIGN: &str = r#"
+const POSITIVE_UNTYPED = 2
+transaction Unsigned64
+    u : uint<64>
+    s : uint<64>
+    keep u == 0xfffffffffffffffe
+    keep s == 2
+    keep u / s == 0x7fffffffffffffff
+    keep u > s
+    keep u % 3 == 2
+end transaction Unsigned64
+transaction NarrowSigned
+    u : sint<64>
+    s : sint<64>
+    keep u == 2
+    keep u == POSITIVE_UNTYPED
+    keep s == -6
+    keep s + u == -4
+    keep s < u
+end transaction NarrowSigned
+transaction NestedSigned
+    u : sint<64>
+    s : sint<64>
+    keep u == 2
+    keep s == -6
+    keep s + (u + 0) == -4
+    keep s < (1 + 2)
+end transaction NestedSigned
+transaction ShiftSigned
+    u : sint<64>
+    sh : uint<64>
+    s : sint<64>
+    keep u == 2
+    keep sh == 64
+    keep s == -6
+    keep s < (u >> sh)
+end transaction ShiftSigned
+test SameSign
+    let dut : Top
+    run
+        let m : Unsigned64
+        randomize(m)
+        assert m.u == 0xfffffffffffffffe else fail("unsigned 64-bit value")
+        let n : NarrowSigned
+        randomize(n)
+        assert n.s == -6 else fail("signed narrow value")
+        let x : NestedSigned
+        randomize(x)
+        assert x.s == -6 else fail("signed nested value")
+        let q : ShiftSigned
+        randomize(q)
+        assert q.s == -6 else fail("signed shift value")
+    end run
+end test SameSign
+"#;
+
+#[test]
+fn native_same_sign_solver_controls() {
+    let (ok, log) = sim("same_sign", SAME_SIGN);
+    assert!(ok, "same-sign solver controls failed:\n{log}");
+    assert!(log.contains("ALL TESTS PASSED"), "{log}");
 }

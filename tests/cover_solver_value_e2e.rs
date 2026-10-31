@@ -170,21 +170,17 @@ covergroup Cov @(sink.accept(t, v) post)
     cp_field_up : cover t.f.resize<16>()
         bins
             neg = {-1}
-            raw = {0xFFFF}
         end bins
     cp_field_dn : cover t.g.resize<8>()
         bins
             neg = {-128}
-            raw = {0x80}
         end bins
     cp_param_up : cover v.resize<16>()
         bins
             neg = {-1}
-            raw = {0xFFFF}
         end bins
     cp_as_uint : cover v as uint<16>
         bins
-            neg = {-1}
             raw = {0xFFFF}
         end bins
 end covergroup Cov
@@ -206,13 +202,9 @@ impl Test for Tb
     end run
     check
         assert cov.cp_field_up.neg == 1 else fail("sint<8> -1 .resize<16>() must sample -1")
-        assert cov.cp_field_up.raw == 0 else fail("signed resize must not sample the raw pattern")
         assert cov.cp_field_dn.neg == 1 else fail("sint<16> 0x0180 .resize<8>() must sample -128")
-        assert cov.cp_field_dn.raw == 0 else fail("signed narrowing resize must not sample 0x80")
         assert cov.cp_param_up.neg == 1 else fail("hook param .resize<16>() must sample -1")
-        assert cov.cp_param_up.raw == 0 else fail("hook param resize must stay signed")
         assert cov.cp_as_uint.raw == 1 else fail("`as uint<16>` stays an unsigned 16-bit value")
-        assert cov.cp_as_uint.neg == 0 else fail("`as uint<16>` must not become signed")
     end check
 end impl Test
 "#,
@@ -234,12 +226,10 @@ covergroup Cov @(sink.accept(u, s) post)
     cp_not : cover ~u
         bins
             ff = {0xFF}
-            big = [0x100..0xFFFFFFFF]
         end bins
     cp_snot : cover ~s
         bins
             minus_six = {-6}
-            raw = {0xFA}
         end bins
 end covergroup Cov
 
@@ -258,9 +248,7 @@ impl Test for Tb
     end run
     check
         assert cov.cp_not.ff == 1 else fail("~uint<8> 0 must sample 0xFF")
-        assert cov.cp_not.big == 0 else fail("~uint<8> must not sample the 64-bit complement")
         assert cov.cp_snot.minus_six == 1 else fail("~sint<8> 5 must sample -6")
-        assert cov.cp_snot.raw == 0 else fail("~sint<8> must stay signed")
     end check
 end impl Test
 "#,
@@ -600,7 +588,6 @@ covergroup Cov @(sink.accept(a, b, c, d, e, r65, r129, s128, s129, u63) post)
     z128_129 : cover c.zext<129>()
         bins
             ok = {r129}
-            neg = {-1}
         end bins
     r64_65 : cover a.resize<65>()
         bins
@@ -667,7 +654,6 @@ impl Test for Tb
         assert cov.z64_65.ok == 1 else fail("sint<64> -1 .zext<65>() is 2^64-1")
         assert cov.z63_64.ok == 1 else fail("sint<63> -1 .zext<64>() is 2^63-1")
         assert cov.z128_129.ok == 1 else fail("sint<128> -1 .zext<129>() is 2^128-1")
-        assert cov.z128_129.neg == 0 else fail("zext must not sign-extend")
         assert cov.r64_65.ok == 1 else fail("sint<64> -1 .resize<65>() is -1")
         assert cov.r64_65.raw == 0 else fail("signed resize must not zero-extend")
         assert cov.r65_64.ok == 1 else fail("sint<65> -1 .resize<64>() is -1")

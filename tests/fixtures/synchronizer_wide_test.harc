@@ -61,11 +61,11 @@ impl DataSyncTest for DataSyncTb
         // i=3: drive 0x44 → wait 1 → out = 0x22
         // i=4: drive 0x55 → wait 1 → out = 0x33
 
-        let vals0 = 17                  // 0x11
-        let vals1 = 34                  // 0x22
-        let vals2 = 51                  // 0x33
-        let vals3 = 68                  // 0x44
-        let vals4 = 85                  // 0x55
+        let vals0 : uint<8> = 17                  // 0x11
+        let vals1 : uint<8> = 34                  // 0x22
+        let vals2 : uint<8> = 51                  // 0x33
+        let vals3 : uint<8> = 68                  // 0x44
+        let vals4 : uint<8> = 85                  // 0x55
 
         dut.data_in = vals0
         wait 1 cycle on dst_clk

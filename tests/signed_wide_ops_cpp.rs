@@ -90,10 +90,11 @@ fn signed_wide_operators_route_to_twos_complement_helpers() {
         cpp.contains("harc_sext_u128"),
         "mixed signed scalar arithmetic must sign-extend to its common width:\n{cpp}"
     );
-    // `q129 + zero160`: the 129-bit operand is sign-extended to the
-    // 160-bit common width before the HarcWide<5> operator.
+    // `q129 + zero160`: both operands are sign-extended to the 161-bit
+    // ARCH result width (max + 1) before the HarcWide<6> operator.
     assert!(
-        cpp.contains("harc_wide_sext<5>(") && cpp.contains(", 129, 160)"),
+        cpp.contains("harc_wide_sext<6>(q129, 129, 161)")
+            && cpp.contains("harc_wide_sext<6>(zero160, 160, 161)"),
         "mixed signed HarcWide arithmetic must sign-extend to its common width:\n{cpp}"
     );
 }

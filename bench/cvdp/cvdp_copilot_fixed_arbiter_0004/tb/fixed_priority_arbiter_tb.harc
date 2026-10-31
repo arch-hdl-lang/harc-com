@@ -17,7 +17,7 @@
 function priority_grant(req: uint<8>) -> uint<8>
     for i in 0 .. 7
         if ((req >> i) & 1) == 1
-            return 1 << i
+            return (1 as uint<8>) << i
         end if
     end for
     return 0

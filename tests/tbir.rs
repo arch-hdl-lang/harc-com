@@ -741,7 +741,7 @@ end test T"#
 #[test]
 fn const_sint_reinterprets_high_bit_patterns() {
     let cpp = emit_cpp_src(
-        r#"const ALL63 : sint<63> = 0xFFFFFFFFFFFFFFFF
+        r#"const ALL63 : sint<63> = 0xFFFFFFFFFFFFFFFF as sint<63>
 const CASTNEG : sint<8> = 0xFF as sint<8>
 
 test T
@@ -754,8 +754,22 @@ end test T"#,
     );
     assert!(
         cpp.contains("((int64_t)(-1))"),
-        "sint reinterpretation must store -1; got:\n{cpp}"
+        "an explicit `as sint<N>` reinterpretation must store -1; got:\n{cpp}"
     );
+    // Without the cast the pattern is NOT reinterpreted (strict fit, owner
+    // decision): 2**64 - 1 does not fit `sint<63>`.
+    let err = lower_src(
+        r#"const ALL63 : sint<63> = 0xFFFFFFFFFFFFFFFF
+
+test T
+    let dut : Top
+    run
+        assert ALL63 == 0 else fail("x")
+    end run
+end test T"#,
+    )
+    .expect_err("2**64 - 1 does not fit sint<63>");
+    assert!(assert_invalid(&err).contains("does not fit `sint<63>`"));
     // `as uint<8>` is the 8-bit value (255), the same as at runtime, so it
     // does not fit a `sint<8>` constant.
     let err = lower_src(
@@ -938,12 +952,19 @@ const RESULT : bool = negative_time() < 0"#,
         let source = format!(
             "{helper}\n\ntest T\n    let dut : Top\n    run\n        assert RESULT == false else fail(\"{label}\")\n    end run\nend test T"
         );
-        let prog = lower_src(&source).unwrap_or_else(|err| panic!("{label} helper folds: {err}"));
-        let text = format!("{prog}");
-        assert!(
-            text.contains("(0 == 0)"),
-            "{label} must coerce to the unsigned helper ABI before comparison:\n{text}"
+        // Strict fit (owner decision): -1 does not fit the unsigned
+        // helper slot, so it is an error rather than a reinterpreted
+        // 64-bit pattern.
+        let msg = assert_invalid(
+            &lower_src(&source).expect_err("-1 does not fit an unsigned helper slot"),
         );
+        assert!(msg.contains("does not fit"), "{label}: {msg}");
+        // A value that fits folds through the unsigned slot.
+        let fitting = source
+            .replace("(-1)", "(1)")
+            .replace("return -1", "return 1");
+        let prog = lower_src(&fitting).unwrap_or_else(|err| panic!("{label} helper folds: {err}"));
+        assert!(format!("{prog}").contains("(0 == 0)"), "{label}");
     }
 }
 
@@ -1035,7 +1056,9 @@ end test T"#,
     )
     .expect_err("a sint/uint comparison must not lower");
     assert!(
-        error.to_string().contains("mixes signed and unsigned operands"),
+        error
+            .to_string()
+            .contains("mixes signed and unsigned operands"),
         "{error}"
     );
 }
@@ -1049,7 +1072,7 @@ fn const_width_violation_is_rejected() {
     for (src_ty, init, needle) in [
         ("uint<8>", "0x1FF", "does not fit `uint<8>`"),
         ("uint<32>", "~0", "does not fit `uint<32>`"),
-        ("uint<32>", "0 - 1", "negative values cannot initialize"),
+        ("uint<32>", "0 - 1", "value -1 does not fit `uint<32>`"),
         ("sint<8>", "128", "does not fit `sint<8>`"),
         ("sint<8>", "0 - 129", "does not fit `sint<8>`"),
     ] {
@@ -1111,7 +1134,7 @@ fn const_width_boundaries_fold() {
 const S8_MAX  : sint<8>  = 127
 const S8_MIN  : sint<8>  = 0 - 128
 const U63     : uint<63> = (1 << 63) - 1
-const ALL_ONES : uint<64> = ~0
+const ALL_ONES : uint<64> = (~0) as uint<64>
 
 test T
     let dut : Top
@@ -1120,7 +1143,7 @@ test T
         assert S8_MAX == 127 else fail("x")
         assert S8_MIN + 128 == 0 else fail("x")
         assert U63 == 9223372036854775807 else fail("x")
-        assert ALL_ONES == ~0 else fail("x")
+        assert ALL_ONES == 0xFFFFFFFFFFFFFFFF else fail("x")
     end run
 end test T"#,
     );
@@ -1145,8 +1168,11 @@ fn const_invalid_evaluations_are_rejected() {
         ("1 / 0", "division by zero"),
         ("1 % 0", "modulo by zero"),
         ("1 / (BASE - BASE)", "division by zero"),
-        ("1 << 64", "shift amount 64 is out of range"),
-        ("1 >> 200", "shift amount 200 is out of range"),
+        // A literal-only shift is exact: 2**64 is a value, which then does
+        // not fit the declared type (strict fit).
+        ("1 << 64", "does not fit `uint<32>`"),
+        ("1 << 2000", "shift amount 2000 is out of range"),
+        ("BASE << 64", "shift amount 64 is out of range"),
         ("1 << (0 - 1)", "negative shift amount (-1)"),
         ("BAD + 1", "references itself"),
     ] {
@@ -1178,12 +1204,12 @@ end test T"#
 fn const_relabel_cast_folds() {
     let cpp = emit_cpp_src(
         r#"const ALL : uint<64> = (0 - 1) as uint<64>
-const BACK : sint<8> = (255 as sint<64>) >> 8
+const BACK : sint<8> = ((255 as sint<64>) >> 8) as sint<8>
 
 test T
     let dut : Top
     run
-        assert ALL == ~0 else fail("x")
+        assert ALL == 0xFFFFFFFFFFFFFFFF else fail("x")
         assert BACK == 0 else fail("x")
     end run
 end test T"#,
@@ -1379,8 +1405,14 @@ fn signed_wide_right_shift_uses_declared_width_arithmetic_helper() {
 end test T"#,
     );
     assert!(
-        cpp.matches("harc_rt::harc_ashr_u128").count() >= 3,
+        cpp.matches("harc_rt::harc_ashr_u128").count() >= 1,
         "wide signed shifts must use the arithmetic helper: {cpp}"
+    );
+    // `wide + 1` is a 129-bit sum (ARCH result width), held in HarcWide<5>,
+    // so its shift uses the HarcWide arithmetic helper at 129 bits.
+    assert!(
+        cpp.matches("harc_rt::harc_wide_ashr(").count() >= 2 && cpp.contains(", 129)"),
+        "nested wide signed shifts shift the 129-bit sum arithmetically: {cpp}"
     );
 }
 
@@ -1540,7 +1572,7 @@ test PureTernary
     let dut : Top
     clock clk = SysDomain
     run
-        let selected = true ? 11 : 22
+        let selected : uint<8> = true ? 11 : 22
         assert selected == 11 else fail("pure ternary")
     end run
 end test PureTernary
@@ -3522,8 +3554,10 @@ end impl NarrowingTest
     .expect("mixed-carrier wide expressions emit");
     assert!(
         emitted.contains("harc_rt::harc_wide_zext<8>(255, 8)")
-            && emitted.contains("harc_rt::harc_wide_zext<8>(1, 1)"),
-        "wide/scalar operators promote the scalar to HarcWide<8>:\n{emitted}"
+            && emitted.contains("harc_rt::harc_wide_zext<9>(_tb.sb.wide, 256)")
+            && emitted.contains("harc_rt::harc_wide_zext<9>(1, 1)"),
+        "wide/scalar operators promote the scalar to HarcWide<8>, and the 257-bit \
+         `wide + 1` (ARCH result width) runs in HarcWide<9>:\n{emitted}"
     );
 
     let wide_read = ir::Expr::ScoreboardQuery {
@@ -3606,8 +3640,8 @@ end impl NarrowingTest
         );
         let err = lower_src(&narrowing).expect_err("storage literals must fit their declaration");
         assert!(
-            err.to_string().contains("narrows"),
-            "an over-width literal must identify storage narrowing: {err}"
+            err.to_string().contains("does not fit"),
+            "an over-width literal must be the strict-fit storage error: {err}"
         );
     }
 
@@ -3661,7 +3695,8 @@ end impl NarrowingTest
         // (owner decision D1), rejected before any narrowing is judged.
         let err = lower_src(&narrowing).expect_err("a signed mask cannot narrow a wide value");
         assert!(
-            err.to_string().contains("mixes signed and unsigned operands"),
+            err.to_string()
+                .contains("mixes signed and unsigned operands"),
             "a signed mask on a wide unsigned value is rejected: {err}"
         );
     }
@@ -12223,7 +12258,7 @@ impl T for Tb
     clock clk = SysDomain
     run
         sb.q.push(7)
-        let guard = 0
+        let guard : uint<64> = 0
         assert (guard == 1 && sb.q.pop() == 7) || sb.q.size() == 1
             else fail("queue was popped despite the short circuit")
         wait 2 cycles
@@ -13818,7 +13853,7 @@ end impl T"#;
     ] {
         let err = lower_src(&bad).expect_err("an oversized state literal is rejected");
         let msg = assert_invalid(&err);
-        assert!(msg.contains("narrows"), "{label}: {msg}");
+        assert!(msg.contains("does not fit"), "{label}: {msg}");
     }
     let mut oversized_scalar_ir = prog.clone();
     let scalar_write = oversized_scalar_ir
@@ -17998,7 +18033,8 @@ end test T"#
 
     // The five shapes the routing predicate excludes. None of them may
     // reach the subscription arms — each is claimed elsewhere first.
-    lower_src(&agent("3 cycles", "seen = (seen + 1).resize<32>()")).expect("a periodic handler lowers");
+    lower_src(&agent("3 cycles", "seen = (seen + 1).resize<32>()"))
+        .expect("a periodic handler lowers");
     for (trigger, elsewhere) in [
         ("clk", "the unresolved name `clk`"),
         ("tagger.in_ev(t)", "transactor/method call `.in_ev(...)`"),
@@ -18033,7 +18069,10 @@ end test T"#
     // Give `u` something else to bind to and v1 compiles and runs to a
     // value the source never asked for, which is the worse one and so
     // the arm's label.
-    for body in ["seen = (seen + 1).resize<32>()", "seen = (seen + u).resize<32>()"] {
+    for body in [
+        "seen = (seen + 1).resize<32>()",
+        "seen = (seen + u).resize<32>()",
+    ] {
         let two = agent("in_ev(t, u)", body);
         assert_not_implemented(
             &lower_src(&two).unwrap_err(),
@@ -18101,7 +18140,11 @@ end test T"#
     lower_src(&one).expect("the control lowers");
     assert_eq!(
         cpp_tb::emit(&merged_src(&one)).expect("v1 emits"),
-        cpp_tb::emit(&merged_src(&agent("in_ev(t, u)", "seen = (seen + t).resize<32>()"))).expect("v1 emits"),
+        cpp_tb::emit(&merged_src(&agent(
+            "in_ev(t, u)",
+            "seen = (seen + t).resize<32>()"
+        )))
+        .expect("v1 emits"),
         "the extra parameter leaves no trace in v1's output"
     );
 }
@@ -28768,9 +28811,7 @@ end test RuntimePromotedLetTest"#;
     let first = cpp
         .find("first = harc_helper_seed()")
         .expect("first local initializes");
-    let middle = cpp
-        .find("((first + 1))")
-        .expect("middle local initializes");
+    let middle = cpp.find("((first + 1))").expect("middle local initializes");
     let observed = cpp
         .find("_tb.observed = ((uint64_t)(((uint64_t)((middle + 1))")
         .expect("promoted field initializes at runtime");
@@ -29066,7 +29107,9 @@ end impl TbRecordFieldTest
     assert!(
         cpp.contains("Tb_seed")
             && cpp.contains("_tb.cur.value = v;")
-            && cpp.contains("_tb.cur.value = ((uint64_t)(((uint64_t)((_tb.cur.value + 1)) & 0xFFULL)));"),
+            && cpp.contains(
+                "_tb.cur.value = ((uint64_t)(((uint64_t)((_tb.cur.value + 1)) & 0xFFULL)));"
+            ),
         "canonical methods should mutate the shared record object:\n{cpp}"
     );
     assert!(
@@ -29165,7 +29208,8 @@ end impl TbScalarFieldTest
 "#;
     let cpp = emit_cpp_src(src);
     assert!(
-        cpp.contains("_tb.count = ((uint64_t)(((uint64_t)((_tb.count + 1)) & 0xFFFFFFFFULL)));") && cpp.contains("if (!((_tb.count == 1)))"),
+        cpp.contains("_tb.count = ((uint64_t)(((uint64_t)((_tb.count + 1)) & 0xFFFFFFFFULL)));")
+            && cpp.contains("if (!((_tb.count == 1)))"),
         "bare scalar testbench field should lower through _tb host state:\n{cpp}"
     );
 }
@@ -29353,10 +29397,20 @@ end test T"#;
             .iter()
             .filter(|cast| **cast == (ir::WidthCastKind::Sext, 129, Some(65)))
             .count(),
-        4,
-        "direct, compound, nested, and masked sext receivers must retain 65-bit metadata \
+        3,
+        "direct, compound, and nested sext receivers must retain 65-bit metadata \
          (a signed sum past 64 bits is not sign-extended in its carrier, so a cast keeps the \
          operand width): {casts:?}"
+    );
+    // `n & 0xFF` is an 8-bit unsigned value (a literal mask bounds `&`),
+    // so a width method on it sees 8 bits.
+    assert_eq!(
+        casts
+            .iter()
+            .filter(|cast| **cast == (ir::WidthCastKind::Sext, 129, Some(8)))
+            .count(),
+        1,
+        "the masked sext receiver is the 8-bit mask result: {casts:?}"
     );
     // The untyped `inferred = n + z` local is itself a `sint<66>` (owner
     // decision D2), so its cast reads 66 declared bits.
@@ -29384,8 +29438,14 @@ end test T"#;
         1,
         "compound zext receiver must carry the 9-bit sum: {casts:?}"
     );
-    assert!(casts.contains(&(ir::WidthCastKind::Sext, 129, Some(65))), "{casts:?}");
-    assert!(casts.contains(&(ir::WidthCastKind::Trunc, 16, Some(65))), "{casts:?}");
+    assert!(
+        casts.contains(&(ir::WidthCastKind::Sext, 129, Some(65))),
+        "{casts:?}"
+    );
+    assert!(
+        casts.contains(&(ir::WidthCastKind::Trunc, 16, Some(8))),
+        "{casts:?}"
+    );
     assert!(casts.iter().all(|(_, _, src_width)| src_width.is_some()));
 }
 
@@ -30843,9 +30903,16 @@ fn regblock_capitalized_field_types_lower_like_lowercase() {
     let field = "field MODE : uint<3> @ 4  reset 0";
     assert!(fixture.contains(field), "fixture field line moved");
     let lower = |ty: &str, reset: &str| {
-        lower_with_stdlib_bus_src(
-            &fixture.replace(field, &format!("field MODE : {ty} @ 4  reset {reset}")),
-        )
+        let src = fixture.replace(field, &format!("field MODE : {ty} @ 4  reset {reset}"));
+        // The fixture writes and reads MODE as 0b101 = 5; as a signed 3-bit
+        // field that pattern is -3 (5 does not fit `sint<3>`, strict fit).
+        let src = if ty.starts_with('s') || ty.starts_with('S') {
+            src.replace("regs.DMACR.MODE = 5", "regs.DMACR.MODE = -3")
+                .replace("regs.DMACR.MODE == 5", "regs.DMACR.MODE == -3")
+        } else {
+            src
+        };
+        lower_with_stdlib_bus_src(&src)
     };
     for (lowercase, capitalized) in [("uint<3>", "UInt<3>"), ("sint<3>", "SInt<3>")] {
         let expected = format!("{}", lower(lowercase, "3").expect("lowercase field lowers"));
@@ -32607,20 +32674,20 @@ end domain SysDomain
 
 test ShadowPromote
     let dut : Top
-    let expected_total = 0
+    let expected_total : uint<64> = 0
 
     clock clk = SysDomain
 
     run
         dut.en = 1
-        expected_total = expected_total + 1
+        expected_total = expected_total +% 1
         wait 1 cycle
     end run
 
     check
         assert expected_total == 1 else fail("outer ${expected_total}")
         if expected_total == 1
-            let expected_total = 99
+            let expected_total : uint<64> = 99
             assert expected_total == 99 else fail("inner ${expected_total}")
         end if
     end check
@@ -32674,7 +32741,7 @@ impl HookLetShadowTest for HookShadowTb
     on drv.send post
         acc = (acc + t.value).resize<32>()
         if t.value == 7
-            let acc = 99
+            let acc : uint<64> = 99
             log(info, "inner acc=${acc}")
         end if
     end on
@@ -32942,7 +33009,12 @@ end test T"#;
     ] {
         let err =
             lower_src(&source(argument)).expect_err("narrowing callable argument must be rejected");
-        assert!(err.to_string().contains("narrows"), "{argument}: {err}");
+        // An untyped literal argument is judged by strict fit.
+        let err = err.to_string();
+        assert!(
+            err.contains("narrows") || err.contains("does not fit"),
+            "{argument}: {err}"
+        );
     }
 }
 
@@ -33123,7 +33195,8 @@ end impl T"#
         let err = lower_src(&source(argument)).expect_err("narrowing tseq argument must reject");
         let message = assert_invalid(&err);
         assert!(
-            message.contains("parameter of tseq `Make`") && message.contains("narrows"),
+            message.contains("parameter of tseq `Make`")
+                && (message.contains("narrows") || message.contains("does not fit")),
             "{argument}: {message}"
         );
     }
@@ -33278,7 +33351,7 @@ fn bare_identifier_assert_without_a_property_stays_immediate() {
         r#"test T
     let dut : Top
     run
-        let flag = 1
+        let flag : uint<64> = 1
         assert flag else fail("flag")
     end run
 end test T"#,
@@ -33754,7 +33827,7 @@ fn an_on_body_referencing_an_enclosing_local_is_rejected() {
         r#"test T
     let dut : Top
     run
-        let seen = 0
+        let seen : uint<64> = 0
         on dut.rst == 1
             log(info, "seen=${seen}")
         end on
@@ -33806,7 +33879,7 @@ end impl T"#;
         r#"test T
     let dut : Top
     run
-        let n = 4
+        let n : uint<64> = 4
         on n cycles
             log(info, "tick")
         end on
@@ -35700,7 +35773,7 @@ fn dump_ir_renders_a_check_body_that_reads_a_local() {
         r#"test T
     let dut : Top
     run
-        let x = 3
+        let x : uint<64> = 3
         cover x == 3
         wait 1 cycle
     end run
@@ -36021,7 +36094,7 @@ end test T"#,
 fn sync_timed_wait_reserves_its_state_and_covers_both_body_emitters() {
     let shadowing = XACTOR_SRC.replace(
         "wait 1 cycle\n            dut.en = 0",
-        "let _wu_start = 7\n            wait until dut.count_out == 1 timeout 5 cycles\n            dut.en = 0",
+        "let _wu_start : uint<64> = 7\n            wait until dut.count_out == 1 timeout 5 cycles\n            dut.en = 0",
     );
     let cpp = emit_cpp_src(&shadowing);
     assert!(
@@ -36074,7 +36147,7 @@ fn probe_sweep_two_constructs_v1_does_not_really_support() {
         r#"test T
     let dut : Top
     run
-        let m = 1
+        let m : uint<64> = 1
         fail(m)
     end run
 end test T"#,
@@ -36089,7 +36162,7 @@ end test T"#,
         r#"test T
     let dut : Top
     run
-        let m = 1
+        let m : uint<64> = 1
         assert dut.a == 1 else fail(m)
         wait 1 cycle
     end run
@@ -36316,7 +36389,7 @@ fn a_runtime_bounded_bit_slice_lowers_through_the_helper() {
 end testbench Tb
 impl T for Tb
     run
-        let i = 1
+        let i : uint<64> = 1
         let b = {slice}
         wait 1 cycle
     end run
@@ -36459,7 +36532,7 @@ fn indexing_and_field_access_on_a_scalar_do_not_point_at_v1() {
 end testbench Tb
 impl T for Tb
     run
-        let a = 5
+        let a : uint<64> = 5
         let b = a[0]
         wait 1 cycle
     end run
@@ -36475,7 +36548,7 @@ end impl T"#,
 end testbench Tb
 impl T for Tb
     run
-        let x = 1
+        let x : uint<64> = 1
         let y = x.foo
         wait 1 cycle
     end run
@@ -36537,7 +36610,7 @@ fn a_concurrent_check_message_interpolates_from_the_closure() {
 end testbench Tb
 impl T for Tb
     run
-        let lo = 0
+        let lo : sint<64> = 0
         assert past(dut.a) == 0 else fail("a=${dut.a} lo=${lo}")
         wait 1 cycle
     end run
@@ -36641,7 +36714,7 @@ fn a_runtime_slice_of_a_wide_value_is_not_cast_to_128_bits() {
 end testbench Tb
 impl T for Tb
     run
-        let i = 200
+        let i : uint<64> = 200
         let w : uint<256> = 5
         let b = w[i:1]
         wait 1 cycle
@@ -36831,9 +36904,9 @@ end testbench Tb
 impl T for Tb
     run
         let r : Bundle
-        let sum = 0
+        let sum : uint<64> = 0
         for x in r.data
-            sum = sum + x
+            sum = sum +% x
         end for
         wait 1 cycle
     end run
@@ -36845,7 +36918,7 @@ end impl T"#,
         "header counts to the Vec length:\n{cpp}"
     );
     assert!(
-        cpp.contains("x = r.data[") && cpp.contains("sum = (sum + x)"),
+        cpp.contains("x = r.data[") && cpp.contains("sum = ((uint64_t)((sum + x)))"),
         "each iteration binds the element, then runs the body:\n{cpp}"
     );
 }
@@ -36867,9 +36940,9 @@ end testbench Tb
 impl T for Tb
     run
         let o : Outer
-        let sum = 0
+        let sum : uint<64> = 0
         for y in o.inner.data
-            sum = sum + y
+            sum = sum +% y
         end for
         wait 1 cycle
     end run
@@ -36947,17 +37020,17 @@ end testbench Tb
 impl T for Tb
     run
         let r : Bundle
-        let sum = 0
+        let sum : uint<64> = 0
         for x in r.data
             if x == 1
-                sum = sum + x
+                sum = sum +% x
             end if
         end for
         wait 1 cycle
     end run
 end impl T"#,
     );
-    assert!(cpp.contains("sum = (sum + x)"), "{cpp}");
+    assert!(cpp.contains("sum = ((uint64_t)((sum + x)))"), "{cpp}");
 }
 
 /// A scalar record field is not iterable in either backend: v1 emits
@@ -37655,11 +37728,11 @@ end testbench Tb
 impl T for Tb
     run
         let t : Tbl
-        let k = 0
-        let sum = 0
+        let k : uint<64> = 0
+        let sum : uint<64> = 0
         for x in t.entries[k].data
-            sum = sum + x
-            k = k + 1
+            sum = sum +% x
+            k = k +% 1
         end for
         wait 1 cycle
     end run
@@ -37670,7 +37743,7 @@ end impl T"#,
         "the selector must be snapshotted, not re-read each iteration:\n{cpp}"
     );
     assert!(
-        cpp.contains("t.entries[__t") && cpp.contains("k = (k + 1)"),
+        cpp.contains("t.entries[__t") && cpp.contains("k = ((uint64_t)((k + 1)))"),
         "the body still advances `k`; the loop just stops following it:\n{cpp}"
     );
 }
@@ -37695,9 +37768,9 @@ end testbench Tb
 impl T for Tb
     run
         let t : Tbl
-        let sum = 0
+        let sum : uint<64> = 0
         for x in t.entries[dut.a].data
-            sum = sum + x
+            sum = sum +% x
         end for
         wait 1 cycle
     end run
@@ -37912,11 +37985,8 @@ end impl T"#
     // declaration rejects, reported the same way.
     for (init, want) in [
         ("1 / 0", "division by zero"),
-        (
-            "-1",
-            "negative values cannot initialize an unsigned constant",
-        ),
-        ("300", "does not fit `uint<8>` (max 255)"),
+        ("-1", "it is a signed 1-bit value"),
+        ("300", "does not fit `uint<8>` (range 0..=255"),
     ] {
         let err = lower_src(&src(init)).unwrap_err();
         let msg = assert_invalid(&err);
@@ -40190,7 +40260,7 @@ end testbench Tb
 impl T for Tb
     run
         let nibble = 4'd3
-        let ordinary = 3
+        let ordinary : uint<64> = 3
         let byte : uint<8> = 8'hAB
         let flag : bool = 1'b1
         let negative = -8'd1
@@ -40236,9 +40306,13 @@ end impl T
             .find(|local| local.name == "ordinary")
             .expect("ordinary local")
             .ty,
-        ir::IrType::Unknown,
-        "admitting sized literals must not change unsized-let inference"
+        ir::IrType::UInt(Some(64))
     );
+    // Admitting sized literals must not admit an unsized one: a bare
+    // integer literal `let` has no type to infer (owner decision, R16).
+    let bare = src.replace("let ordinary : uint<64> = 3", "let ordinary = 3");
+    let err = lower_src(&bare).expect_err("a bare-literal let is rejected");
+    assert!(err.to_string().contains("untyped integer literal"), "{err}");
     assert_eq!(
         run.locals
             .iter()
@@ -40683,22 +40757,23 @@ fn an_unfoldable_or_out_of_range_regblock_value_is_still_rejected() {
     let msg = assert_invalid(&err);
     assert!(msg.contains("must not be negative"), "{msg}");
 
-    // An untyped `const` folds SIGNED, so a value at or above 2^63
-    // lands in that same arm. The message names the escape hatch, and
-    // the escape hatch works.
-    let err = lower_src(&offset("const K = 0x8000000000000000\n\n", "K")).unwrap_err();
-    let msg = assert_invalid(&err);
-    assert!(msg.contains("`const NAME : uint<64> = ...`"), "{msg}");
-    // It folds; the address then has to fit the `via` helper's `addr`
-    // parameter, which this fixture declares `uint<8>`, and the frontdoor
-    // says so precisely instead of handing the verifier a 64-bit argument.
-    let err = lower_src(&offset("const K : uint<64> = 0x8000000000000000\n\n", "K"))
-        .unwrap_err();
-    let msg = assert_invalid(&err);
-    assert!(
-        msg.contains("its offset 0x8000000000000000"),
-        "a uint<64> const spells a >=2^63 address: {msg}"
-    );
+    // Constants fold exactly, so an untyped `const` at or above 2^63 is
+    // that non-negative address (it used to fold SIGNED and land in the
+    // negative arm); typed or untyped, the address then has to fit the
+    // `via` helper's `addr` parameter, which this fixture declares
+    // `uint<8>`, and the frontdoor says so precisely instead of handing the
+    // verifier a 64-bit argument.
+    for decl in [
+        "const K = 0x8000000000000000",
+        "const K : uint<64> = 0x8000000000000000",
+    ] {
+        let err = lower_src(&offset(&format!("{decl}\n\n"), "K")).unwrap_err();
+        let msg = assert_invalid(&err);
+        assert!(
+            msg.contains("its offset 0x8000000000000000"),
+            "`{decl}` spells a >=2^63 address: {msg}"
+        );
+    }
 
     // A FORWARD reference folds: regblocks lower after the whole
     // constant table is built, so the declaration-order caveat that
@@ -42277,7 +42352,14 @@ fn an_absent_tseq_element_type_is_not_a_bad_one() {
     // ABSENT: a gap CLOSED, not classified. v1 defaults the element type
     // to a signed 64-bit scalar and the sequence runs; TB-IR now does the
     // same, byte-identically.
-    let absent = fixture.replace(DECL, "tseq Squares(n: int)");
+    // The defaulted element is signed, so the accumulators that sum it
+    // are declared signed too (D1: no implicit sign mixing).
+    let absent = fixture
+        .replace(DECL, "tseq Squares(n: int)")
+        .replace("let sum : uint<64> = 0", "let sum : sint<64> = 0")
+        .replace("let sum2 : uint<64> = 0", "let sum2 : sint<64> = 0")
+        .replace("(sum + x).trunc<64>()", "(sum + x).resize<64>()")
+        .replace("(sum2 + x).trunc<64>()", "(sum2 + x).resize<64>()");
     let tbir = emit_cpp_src(&absent);
     let v1 = cpp_tb::emit(&merged_src(&absent)).expect("v1 emits without a return type");
     for out in [&tbir, &v1] {
@@ -42478,7 +42560,7 @@ fn regblock_reset_all_is_a_tbir_native_mirror_operation() {
         let shadowed = fixture.replace(
             "regs.SRC = 305419896",
             &format!(
-                "if 1\n            let regs = 0\n            regs.reset_all({args})\n        end if"
+                "if 1\n            let regs : uint<64> = 0\n            regs.reset_all({args})\n        end if"
             ),
         );
         let err = lower_src(&shadowed).expect_err("a scalar shadow must not reset as a record");
@@ -42563,12 +42645,12 @@ fn the_tseq_default_does_not_swallow_what_it_should_reject() {
 end transaction Req
 
 tseq Gen(n: int) -> TSeq<Req>
-    let i = 1
+    let i : uint<8> = 1
     while i <= n
         let t : Req
         t.a = i
         yield t
-        i = i + 1
+        i = i +% 1
     end while
 end tseq Gen
 
@@ -42932,9 +43014,9 @@ end testbench MTb
 impl MTest for MTb
     run
         let xs = Gen(false)
-        let sum = 0
+        let sum : uint<64> = 0
         for x in xs
-            sum = sum + x.a
+            sum = (sum + x.a).trunc<64>()
         end for
         assert sum == 10 else fail("record yield expression sum=${sum}")
     end run
@@ -44914,8 +44996,10 @@ end impl ParamTest
         let shadow = |limit: &str, body: &str| {
             format!(
                 "const N = 9\n{}",
-                mk("Tagger #(N: int = 3)", "Tagger #(4)", limit)
-                    .replace("seen = (seen + 1).resize<32>()", &format!("seen = (seen + {body}).resize<32>()"))
+                mk("Tagger #(N: int = 3)", "Tagger #(4)", limit).replace(
+                    "seen = (seen + 1).resize<32>()",
+                    &format!("seen = (seen + {body}).resize<32>()")
+                )
             )
         };
         let line_of = |out: &str, needle: &str| {
@@ -44956,7 +45040,10 @@ end impl ParamTest
         // identical use, so `#(4)` changed nothing about the value used.
         let no_param = format!(
             "const N = 9\n{}",
-            mk("Tagger", "Tagger", "7").replace("seen = (seen + 1).resize<32>()", "seen = (seen + N).resize<32>()")
+            mk("Tagger", "Tagger", "7").replace(
+                "seen = (seen + 1).resize<32>()",
+                "seen = (seen + N).resize<32>()"
+            )
         );
         lower_src(&no_param)
             .unwrap_or_else(|e| panic!("{kind}: the const-only form lowers: {e:?}"));
@@ -45980,7 +46067,7 @@ relation Band(r: RegOp, lo: int, hi: int) = r.value > lo && r.value < hi
     // field's type — so the site is not collected under `RegOp`.
     assert_eq!(
         sites(&format!(
-            "agent A\n    r : RegOp\n    hookable go()\n        let r = 5\n{RZ_R}    end go\nend agent A\n"
+            "agent A\n    r : RegOp\n    hookable go()\n        let r : uint<64> = 5\n{RZ_R}    end go\nend agent A\n"
         )),
         0,
         "an untyped `let` shadows the field rather than inheriting its type"
@@ -46899,7 +46986,7 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
         // so the emitted C++ does not compile.
         let named = src.replacen("on 5 cycles", "on limit cycles", 1).replacen(
             "    run\n",
-            "    let limit = 5\n\n    run\n",
+            "    let limit : uint<64> = 5\n\n    run\n",
             1,
         );
         let v1 = cpp_tb::emit(&merged_src(&named))
@@ -46939,7 +47026,7 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
             .to_string();
         let early = src.replacen("on 5 cycles", "on limit cycles", 1).replacen(
             &binding,
-            &format!("    let limit = 5\n{binding}"),
+            &format!("    let limit : uint<64> = 5\n{binding}"),
             1,
         );
         assert!(
@@ -47005,7 +47092,8 @@ fn a_bound_to_transactor_on_arm_is_reachable_only_for_a_periodic_handler() {
     // the three arms. Each row below is the same source as one of the
     // positive rows above with only the TRIGGER changed, so what moves
     // it is the gate and nothing else.
-    let non_periodic = "    on read_count > 0\n        prep_acc = (prep_acc + 1).resize<32>()\n    end on\n";
+    let non_periodic =
+        "    on read_count > 0\n        prep_acc = (prep_acc + 1).resize<32>()\n    end on\n";
     // Every row routes the non-periodic handler to component IR. The target
     // row additionally retains its responder in transactor IR and joins both
     // views at the bound instance; the two initiator rows need only the
@@ -47545,7 +47633,8 @@ end impl T"#,
             }
         )
     };
-    let hookable = "    hookable take(v: uint<8>)\n        seen = (seen + 1).resize<32>()\n    end take";
+    let hookable =
+        "    hookable take(v: uint<8>)\n        seen = (seen + 1).resize<32>()\n    end take";
     let dst = |payload: &str| {
         format!("transactor Dst\n    incoming : event<{payload}>\nend transactor Dst\n")
     };
@@ -47641,10 +47730,13 @@ fn a_testbench_periodic_handler_with_a_named_period_is_not_an_escape_hatch() {
 
     let named = base.replacen(LITERAL, "    on per cycles", 1).replacen(
         "\n    run\n",
-        "\n    let per = 2\n\n    run\n",
+        "\n    let per : uint<64> = 2\n\n    run\n",
         1,
     );
-    assert!(named.contains("let per = 2"), "the `let` must be inserted");
+    assert!(
+        named.contains("let per : uint<64> = 2"),
+        "the `let` must be inserted"
+    );
 
     for (what, src) in [
         ("bare `let`", named.clone()),
@@ -48038,7 +48130,7 @@ end testbench SpTb
 
 impl SpTest for SpTb
     clock clk = SysDomain
-    let per = 2
+    let per : uint<64> = 2
 
     run
         on {on} cycles
@@ -48697,7 +48789,11 @@ end impl SubTest"#
 
     // A local that is not an event falls to the `Invalid` just below
     // the arm under test, not into it.
-    let not_event = src("ch").replacen("    let ch : event<uint<8>>", "    let ch = 5", 1);
+    let not_event = src("ch").replacen(
+        "    let ch : event<uint<8>>",
+        "    let ch : uint<64> = 5",
+        1,
+    );
     let msg = assert_invalid(&lower_src(&not_event).unwrap_err());
     assert!(msg.contains("is not an event channel"), "{msg}");
 
@@ -50809,13 +50905,13 @@ fn side_table_local_reads_obey_registration_point_dominance() {
     let src = r#"test T
     let dut : Top
     run
-        let x = 3
+        let x : uint<64> = 3
         assert past(x) == 3 else fail("x=${x}")
         cover x == 3
         on x == 3
             log(info, "x")
         end on
-        let y = 4
+        let y : uint<64> = 4
         wait 1 cycle
     end run
 end test T"#;
@@ -51262,7 +51358,8 @@ fn a_wide_component_field_write_is_checked_for_width_and_signedness() {
              run\n        wait 2 cycles\n        emit tagger.in_ev(1)\n        \
                  wait 2 cycles\n    end run\n\
          end test T\n";
-    lower_src(counter).expect("`seen = (seen + t` on an event payload param stays legal).resize<32>()");
+    lower_src(counter)
+        .expect("`seen = (seen + t` on an event payload param stays legal).resize<32>()");
 }
 
 /// A fixed-vector ELEMENT wider than 64 bits keeps its width in the
@@ -52199,8 +52296,11 @@ end impl T"#
     // the element-type resolvers descending on `inner_index`.)
     let dump = format!(
         "{}",
-        lower_src(&prog("uint<8>", "v[0][1] = x\n        n = (n + v[0][1]).resize<1024>()"))
-            .expect("nested read/write lowers")
+        lower_src(&prog(
+            "uint<8>",
+            "v[0][1] = x\n        n = (n + v[0][1]).resize<1024>()"
+        ))
+        .expect("nested read/write lowers")
     );
     assert!(
         dump.contains("self.v[0][1]"),
@@ -53300,7 +53400,7 @@ end impl T"#;
 #[test]
 fn const_ternary_folds_only_the_selected_arm() {
     let src = r#"const Lazy : uint<8> = true ? 7 : (1 / 0)
-const Selected : uint<8> = true ? (7 as sint<8>) : (1 as uint<8>)
+const Selected : uint<8> = true ? (7 as uint<8>) : (1 as uint<8>)
 
 test T
     let dut : Top
@@ -53315,12 +53415,15 @@ end test T"#;
     tbir::emit(&program, &merged_src(src), &cpp_tb::EmitOpts::default())
         .expect("constant ternary emits");
 
-    let narrow = src.replace("(7 as sint<8>)", "(-1 as sint<8>)");
-    let err = lower_src(&narrow).expect_err("64-bit unsigned result does not fit uint<8>");
+    // Arms of different declared signedness are a compile-time error in
+    // a constant too (owner decision, R16 review), even when one arm is
+    // never selected.
+    let mixed = src.replace("(7 as uint<8>)", "(7 as sint<8>)");
+    let err = lower_src(&mixed).expect_err("mixed-signedness ternary arms are rejected");
     assert!(
         matches!(err, lower::LowerError::Invalid(_))
-            && err.to_string().contains("max 255"),
-        "mixed signedness must use the unsigned 64-bit carrier before width validation: {err}"
+            && err.to_string().contains("arms of a conditional"),
+        "{err}"
     );
 
     let unresolved = src.replace("(1 as uint<8>)", "(MISSING as uint<8>)");
@@ -53350,8 +53453,9 @@ end function Pick
 }
 
 /// Wrapping arithmetic has an unsigned result even when its operands are
-/// signed literals. The shape pass must carry that result through a constant
-/// ternary, including when the wrapping arm is unselected.
+/// signed literals. A ternary pairing it with a negative literal arm is a
+/// mixed-signedness conditional (owner decision, R16 review) in either arm
+/// order, selected or not; the ordinary signed control still folds.
 #[test]
 fn const_ternary_inline_wraps_are_unsigned_in_both_arm_orders() {
     let src = r#"
@@ -53378,21 +53482,32 @@ test T
     end run
 end test T
 "#;
-    let program = lower_src(src).expect("inline wrapping ternaries lower");
-    verify::verify_program(&program).expect("inline wrapping ternaries verify");
-    let text = format!("{program}");
+    for name in [
+        "AddThen", "AddElse", "SubThen", "SubElse", "MulThen", "MulElse", "Nested",
+    ] {
+        let line = src
+            .lines()
+            .find(|l| l.starts_with(&format!("const {name} ")))
+            .expect("const line");
+        let one = format!(
+            "{line}\n\ntest T\n    let dut : Top\n    run\n        assert {name} == false else fail(\"x\")\n    end run\nend test T\n"
+        );
+        let err = lower_src(&one).expect_err("a wrap arm against a negative literal arm is a mix");
+        assert!(
+            err.to_string().contains("arms of a conditional"),
+            "{name}: {err}"
+        );
+    }
+    let control = "const Ordinary : bool = (false ? (7 + 1) : -1) < 0\n\ntest T\n    let dut : Top\n    run\n        assert Ordinary == true else fail(\"ordinary control\")\n    end run\nend test T\n";
+    let program = lower_src(control).expect("ordinary signed ternary lowers");
+    verify::verify_program(&program).expect("ordinary signed ternary verifies");
     assert_eq!(
-        text.matches("(0 == 0)").count(),
-        7,
-        "wrap ternaries must fold false: {text}"
-    );
-    assert_eq!(
-        text.matches("(1 == 1)").count(),
+        format!("{program}").matches("(1 == 1)").count(),
         1,
-        "ordinary signed control must stay true: {text}"
+        "ordinary signed control must stay true"
     );
-    tbir::emit(&program, &merged_src(src), &cpp_tb::EmitOpts::default())
-        .expect("inline wrapping ternaries emit");
+    tbir::emit(&program, &merged_src(control), &cpp_tb::EmitOpts::default())
+        .expect("ordinary signed ternary emits");
 
     let lazy = r#"const LazyWrap : bool = (false ? (1 / 0) : -1) < 0
 
@@ -54365,13 +54480,19 @@ fn a_le64_component_field_write_is_checked_without_manufactured_widths() {
 
     // Lowers: a payload param carries its declared width, so
     // `seen(uint<32>) + t(uint<8>)` is 32-bit — no narrowing.
-    lower_src(&src("    seen : uint<32> default 0", "seen = (seen + t).resize<32>()"))
-        .expect("`seen = (seen + t` on a payload param must lower).resize<32>()");
+    lower_src(&src(
+        "    seen : uint<32> default 0",
+        "seen = (seen + t).resize<32>()",
+    ))
+    .expect("`seen = (seen + t` on a payload param must lower).resize<32>()");
 
     // Lowers: a widthless `const` manufactures a 64-bit width, which the
     // check must NOT treat as a real narrowing.
-    lower_src(&src("    seen : uint<32> default 0", "seen = (seen + N).resize<32>()"))
-        .expect("`seen = (seen + N` for a widthless const must lower).resize<32>()");
+    lower_src(&src(
+        "    seen : uint<32> default 0",
+        "seen = (seen + N).resize<32>()",
+    ))
+    .expect("`seen = (seen + N` for a widthless const must lower).resize<32>()");
 
     // Refuses: a DECLARED wider width into a narrower ≤64-bit field is a
     // genuine narrowing. This is the case the >64 bound used to let
@@ -54810,7 +54931,7 @@ end testbench Tb
 impl T for Tb
     run
         let r : EmptyRecord
-        let i = 0
+        let i : uint<64> = 0
         let x = r.data[i]
         wait 1 cycle
     end run
@@ -54827,7 +54948,7 @@ end testbench Tb
 impl T for Tb
     run
         empty.dut = dut
-        let i = 0
+        let i : uint<64> = 0
         let x = empty.data[i]
         wait 1 cycle
     end run
@@ -54836,7 +54957,7 @@ end impl T"#;
     let component = r#"scoreboard Empty
     data : Vec<uint<8>, 0>
     hookable put(x: uint<8>)
-        let i = 0
+        let i : uint<64> = 0
         let y = data[i]
     end put
 end scoreboard Empty
@@ -55227,12 +55348,12 @@ fn unsupported_string_operations_and_numeric_contexts_are_rejected() {
         ("let same = s == \"text\"", "binary operator"),
         ("let n = !s", "unary operators"),
         (
-            "if s\n            let n = 1\n        end if",
+            "if s\n            let n : uint<64> = 1\n        end if",
             "numeric or boolean",
         ),
         ("wait s cycles", "wait cycle count"),
         (
-            "repeat s\n            let n = 1\n        end repeat",
+            "repeat s\n            let n : uint<64> = 1\n        end repeat",
             "repeat count",
         ),
         ("let lane = dut.count_out[s]", "DUT lane index"),
@@ -56357,8 +56478,14 @@ end test CaptureConstTest
 "#;
     let error = lower::lower_program(&merged_src(src)).expect_err("mixed constraint rejected");
     let text = error.to_string();
-    assert!(text.contains("mixes signed and unsigned operands"), "{text}");
-    assert!(text.contains("right is unsigned"), "constant wins over the local: {text}");
+    assert!(
+        text.contains("mixes signed and unsigned operands"),
+        "{text}"
+    );
+    assert!(
+        text.contains("right is unsigned"),
+        "constant wins over the local: {text}"
+    );
 }
 
 
@@ -56366,8 +56493,13 @@ end test CaptureConstTest
 fn blocking_randomize_mixed_rank_comparison_is_rejected() {
     // These pairs used to pick a signed or unsigned Z3 comparison by
     // declared width; every sint/uint mix is now a compile-time error.
-    for (field, binding) in [("uint<32>", "sint<64>"), ("sint<32>", "uint<8>"), ("sint<8>", "uint<32>")] {
-        let src = format!(r#"
+    for (field, binding) in [
+        ("uint<32>", "sint<64>"),
+        ("sint<32>", "uint<8>"),
+        ("sint<8>", "uint<32>"),
+    ] {
+        let src = format!(
+            r#"
 transaction Req
     x : {field}
 end transaction Req
@@ -56385,7 +56517,9 @@ end test RankTest
 "#);
         let error = lower::lower_program(&merged_src(&src)).expect_err("mixed constraint rejected");
         assert!(
-            error.to_string().contains("mixes signed and unsigned operands"),
+            error
+                .to_string()
+                .contains("mixes signed and unsigned operands"),
             "{field}/{binding}: {error}"
         );
     }
@@ -56419,7 +56553,13 @@ end test WideCaptureTest
 
 #[test]
 fn blocking_randomize_scalar_condition_requires_flag() {
-    for (ty, succeeds) in [("bool", true), ("uint<1>", true), ("uint<8>", false), ("sint<1>", false)] {
+    for (ty, init, succeeds) in [
+        ("bool", "1", true),
+        ("uint<1>", "1", true),
+        ("uint<8>", "1", false),
+        // `1` does not fit `sint<1>` (range -1..=0, strict fit).
+        ("sint<1>", "-1", false),
+    ] {
         let src = format!(r#"
 transaction Req
     x : uint<8>
@@ -56428,7 +56568,7 @@ end transaction Req
 test CaptureConditionTest
     let dut : Top
     run
-        let flag : {ty} = 1
+        let flag : {ty} = {init}
         let request : Req
         blocking randomize(request) with
             flag

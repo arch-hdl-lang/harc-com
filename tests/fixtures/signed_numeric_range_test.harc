@@ -44,7 +44,7 @@ test SignedNumericRange
         assert mixed_count == 5 else fail("mixed count ${mixed_count}")
         assert mixed_sum == 0 else fail("mixed sum ${mixed_sum}")
 
-        let untyped_upper = 2
+        let untyped_upper : uint<64> = 2
         let untyped_count : uint<64> = 0
         let untyped_sum : sint<64> = 0
         for i in -2 .. untyped_upper
