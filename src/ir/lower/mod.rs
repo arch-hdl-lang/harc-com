@@ -1687,18 +1687,35 @@ fn lower_program_impl(
         .collect();
 
     // Domain table: `domain D freq_mhz: N` → period_ps = 1_000_000 / N.
-    let mut domains: HashMap<String, i64> = HashMap::new();
+    // A declared domain whose `freq_mhz` is not a positive integer literal
+    // records the reason instead of a period, so a clock that references
+    // it reports the bad value rather than "no `domain D` declaration".
+    // The error is deferred to the referencing clock: an unused domain
+    // stays inert, as before.
+    let mut domains: HashMap<String, Result<i64, String>> = HashMap::new();
     for it in &file.items {
         if let Item::Domain(d) = it {
             for f in &d.fields {
                 if f.name.name == "freq_mhz" {
-                    if let ExprKind::Int(s) = &*f.value.kind {
-                        if let Ok(n) = s.replace('_', "").parse::<i64>() {
-                            if n > 0 {
-                                domains.insert(d.name.name.clone(), 1_000_000 / n);
-                            }
+                    let parsed = match &*f.value.kind {
+                        ExprKind::Int(s) => s.replace('_', "").parse::<i64>().ok(),
+                        _ => None,
+                    };
+                    let period = match parsed {
+                        // Above 1 THz the 1 ps-resolution period rounds
+                        // to zero, which would never advance time.
+                        Some(n) if n > 0 && n <= 1_000_000 => Ok(1_000_000 / n),
+                        _ => {
+                            let mut value = String::new();
+                            crate::pretty::print_expr(&mut value, &f.value);
+                            Err(format!(
+                                "domain `{}` has `freq_mhz: {value}`; `freq_mhz` must be a \
+                                 positive integer literal (MHz) no greater than 1000000",
+                                d.name.name
+                            ))
                         }
-                    }
+                    };
+                    domains.insert(d.name.name.clone(), period);
                 }
             }
         }
@@ -4403,7 +4420,7 @@ fn lower_test(
     tb_of_test: &HashMap<String, String>,
     components: &HashMap<String, &ComponentDecl>,
     component_ids: &HashMap<String, ir::ComponentId>,
-    domains: &HashMap<String, i64>,
+    domains: &HashMap<String, Result<i64, String>>,
     covgroup_ids: &HashMap<String, CovgroupId>,
     record_ids: &HashMap<String, RecordId>,
     regblock_ids: &HashMap<String, RegblockId>,
@@ -5281,6 +5298,9 @@ fn lower_test(
                         "clock {} references domain `{}` but no `domain {}` declaration was found",
                         c.name.name, id.name, id.name
                     ))
+                })?;
+                let p = p.as_ref().map_err(|why| {
+                    LowerError::Invalid(format!("clock {}: {why}", c.name.name))
                 })?;
                 (*p, Some(id.name.clone()))
             }
