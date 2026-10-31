@@ -1885,7 +1885,24 @@ impl Parser {
                 kw_tok.span,
             ));
         }
-        let _close_path = self.parse_dotted_path()?;
+        // The closer must repeat the opener's full dotted path (spec §1:
+        // "A closing name that is present must match the opening name").
+        let close_path = self.parse_dotted_path()?;
+        let dotted = |p: &Path| {
+            p.segments
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".")
+        };
+        let (open_name, close_name) = (dotted(&target), dotted(&close_path));
+        if open_name != close_name {
+            return Err(CompileError::mismatched_closing(
+                &open_name,
+                &close_name,
+                close_path.span,
+            ));
+        }
         let span = start.merge(end_tok.span);
         Ok(ExtendDecl {
             target,
@@ -3192,7 +3209,37 @@ impl Parser {
         }
     }
 
+    /// End offset of the most recently consumed non-doc token.
+    fn prev_token_end(&self) -> Option<usize> {
+        self.tokens[..self.pos.min(self.tokens.len())]
+            .iter()
+            .rev()
+            .find(|t| !matches!(t.kind, TokenKind::DocOuter(_) | TokenKind::DocInner(_)))
+            .map(|t| t.span.end_usize())
+    }
+
+    /// One statement, which must end at a newline or at the enclosing
+    /// block's `end` / `else` / `elsif` (spec §1 "Statement separation"):
+    /// `let a = 1 let b = 2` on one line is an error, not two statements.
     fn parse_stmt(&mut self) -> Result<Stmt, CompileError> {
+        let stmt = self.parse_stmt_inner()?;
+        let ends_line = match self.prev_token_end() {
+            Some(end) => self.newline_before_peek(end),
+            None => true,
+        };
+        // A same-line `;` gets its own, more specific diagnostic from the
+        // expression parser when the next statement is parsed.
+        if !ends_line && !self.is_block_terminator() && !self.check(TokenKind::Semi) {
+            return Err(CompileError::general(
+                "a statement must end at a newline (or the block's `end`); start the next \
+                 statement on its own line",
+                self.peek_span(),
+            ));
+        }
+        Ok(stmt)
+    }
+
+    fn parse_stmt_inner(&mut self) -> Result<Stmt, CompileError> {
         // Skip stray doc — statements don't carry doc strings here.
         let _ = self.consume_outer_doc();
         let start = self.peek_span();
@@ -3693,6 +3740,20 @@ impl Parser {
                         span,
                     })
                 } else {
+                    // An expression statement must do something (spec §1
+                    // "Statement separation"): a pure expression's value is
+                    // discarded, so a stray `[1]` or `(x)` line — e.g. one
+                    // the newline rule split off the previous line — would
+                    // otherwise vanish silently.
+                    if !expr_stmt_has_effect(&lhs) {
+                        return Err(CompileError::general(
+                            "expression statement has no effect: its value is discarded; \
+                             only a call, assignment, send (`<-`) or randomize can stand \
+                             alone as a statement (a call's `(` and an index's `[` must \
+                             start on the same line as the callee)",
+                            lhs.span,
+                        ));
+                    }
                     let span = lhs.span;
                     Ok(Stmt {
                         kind: StmtKind::Expr(lhs),
@@ -4441,6 +4502,13 @@ impl Parser {
                     if !callable {
                         break;
                     }
+                    // A newline ends the expression before a postfix `(`
+                    // (spec §1 "Statement separation"): the call's `(` must
+                    // sit on the callee's line, so a paren-led statement on
+                    // the next line is never glued on as a call.
+                    if self.newline_before_peek(e.span.end_usize()) {
+                        break;
+                    }
                     self.advance();
                     let mut args = Vec::new();
                     while !self.check(TokenKind::RParen) {
@@ -4456,6 +4524,11 @@ impl Parser {
                     e = Expr::new(ExprKind::Call { callee: e, args }, span);
                 }
                 Some(TokenKind::LBracket) => {
+                    // Same rule as the call postfix: an index/slice `[`
+                    // must sit on the indexed expression's line.
+                    if self.newline_before_peek(e.span.end_usize()) {
+                        break;
+                    }
                     self.advance();
                     // Could be `[i]`, `[m:n]`, `[m..n]`. Parse the first expression and check.
                     let first = self.parse_expr()?;
@@ -4740,6 +4813,27 @@ impl Parser {
 /// Longest sized DECIMAL literal that gets sized exactly. Bounds the
 /// quadratic fallback in `significant_bits`; see the check that uses it.
 const MAX_EXACT_DECIMAL_DIGITS: usize = 4096;
+
+/// Whether an expression may stand alone as a statement: a call (including
+/// `fork` calls and `$system` calls), a send, a `randomize(...)`, or such a
+/// form under parentheses or as a ternary arm. Everything else only
+/// computes a value the statement would discard.
+fn expr_stmt_has_effect(e: &Expr) -> bool {
+    match &*e.kind {
+        ExprKind::Call { .. }
+        | ExprKind::ForkCall { .. }
+        | ExprKind::Send { .. }
+        | ExprKind::SystemCall { .. }
+        | ExprKind::Randomize { .. } => true,
+        ExprKind::Paren(inner) => expr_stmt_has_effect(inner),
+        ExprKind::Ternary {
+            then_branch,
+            else_branch,
+            ..
+        } => expr_stmt_has_effect(then_branch) || expr_stmt_has_effect(else_branch),
+        _ => false,
+    }
+}
 
 fn check_decimal_literal(text: &str, span: Span) -> Result<(), CompileError> {
     let digits = text.bytes().filter(|byte| *byte != b'_').count();

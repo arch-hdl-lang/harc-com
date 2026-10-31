@@ -2090,7 +2090,9 @@ pub(super) fn log_helpers_and_seed(out: &mut String, qualified_clock_wait: bool)
         _fatal = true;
     });
 
-    sim_log_line("INFO", "seed=%llu", (long long)harc_rng.state);
+    // The seed line is logged at verbosity LOW so it prints at every
+    // `--verbosity` (the --seed help promises it on every run).
+    { harc_rt::log::HarcLogAttrScope _harc_seed_always(harc_rt::log::HARC_V_LOW, nullptr); sim_log_line("INFO", "seed=%llu", (long long)harc_rng.state); }
 
     harc_rt::ThreadScheduler sched;
 "#,
@@ -2418,12 +2420,47 @@ pub(super) fn dispatcher(out: &mut String, test_names: &[String]) {
         "{INDENT}const char* test_sel = harc_rt::log::harc_select_test(argc, argv);"
     )
     .ok();
+    // No `--test` / `HARC_TEST`: run the whole suite (one aggregate
+    // banner). A single-test suite runs its test directly, unchanged.
     let first = &test_names[0];
-    writeln!(
-        out,
-        "{INDENT}if (!test_sel) return run_{first}(argc, argv);"
-    )
-    .ok();
+    if test_names.len() == 1 {
+        writeln!(
+            out,
+            "{INDENT}if (!test_sel) return run_{first}(argc, argv);"
+        )
+        .ok();
+    } else {
+        let names = test_names
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let fns = test_names
+            .iter()
+            .map(|n| format!("&run_{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(out, "{INDENT}if (!test_sel) {{").ok();
+        writeln!(
+            out,
+            "{INDENT}{INDENT}static const char* const harc_suite_names[] = {{{names}}};"
+        )
+        .ok();
+        writeln!(
+            out,
+            "{INDENT}{INDENT}static int (*const harc_suite_fns[])(int, char**) = {{{fns}}};"
+        )
+        .ok();
+        writeln!(
+            out,
+            "{INDENT}{INDENT}return harc_rt::log::harc_run_suite(argc, argv, {}, \
+             [](size_t i) {{ return harc_suite_names[i]; }}, \
+             [](size_t i, int c, char** v) {{ return harc_suite_fns[i](c, v); }});",
+            test_names.len()
+        )
+        .ok();
+        writeln!(out, "{INDENT}}}").ok();
+    }
     for name in test_names {
         writeln!(
             out,
@@ -2465,12 +2502,24 @@ pub(super) fn cosim_entrypoints(out: &mut String, test_names: &[String], half_pe
     const char* test_sel = harc_rt::log::harc_select_test(0, nullptr);
 "#,
     );
+    // Co-sim runs exactly one test per simulator process, so a suite with
+    // several tests needs an explicit selection (the harc CLI rejects the
+    // unselected case before building; this guards a direct run).
     let first = &test_names[0];
-    writeln!(
-        out,
-        "{INDENT}if (!test_sel) {{ _b.body = &run_{first}; return; }}"
-    )
-    .ok();
+    if test_names.len() == 1 {
+        writeln!(
+            out,
+            "{INDENT}if (!test_sel) {{ _b.body = &run_{first}; return; }}"
+        )
+        .ok();
+    } else {
+        writeln!(
+            out,
+            "{INDENT}if (!test_sel) {{ std::fprintf(stderr, \"harc: co-sim runs one test per simulation; select one of {} with HARC_TEST\\n\"); _b.body = nullptr; return; }}",
+            test_names.join(", ")
+        )
+        .ok();
+    }
     for name in test_names {
         writeln!(
             out,

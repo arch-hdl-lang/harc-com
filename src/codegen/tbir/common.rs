@@ -6272,7 +6272,7 @@ fn render_common_runtime_template(plan: &CommonCppPlan) -> Result<String, EmitEr
     .ok();
     writeln!(
         out,
-        "{INDENT}harc_rt::log::harc_log_line(ctx.log_ctx.sim_log, &ctx.trace, ctx.cycle_count, \"INFO\", seed_message);"
+        "{INDENT}{{ harc_rt::log::HarcLogAttrScope _harc_seed_always(harc_rt::log::HARC_V_LOW, nullptr); harc_rt::log::harc_log_line(ctx.log_ctx.sim_log, &ctx.trace, ctx.cycle_count, \"INFO\", seed_message); }}"
     )
     .ok();
     writeln!(

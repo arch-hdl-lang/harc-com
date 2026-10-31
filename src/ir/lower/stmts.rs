@@ -6492,10 +6492,55 @@ impl FuncBuilder<'_> {
             .iter()
             .any(|a| matches!(a, CallArg::Expr(e) if matches!(&*e.kind, ExprKind::Ident(_))));
         let what = if file.is_some() { "logf" } else { "log" };
+        // Per-message attributes (spec §7.7): `verbosity=LEVEL` overrides the
+        // severity's default verbosity and `id="..."` selects a
+        // `--verbosity-of ID=LEVEL` threshold. Both feed the runtime print
+        // filter only.
+        let mut attrs = crate::ir::LogAttrs::default();
         for a in args {
             let CallArg::Named { name, value } = a else {
                 continue;
             };
+            match name.name.as_str() {
+                "verbosity" => {
+                    let level = match &*value.kind {
+                        ExprKind::Ident(id) => crate::ir::LogVerbosity::parse(&id.name),
+                        _ => None,
+                    };
+                    let Some(level) = level else {
+                        return Err(LowerError::Invalid(format!(
+                            "`{what}(..., verbosity=...)` takes a verbosity level: LOW, \
+                             MEDIUM, HIGH, DEBUG or FULL (spec §7.7)"
+                        )));
+                    };
+                    if attrs.verbosity.replace(level).is_some() {
+                        return Err(LowerError::Invalid(format!(
+                            "`{what}` has more than one `verbosity=` argument"
+                        )));
+                    }
+                    continue;
+                }
+                "id" => {
+                    let id = match &*value.kind {
+                        ExprKind::String(s) if !s.contains("${") && !s.is_empty() => {
+                            Some(s.clone())
+                        }
+                        _ => None,
+                    };
+                    let Some(id) = id else {
+                        return Err(LowerError::Invalid(format!(
+                            "`{what}(..., id=...)` takes a non-empty, non-interpolated \
+                             string literal (spec §7.7)"
+                        )));
+                    };
+                    if attrs.id.replace(id).is_some() {
+                        return Err(LowerError::Invalid(format!(
+                            "`{what}` has more than one `id=` argument"
+                        )));
+                    }
+                }
+                _ => {}
+            }
             let hidden = match &*value.kind {
                 // Only a REAL severity can be hidden. `who = nosuch` was
                 // never going to become one — positionally it would have
@@ -6608,6 +6653,7 @@ impl FuncBuilder<'_> {
         self.push(Stmt::Log {
             level,
             args: fmt_args,
+            attrs,
         });
         Ok(())
     }

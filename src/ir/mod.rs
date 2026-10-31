@@ -2798,6 +2798,8 @@ pub enum Stmt {
     Log {
         level: LogLevel,
         args: FmtArgs,
+        /// Per-message `verbosity=` / `id=` (spec §7.7); default = none.
+        attrs: LogAttrs,
     },
     AssertCheck {
         cond: Expr,
@@ -3163,7 +3165,8 @@ pub enum ScoreboardOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogLevel {
-    /// `log(debug, ...)` — printed with a DEBUG tag; no test-result
+    /// `log(debug, ...)` — printed with a DEBUG tag when the runtime
+    /// `--verbosity` threshold is HIGH or above; no test-result
     /// effect (v1 passes any severity ident through uppercased).
     Debug,
     Info,
@@ -3175,6 +3178,64 @@ pub enum LogLevel {
         path: String,
         level: FileLogLevel,
     },
+}
+
+/// Per-message `log` attributes (spec §7.7). `verbosity` overrides the
+/// severity's default verbosity; `id` selects a `--verbosity-of ID=LEVEL`
+/// threshold. Both only affect whether the message prints — a hidden
+/// message is still recorded in the semantic trace.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogAttrs {
+    pub verbosity: Option<LogVerbosity>,
+    pub id: Option<String>,
+}
+
+impl LogAttrs {
+    pub fn is_empty(&self) -> bool {
+        self.verbosity.is_none() && self.id.is_none()
+    }
+}
+
+/// Verbosity levels, ordered LOW < MEDIUM < HIGH < DEBUG < FULL (§7.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LogVerbosity {
+    Low,
+    Medium,
+    High,
+    Debug,
+    Full,
+}
+
+impl LogVerbosity {
+    pub const ALL: [LogVerbosity; 5] = [
+        LogVerbosity::Low,
+        LogVerbosity::Medium,
+        LogVerbosity::High,
+        LogVerbosity::Debug,
+        LogVerbosity::Full,
+    ];
+
+    /// Rank used by the runtime (`HarcVerbosity`): LOW = 0 … FULL = 4.
+    pub fn rank(self) -> u8 {
+        self as u8
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            LogVerbosity::Low => "LOW",
+            LogVerbosity::Medium => "MEDIUM",
+            LogVerbosity::High => "HIGH",
+            LogVerbosity::Debug => "DEBUG",
+            LogVerbosity::Full => "FULL",
+        }
+    }
+
+    /// Case-insensitive level name.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|v| v.name().eq_ignore_ascii_case(name))
+    }
 }
 
 /// Severity inside a `logf` file sink (no nested `File`).

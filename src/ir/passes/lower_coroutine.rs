@@ -695,6 +695,7 @@ mod tests {
                             fmt: "boom".to_string(),
                             args: vec![],
                         },
+                        attrs: Default::default(),
                     }],
                     Terminator::Fatal(crate::ir::FmtArgs {
                         fmt: "boom".to_string(),

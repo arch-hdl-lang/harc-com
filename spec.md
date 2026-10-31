@@ -196,12 +196,21 @@ And `use` is the ARCH-style namespace import (§3.6), distinct from `apply` whic
 | `agent Name` (and `transactor`/`env`) | `#(` → parameters; `bound` → bound-to clause; newline → body opens |
 | `name : type` (field decl) | `default` → default clause; `with` → attributes; newline / `,` → end of field |
 | `on event-expr` | `pre` → pre-hook; `post` → post-hook; newline → main handler body |
-| `assert`/`assume` | IDENT (followed by `;` or end-of-line) → named property; expression → inline boolean or temporal property (the temporal operators `|=>`, `##N`, etc. are part of the expression grammar, not separate productions) |
+| `assert`/`assume` | IDENT (followed by end-of-line) → named property; expression → inline boolean or temporal property (the temporal operators `|=>`, `##N`, etc. are part of the expression grammar, not separate productions) |
 | `end` | `module` / `transaction` / `agent` / etc. → close that named declaration; `on` / `fork` / `when` / etc. → close anonymous compound block |
 
 New language features must preserve this property. The check is mechanical: for every keyword that introduces a construct, FIRST sets of all possible continuations must be pairwise disjoint.
 
 **Block syntax: end-construct style throughout.** HARC follows ARCH's `end <kind> [<name>]` convention for all block bodies — no curly braces for declaration bodies, statement-block bodies, or compound expressions. A named declaration closes with `end <kind> <name>` (e.g., `end module AxiSlaveTb`); an anonymous compound block closes with `end <kind>` (e.g., `end on`, `end fork`, `end when`). Where the closing name is optional, it must appear on the same line as `end <kind>`; an identifier on a following line starts the next item rather than naming the closer. A closing name that is present must match the opening name — a mismatch is a compile error. The rule applies at every nesting level, including members of components and buses: a component `function f` closes with `end function [f]`, a `hookable h` closes with `end [h]` (the hookable form has no kind keyword), and a bus `handshake_channel ch` closes with `end handshake_channel [ch]`. The named-end form is the parser-validating, AI-codegen-friendly shape that ARCH §2.4 commits to, and HARC mirrors it. Curly braces are reserved for *value literals* — set literals (`{READ, WRITE}`), distribution literals (`dist {[0..0xFF] :/ 80}`), record/struct literals — never for blocks.
+
+**Statement separation: newlines, never `;`.** Statements and items are separated by newlines. A statement ends at a newline or at its block's `end` / `else` / `elsif`; a second statement on the same line (`let a : uint<8> = 1 let b : uint<8> = 2`) is a compile error; `;` is not a separator, and the parser rejects it where a statement ends (the only `;` in HARC is the ARCH-inherited terminator of a `bus` member such as `tlm_method ... : blocking;`). A newline also ends an expression before a postfix `(` or `[`: a call's argument list and an index/slice must open on the same line as the callee or indexed expression, so
+
+```
+let y : uint<8> = a
+(g())
+```
+
+is two statements (the second a parenthesized call of `g`), never `a(g())`. The rule holds inside brackets too; line breaks *between* arguments or elements stay free. An expression standing alone as a statement must have an effect: a call (including `fork` and `$system` calls), a send (`<-`) or a `randomize(...)`, possibly parenthesized or as a ternary arm. Any other expression statement — `x`, `[1]`, `a + b`, `(x)` — only computes a discarded value and is a compile error, so a line the newline rule splits off can never vanish silently.
 
 **Discard pattern `_` in binding positions.** A lone underscore is a binding name that says "I need to introduce a binding here but don't intend to read it." It is not an identifier — it cannot be referenced from the body, and reusing the same `_` in nested binders does not collide. v1 admits `_` in discard-capable binders:
 
@@ -852,6 +861,8 @@ This is a strict win over e: the `use` line tells you the aspect *exists*; the `
 - Conflicts at the field level (two extensions adding the same field name with different types) are compile errors. Conflicts at the constraint level (unsatisfiable composed constraints) are runtime solver failures with both sources reported.
 - Nested scopes inherit applies from their enclosing scope; nested `apply` adds to the inherited set, never removes.
 
+**Naming the target.** `extend T` names `T` directly. A qualified `extend P.T` (nested packages chain as `P.Q.T`) resolves its qualifier as a package path, first relative to the package enclosing the `extend` (inside `package Outer`, `P` means `Outer.P` when that exists) and then absolute from the root. The package must be declared in an input file — `use` imports carry only buses, not packages — and may be opened more than once (all its declarations count). One of those declarations must itself declare `T` as a base declaration; a qualifier that names no package, or a package that declares no `T`, is a compile error. The closer repeats the opener's full dotted path: `extend P.T ... end extend P.T`; `end extend T` (or any other path) is a mismatched closing name.
+
 **Depth-1 rule: `extend` targets base type declarations only.**
 
 This is the single most important constraint on the aspect system, and it's what addresses the "where does this come from" critique of unrestricted AOP. An `extend` block must name a type declared with `transaction`, `struct`, `agent`, `env`, etc. — never another `extend` or aspect package.
@@ -872,6 +883,8 @@ package StrictBursts
 end package StrictBursts
 ```
 
+`extend ShortBursts.AxiTxn` is rejected because package `ShortBursts` only *extends* `AxiTxn`; it does not declare it.
+
 What this rules out: extension chains. What it allows (and is sufficient): multiple flat extensions of the same base. Composition is realized at `apply` sites by stacking activations, not by chaining extension definitions:
 
 ```
@@ -880,7 +893,9 @@ extend AxiTxn keep B end extend AxiTxn          // package B, depth 1
 extend AxiTxn keep C end extend AxiTxn          // package C, depth 1
 
 test T
-    apply A; apply B; apply C                   // effective type: AxiTxn ∧ A ∧ B ∧ C
+    apply A                                     // effective type: AxiTxn ∧ A ∧ B ∧ C
+    apply B
+    apply C
 end test T
 ```
 
@@ -1383,10 +1398,12 @@ The `hookable` marker is mandatory on the method declaration — only methods th
 ```
 fork
     branch
-        drv.send(t1); drv.send(t2)        // sequence A
+        drv.send(t1)                      // sequence A
+        drv.send(t2)
     end branch
     branch
-        mon.expect(t1); mon.expect(t2)    // sequence B
+        mon.expect(t1)                    // sequence B
+        mon.expect(t2)
     end branch
 join_all
 ```
@@ -1491,7 +1508,7 @@ This means severity composes — you can pass it through generics, store it in a
 
 ```
 log(info, "details", verbosity=HIGH)         // override default verbosity
-log(info, "...", id="AXI_DRV")               // override implicit component ID
+log(info, "...", id="AXI_DRV")               // tag with an ID for --verbosity-of
 log(info, "...", id="AXI_DRV", verbosity=HIGH)
 ```
 
@@ -1505,9 +1522,9 @@ log(info, "...", id="AXI_DRV", verbosity=HIGH)
 | `info` | MEDIUM | yes |
 | `debug` | HIGH | no — must opt in via `--verbosity HIGH` or higher |
 
-The runtime exposes verbosity as a flag (`harc sim --verbosity HIGH`) and per-component overrides (`--verbosity-of env.agent.xact=DEBUG`). Verbosity levels are LOW / MEDIUM / HIGH / DEBUG / FULL — only messages whose verbosity ≤ the runtime threshold print. `error` and `fatal` always print regardless of threshold (they're test-result-bearing).
+The runtime exposes verbosity as a flag (`harc sim --verbosity HIGH`) and per-ID overrides (`--verbosity-of AXI_DRV=DEBUG`). Verbosity levels are LOW / MEDIUM / HIGH / DEBUG / FULL — only messages whose verbosity ≤ the runtime threshold print. The default threshold is MEDIUM. `error` and `fatal` always print regardless of threshold (they're test-result-bearing). A message hidden by the threshold is still recorded in the semantic trace.
 
-**Component IDs are implicit** from the enclosing TB component context. A `log(info, ...)` call inside `env.agent.xact` gets `id="env.agent.xact"` automatically. The explicit `id=` override is for cases where the call is in a free function or shared utility.
+**Message IDs are explicit.** A log call carries an ID only when it passes `id="..."` (a non-empty, non-interpolated string literal); there are no implicit component IDs. `--verbosity-of ID=LEVEL` (repeatable) matches that ID exactly and replaces the `--verbosity` threshold for those messages, in either direction; calls without a matching `id=` use `--verbosity`. A per-message `verbosity=LEVEL` replaces the severity's default verbosity. Neither affects `error`/`fatal`, which always print. `logf("path", ...)` file sinks obey the same filter as `log`: a message hidden by `--verbosity` / `--verbosity-of` is written to neither stdout nor the file.
 
 **Behavioral semantics by severity:**
 
@@ -1819,7 +1836,7 @@ explicit modes (`drv : T active`) win over inherited ones at any depth.
 - `let drv : T mode` default-constructs the struct; the user assigns DUT pointers and other field values explicitly afterward (`drv.dut = dut`). The mode annotation (`active`/`passive`) selects which body halves get codegen-instantiated.
 - **Mode inheritance through agent and env composition.** A transactor field nested inside an `agent` or `env` (e.g. `agent A { drv : T }`) without an explicit mode inherits its mode from the parent's let-instantiation. Same agent declaration + `let act : A active` makes `act.drv` active; `let pas : A passive` makes it passive. Inheritance cascades through any number of nesting layers — `env E { ag : Agent { drv : T } }` flows mode from `let topenv : E passive` all the way down to `topenv.ag.drv`. A field-level explicit mode (e.g. `drv : T active`) wins over the inherited mode at any depth.
 - `const NAME : Ty = expr` — a file-scope named constant, visible everywhere (main, hookable lambdas, on-handler closures, struct field defaults). The initializer must be a **compile-time constant expression**: integer literals (plain, or ARCH sized literals such as `8'h3`, which fold to their value), references to *earlier* `const` / enum-variant names (constants resolve in declaration order; forward and cyclic references are compile errors), parentheses, `as uint/sint/bits<≤64>` casts (the `W`-bit value of the operand's bit pattern, as at runtime, §2: `(0 - 4) as uint<8>` is 252), unary `-`/`~`/`!`/`not`, arithmetic `+ - * / %`, shifts `<< >>`, bitwise `& | ^`, comparison, and logical operators. (The wrapping `+% -% *%` spellings are *not* in the const subset — their §2.4 mask depends on static operand widths; spell the mask explicitly.) Evaluation (harc#521) is in the **64-bit two's-complement domain** with signedness taken from each referenced constant's declared type — `>>` on a `sint` constant is an arithmetic shift, `<<` on a typed constant or cast of `W < 64` bits keeps its low `W` bits (§2), `/` and `%` truncate toward zero, and a binary op is signed only when both operands are. The result must fit the declared type: a value outside `uint<W>` / `sint<W>` (W < 64) is a precise compile-time error, never a silent truncation, with one deliberate asymmetry — a `sint<W>` initializer's bit pattern is reinterpreted as signed two's complement before the range check (so `sint<8> = 0xFFFFFFFFFFFFFFFF` is `-1`, the mod-2⁶⁴ conversion C++ defines; `sint<8> = (0 - 1) as uint<8>` is 255 and therefore an out-of-range error), while an unsigned constant never accepts a negative value. Division or modulo by zero, signed `MIN / -1` and `MIN % -1` at 64 bits, and shift amounts outside `0..=63` are compile-time errors (at runtime the first three are FATAL errors at every width and the last saturates, §2). The legacy `--codegen v1` backend lowers the raw expression to a file-scope `static constexpr <c_type> NAME = <expr>;`; the TB-IR backend folds the value at compile time and substitutes it at use sites. TB-IR's 64-bit fold is authoritative: values agree with v1 wherever v1's C++ evaluation is well-defined at 64-bit rank, but corners where v1's emitted C++ evaluates literals as 32-bit `int` (`1 << 31` sign-extends under v1), fails to compile (shift ≥ 32 of a small literal, `INT_MAX`-overflowing intermediates, enum-variant references in initializers), or skips the §2.4 wrap mask are defined — or precisely diagnosed — only by TB-IR.
-- **`log` severity test-result semantics** (§7.7) are honored: `log(error, ...)` increments the failure counter so the test fails at end of run; `log(fatal, ...)` additionally aborts this test instance at end of the current cycle; a wall-clock or cycle wait that completes on the fatal cycle lets the following statements of that cycle run, while one interrupted with time still owed (or begun after the fatal) aborts immediately — except inside synchronously dispatched event hooks and target responders, where the interrupted wait just ends and its successor runs (see §7.7). `info` / `warn` / `debug` have no test-result effect. Verbosity filtering, component IDs, and per-component overrides remain deferred — the runtime currently prints all severities unconditionally.
+- **`log` severity test-result semantics** (§7.7) are honored: `log(error, ...)` increments the failure counter so the test fails at end of run; `log(fatal, ...)` additionally aborts this test instance at end of the current cycle; a wall-clock or cycle wait that completes on the fatal cycle lets the following statements of that cycle run, while one interrupted with time still owed (or begun after the fatal) aborts immediately — except inside synchronously dispatched event hooks and target responders, where the interrupted wait just ends and its successor runs (see §7.7). `info` / `warn` / `debug` have no test-result effect. Verbosity filtering is implemented: `--verbosity`, per-message `verbosity=`, and `--verbosity-of` keyed on an explicit `id=` (debug is hidden by default).
 - **`fail("...")` as a standalone statement** — unconditional failure marker. Same emission as the failure arm of `assert ... else fail(...)` (a `sim_log_line("FAIL", ...)` + `errors++;`) just without the surrounding `if (!cond)` guard. Useful when the failure trigger is control-flow-structural rather than expressible as a single boolean predicate (e.g. inside an `if`/`for` body where the condition has already been spelled out by the surrounding code). Supports `${expr}` interpolation in the message string identically to `log`.
 - **Wide bit-vector value type.** HARC unsigned integer and bit-vector values wider than 64 bits lower to `_harc_u128` for 65..128-bit arithmetic and to `harc_rt::HarcWide<N>` for wider value arithmetic, where `N = ceil(width / 32)`. `_harc_u128` uses native unsigned `__int128`; `HarcWide<N>` stores LSB-first 32-bit words and supports unsigned arithmetic, bitwise operations, logical shifts, comparisons, division, modulo, resize, and sign-extension helpers. FFI remains limited to `_harc_u128` for 65..128-bit scalar values; wider values should be passed in slices or through DUT signals.
 - **Bit-vector width-method intrinsics.** Four explicit width-changing operators are supported: `<expr>.trunc<N>()`, `<expr>.zext<N>()`, `<expr>.sext<N>()`, and `<expr>.resize<N>()`. Width `N` must be a positive constant integer literal in `1..=1024`. Widths up to 128 lower through `_harc_u128`; wider widths lower through `harc_rt::HarcWide<N>`. When the source width is statically known, the compiler rejects wrong-direction `.trunc`, `.zext`, and `.sext` calls and suggests the opposite-direction method. `.resize<N>()` remains direction-agnostic: it truncates when narrowing; when widening it zero-extends an unsigned source and sign-extends a signed source; the result has the source's signedness (`uint<N>` or `sint<N>`), matching ARCH's `N'($signed(x))` lowering for signed bases. `.sext<N>()` and a signed `.resize<N>()` produce a `sint<N>` **value** at every width, including widths below 64: `sint<8>(-1).sext<16>()` is `-1` (not `0xFFFF`), `sint<16>(0x0180).resize<8>()` is `-128`, and either compares, prints and assigns exactly like a declared `sint<N>` local holding that value. Use `.zext<M>()` or a slice to see the raw bit pattern. These intrinsics co-exist with `as uint<N>` / `as sint<N>`, which always produce the `N`-bit value of the operand's bit pattern (§2: the low `N` bits, sign-extended from bit `N - 1` for `as sint<N>`); use `.zext<N>()` / `.sext<N>()` / `.trunc<N>()` when the source spelling should state the direction of the width change.
@@ -2519,7 +2536,11 @@ ISA-spec embedding: a Sail model compiles to a C library, exposed to HARC today 
 **v0 toolchain.** `harc sim --sv <dut.sv> <test.harc> --top <TopModule>` parses
 the HARC source, lowers it to a single `.cpp` testbench plus the runtime
 header, and chains through Verilator to produce a self-contained binary. Run
-the binary to see `ALL TESTS PASSED` or `N TESTS FAILED`.
+the binary to see `ALL TESTS PASSED` or `N TESTS FAILED`. With no `--test`
+(and no `HARC_TEST`), every test in the suite runs, each against a fresh DUT,
+and that banner covers all of them: `ALL TESTS PASSED` only when every test
+passed, otherwise `N TESTS FAILED` with `N` the number of failing tests.
+`--test <name>` runs just that test.
 
 ```mermaid
 flowchart TB

@@ -601,6 +601,7 @@ impl FuncBuilder<'_> {
                             .to_string(),
                         args: Vec::new(),
                     },
+                    attrs: Default::default(),
                 });
                 self.push(Stmt::ErrorIncrement);
                 self.terminate(Terminator::Jump(exit));

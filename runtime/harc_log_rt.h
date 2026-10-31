@@ -2,12 +2,15 @@
 
 #pragma once
 
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "harc_trace_rt.h"
 
@@ -35,7 +38,12 @@ inline FILE* harc_open_sim_log(
     const char* fallback_path = "sim.log") {
     const char* path = std::getenv(env_name);
     if (!path || !*path) path = fallback_path;
-    return std::fopen(path, "w");
+    FILE* f = std::fopen(path, harc_output_open_mode(path));
+    const HarcSuiteRun& suite = harc_suite_run();
+    if (f && suite.active && suite.name) {
+        std::fprintf(f, "[suite] test %s\n", suite.name);
+    }
+    return f;
 }
 
 inline void harc_close_file(FILE*& f) {
@@ -115,11 +123,59 @@ inline const char* harc_select_test(
 }
 
 inline int harc_report_test_result(int errors) {
+    if (harc_suite_run().active) {
+        // Suite mode: one line per test; `harc_run_suite` prints the
+        // aggregate banner once every test has run.
+        if (errors == 0) {
+            std::printf("[suite] test PASSED\n");
+        } else {
+            std::printf("[suite] test FAILED (%d error(s))\n", errors);
+        }
+        return errors == 0 ? 0 : 1;
+    }
     if (errors == 0) {
         std::printf("\nALL TESTS PASSED\n");
         return 0;
     }
     std::printf("\n%d TESTS FAILED\n", errors);
+    return 1;
+}
+
+// Run every test in order (no `--test` / `HARC_TEST` given) and print one
+// banner covering all of them: `ALL TESTS PASSED` only when every test
+// passed, otherwise `<N> TESTS FAILED` with N the number of failing tests.
+template <typename NameFn, typename RunFn>
+inline int harc_run_suite(
+    int argc,
+    char** argv,
+    size_t count,
+    NameFn name_at,
+    RunFn run_at) {
+    HarcSuiteRun& s = harc_suite_run();
+    s.active = true;
+    std::vector<std::string> failed;
+    for (size_t i = 0; i < count; ++i) {
+        s.index = i + 1;
+        const char* name = name_at(i);
+        s.name = name;
+        std::printf("[suite] running test %s (%zu/%zu)\n", name, i + 1, count);
+        std::fflush(stdout);
+        if (run_at(i, argc, argv) != 0) failed.push_back(name);
+    }
+    s.active = false;
+    s.index = 0;
+    s.name = nullptr;
+    std::printf("\n[suite] %zu test(s) run: %zu passed, %zu failed", count,
+                count - failed.size(), failed.size());
+    for (size_t i = 0; i < failed.size(); ++i) {
+        std::printf("%s%s", i == 0 ? " (" : ", ", failed[i].c_str());
+    }
+    std::printf("%s\n", failed.empty() ? "" : ")");
+    if (failed.empty()) {
+        std::printf("\nALL TESTS PASSED\n");
+        return 0;
+    }
+    std::printf("\n%zu TESTS FAILED\n", failed.size());
     return 1;
 }
 
@@ -215,7 +271,7 @@ inline FILE* harc_open_coverage_json() {
     const char* path = std::getenv("HARC_COVERAGE_JSONL");
     if (!path || !*path) path = std::getenv("HARC_COVERAGE_JSON");
     if (!path || !*path) return nullptr;
-    return std::fopen(path, "w");
+    return std::fopen(path, harc_output_open_mode(path));
 }
 
 inline void harc_json_string(FILE* f, const char* value) {
@@ -387,7 +443,7 @@ struct HarcLogFiles {
         std::string resolved = harc_resolve_log_path(path);
         auto it = files.find(resolved);
         if (it != files.end()) return it->second;
-        FILE* f = std::fopen(resolved.c_str(), "w");
+        FILE* f = std::fopen(resolved.c_str(), harc_output_open_mode(resolved.c_str()));
         files[resolved] = f;
         return f;
     }
@@ -428,6 +484,123 @@ inline int harc_finish_sim_run(
     return harc_report_test_result(errors);
 }
 
+// Verbosity (spec §7.7). Levels rank LOW < MEDIUM < HIGH < DEBUG < FULL.
+// A message prints when its verbosity is at or below its threshold. The
+// verbosity is the call's `verbosity=` when given, else the severity's
+// default (warn/info MEDIUM, debug HIGH). The threshold is the
+// `--verbosity-of ID=LEVEL` entry matching the call's `id=` exactly
+// (`HARC_VERBOSITY_OF`, comma-separated), else `--verbosity`
+// (`HARC_VERBOSITY`), else MEDIUM. error and fatal (and any other tag, e.g.
+// assertion FAIL lines) always print.
+enum HarcVerbosity : int { HARC_V_LOW = 0, HARC_V_MEDIUM, HARC_V_HIGH, HARC_V_DEBUG, HARC_V_FULL };
+
+// Level name (case-insensitive) in [begin, end) -> rank, or -1.
+inline int harc_verbosity_rank(const char* begin, const char* end) {
+    static const char* const names[] = {"LOW", "MEDIUM", "HIGH", "DEBUG", "FULL"};
+    for (int i = 0; i < 5; ++i) {
+        const char* a = begin;
+        const char* b = names[i];
+        while (a < end && *b && std::toupper(static_cast<unsigned char>(*a)) == *b) {
+            ++a;
+            ++b;
+        }
+        if (a == end && !*b) return i;
+    }
+    return -1;
+}
+
+inline int harc_verbosity_threshold() {
+    static const int threshold = [] {
+        const char* v = std::getenv("HARC_VERBOSITY");
+        if (!v || !*v) return static_cast<int>(HARC_V_MEDIUM);
+        int rank = harc_verbosity_rank(v, v + std::strlen(v));
+        if (rank >= 0) return rank;
+        std::fprintf(
+            stderr,
+            "harc: unknown HARC_VERBOSITY '%s' (expected LOW, MEDIUM, HIGH, DEBUG or FULL); using MEDIUM\n",
+            v);
+        return static_cast<int>(HARC_V_MEDIUM);
+    }();
+    return threshold;
+}
+
+// `HARC_VERBOSITY_OF=id1=LEVEL,id2=LEVEL` parsed once; a malformed entry
+// warns and is ignored.
+inline const std::vector<std::pair<std::string, int>>& harc_verbosity_of() {
+    static const std::vector<std::pair<std::string, int>> entries = [] {
+        std::vector<std::pair<std::string, int>> out;
+        const char* v = std::getenv("HARC_VERBOSITY_OF");
+        if (!v) return out;
+        std::string all(v);
+        size_t start = 0;
+        while (start <= all.size()) {
+            size_t comma = all.find(',', start);
+            if (comma == std::string::npos) comma = all.size();
+            std::string entry = all.substr(start, comma - start);
+            if (!entry.empty()) {
+                size_t eq = entry.rfind('=');
+                int rank = eq == std::string::npos
+                    ? -1
+                    : harc_verbosity_rank(entry.c_str() + eq + 1, entry.c_str() + entry.size());
+                if (eq == 0 || rank < 0) {
+                    std::fprintf(
+                        stderr,
+                        "harc: ignoring malformed HARC_VERBOSITY_OF entry '%s' (expected ID=LEVEL)\n",
+                        entry.c_str());
+                } else {
+                    out.emplace_back(entry.substr(0, eq), rank);
+                }
+            }
+            start = comma + 1;
+        }
+        return out;
+    }();
+    return entries;
+}
+
+// Per-message attributes of the log call being executed (set by generated
+// code through `HarcLogAttrScope` around a `log(..., verbosity=, id=)`).
+struct HarcLogAttrs {
+    int verbosity = -1;        // -1: the severity's default
+    const char* id = nullptr;  // nullptr: no `id=`
+};
+
+inline HarcLogAttrs& harc_current_log_attrs() {
+    thread_local HarcLogAttrs attrs;
+    return attrs;
+}
+
+struct HarcLogAttrScope {
+    HarcLogAttrs saved;
+    HarcLogAttrScope(int verbosity, const char* id) : saved(harc_current_log_attrs()) {
+        harc_current_log_attrs() = HarcLogAttrs{verbosity, id};
+    }
+    ~HarcLogAttrScope() { harc_current_log_attrs() = saved; }
+    HarcLogAttrScope(const HarcLogAttrScope&) = delete;
+    HarcLogAttrScope& operator=(const HarcLogAttrScope&) = delete;
+};
+
+inline bool harc_log_enabled(const char* sev) {
+    if (!sev) return true;
+    int level;
+    if (std::strcmp(sev, "DEBUG") == 0) {
+        level = HARC_V_HIGH;
+    } else if (std::strcmp(sev, "INFO") == 0 || std::strcmp(sev, "WARN") == 0) {
+        level = HARC_V_MEDIUM;
+    } else {
+        return true;
+    }
+    const HarcLogAttrs& attrs = harc_current_log_attrs();
+    if (attrs.verbosity >= 0) level = attrs.verbosity;
+    int threshold = harc_verbosity_threshold();
+    if (attrs.id) {
+        for (const auto& entry : harc_verbosity_of()) {
+            if (entry.first == attrs.id) threshold = entry.second;
+        }
+    }
+    return level <= threshold;
+}
+
 inline void harc_log_stdout_line(uint64_t cycle, const char* sev, const char* msg) {
     std::printf("[cycle:%llu %s] ", static_cast<unsigned long long>(cycle), sev ? sev : "");
     std::printf("%s", msg ? msg : "");
@@ -448,8 +621,12 @@ inline void harc_log_line(
     uint64_t cycle,
     const char* sev,
     const char* msg) {
-    harc_log_stdout_line(cycle, sev, msg);
-    harc_log_file_line(sim_log, cycle, sev, msg);
+    // Below-threshold messages are not printed, but the semantic trace
+    // keeps every log event so trace diffs do not depend on verbosity.
+    if (harc_log_enabled(sev)) {
+        harc_log_stdout_line(cycle, sev, msg);
+        harc_log_file_line(sim_log, cycle, sev, msg);
+    }
     if (trace) trace->log(cycle, sev, msg ? msg : "");
 }
 
@@ -469,6 +646,7 @@ inline void harc_log_vline(
 }
 
 inline void harc_log_file_only_line(FILE* f, uint64_t cycle, const char* sev, const char* msg) {
+    if (!harc_log_enabled(sev)) return;
     harc_log_stdout_line(cycle, sev, msg);
     harc_log_file_line(f, cycle, sev, msg);
 }
@@ -479,6 +657,7 @@ inline void harc_log_file_only_vline(
     const char* sev,
     const char* fmt,
     va_list ap) {
+    if (!harc_log_enabled(sev)) return;
     std::printf("[cycle:%llu %s] ", static_cast<unsigned long long>(cycle), sev ? sev : "");
     va_list stdout_ap;
     va_copy(stdout_ap, ap);

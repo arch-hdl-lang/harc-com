@@ -1999,6 +1999,28 @@ fn write_fixture(dir: &Path) -> (PathBuf, PathBuf) {
     (sv, tb)
 }
 
+/// The test these build helpers' own run executes. Without `--test` /
+/// `HARC_TEST` a multi-test suite now runs every test (spec §10.1); these
+/// helpers only need the build plus the run of the suite's first test in
+/// name order (the dispatcher's former default), and several fixtures carry
+/// deliberately failing tests that their callers run explicitly later.
+fn first_test_name(tb: &Path) -> String {
+    let source = std::fs::read_to_string(tb).expect("read HARC fixture");
+    let mut names: Vec<String> = source
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next(), words.next()) {
+                (Some("test"), Some(name), None) => Some(name.to_string()),
+                (Some("impl"), Some(name), Some("for")) => Some(name.to_string()),
+                _ => None,
+            }
+        })
+        .collect();
+    names.sort();
+    names.into_iter().next().expect("fixture declares a test")
+}
+
 fn build_common_suite(sv: &Path, tb: &Path, top: &str, outdir: &Path) -> String {
     build_common_suite_with_args(sv, tb, top, outdir, &[])
 }
@@ -2022,6 +2044,7 @@ fn build_common_suite_with_args(
         .arg("--outdir")
         .arg(outdir)
         .env("HARC_SEED", "1")
+        .env("HARC_TEST", first_test_name(tb))
         .output()
         .expect("run TB-IR common build");
     let log = format!(
@@ -2045,6 +2068,7 @@ fn build_common_suite_mt(sv: &Path, tb: &Path, top: &str, outdir: &Path) -> Stri
         .arg("--outdir")
         .arg(outdir)
         .env("HARC_SEED", "1")
+        .env("HARC_TEST", first_test_name(tb))
         .output()
         .expect("run MT TB-IR common build");
     let log = format!(
@@ -2066,6 +2090,7 @@ fn build_self_contained(sv: &Path, tb: &Path, top: &str, outdir: &Path) -> Strin
         .arg("--outdir")
         .arg(outdir)
         .env("HARC_SEED", "1")
+        .env("HARC_TEST", first_test_name(tb))
         .output()
         .expect("run TB-IR self-contained build");
     let log = format!(
@@ -2090,6 +2115,7 @@ fn build_self_contained_mt(sv: &Path, tb: &Path, top: &str, outdir: &Path) -> St
         .arg("--outdir")
         .arg(outdir)
         .env("HARC_SEED", "1")
+        .env("HARC_TEST", first_test_name(tb))
         .output()
         .expect("run MT TB-IR self-contained build");
     let log = format!(
@@ -2120,6 +2146,7 @@ fn build_self_contained_with_param(
         .arg("--outdir")
         .arg(outdir)
         .env("HARC_SEED", "1")
+        .env("HARC_TEST", first_test_name(tb))
         .output()
         .expect("run parameterized TB-IR self-contained build");
     let log = format!(
@@ -2152,6 +2179,7 @@ fn build_common_with_param(
         .arg("--outdir")
         .arg(outdir)
         .env("HARC_SEED", "1")
+        .env("HARC_TEST", first_test_name(tb))
         .output()
         .expect("run parameterized TB-IR common build");
     let log = format!(

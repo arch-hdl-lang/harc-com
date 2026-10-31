@@ -82,21 +82,40 @@ run_one() {
     local harc_files=("$FIX_DIR/$test.harc")
     for f in $extras; do harc_files+=("$FIX_DIR/$f"); done
 
-    local test_args=()
-    [ -n "$test_struct" ] && test_args=("--test" "$test_struct")
+    # Which tests to run, one `harc sim` each. Normally one run: the row's
+    # test_struct, or (empty) the whole suite, which `harc sim` runs in full
+    # without `--test`. `--cosim dpi` runs one test per simulation and
+    # rejects an unselected multi-test suite, so under co-sim a multi-test
+    # row runs each of its tests separately and must pass them all.
+    local selections=("$test_struct")
+    if [ -z "$test_struct" ] && [[ " ${HARC_SIM_EXTRA_ARGS:-} " == *" --cosim "* ]]; then
+        local names
+        names="$(sed -nE 's/^[[:space:]]*(test|impl)[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)([[:space:]]+for[[:space:]].*)?[[:space:]]*$/\2/p' "${harc_files[@]}" | sort -u)"
+        if [ "$(printf '%s\n' "$names" | grep -c .)" -gt 1 ]; then
+            # shellcheck disable=SC2206
+            selections=($names)
+        fi
+    fi
 
     rm -rf "$outdir"
-    local out
-    # `${ref_args[@]:-}` tolerates an empty array under `set -u` (most
-    # fixtures don't pass any --ref-src). `--outdir` keeps each worker's
-    # verilator build isolated so parallel runs never collide.
-    # HARC_SIM_EXTRA_ARGS: optional extra `harc sim` flags, e.g.
-    # `--cosim dpi` (see tests/run_cosim_fixtures.sh). Word-split on
-    # purpose.
-    # shellcheck disable=SC2086
-    out="$("$HARC" sim "${sv_args[@]}" ${ref_args[@]+"${ref_args[@]}"} "${harc_files[@]}" --top "$top" ${test_args[@]+"${test_args[@]}"} --outdir "$outdir" ${HARC_SIM_EXTRA_ARGS:-} 2>&1)" || true
+    local out="" sel_out sel
+    local passed=1
+    for sel in "${selections[@]}"; do
+        local test_args=()
+        [ -n "$sel" ] && test_args=("--test" "$sel")
+        # `${ref_args[@]:-}` tolerates an empty array under `set -u` (most
+        # fixtures don't pass any --ref-src). `--outdir` keeps each worker's
+        # verilator build isolated so parallel runs never collide.
+        # HARC_SIM_EXTRA_ARGS: optional extra `harc sim` flags, e.g.
+        # `--cosim dpi` (see tests/run_cosim_fixtures.sh). Word-split on
+        # purpose.
+        # shellcheck disable=SC2086
+        sel_out="$("$HARC" sim "${sv_args[@]}" ${ref_args[@]+"${ref_args[@]}"} "${harc_files[@]}" --top "$top" ${test_args[@]+"${test_args[@]}"} --outdir "$outdir" ${HARC_SIM_EXTRA_ARGS:-} 2>&1)" || true
+        out="$out$sel_out"$'\n'
+        [[ "$sel_out" == *"ALL TESTS PASSED"* ]] || passed=0
+    done
 
-    if [[ "$out" == *"ALL TESTS PASSED"* ]]; then
+    if [ "$passed" -eq 1 ]; then
         echo "  PASS  $test"
         echo "__STATUS__ PASS $test"
     else
