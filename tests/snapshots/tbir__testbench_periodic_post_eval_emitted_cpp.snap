@@ -148,6 +148,7 @@ struct HarcTestContext {
     harc_rt::log::HarcLogContext log_ctx;
     harc_rt::random::HarcRng rng;
     std::vector<std::function<void()>> _checkers;
+    uint64_t _harc_checked_cycle = 0;
     std::vector<std::function<void()>> _post_eval_services;
     std::vector<std::function<void()>> _auto_cov_reports;
 };
@@ -175,6 +176,7 @@ int run_TbReactivePostEval(int argc, char** argv) {
     auto& harc_rng = ctx.rng;
     auto harc_rng_next = [&]() { return harc_rng.next(); };
     auto& _checkers = ctx._checkers;
+    auto& _harc_checked_cycle = ctx._harc_checked_cycle;
     auto& _post_eval_services = ctx._post_eval_services;
     auto& _auto_cov_reports = ctx._auto_cov_reports;
 #if HARC_TRACE_ENABLED
@@ -213,6 +215,7 @@ int run_TbReactivePostEval(int argc, char** argv) {
         _harc_eval_negedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)cycle_count);
         now_ps = (unsigned __int128)_trace_time;
+        if (cycle_count != _harc_checked_cycle) { _harc_checked_cycle = cycle_count; for (auto& _c : _checkers) _c(); }
         _harc_eval_posedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)(cycle_count + 1));
         now_ps = (unsigned __int128)_trace_time;
@@ -220,8 +223,9 @@ int run_TbReactivePostEval(int argc, char** argv) {
         for (auto& _svc : _post_eval_services) _svc();
         if (!_post_eval_services.empty()) dut->eval();
         if (!_post_eval_services.empty()) { _harc_trace_dump_next("clk", (uint64_t)cycle_count); now_ps = (unsigned __int128)_trace_time; }
-        for (auto& _c : _checkers) _c();
     };
+
+    auto eval_clocks_until_checked = [&](unsigned __int128 t_ps) { eval_clocks_until(t_ps); };
 
     auto sim_logf_line = [&](FILE* f, const char* sev, const char* fmt, ...) {
         HARC_RT_LOG_FILE_ONLY_PRINTF(f, cycle_count, sev, fmt);
@@ -420,6 +424,7 @@ int run_TbReactivePostEval(int argc, char** argv) {
     _harc_trace_dump_next("clk", (uint64_t)cycle_count);
     now_ps = (unsigned __int128)_trace_time;
     while (_run_slot.kind != harc_rt::WaitKind::Done && !_fatal) {
+        if (cycle_count != _harc_checked_cycle) { _harc_checked_cycle = cycle_count; for (auto& _c : _checkers) _c(); }
         _harc_eval_posedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)(cycle_count + 1));
         now_ps = (unsigned __int128)_trace_time;
@@ -431,7 +436,7 @@ int run_TbReactivePostEval(int argc, char** argv) {
         _harc_eval_negedge(dut);
         _harc_trace_dump_next("clk", (uint64_t)cycle_count);
         now_ps = (unsigned __int128)_trace_time;
-        for (auto& _c : _checkers) _c();
+        if (cycle_count != _harc_checked_cycle) { _harc_checked_cycle = cycle_count; for (auto& _c : _checkers) _c(); }
     }
 
 

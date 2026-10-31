@@ -1398,11 +1398,11 @@ Compiles to one coroutine per branch with explicit suspend points at each cycle 
 **Loops.** Four loop forms cover the common cases:
 
 - `for i in lo .. hi ... end for` — bounded count, **inclusive of both `lo` and `hi`** (`i = lo, lo+1, …, hi`, i.e. `hi - lo + 1` iterations), matching ARCH's `..`; `i` available in the body, or `_` when unused. (To repeat exactly `N` times, `for _ in 1 .. N` or `repeat N`; to index an `N`-element structure, `for i in 0 .. N - 1`.)
-- `repeat <expr> ... end repeat` — fixed iteration count; no induction variable.
+- `repeat <expr> ... end repeat` — fixed iteration count; no induction variable. A count that is a negative compile-time constant is a compile error; a count that is negative at run time runs the body zero times.
 - `while <cond> ... end while` — pre-tested loop; the body re-checks `cond` on each iteration.
 - `loop ... end loop` — infinite; exit via `break` (typically inside an `if`).
 
-A `for` range's bounds and a `repeat` count are evaluated **once, on loop entry**; assignments in the body to variables they mention (e.g. `for i in 0 .. n … n = 0`) do not change the iteration count. Only a `while` condition is re-evaluated on every iteration.
+A `for` range's bounds and a `repeat` count are evaluated **once, on loop entry**; assignments in the body to variables they mention (e.g. `for i in 0 .. n … n = 0`) do not change the iteration count. Only a `while` condition is re-evaluated on every iteration. Both bounds of a `for` range are evaluated in the **enclosing** scope: the loop variable is not in scope in its own bounds, so `for n in 0 .. n` iterates up to the outer `n`.
 
 `break` exits the innermost enclosing loop; `continue` skips to its next iteration. Both are statements in their own right and lower to C++ `break` / `continue`, so they also work inside `for` / `repeat` / `loop` bodies.
 
@@ -1429,7 +1429,7 @@ wait 2 cycles on slow_clk        // 2 slow_clk rising edges; fast_clk
                                  // (8 fast edges elapse in this span).
 ```
 
-Cycle counts in `on <clock>` are real-time–correct: every other clock keeps ticking at its declared frequency. Use this form when an assertion is naturally phrased in the destination domain ("after 2 dst cycles, X holds"); use the bare form when reasoning is in the primary domain or when there's only one clock.
+Cycle counts in `on <clock>` are real-time–correct: every other clock keeps ticking at its declared frequency. Neither `wait N cycles on <clock>` nor a wall-clock wait (`wait 40ns`) pauses the rest of the testbench's per-cycle machinery: periodic `on <N> cycles` handlers (§7.10), `on <expr>` handlers, watchdogs and concurrent checks still run once for every primary-clock cycle the wait spans, exactly as during a plain `wait N cycles`. This holds for every wait form in every context — the `run`/`check` body, testbench and component functions, hookables and other helpers: each primary cycle gets exactly one pass of that machinery, never zero and never two. With a single clock, `wait N cycles on clk`, `wait N cycles`, and a wall-clock wait of exactly `N` periods (starting on a cycle boundary) run the same checker passes, in the same order relative to the waiting body. That guarantee covers the per-cycle checker machinery only. A wall-clock or clock-qualified wait advances time inline in the waiting body rather than yielding to the scheduler, so the test's other coroutines (`fork` branches, statement-scoped `on` handlers) are not stepped exactly as during a plain `wait N cycles`: they do not advance at all during a wall-clock wait, and they can miss a cycle at the start of a `wait N cycles on <clock>`. (Known limitation, under review.) Use this form when an assertion is naturally phrased in the destination domain ("after 2 dst cycles, X holds"); use the bare form when reasoning is in the primary domain or when there's only one clock.
 ### 7.5 Multi-clock domain spanning
 
 Each `on` block has a primary clock domain inferred from its trigger. Reads of signals or events from another domain are allowed but **not silent**: the compiler synthesizes a synchronizer (default 2-FF) and the read evaluates to a typed value with explicit latency.
@@ -1643,7 +1643,9 @@ timeout 10000 cycles
 
 (The block-style multi-line form is just the same comma-separated list with newlines between items; the parser is whitespace-insensitive between commas and `timeout`.)
 
-**Lowering.** Without `timeout`, `wait until <cond>` lowers to `co_await harc_rt::wait_until(_slot, [&]{ return <cond>; });` in coroutine context (efficient: the scheduler evaluates the predicate once per cycle and only resumes when true) and to `while (!<cond>) tick();` in synchronous contexts (hookable bodies, free functions).
+**At least one cycle.** Every `wait until` — single, `all of` or `any of`, with or without `timeout`, in a `run`/`check` body or inside a function, hookable or other helper — takes **at least one cycle**, even when the predicate already holds when the wait is reached: the predicate is first observed at the next primary-clock cycle, and the wait resumes at the first such observation that is true. This matches ARCH, where `wait until` is a state boundary that always adds a one-cycle pause before the condition is observed (ARCH `doc/thread_spec_section.md` §20.2, line 65, and §20.13, line 458). Moving a `wait until` into a helper, or adding a `timeout` tail, therefore never changes the cycle it resumes on. Consequently a `timeout` budget must be at least one cycle: a compile-time constant budget below 1 (`timeout 0 cycles`, or a negative constant) is a compile error. A budget computed at run time that turns out below 1 is clamped to one cycle — the same way other run-time cycle counts are clamped rather than rejected — so the wait observes the predicate once, one cycle later, and times out if it is false then.
+
+**Lowering.** Without `timeout`, `wait until <cond>` lowers to `co_await harc_rt::wait_until(_slot, [&]{ return <cond>; });` in coroutine context (efficient: the scheduler evaluates the predicate once per cycle and only resumes when true) and to `do tick(); while (!<cond>);` in synchronous contexts (hookable bodies, free functions).
 
 With `timeout`, **coroutine** context uses the runtime's `wait_until_timeout` awaiter — *one* scheduler round-trip rather than one-per-cycle. The scheduler evaluates the predicate and decrements a per-slot countdown each tick; the coroutine resumes when either pred fires or the countdown hits zero, with the awaiter's return value indicating which:
 
@@ -1666,14 +1668,15 @@ With `timeout`, **coroutine** context uses the runtime's `wait_until_timeout` aw
 {
     int64_t _wu_budget = (N);
     int64_t _wu_start  = (int64_t)cycle_count;
-    while (!<overall_cond>() && ((int64_t)cycle_count - _wu_start) < _wu_budget) {
+    if (_wu_budget < 1) _wu_budget = 1;  // run-time budget below one cycle
+    do {
         tick();
-    }
+    } while (!<overall_cond>() && ((int64_t)cycle_count - _wu_start) < _wu_budget);
     if (!<overall_cond>()) { /* same diagnostic + errors++ */ }
 }
 ```
 
-The two shapes are observationally identical: same cycle of resumption, same diagnostic on timeout. The coroutine path is strictly cheaper at runtime — long timeouts (`timeout 10000 cycles`) no longer wake the coroutine 10,000 times to do nothing.
+The two shapes are observationally identical: same cycle of resumption (at least one cycle after the wait is reached, see above), same diagnostic on timeout. The coroutine path is strictly cheaper at runtime — long timeouts (`timeout 10000 cycles`) no longer wake the coroutine 10,000 times to do nothing.
 
 **Per-sub-predicate diagnostics.** On `timeout`, the codegen reports exactly which condition(s) failed to become true:
 
@@ -1696,7 +1699,7 @@ Compare with UVM, where a hung test typically surfaces as a generic "Drain time 
 
 ### 7.10 Periodic triggers — `on <N> cycles`
 
-`on <N> cycles … end on` fires its body once every `N` primary-clock cycles. The form is dual to `on <bool-expr> … end on` — same `on` keyword, the trailing `cycles`/`cycle` decoration tells the parser to interpret `<N>` as a period rather than a boolean predicate.
+`on <N> cycles … end on` fires its body once every `N` primary-clock cycles — including cycles that elapse inside a wall-clock wait or a `wait N cycles on <clock>` (§7.4). The form is dual to `on <bool-expr> … end on` — same `on` keyword, the trailing `cycles`/`cycle` decoration tells the parser to interpret `<N>` as a period rather than a boolean predicate.
 
 ```
 on 1000 cycles

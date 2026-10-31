@@ -24,6 +24,10 @@ const PROBE: &str = r#"#include "harc_thread_rt.h"
 #include <cstdio>
 #include <vector>
 
+// Every `wait until` takes at least one cycle (spec §7.9): a timed wait
+// never completes at entry, even with a true predicate, and a runtime
+// budget of zero is clamped to one cycle. Each wait reports its own result,
+// never a stale `timed_out` flag left on the slot by an earlier wait.
 harc_rt::HarcThread exercise(
     harc_rt::ThreadSlot* slot, bool* gate, std::vector<int>* results) {
     results->push_back(co_await harc_rt::wait_until_timeout(
@@ -34,14 +38,14 @@ harc_rt::HarcThread exercise(
         slot, []() { return false; }, 1) ? 1 : 0);
     results->push_back(co_await harc_rt::wait_until_timeout(
         slot, [gate]() { return *gate; }, 1) ? 1 : 0);
-    // This immediate false wait follows a real timeout and must not read its
-    // stale slot flag. The immediate true wait must still succeed.
+    // A false wait after a real timeout, then a true one: the true wait
+    // must succeed despite the previous wait's timeout.
     results->push_back(co_await harc_rt::wait_until_timeout(
         slot, []() { return false; }, 0) ? 1 : 0);
     results->push_back(co_await harc_rt::wait_until_timeout(
         slot, []() { return true; }, 0) ? 1 : 0);
-    // A suspended predicate that fires clears the slot's timeout state; the
-    // following immediate false wait must remain false after that success.
+    // A predicate that fires clears the slot's timeout state; the following
+    // false wait must still time out after that success.
     results->push_back(co_await harc_rt::wait_until_timeout(
         slot, [gate]() { return *gate; }, 1) ? 1 : 0);
     results->push_back(co_await harc_rt::wait_until_timeout(
@@ -57,10 +61,20 @@ int main() {
     slot.thread = exercise(&slot, &gate, &results);
 
     scheduler.bootstrap();
-    scheduler.tick(); // timeout the first one-cycle false wait
-    scheduler.tick(); // timeout the gate wait while gate is false
-    gate = true;
-    scheduler.tick(); // satisfy the gate wait
+    if (!results.empty()) {
+        std::fprintf(stderr, "a timed wait completed without taking a cycle\n");
+        return 1;
+    }
+    // Each tick resolves exactly one wait: none completes at entry, and a
+    // wait suspended during a tick is first observed on the next tick.
+    for (int i = 0; i < 8; ++i) {
+        if (i == 6) gate = true;  // the second gate wait fires
+        scheduler.tick();
+        if (results.size() != static_cast<size_t>(i + 1)) {
+            std::fprintf(stderr, "tick %d resolved %zu waits\n", i, results.size());
+            return 1;
+        }
+    }
 
     const std::vector<int> expected{0, 1, 0, 0, 0, 1, 1, 0};
     if (results != expected || !scheduler.all_done()) {

@@ -21380,12 +21380,13 @@ fn verifier_catches_bad_wait_clock() {
     );
 }
 
-/// tbir emission of a clock-qualified wait mirrors v1's inline
-/// eval_clocks_until loop: advance to whichever clock's next edge is
-/// sooner until the named clock has seen N more rising edges, service
-/// actor schedulers on each primary edge without re-entering the active
-/// run slot, then run the checkers. A fatal that ended the loop with edges
-/// still owed aborts the run after that checker pass.
+/// tbir emission of a clock-qualified wait keeps v1's inline edge-by-edge
+/// loop: advance to whichever clock's next edge is sooner until the named
+/// clock has seen N more rising edges, service actor schedulers on each
+/// primary edge without re-entering the active run slot. Each step goes
+/// through `eval_clocks_until_checked`, which runs the checker pass for
+/// every primary cycle spanned (spec §7.10); there is no extra end-of-wait
+/// pass. A fatal that ended the loop with edges still owed aborts the run.
 #[test]
 fn tbir_emit_wait_on_clock_inline_loop() {
     let merged = merged_src(WAIT_ON_CLOCK_SRC);
@@ -21399,12 +21400,11 @@ fn tbir_emit_wait_on_clock_inline_loop() {
         "uint64_t _before_rising = clocks_[1].rising_count;",
         "unsigned __int128 _next = clocks_[0].next_edge_ps;",
         "for (auto& _ck : clocks_) if (_ck.next_edge_ps < _next) _next = _ck.next_edge_ps;",
-        "eval_clocks_until(_next);",
+        "eval_clocks_until_checked(_next);",
         "uint64_t _advanced = clocks_[1].rising_count - _before_rising;",
         "if (_advanced > 0) _remaining = _advanced >= _remaining ? 0 : _remaining - _advanced;",
         "if (cycle_count != _before_cycle) _harc_advance_actors();",
-        "} for (auto& _c : _checkers) _c(); \
-         if (_remaining > 0) throw harc_rt::HarcFatalAbort{}; }",
+        "} if (_remaining > 0) throw harc_rt::HarcFatalAbort{}; }",
     ] {
         assert!(
             cpp.contains(marker),
@@ -21597,11 +21597,18 @@ fn clock_periods_must_have_two_positive_half_cycles() {
         )
     };
 
-    for (mhz, period) in [(2_000_000, 0), (333, 3003)] {
+    for (mhz, period) in [(333, 3003)] {
         let msg = assert_invalid(&lower_src(&source(mhz)).unwrap_err());
         assert!(msg.contains(&format!("invalid period of {period} ps")), "{msg}");
         assert!(msg.contains("positive and even"), "{msg}");
     }
+    // Above 1 THz the period would round to 0 ps; the domain itself is
+    // rejected, naming the bad frequency.
+    let msg = assert_invalid(&lower_src(&source(2_000_000)).unwrap_err());
+    assert!(
+        msg.contains("`freq_mhz: 2000000`") && msg.contains("no greater than 1000000"),
+        "{msg}"
+    );
 
     let mut corrupted = lower_src(&source(100)).expect("valid 10 ns clock lowers");
     corrupted.tests[0].clocks[0].period_ps = 0;
@@ -24659,7 +24666,7 @@ end impl MethodWaitTimeTest
 "#;
     let cpp = emit_cpp_src(src);
     assert!(
-        cpp.matches("eval_clocks_until(now_ps + 1);").count() >= 4,
+        cpp.matches("eval_clocks_until_checked(now_ps + 1);").count() >= 4,
         "transactor, component, testbench, and hook methods should emit wall-clock settle waits:\n{cpp}"
     );
 }
@@ -24691,7 +24698,7 @@ end test ClocklessMethodWaitTest
         "clockless tests with wall waits should emit a time-advance helper:\n{cpp}"
     );
     assert!(
-        cpp.contains("eval_clocks_until(now_ps + 1);"),
+        cpp.contains("eval_clocks_until_checked(now_ps + 1);"),
         "method-local wall wait should advance clockless absolute time:\n{cpp}"
     );
 }
@@ -24729,7 +24736,7 @@ end impl ClocklessTransactorMethodEmitTest
         "clockless transactor method waits should emit a time-advance helper:\n{cpp}"
     );
     assert!(
-        cpp.contains("eval_clocks_until(now_ps + 1);"),
+        cpp.contains("eval_clocks_until_checked(now_ps + 1);"),
         "transactor method wall wait should advance clockless absolute time:\n{cpp}"
     );
 }
@@ -24771,7 +24778,7 @@ end impl ClocklessTestHookEmitTest
         "clockless hook waits should emit a time-advance helper:\n{cpp}"
     );
     assert!(
-        cpp.contains("eval_clocks_until(now_ps + 1);"),
+        cpp.contains("eval_clocks_until_checked(now_ps + 1);"),
         "test hook wall wait should advance clockless absolute time:\n{cpp}"
     );
 }
@@ -26705,7 +26712,8 @@ fn transactor_method_timed_wait_lowers_to_the_sync_poll_loop() {
     for needle in [
         "uint64_t _wu_budget = (uint64_t)(",
         "uint64_t _wu_start = cycle_count;",
-        ") < _wu_budget) { if (_fatal) throw harc_rt::HarcFatalAbort{}; tick(); }",
+        "if (_wu_budget < 1) _wu_budget = 1; do { if (_fatal) throw harc_rt::HarcFatalAbort{}; tick(); } while (",
+        ") < _wu_budget);",
         "ctx.errors++;",
     ] {
         assert!(cpp.contains(needle), "missing `{needle}` in:\n{cpp}");
@@ -36040,7 +36048,10 @@ end impl T"#,
     );
     assert!(
         cpp.contains("uint64_t _wu_start = cycle_count;")
-            && cpp.contains(") < _wu_budget) { if (_fatal) throw harc_rt::HarcFatalAbort{}; tick(); }"),
+            && cpp.contains(
+                "if (_wu_budget < 1) _wu_budget = 1; do { if (_fatal) throw harc_rt::HarcFatalAbort{}; tick(); } while ("
+            )
+            && cpp.contains(") < _wu_budget);"),
         "a component method must render the same sync poll loop; got:\n{cpp}"
     );
 }
@@ -53419,7 +53430,7 @@ fn target_responder_wall_clock_wait_uses_the_test_scheduler() {
     verify::verify_program(&program).expect("target responder wall-clock wait verifies");
     let cpp = tbir::emit(&program, &merged_src(&src), &cpp_tb::EmitOpts::default())
         .expect("target responder wall-clock wait emits");
-    assert!(cpp.contains("eval_clocks_until(now_ps + 1000);"), "{cpp}");
+    assert!(cpp.contains("eval_clocks_until_checked(now_ps + 1000);"), "{cpp}");
 }
 
 #[test]
@@ -53441,7 +53452,7 @@ end test T"#;
     verify::verify_program(&program).expect("tseq wall-clock wait verifies");
     let cpp = tbir::emit(&program, &merged_src(src), &cpp_tb::EmitOpts::default())
         .expect("tseq wall-clock wait emits");
-    assert!(cpp.contains("eval_clocks_until(now_ps + 1000);"), "{cpp}");
+    assert!(cpp.contains("eval_clocks_until_checked(now_ps + 1000);"), "{cpp}");
 }
 
 #[test]

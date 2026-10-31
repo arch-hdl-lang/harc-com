@@ -3233,10 +3233,13 @@ pub enum Terminator {
     /// delta in the final `sim_end` clock attribution.
     WaitCyclesSync(Expr, BlockId),
     /// Wall-clock wait (`wait 80ns`), duration resolved to picoseconds
-    /// at lowering. Mirrors v1's inline `eval_clocks_until(now_ps + N)`
-    /// emission (no coroutine yield, no checker pass) — only valid in
-    /// tests with declared clocks (lowering enforces this; v1 emits
-    /// uncompilable C++ for the clockless case).
+    /// at lowering. Emitted as an inline time advance (no coroutine
+    /// yield, so sub-cycle precision is kept) that still runs the
+    /// per-cycle checker pass for every primary cycle it spans
+    /// (`eval_clocks_until_checked`; spec §7.4/§7.10) — deliberately
+    /// unlike v1, which skipped those passes. Only valid in tests with
+    /// declared clocks (lowering enforces this; v1 emits uncompilable C++
+    /// for the clockless case).
     WaitTimePs(i64, BlockId),
     WaitUntil {
         preds: Vec<PredSrc>,

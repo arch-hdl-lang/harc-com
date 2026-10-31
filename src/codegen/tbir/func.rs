@@ -67,6 +67,8 @@ const RESERVED: &[&str] = &[
     "sim_log_line",
     "sim_logf_line",
     "eval_clocks_until",
+    "eval_clocks_until_checked",
+    "_harc_checked_cycle",
     "_tb",
     "_fatal",
     "_trace_time",
@@ -539,12 +541,11 @@ fn emit_function_with_tseq_calls(
                             )
                             .ok();
                         } else {
-                            // `wait N cycles on <clock>` — mirror v1's
-                            // inline eval_clocks_until loop (cpp_tb.rs,
-                            // StmtKind::Wait with a clock): advance
-                            // simulated time edge-by-edge until the named
-                            // clock has seen N more rising edges, then run
-                            // the checkers.
+                            // `wait N cycles on <clock>` — advance
+                            // simulated time inline, edge-by-edge, until
+                            // the named clock has seen N more rising
+                            // edges, running the per-cycle checker pass
+                            // for every primary cycle spanned.
                             emit_local_qualified_clock_wait(out, &pad3, c.index, &n, true);
                         }
                     }
@@ -570,17 +571,18 @@ fn emit_function_with_tseq_calls(
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::WaitTimePs(ps, b) => {
-                // Wall-clock wait — v1's inline emission for a Time
-                // duration: advance absolute time, no coroutine yield,
-                // no checker pass.
+                // Wall-clock wait: advance absolute time inline (no
+                // coroutine yield, so sub-cycle precision is kept), running
+                // the per-cycle checker pass for every primary cycle the
+                // wait spans (spec §7.10).
                 if let Some(context) = cx.bindings.run_context {
                     let now = format!("{context}.now_ps");
                     emit_wall_clock_wait(out, &pad3, &now, *ps, *b, |target| {
-                        format!("harc_eval_clocks_until({context}, {target})")
+                        format!("harc_eval_clocks_until_checked({context}, {target})")
                     });
                 } else {
                     emit_wall_clock_wait(out, &pad3, "now_ps", *ps, *b, |target| {
-                        format!("eval_clocks_until({target})")
+                        format!("eval_clocks_until_checked({target})")
                     });
                 }
             }
@@ -1869,10 +1871,12 @@ fn emit_tseq_impl(
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::WaitUntil { preds, mode, succ } => {
+                // At least one cycle even when the predicate already
+                // holds (spec §7.9), like the coroutine awaiter.
                 let cond = preds_cpp(&cx, preds, *mode)?;
                 writeln!(
                     out,
-                    "{pad3}while (!({cond})) {}",
+                    "{pad3}do {} while (!({cond}));",
                     fatal_guarded_tick("tick()")
                 )
                 .ok();
@@ -1881,7 +1885,7 @@ fn emit_tseq_impl(
             Terminator::WaitTimePs(ps, b) => match emission {
                 TseqEmission::LocalLambda => {
                     emit_wall_clock_wait(out, &pad3, "now_ps", *ps, *b, |target| {
-                        format!("eval_clocks_until({target})")
+                        format!("eval_clocks_until_checked({target})")
                     });
                 }
                 TseqEmission::Common {
@@ -1889,7 +1893,7 @@ fn emit_tseq_impl(
                     ..
                 } => {
                     emit_wall_clock_wait(out, &pad3, "ctx.now_ps", *ps, *b, |target| {
-                        format!("harc_eval_clocks_until(ctx, {target})")
+                        format!("harc_eval_clocks_until_checked(ctx, {target})")
                     });
                 }
                 TseqEmission::Common {
@@ -2564,13 +2568,20 @@ fn fatal_guarded_tick(tick: &str) -> String {
     format!("{{ if (_fatal) throw harc_rt::HarcFatalAbort{{}}; {tick}; }}")
 }
 
+/// `wait N cycles on <clock>`: step edge by edge until the named clock has
+/// seen N more rising edges. Each step goes through
+/// `eval_clocks_until_checked`, so every primary cycle the wait spans gets
+/// its checker pass exactly once (spec §7.10), as with a plain
+/// `wait N cycles`; the cycle the wait ends in gets its pass from the
+/// caller's next scheduler step.
+///
 /// `abort_on_fatal`: a fatal ends the wait loop early; with edges still
 /// owed, the caller's successor must not run (spec §7.7 aborts the test
-/// at end of the current cycle), so after the usual checker pass the wait
-/// throws `HarcFatalAbort` like a positive wall-clock wait. Zero waits and
-/// waits whose last edge lands in the fatal cycle still reach their
-/// successor. Test hooks pass `false`: they fire in synchronous callback
-/// dispatch, outside the coroutine that catches the abort.
+/// at end of the current cycle), so the wait throws `HarcFatalAbort` like
+/// a positive wall-clock wait. Zero waits and waits whose last edge lands
+/// in the fatal cycle still reach their successor. Test hooks pass
+/// `false`: they fire in synchronous callback dispatch, outside the
+/// coroutine that catches the abort.
 fn emit_local_qualified_clock_wait(
     out: &mut String,
     pad: &str,
@@ -2591,7 +2602,7 @@ fn emit_local_qualified_clock_wait(
     )
     .ok();
     writeln!(out, "{pad}{INDENT}for (auto& _ck : clocks_) if (_ck.next_edge_ps < _next) _next = _ck.next_edge_ps;").ok();
-    writeln!(out, "{pad}{INDENT}eval_clocks_until(_next);").ok();
+    writeln!(out, "{pad}{INDENT}eval_clocks_until_checked(_next);").ok();
     writeln!(out, "{pad}{INDENT}uint64_t _advanced = clocks_[{clock_index}].rising_count - _before_rising;").ok();
     writeln!(out, "{pad}{INDENT}if (_advanced > 0) _remaining = _advanced >= _remaining ? 0 : _remaining - _advanced;").ok();
     writeln!(
@@ -2599,12 +2610,11 @@ fn emit_local_qualified_clock_wait(
         "{pad}{INDENT}if (cycle_count != _before_cycle) _harc_advance_actors();"
     )
     .ok();
-    let abort = if abort_on_fatal {
-        " if (_remaining > 0) throw harc_rt::HarcFatalAbort{};"
+    if abort_on_fatal {
+        writeln!(out, "{pad}}} if (_remaining > 0) throw harc_rt::HarcFatalAbort{{}}; }}").ok();
     } else {
-        ""
-    };
-    writeln!(out, "{pad}}} for (auto& _c : _checkers) _c();{abort} }}").ok();
+        writeln!(out, "{pad}}} }}").ok();
+    }
 }
 
 fn event_payload_ir_type(payload: crate::ir::EventPayload) -> IrType {
@@ -5787,7 +5797,7 @@ pub(super) fn declare_method_slot(
 /// a coroutine. v1 hookables run synchronously — their waits advance
 /// the clock directly instead of yielding to the scheduler — so the
 /// suspension terminators emit v1's sync shapes (`for (...) tick();`,
-/// `while (!(pred)) tick();`) and `Return` is a real `return`.
+/// `do tick(); while (!(pred));`) and `Return` is a real `return`.
 ///
 /// Direct transactor instance storage and heartbeat predicates are emitted
 /// by the surrounding test scaffold; this routine owns the method lambda and
@@ -5938,11 +5948,14 @@ pub(super) fn emit_method(
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::WaitUntil { preds, mode, succ } => {
-                // v1's synchronous polling loop.
+                // Synchronous polling loop. `do … while` because every
+                // `wait until` takes at least one cycle, even when the
+                // predicate already holds (spec §7.9), matching the
+                // coroutine `wait_until` awaiter.
                 let cond = preds_cpp(&cx, preds, *mode)?;
                 writeln!(
                     out,
-                    "{pad3}while (!({cond})) {}",
+                    "{pad3}do {} while (!({cond}));",
                     fatal_guarded_tick("tick()")
                 )
                 .ok();
@@ -5953,7 +5966,7 @@ pub(super) fn emit_method(
                 // v1 advances absolute simulation time inline, and these
                 // lambdas capture `now_ps` / `eval_clocks_until` by reference.
                 emit_wall_clock_wait(out, &pad3, "now_ps", *ps, *b, |target| {
-                    format!("eval_clocks_until({target})")
+                    format!("eval_clocks_until_checked({target})")
                 });
             }
             Terminator::Return => {
@@ -6030,10 +6043,13 @@ pub(super) fn emit_method(
                 on_timeout,
             } => {
                 // A method body has no scheduler to defer to, so the
-                // timed wait keeps v1's explicit polling loop (spec
-                // §7.4's "synchronous context" shape) rather than the
+                // timed wait keeps an explicit polling loop (spec §7.9's
+                // "synchronous context" shape) rather than the
                 // coroutine `wait_until_timeout` awaiter: budget read
                 // once, `tick()` per cycle, bounded by elapsed cycles.
+                // Every `wait until` takes at least one cycle; a
+                // runtime budget below one (a constant one is a compile
+                // error) is clamped to one cycle, as the awaiter does.
                 // The error bump rides the timeout edge, exactly as on
                 // the coroutine path, so the `on_timeout` block carries
                 // only the diagnostic text.
@@ -6043,7 +6059,7 @@ pub(super) fn emit_method(
                 writeln!(out, "{pad3}uint64_t _wu_start = cycle_count;").ok();
                 writeln!(
                     out,
-                    "{pad3}while (!({cond}) && (cycle_count - _wu_start) < _wu_budget) {}",
+                    "{pad3}if (_wu_budget < 1) _wu_budget = 1; do {} while (!({cond}) && (cycle_count - _wu_start) < _wu_budget);",
                     fatal_guarded_tick("tick()")
                 )
                 .ok();
@@ -7494,10 +7510,12 @@ fn emit_component_fn_lambda(
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
             Terminator::WaitUntil { preds, mode, succ } => {
+                // At least one cycle even when the predicate already
+                // holds (spec §7.9), like the coroutine awaiter.
                 let cond = preds_cpp(&cx, preds, *mode)?;
                 writeln!(
                     out,
-                    "{pad3}while (!({cond})) {}",
+                    "{pad3}do {} while (!({cond}));",
                     fatal_guarded_tick(&tick_call)
                 )
                 .ok();
@@ -7506,12 +7524,12 @@ fn emit_component_fn_lambda(
             Terminator::WaitTimePs(ps, b) => match emission {
                 ComponentFunctionEmission::LocalLambda => {
                     emit_wall_clock_wait(out, &pad3, "now_ps", *ps, *b, |target| {
-                        format!("eval_clocks_until({target})")
+                        format!("eval_clocks_until_checked({target})")
                     });
                 }
                 ComponentFunctionEmission::CommonFunction => {
                     emit_wall_clock_wait(out, &pad3, "ctx.now_ps", *ps, *b, |target| {
-                        format!("harc_eval_clocks_until(ctx, {target})")
+                        format!("harc_eval_clocks_until_checked(ctx, {target})")
                     });
                 }
             },
@@ -7596,7 +7614,7 @@ fn emit_component_fn_lambda(
                 writeln!(out, "{pad3}uint64_t _wu_start = cycle_count;").ok();
                 writeln!(
                     out,
-                    "{pad3}while (!({cond}) && (cycle_count - _wu_start) < _wu_budget) {}",
+                    "{pad3}if (_wu_budget < 1) _wu_budget = 1; do {} while (!({cond}) && (cycle_count - _wu_start) < _wu_budget);",
                     fatal_guarded_tick(&tick_call)
                 )
                 .ok();
@@ -7971,11 +7989,11 @@ fn emit_responder_loop_switch(
                 if let Some(context) = cx.bindings.run_context {
                     writeln!(
                         out,
-                        "{pad_body}harc_eval_clocks_until({context}, {context}.now_ps + {ps});"
+                        "{pad_body}harc_eval_clocks_until_checked({context}, {context}.now_ps + {ps});"
                     )
                     .ok();
                 } else {
-                    writeln!(out, "{pad_body}eval_clocks_until(now_ps + {ps});").ok();
+                    writeln!(out, "{pad_body}eval_clocks_until_checked(now_ps + {ps});").ok();
                 }
                 writeln!(out, "{pad_body}__bb = {};", b.0).ok();
             }
@@ -8834,7 +8852,8 @@ pub(super) fn emit_test_hook(
                     // A hook runs in synchronous dispatch, where nothing
                     // catches `HarcFatalAbort`; once fatal stops time the
                     // wait just ends instead (a polling wait would
-                    // otherwise spin forever).
+                    // otherwise spin forever). `do … while`: at least one
+                    // cycle even when the predicate already holds.
                     let fatal = hook_fatal_flag(render.flow.run_context);
                     writeln!(
                         out,
@@ -8899,7 +8918,7 @@ pub(super) fn emit_test_hook(
                     // wait just ends instead (a polling wait would
                     // otherwise spin forever).
                     let fatal = hook_fatal_flag(render.flow.run_context);
-                    writeln!(out, "{pad3}while (!({cond}) && !{fatal}) {tick};").ok();
+                    writeln!(out, "{pad3}if (!{fatal}) do {tick}; while (!({cond}) && !{fatal});").ok();
                 }
                 writeln!(out, "{pad3}__bb = {};", succ.0).ok();
             }
@@ -8927,11 +8946,11 @@ pub(super) fn emit_test_hook(
                 } else if let Some(context) = render.flow.run_context {
                     writeln!(
                         out,
-                        "{pad3}harc_eval_clocks_until({context}, {context}.now_ps + {ps});"
+                        "{pad3}harc_eval_clocks_until_checked({context}, {context}.now_ps + {ps});"
                     )
                     .ok();
                 } else {
-                    writeln!(out, "{pad3}eval_clocks_until(now_ps + {ps});").ok();
+                    writeln!(out, "{pad3}eval_clocks_until_checked(now_ps + {ps});").ok();
                 }
                 writeln!(out, "{pad3}__bb = {};", b.0).ok();
             }
