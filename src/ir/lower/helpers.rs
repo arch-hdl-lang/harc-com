@@ -689,6 +689,11 @@ impl FuncBuilder<'_> {
             IrType::SInt(Some(width)) => (*width, true),
             _ => return Ok(None),
         };
+        // An untyped literal value is judged only by strict fit.
+        if super::exprs::expr_is_untyped_literal(value) {
+            self.check_literal_store_fits(value, expected, what)?;
+            return Ok(Some(expected.clone()));
+        }
         let ScalarValueEvidence::Integer {
             width,
             signed,
@@ -736,6 +741,7 @@ impl FuncBuilder<'_> {
                 )));
             }
         }
+        self.check_literal_store_fits(value, expected, what)?;
         self.check_arch_result_width(value, dest_width, what)?;
         Ok(Some(expected.clone()))
     }
@@ -1149,6 +1155,9 @@ impl FuncBuilder<'_> {
         let (IrType::UInt(Some(dw)) | IrType::SInt(Some(dw))) = expected else {
             return Ok(());
         };
+        if super::exprs::expr_is_untyped_literal(value) {
+            return self.check_literal_store_fits(value, expected, "the return value");
+        }
         if let Some(IrType::UInt(Some(aw)) | IrType::SInt(Some(aw))) = self.expr_type(value) {
             if aw > *dw && !matches!(value, Expr::Binary(..) | Expr::Unary(..)) {
                 return Err(LowerError::Invalid(format!(
@@ -1158,6 +1167,7 @@ impl FuncBuilder<'_> {
                 )));
             }
         }
+        self.check_literal_store_fits(value, expected, "the return value")?;
         self.check_arch_result_width(value, *dw, "the return value")
     }
 

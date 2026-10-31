@@ -399,42 +399,103 @@ unsigned operands never combine implicitly.
 | `a + b`, `a - b` | `max(W(a), W(b)) + 1` |
 | `a * b` | `W(a) + W(b)` |
 | `a / b`, `a % b`, `a << n`, `a >> n` | `W(a)` |
-| `a \| b`, `a ^ b` | `max(W(a), W(b))` |
-| `a & b` | the narrower unsigned operand's width (a literal mask bounds it) |
+| `a \| b`, `a ^ b` | `max(W(a), W(b))` (an untyped literal operand must fit its typed peer, so this is the typed width) |
+| `a & b` | the narrower unsigned operand's width (a literal mask bounds it; the result is then unsigned) |
 | `a +% b`, `a -% b`, `a *% b` | `max(W(a), W(b))` (unsigned residue) |
 | `x.trunc/zext/sext/resize<N>()` | `N` |
 
-An untyped integer literal (or untyped `const`) contributes the bits of its
-value, so `uint<8> + 1` is a 9-bit value. Storing a result into a narrower
-typed slot — a typed `let`, a local, a component / scoreboard / testbench /
-transactor-state field, a record or transaction field, a `Vec` element, a
-queue push, a helper argument, a return value, or a typed `const` — is the
-ordinary narrowing error. Write the intent explicitly: a wrapping operator
-(`count = count +% 1`), `.trunc<N>()` (`(a + 1).trunc<8>()`), or a wider
-declaration. A signed accumulator keeps its sign with `.resize<N>()`
-(`total = (total + v).resize<32>()`), because a wrapping operator's residue is
-unsigned; negate with unary `-x` rather than `0 - x`. An untyped `let` infers
-the widened type (`let c = a + 1` is `uint<9>`), and a width method sees the
-widened value with its carry (`(a + 1).zext<16>()` keeps bit 8; `.trunc<8>()`
-narrows the 9-bit sum). Widths that would cross a carrier tier the operands
-do not use (a 64-bit sum is 65 bits) are judged for narrowing but computed in
-the operands' carrier, so the carry above bit 63 is not kept; use
-`.zext<65>()` on an operand when it is needed. Likewise a width method on a
-composed *signed* operand wider than 64 bits reads the operands' width, not
-the carry bit, because such values are held as their declared-width pattern.
+An untyped integer literal or untyped `const` contributes the bits of its
+value, so `uint<8> + 1` and `uint<8> + K` (with `const K = 3`) are 9-bit
+values. The value is exact at that width: the operation runs in the carrier
+its result needs (`u64 + 1` is a 65-bit value with its carry, `p * q` on two
+`uint<40>` is 80 bits), and an unsigned difference is its result-width
+pattern (`uint<8>(1) - uint<8>(255)` is the `uint<9>` value 258).
 
-This changes one case of the shift and division rules above: an untyped
-`let` of a composed expression is no longer width-erased; it has its
-inferred result type (`let c = a + 1` shifts and divides as a `uint<9>`).
+Storing a result into a narrower typed slot — a typed `let`, a local, a
+component / scoreboard / testbench / transactor-state field, a record or
+transaction field, a `Vec` element, a queue push, a helper argument, a return
+value, or a typed `const` — is the ordinary narrowing error. Write the intent
+explicitly: a wrapping operator (`count = count +% 1`; through 64 bits),
+`.trunc<N>()` (`(a + 1).trunc<8>()`, at any width), an explicit `as` cast in a
+`const`, or a wider declaration. A signed accumulator keeps its sign with
+`.resize<N>()` (`total = (total + v).resize<32>()`), because a wrapping
+operator's residue is unsigned; negate with unary `-x` rather than `0 - x`.
+
+An untyped `let` of a composed expression infers its result type (`let c =
+a + 1` is a `uint<9>`, `let pq = p * q` a `uint<80>`), so storing it later
+into a narrower slot is a narrowing error, and it shifts and divides at that
+width; this changes one case of the shift and division rules above, where an
+untyped `let` was width-erased. `let x = 5` — an untyped integer literal or
+literal-only expression with no type (`let x = 1 + 299`, `let n = ~0`,
+`let s = 1 << 3`, `let k = K` for an untyped `const K`) — is an error: a
+literal has no width or signedness to infer, so the declaration names one
+(`let x : uint<32> = 5`). A sized literal (`4'd3`) declares its width and is
+accepted. A discard is no exception: `let _ = 1` is the same error.
+
+An untyped literal as the left operand of a shift by a non-constant amount
+is an error for the same reason — `5 << n` has no width to shift in. Give it
+one with a cast: `(5 as uint<16>) << n`. A shift whose amount is a constant
+is a literal-only expression and is evaluated exactly.
+
+A width method sees its receiver's result width, carry included:
+`(a + 1).zext<16>()` keeps bit 8 of the 9-bit sum, `.trunc<8>()` narrows that
+sum, and on a signed receiver `(s + t).sext<16>()` extends from the 9-bit
+result, so a sum that overflows 8 bits keeps its true value instead of
+wrapping first. One exception: a composed *signed* receiver whose operands are
+wider than 64 bits is extended from the operands' width, because a signed
+value of that width is held as its declared-width bit pattern in an unsigned
+carrier, so the bit above it is not a sign bit until the operand is extended.
 
 A binary operator whose two operands have declared, different signedness —
 comparison, equality, arithmetic or bitwise — is a compile-time error in
 procedural code, in a `const` initializer and in a `keep` / `randomize ...
-with` constraint. Convert one side with `as sint<N>` / `as uint<N>`. Operands
-with no declared signedness adapt to their peer and are not judged: untyped
-literals and untyped constants (`const N = 3`), enum values, and widthless
-values (a list `.size()`, an unsized DUT-port read). A shift count and the
-logical `&&` / `||` are not judged either.
+with` constraint (including `Vec`/list elements and `foreach` variables), and
+so are the two arms of a conditional `? :`. Convert one side with
+`as sint<N>` / `as uint<N>`. An untyped literal or untyped constant —
+including a literal expression such as `~0` — is judged by its exact value:
+a negative one is a signed value, so `a < -1`, `a < ~0` or `a < NEG` (with
+`const NEG = -5`) on a `uint` `a` is the mixed-signedness error. Enum values
+and widthless values (a list `.size()`, an unsized DUT-port read) are not
+judged, and neither are a shift count and the logical `&&` / `||`.
+
+**Strict fit.** An untyped literal or untyped constant has no type of its
+own, so it takes the type it meets — and its exact value must fit that type.
+There is one rule, in procedural code, in a `const` initializer and in a
+constraint, with no reinterpretation of bit patterns anywhere:
+
+- Stored into a typed slot (a typed `let` or `const`, an assignment, a
+  field or a field `default`, a `Vec` element, a queue push, a helper
+  argument or return value),
+  it must fit the declared type: `let x : uint<8> = -1`,
+  `let s : sint<8> = 0xFF`, `let u : uint<32> = ~0` and
+  `const ALL : uint<64> = ~0` are errors. Write the value that fits
+  (`0xFFFF_FFFF_FFFF_FFFF`, `-1`) or convert explicitly
+  (`(~0) as uint<64>`).
+- As an operand of a comparison, an equality or a bitwise `& | ^`, it adapts
+  to the typed peer only when its value fits the peer's type:
+  `s < 0x8000000000000000` or `s == 0xFFFF_FFFF_FFFF_FFFF` on a `sint<64>`
+  `s`, `a == 300` and `a | 300` on a `uint<8>` `a`, are errors (so the
+  `| ^` max-width rule above applies to typed operands). The same holds for
+  the members and range bounds of a membership test (`keep u in {1, 300}`),
+  and for the constant values and range bounds of a covergroup bin on a
+  coverpoint of declared type (one that reads no width-erased DUT port):
+  `[2..300]` or `{-1}` on a `uint<8>` coverpoint is an error.
+- `+ - *` (and `+% -% *%`) widen per ARCH: the literal contributes its own
+  value bits and need only match the peer's signedness (a non-negative value
+  against a `uint`, any value against a `sint`), at any width —
+  `a + 300` is a 10-bit value, `s + 0x8000000000000000` on a `sint<64>` a
+  65-bit one, and `u * 0x1_0000_0000_0000_0000` on a `uint<64>` a 129-bit
+  one.
+- A literal-only expression is evaluated exactly before it is judged:
+  `3 << 63` is `3 * 2**63`, so it fits a `uint<128>` but not a `uint<64>`,
+  and `(0 - 3) << 62` stays negative. One that cannot be evaluated — a zero
+  divisor (`1 / 0`), a shift amount outside `0..=1024` — is an error
+  wherever it appears, as it is in a `const`.
+
+Because constants are evaluated exactly, like runtime values, a `const` and
+the same expression at runtime always agree: `const C : uint<65> = ~0` and
+`let c : uint<65> = ~0` are both errors, and with the explicit cast both are
+`2**65 - 1`.
 
 ---
 
@@ -1881,7 +1942,7 @@ explicit modes (`drv : T active`) win over inherited ones at any depth.
 - `obj.method(args)` and arbitrarily-deep field chains like `env.ag.seq.method(args)` rewrite to `<Type>_<method>(<self>, args)`. The call-site dispatcher walks the field-access chain from its leaf to the root, resolving the type at each step against the let-binding's declared type or the current component field context, and looks up the hookable or component-local function on the leaf type.
 - `let drv : T mode` default-constructs the struct; the user assigns DUT pointers and other field values explicitly afterward (`drv.dut = dut`). The mode annotation (`active`/`passive`) selects which body halves get codegen-instantiated.
 - **Mode inheritance through agent and env composition.** A transactor field nested inside an `agent` or `env` (e.g. `agent A { drv : T }`) without an explicit mode inherits its mode from the parent's let-instantiation. Same agent declaration + `let act : A active` makes `act.drv` active; `let pas : A passive` makes it passive. Inheritance cascades through any number of nesting layers — `env E { ag : Agent { drv : T } }` flows mode from `let topenv : E passive` all the way down to `topenv.ag.drv`. A field-level explicit mode (e.g. `drv : T active`) wins over the inherited mode at any depth.
-- `const NAME : Ty = expr` — a file-scope named constant, visible everywhere (main, hookable lambdas, on-handler closures, struct field defaults). The initializer must be a **compile-time constant expression**: integer literals (plain, or ARCH sized literals such as `8'h3`, which fold to their value), references to *earlier* `const` / enum-variant names (constants resolve in declaration order; forward and cyclic references are compile errors), parentheses, `as uint/sint/bits<≤64>` casts (the `W`-bit value of the operand's bit pattern, as at runtime, §2: `(0 - 4) as uint<8>` is 252), unary `-`/`~`/`!`/`not`, arithmetic `+ - * / %`, shifts `<< >>`, bitwise `& | ^`, comparison, and logical operators. (The wrapping `+% -% *%` spellings are *not* in the const subset — their §2.4 mask depends on static operand widths; spell the mask explicitly.) Evaluation (harc#521) is in the **64-bit two's-complement domain** with signedness taken from each referenced constant's declared type — `>>` on a `sint` constant is an arithmetic shift, `<<` on a typed constant or cast of `W < 64` bits keeps its low `W` bits (§2), `/` and `%` truncate toward zero, and a binary op is signed only when both operands are; an operator mixing two operands of declared, different signedness (a typed `sint` constant or `as sint` cast against a typed `uint` one) is a compile-time error (§2.4). A typed constant's initializer also carries its §2.4 result width: `const L : uint<32> = N - 1` on a `uint<32>` `N` is 33 bits and is rejected — write `N -% 1`. The result must fit the declared type: a value outside `uint<W>` / `sint<W>` (W < 64) is a precise compile-time error, never a silent truncation, with one deliberate asymmetry — a `sint<W>` initializer's bit pattern is reinterpreted as signed two's complement before the range check (so `sint<8> = 0xFFFFFFFFFFFFFFFF` is `-1`, the mod-2⁶⁴ conversion C++ defines; `sint<8> = (0 - 1) as uint<8>` is 255 and therefore an out-of-range error), while an unsigned constant never accepts a negative value. Division or modulo by zero, signed `MIN / -1` and `MIN % -1` at 64 bits, and shift amounts outside `0..=63` are compile-time errors (at runtime the first three are FATAL errors at every width and the last saturates, §2). The legacy `--codegen v1` backend lowers the raw expression to a file-scope `static constexpr <c_type> NAME = <expr>;`; the TB-IR backend folds the value at compile time and substitutes it at use sites. TB-IR's 64-bit fold is authoritative: values agree with v1 wherever v1's C++ evaluation is well-defined at 64-bit rank, but corners where v1's emitted C++ evaluates literals as 32-bit `int` (`1 << 31` sign-extends under v1), fails to compile (shift ≥ 32 of a small literal, `INT_MAX`-overflowing intermediates, enum-variant references in initializers), or skips the §2.4 wrap mask are defined — or precisely diagnosed — only by TB-IR.
+- `const NAME : Ty = expr` — a file-scope named constant, visible everywhere (main, hookable lambdas, on-handler closures, struct field defaults). The initializer must be a **compile-time constant expression**: integer literals (plain, or ARCH sized literals such as `8'h3`, which fold to their value), references to *earlier* `const` / enum-variant names (constants resolve in declaration order; forward and cyclic references are compile errors), parentheses, `as uint/sint/bits<W>` casts (W ≤ 128; the `W`-bit value of the operand's bit pattern, as at runtime, §2: `(0 - 4) as uint<8>` is 252), unary `-`/`~`/`!`/`not`, arithmetic `+ - * / %`, shifts `<< >>`, bitwise `& | ^`, comparison, and logical operators. The wrapping `+% -% *%` spellings fold when both operand widths are statically known (a literal, a cast, or a typed constant). Evaluation is **exact at each operation's ARCH result width** (§2.4), exactly as the same expression evaluates at runtime, so a constant and its runtime counterpart always agree: `+ - *` never wrap (`uint<64>(0) - uint<64>(15)` is the 65-bit `2**65 - 15`, so `(A - B) % 127` is 116, and 128- or 192-bit intermediates are kept whole), an unsigned difference is its result-width pattern, and an untyped literal or untyped constant contributes its value's bits. Signedness is taken from each referenced constant's declared type — `>>` on a `sint` constant is an arithmetic shift, `<<` on a typed constant or cast of `W < 64` bits keeps its low `W` bits (§2), `/` and `%` truncate toward zero, and a binary op is signed only when both operands are; an operator mixing two operands of declared, different signedness (a typed `sint` constant or `as sint` cast against a typed `uint` one) is a compile-time error (§2.4). A typed constant's initializer also carries its §2.4 result width: `const L : uint<32> = N - 1` on a `uint<32>` `N` is 33 bits and is rejected — write `N -% 1`. The result must fit the declared type exactly (strict fit, §2.4): a value outside `uint<W>` / `sint<W>` — at any width — is a precise compile-time error, never a silent truncation or reinterpretation, and a runtime store of the same value is the same error. So `uint<64> = ~0` and `sint<8> = 0xFFFFFFFFFFFFFFFF` are errors; write the value that fits or convert explicitly (`(~0) as uint<64>`, `0xFF as sint<8>` is -1; `sint<8> = (0 - 1) as uint<8>` is 255 and therefore an out-of-range error). Division or modulo by zero, signed `MIN / -1` and `MIN % -1` at the dividend's width, and shift amounts outside `0..=63` (`0..W-1` for a typed operand wider than 64 bits) are compile-time errors (at runtime the first three are FATAL errors at every width and the last saturates, §2). The legacy `--codegen v1` backend lowers the raw expression to a file-scope `static constexpr <c_type> NAME = <expr>;`; the TB-IR backend folds the value at compile time and substitutes it at use sites. TB-IR's exact fold is authoritative: values agree with v1 wherever v1's C++ evaluation is well-defined at 64-bit rank and no intermediate exceeds 64 bits, but corners where v1's emitted C++ evaluates literals as 32-bit `int` (`1 << 31` sign-extends under v1), fails to compile (shift ≥ 32 of a small literal, `INT_MAX`-overflowing intermediates, enum-variant references in initializers), or skips the §2.4 wrap mask are defined — or precisely diagnosed — only by TB-IR.
 - **`log` severity test-result semantics** (§7.7) are honored: `log(error, ...)` increments the failure counter so the test fails at end of run; `log(fatal, ...)` additionally aborts this test instance at end of the current cycle; a wall-clock or cycle wait that completes on the fatal cycle lets the following statements of that cycle run, while one interrupted with time still owed (or begun after the fatal) aborts immediately — except inside synchronously dispatched event hooks and target responders, where the interrupted wait just ends and its successor runs (see §7.7). `info` / `warn` / `debug` have no test-result effect. Verbosity filtering is implemented: `--verbosity`, per-message `verbosity=`, and `--verbosity-of` keyed on an explicit `id=` (debug is hidden by default).
 - **`fail("...")` as a standalone statement** — unconditional failure marker. Same emission as the failure arm of `assert ... else fail(...)` (a `sim_log_line("FAIL", ...)` + `errors++;`) just without the surrounding `if (!cond)` guard. Useful when the failure trigger is control-flow-structural rather than expressible as a single boolean predicate (e.g. inside an `if`/`for` body where the condition has already been spelled out by the surrounding code). Supports `${expr}` interpolation in the message string identically to `log`.
 - **Wide bit-vector value type.** HARC unsigned integer and bit-vector values wider than 64 bits lower to `_harc_u128` for 65..128-bit arithmetic and to `harc_rt::HarcWide<N>` for wider value arithmetic, where `N = ceil(width / 32)`. `_harc_u128` uses native unsigned `__int128`; `HarcWide<N>` stores LSB-first 32-bit words and supports unsigned arithmetic, bitwise operations, logical shifts, comparisons, division, modulo, resize, and sign-extension helpers. FFI remains limited to `_harc_u128` for 65..128-bit scalar values; wider values should be passed in slices or through DUT signals.

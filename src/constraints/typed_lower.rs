@@ -1344,6 +1344,56 @@ fn solve_order_field_path(ctx: &mut LowerCtx<'_>, expr: &Expr) -> Option<FieldPa
 /// constant, which lowers to a literal), possibly negated/complemented or
 /// combined only with other literals. It adapts to its peer, so it never
 /// takes part in a signedness mismatch.
+/// The signedness pair of a DECLARED mix, if `lhs op rhs` is one: two
+/// operands of declared, different signedness, or a negative untyped
+/// literal (or constant) against a declared unsigned operand (owner
+/// decision, R16 review). A non-negative literal adapts to its peer.
+fn declared_sign_mix(
+    lhs: &CTypedExpr,
+    rhs: &CTypedExpr,
+    ls: Sign,
+    rs: Sign,
+) -> Option<(Sign, Sign)> {
+    let (l_lit, r_lit) = (is_untyped_literal(lhs), is_untyped_literal(rhs));
+    if !l_lit && !r_lit {
+        return (ls != rs).then_some((ls, rs));
+    }
+    let negative = |e: &CTypedExpr| literal_value(e).is_some_and(|v| v < 0);
+    if l_lit && !r_lit && negative(lhs) && rs == Sign::Unsigned {
+        return Some((Sign::Signed, rs));
+    }
+    if r_lit && !l_lit && negative(rhs) && ls == Sign::Unsigned {
+        return Some((ls, Sign::Signed));
+    }
+    None
+}
+
+/// The value of an untyped literal tree (`BvLit`, negation, `+ - *`).
+fn literal_value(e: &CTypedExpr) -> Option<i128> {
+    match &e.kind {
+        CExprKind::BvLit { value } => i128::try_from(*value).ok(),
+        CExprKind::Unary {
+            op: CUnaryOp::Neg,
+            expr,
+        } => literal_value(expr)?.checked_neg(),
+        // `~0` is -1: its exact value decides D1 like any other negative.
+        CExprKind::Unary {
+            op: CUnaryOp::BitNot,
+            expr,
+        } => Some(!literal_value(expr)?),
+        CExprKind::Binary { op, lhs, rhs } => {
+            let (a, b) = (literal_value(lhs)?, literal_value(rhs)?);
+            match op {
+                CBinaryOp::Add => a.checked_add(b),
+                CBinaryOp::Sub => a.checked_sub(b),
+                CBinaryOp::Mul => a.checked_mul(b),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn is_untyped_literal(e: &CTypedExpr) -> bool {
     match &e.kind {
         CExprKind::BvLit { .. } => true,
@@ -1412,11 +1462,11 @@ fn type_check_binary(
             // between two operands of DECLARED signedness is a program
             // error the caller surfaces; a width mismatch is a constraint-IR
             // capability gap the native solver path still handles.
-            if ls != rs && !is_untyped_literal(lhs) && !is_untyped_literal(rhs) {
+            if let Some((lhs_sign, rhs_sign)) = declared_sign_mix(lhs, rhs, ls, rs) {
                 ctx.record_error(LowerError::SignednessMismatch {
                     op: bin_op_str(op),
-                    lhs_sign: ls,
-                    rhs_sign: rs,
+                    lhs_sign,
+                    rhs_sign,
                     span,
                     declared: true,
                 });
@@ -1499,11 +1549,11 @@ fn type_check_binary(
                     return CType::Bottom;
                 }
             };
-            if ls != rs && !is_untyped_literal(lhs) && !is_untyped_literal(rhs) {
+            if let Some((lhs_sign, rhs_sign)) = declared_sign_mix(lhs, rhs, ls, rs) {
                 ctx.record_error(LowerError::SignednessMismatch {
                     op: bin_op_str(op),
-                    lhs_sign: ls,
-                    rhs_sign: rs,
+                    lhs_sign,
+                    rhs_sign,
                     span,
                     declared: true,
                 });

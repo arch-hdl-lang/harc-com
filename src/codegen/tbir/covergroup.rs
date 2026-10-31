@@ -1661,6 +1661,50 @@ fn sample_body(
             };
             writeln!(out, "{pad3}{sample_type} _v = ({sample_type})({target});").ok();
         }
+        // Strict fit: a constant bin value or range bound is compared with
+        // the sample, so on a coverpoint of known type it must fit that
+        // type (`[2..300]` or `{-1}` on a `uint<8>` point is an error).
+        // A bare DUT-port read is width-erased (its value can exceed its
+        // port width once composed, `(dut.en << 1)`), so only a point
+        // that reads no port has a declared type to judge against.
+        let mut reads_port = false;
+        crate::ir::visit::walk_expr(&p.target, &mut |e| {
+            reads_port |= matches!(e, Expr::Port(_) | Expr::PortSnapshotLane { .. });
+        });
+        if let Some(width) = target_width.filter(|_| !reads_port) {
+            let signed = cover_expr_signed(&p.target, widths);
+            for b in &p.bins {
+                for value in &b.values {
+                    let bounds: Vec<&CovBinBound> = match value {
+                        CovBinValue::Eq(x) => vec![x],
+                        CovBinValue::Range { lo, hi } => lo.iter().chain(hi.iter()).collect(),
+                    };
+                    for bound in bounds {
+                        let exact = match bound {
+                            CovBinBound::Const(v) => {
+                                crate::exact_int::ExactInt::from_bits(*v, false)
+                            }
+                            CovBinBound::ConstSigned(v) => {
+                                crate::exact_int::ExactInt::from_bits(*v as u64, true)
+                            }
+                            CovBinBound::Runtime(_) => continue,
+                        };
+                        if !exact.fits(width, signed) {
+                            return Err(EmitError(format!(
+                                "covergroup `{}` point `{}` bin `{}`: the bin value {exact} does \
+                                 not fit the coverpoint's type `{}<{width}>`. A bin value is \
+                                 compared with the sample, so it must fit the coverpoint's type \
+                                 (strict fit).",
+                                schema.name,
+                                p.name,
+                                b.name,
+                                if signed { "sint" } else { "uint" },
+                            )));
+                        }
+                    }
+                }
+            }
+        }
         for (bin_idx, b) in p.bins.iter().enumerate() {
             let membership = bin_membership(&b.values, &p.target, widths)?;
             if !any_cross {

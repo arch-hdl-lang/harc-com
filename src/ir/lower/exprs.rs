@@ -7,6 +7,7 @@ use super::{not_implemented, FuncBuilder, LowerError, V1Status};
 use crate::ast::{
     BinaryOp, BuiltinTy, CallArg, Expr as AstExpr, ExprKind, TypeArg, TypeExpr, UnaryOp,
 };
+use crate::exact_int::ExactInt;
 use crate::ir::{
     BinOp, Expr, IrType, LocalId, PortAccess, PortRef, RecordId, Stmt, Terminator, UnOp,
     WidthCastKind,
@@ -145,6 +146,246 @@ pub(crate) fn expr_is_untyped_literal(e: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// The exact value of an untyped literal tree (see
+/// `expr_is_untyped_literal`), evaluated as a constant initializer
+/// evaluates it: literals and untyped constants, `-`, `~`, and the
+/// arithmetic, bitwise and shift operators over them. `Ok(None)` for a
+/// conditional (its value depends on the condition) or a tree that is not
+/// a literal; `Err` for an evaluation a constant would reject (a zero
+/// divisor, a shift amount out of range), with the constant folder's
+/// diagnostic.
+pub(crate) fn untyped_literal_eval(e: &Expr) -> Result<Option<ExactInt>, String> {
+    Ok(Some(match e {
+        Expr::Literal {
+            value,
+            ty: IrType::SInt(None),
+        } => ExactInt::from_bits(*value, true),
+        Expr::Literal {
+            value,
+            ty: IrType::Unknown,
+        } => ExactInt::from_bits(*value, *value <= i64::MAX as u64),
+        Expr::Literal {
+            value,
+            ty: IrType::UInt(None),
+        } => ExactInt::from_bits(*value, false),
+        Expr::WideLiteral(words) => ExactInt::from_words(words),
+        Expr::Unary(crate::ir::UnOp::Neg, inner) => match untyped_literal_eval(inner)? {
+            Some(v) => v.neg(),
+            None => return Ok(None),
+        },
+        Expr::Unary(crate::ir::UnOp::BitNot | crate::ir::UnOp::BitNotHost, inner) => {
+            match untyped_literal_eval(inner)? {
+                Some(v) => v.not(),
+                None => return Ok(None),
+            }
+        }
+        Expr::Binary(op, a, b) => {
+            let (Some(x), Some(y)) = (untyped_literal_eval(a)?, untyped_literal_eval(b)?) else {
+                return Ok(None);
+            };
+            let label = if matches!(op, BinOp::Div) {
+                "division"
+            } else {
+                "modulo"
+            };
+            let shift = |y: &ExactInt| {
+                if y.is_negative() {
+                    return Err(format!("negative shift amount ({y})"));
+                }
+                y.to_u32()
+                    .filter(|n| *n <= crate::MAX_WIDTH_METHOD_BITS)
+                    .ok_or_else(|| {
+                        format!(
+                            "shift amount {y} is out of range (shift amounts must be 0..={})",
+                            crate::MAX_WIDTH_METHOD_BITS
+                        )
+                    })
+            };
+            match op {
+                BinOp::Add => x.add(&y),
+                BinOp::Sub => x.sub(&y),
+                BinOp::Mul => x.mul(&y),
+                BinOp::Div | BinOp::Mod => {
+                    let (q, r) = x.div_rem(&y).ok_or_else(|| format!("{label} by zero"))?;
+                    if matches!(op, BinOp::Div) {
+                        q
+                    } else {
+                        r
+                    }
+                }
+                BinOp::BitAnd => x.and(&y),
+                BinOp::BitOr => x.or(&y),
+                BinOp::BitXor => x.xor(&y),
+                // A literal-only shift is exact (`3 << 63` is 3 * 2**63);
+                // strict fit then judges it against its destination.
+                BinOp::Shl => x.shl(shift(&y)?),
+                BinOp::Shr => x.shr(shift(&y)?),
+                _ => return Ok(None),
+            }
+        }
+        _ => return Ok(None),
+    }))
+}
+
+/// `untyped_literal_eval`, with an invalid evaluation read as "no value".
+pub(crate) fn untyped_literal_exact(e: &Expr) -> Option<ExactInt> {
+    untyped_literal_eval(e).ok().flatten()
+}
+
+/// An exact untyped value as an untyped IR literal: an ordinary literal when
+/// it fits the 64-bit carrier (a negative one as the signed untyped form),
+/// a wide literal (negated, when negative) beyond it.
+pub(crate) fn untyped_literal_expr(v: &ExactInt) -> Expr {
+    if v.is_negative() && v.fits_i64() {
+        return Expr::Literal {
+            value: v.low_u64(),
+            ty: IrType::SInt(None),
+        };
+    }
+    if !v.is_negative() && v.fits_u64() {
+        return Expr::Literal {
+            value: v.low_u64(),
+            ty: IrType::Unknown,
+        };
+    }
+    let magnitude = if v.is_negative() { v.neg() } else { v.clone() };
+    let words = magnitude.pattern_words(magnitude.magnitude_bits().max(65));
+    let wide = Expr::WideLiteral(words);
+    if v.is_negative() {
+        Expr::Unary(crate::ir::UnOp::Neg, Box::new(wide))
+    } else {
+        wide
+    }
+}
+
+/// `untyped_literal_exact` as an `i128`, when it fits.
+pub(crate) fn untyped_literal_value(e: &Expr) -> Option<i128> {
+    untyped_literal_exact(e)?.to_i128()
+}
+
+/// Strict fit (owner decision, R16 review): an untyped literal value — a
+/// literal, an untyped constant, or a literal tree such as `~0` — is
+/// evaluated exactly and must fit the type it meets, whether a typed
+/// destination or a typed operand it adapts to. `None` when it fits (or
+/// is not an untyped literal); otherwise the exact value.
+pub(crate) fn untyped_literal_misfit(
+    e: &Expr,
+    width: u32,
+    signed: bool,
+) -> Result<Option<ExactInt>, String> {
+    if !expr_is_untyped_literal(e) {
+        return Ok(None);
+    }
+    if let Expr::Ternary(_, t, f) = e {
+        return Ok(match untyped_literal_misfit(t, width, signed)? {
+            Some(v) => Some(v),
+            None => untyped_literal_misfit(f, width, signed)?,
+        });
+    }
+    // An untyped literal tree that cannot be evaluated is an error wherever
+    // it is judged, not a value that "fits".
+    let Some(v) = untyped_literal_eval(e)? else {
+        return Ok(None);
+    };
+    Ok((!v.fits(width, signed)).then_some(v))
+}
+
+/// "a 9-bit value" / "a signed 2-bit value" for a strict-fit diagnostic.
+pub(crate) fn literal_width_spelling(v: &ExactInt) -> String {
+    if v.is_negative() {
+        format!("a signed {}-bit value", v.literal_width())
+    } else {
+        format!("a {}-bit value", v.literal_width())
+    }
+}
+
+/// `uint<W>` / `sint<W>` and its range, for strict-fit diagnostics.
+pub(crate) fn scalar_range_spelling(width: u32, signed: bool) -> String {
+    let one = ExactInt::from_i128(1);
+    if signed {
+        format!(
+            "`sint<{width}>` (range {}..={})",
+            ExactInt::pow2(width - 1).neg(),
+            ExactInt::pow2(width - 1).sub(&one)
+        )
+    } else {
+        format!(
+            "`uint<{width}>` (range 0..={})",
+            ExactInt::pow2(width).sub(&one)
+        )
+    }
+}
+
+/// Is `e` an untyped literal-only expression: integer literals (not sized
+/// ones, which declare a width) and untyped constants, combined with
+/// parentheses, `-`, `~`, the arithmetic/bitwise/shift operators or a
+/// conditional's arms?
+pub(crate) fn ast_is_untyped_literal_expr(
+    e: &AstExpr,
+    consts: &std::collections::HashMap<String, super::ConstVal>,
+) -> bool {
+    use crate::ast::BinaryOp as B;
+    match &*e.kind {
+        ExprKind::Int(text) => !text.contains('\''),
+        ExprKind::Ident(id) => consts
+            .get(&id.name)
+            .is_some_and(|c| matches!(c.provenance, super::ConstProvenance::Untyped)),
+        ExprKind::Paren(inner) => ast_is_untyped_literal_expr(inner, consts),
+        ExprKind::Unary {
+            op: UnaryOp::Neg | UnaryOp::BitNot,
+            expr,
+        } => ast_is_untyped_literal_expr(expr, consts),
+        ExprKind::Binary { op, lhs, rhs } => {
+            matches!(
+                op,
+                B::Add
+                    | B::Sub
+                    | B::Mul
+                    | B::Div
+                    | B::Mod
+                    | B::BitAnd
+                    | B::BitOr
+                    | B::BitXor
+                    | B::Shl
+                    | B::Shr
+            ) && ast_is_untyped_literal_expr(lhs, consts)
+                && ast_is_untyped_literal_expr(rhs, consts)
+        }
+        ExprKind::Ternary {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            ast_is_untyped_literal_expr(then_branch, consts)
+                && ast_is_untyped_literal_expr(else_branch, consts)
+        }
+        _ => false,
+    }
+}
+
+/// `let x = <integer literal or literal-only expression>` without a type
+/// annotation is an error (owner decision, R16 review): it has no declared
+/// width or signedness to infer (`let x = 1 + 299`, `let n = ~0` and
+/// `let s = 1 << 3` included), so the declaration must name one.
+pub(crate) fn reject_untyped_literal_let(
+    l: &crate::ast::LetStmt,
+    consts: &std::collections::HashMap<String, super::ConstVal>,
+) -> Result<(), LowerError> {
+    if l.ty.is_none()
+        && l.value
+            .as_ref()
+            .is_some_and(|v| ast_is_untyped_literal_expr(v, consts))
+    {
+        return Err(LowerError::Invalid(format!(
+            "`let {}` is initialized from an untyped integer literal or literal-only \
+             expression and has no type; a literal has no width or signedness to infer. \
+             Declare the type, e.g. `let {} : uint<32> = ...` or `let {} : sint<32> = ...`.",
+            l.name.name, l.name.name, l.name.name
+        )));
+    }
+    Ok(())
 }
 
 /// `uint<8>` / `sint<8>` / `uint` spelling of a scalar type for diagnostics.
@@ -1487,10 +1728,7 @@ impl FuncBuilder<'_> {
                     )));
                 }
                 if let Some(v) = self.ctx.consts.get(&id.name) {
-                    return Ok(Expr::Literal {
-                        value: v.bits,
-                        ty: v.value_type(),
-                    });
+                    return Ok(const_value_expr(v));
                 }
                 // The framework cycle counter (`cycle_count`), conventionally
                 // referenced from `${cycle_count}` in a watchdog/log
@@ -1957,6 +2195,49 @@ impl FuncBuilder<'_> {
                 let (l, r) = self.zext_mixed_width_unsigned_operands(ir_op, l, r);
                 self.reject_unbuildable_wide_operator(*op, ir_op, &l, &r)?;
                 let inner = Expr::Binary(ir_op, Box::new(l), Box::new(r));
+                if let Expr::Binary(BinOp::Shl | BinOp::Shr, lhs_ir, rhs_ir) = &inner {
+                    if expr_is_untyped_literal(lhs_ir) {
+                        // An untyped literal has no width, so a shift of one
+                        // by a non-constant amount has no defined result
+                        // width (owner decision, R16 review).
+                        let count = match &**rhs_ir {
+                            Expr::Literal { value, .. } => Some(ExactInt::from_bits(*value, false)),
+                            other if expr_is_untyped_literal(other) => {
+                                untyped_literal_eval(other).map_err(LowerError::Invalid)?
+                            }
+                            _ => None,
+                        };
+                        let Some(count) = count else {
+                            let sym = if matches!(ir_op, BinOp::Shl) {
+                                "<<"
+                            } else {
+                                ">>"
+                            };
+                            return Err(LowerError::Invalid(format!(
+                                "an untyped literal shifted by a non-constant amount has no \
+                                 width: give it one with a cast, e.g. `({} as uint<16>) {sym} \
+                                 ...`.",
+                                {
+                                    let mut text = String::new();
+                                    crate::pretty::print_expr(&mut text, lhs);
+                                    text
+                                }
+                            )));
+                        };
+                        // A literal-only shift is folded to its exact value:
+                        // the runtime carrier would otherwise drop or
+                        // sign-flip bits past 64 (`3 << 63`), where a
+                        // `const` keeps them.
+                        let lit = Expr::Binary(
+                            ir_op,
+                            lhs_ir.clone(),
+                            Box::new(untyped_literal_expr(&count)),
+                        );
+                        if let Some(v) = untyped_literal_eval(&lit).map_err(LowerError::Invalid)? {
+                            return Ok(untyped_literal_expr(&v));
+                        }
+                    }
+                }
                 // Wrapping arithmetic `+% -% *%` (harc#473): mask the result
                 // to `max(W(lhs), W(rhs))` bits, matching ARCH's
                 // `AddWrap/SubWrap/MulWrap` (result width = wider operand, no
@@ -2018,6 +2299,7 @@ impl FuncBuilder<'_> {
                         "ternary branches cannot mix `String` and non-`String` values".to_string(),
                     ));
                 }
+                self.reject_mixed_signedness_arms(&t, &e)?;
                 Ok(Expr::Ternary(Box::new(c), Box::new(t), Box::new(e)))
             }
             ExprKind::Call { callee, args } => {
@@ -4112,6 +4394,22 @@ impl FuncBuilder<'_> {
     ///
     /// Static checking only: emission carriers still come from
     /// `expr_type`/`scalar_assignment_type`.
+    /// `(width, signed)` of a COMPOSED expression's ARCH static type; `None`
+    /// for a leaf or an undeterminable width. A composed value's operand-
+    /// level type (`scalar_assignment_type`) is a carrier view, so the
+    /// narrowing checks judge composed values by this instead: an untyped
+    /// constant contributes its value's bits (`a + K` with `const K = 3` on
+    /// a `uint<8>` `a` is 9 bits, not 64).
+    pub(crate) fn arch_composed_type(&self, e: &Expr) -> Option<(u32, bool)> {
+        if !matches!(e, Expr::Binary(..) | Expr::Unary(..) | Expr::Ternary(..)) {
+            return None;
+        }
+        match self.arch_shape(e) {
+            ArchShape::Typed { width, signed } => Some((width, signed)),
+            _ => None,
+        }
+    }
+
     pub(crate) fn arch_result_width(&self, e: &Expr) -> Option<u32> {
         match self.arch_shape(e) {
             ArchShape::Typed { width, .. } => Some(width),
@@ -4123,10 +4421,10 @@ impl FuncBuilder<'_> {
     /// arithmetic/bitwise operator, a unary `-`/`~`, or a ternary), for
     /// inferring an untyped `let` (owner decision D2: `let c = a + 1` on a
     /// `uint<8>` `a` is `uint<9>`). `None` for a bare leaf (a plain copy
-    /// keeps its existing inference), an untyped literal, a widthless
-    /// operand, or a result whose width crosses a C++ carrier tier the
-    /// operands do not (the operands are computed in the narrower carrier,
-    /// so the extra carry bit is not available there).
+    /// keeps its existing inference), an untyped literal, or a widthless
+    /// operand. A result that crosses a C++ carrier tier its operands do not
+    /// (`u64 + 1` is 65 bits) infers the wide type: the emitter computes such
+    /// an operation in the result's carrier, so the carry is exact.
     pub(crate) fn arch_inferred_type(&self, e: &Expr) -> Option<IrType> {
         let composed = match e {
             Expr::Binary(op, _, _) => !matches!(
@@ -4150,41 +4448,22 @@ impl FuncBuilder<'_> {
         let ArchShape::Typed { width, signed } = self.arch_shape(e) else {
             return None;
         };
-        let tier = |w: u32| match w {
-            0..=64 => 0,
-            65..=128 => 1,
-            _ => 2,
-        };
-        let operand_tier = self.arch_operand_max_width(e).map(tier).unwrap_or(0);
-        if tier(width) != operand_tier {
-            return None;
+        // Never infer narrower than the operand-level type the ordinary
+        // narrowing check judges the initializer by (`a % (b as uint<64>)`
+        // is `W(a)` under ARCH but a 64-bit operand expression there);
+        // such an initializer keeps its previous inference.
+        if let Some(IrType::UInt(Some(old)) | IrType::SInt(Some(old))) =
+            self.scalar_assignment_type(e)
+        {
+            if old > width {
+                return None;
+            }
         }
         Some(if signed {
             IrType::SInt(Some(width))
         } else {
             IrType::UInt(Some(width))
         })
-    }
-
-    /// Widest declared leaf width in `e` (the carrier its arithmetic runs in).
-    pub(crate) fn arch_operand_max_width(&self, e: &Expr) -> Option<u32> {
-        match e {
-            Expr::Binary(BinOp::Shl | BinOp::Shr, a, _) => self.arch_operand_max_width(a),
-            Expr::Binary(_, a, b) | Expr::Ternary(_, a, b) => {
-                match (
-                    self.arch_operand_max_width(a),
-                    self.arch_operand_max_width(b),
-                ) {
-                    (Some(x), Some(y)) => Some(x.max(y)),
-                    (x, y) => x.or(y),
-                }
-            }
-            Expr::Unary(_, inner) => self.arch_operand_max_width(inner),
-            _ => match self.arch_shape(e) {
-                ArchShape::Typed { width, .. } | ArchShape::Literal(width) => Some(width),
-                _ => None,
-            },
-        }
     }
 
     fn arch_shape(&self, e: &Expr) -> ArchShape {
@@ -4264,6 +4543,17 @@ impl FuncBuilder<'_> {
                         None => ArchShape::Literal(width),
                     };
                 }
+                // A narrower unsigned mask makes an `&` unsigned (a
+                // literal mask included), as `narrowest_scalar_type` does.
+                if matches!(op, BinOp::BitAnd)
+                    && ((lw < rw && ls != Some(true)) || (rw < lw && rs != Some(true)))
+                    && (ls.is_some() || rs.is_some())
+                {
+                    return ArchShape::Typed {
+                        width,
+                        signed: false,
+                    };
+                }
                 match (ls, rs) {
                     (None, None) => ArchShape::Literal(width),
                     (Some(s), None) | (None, Some(s)) => ArchShape::Typed { width, signed: s },
@@ -4318,7 +4608,12 @@ impl FuncBuilder<'_> {
     /// port read), or a value this context cannot type.
     fn declared_operand_signedness(&self, e: &Expr) -> Option<(bool, IrType)> {
         if expr_is_untyped_literal(e) {
-            return None;
+            // A non-negative untyped literal or constant adapts to its
+            // peer; a NEGATIVE one is a signed value (owner decision, R16
+            // review), so `a < -1` on a `uint` `a` is a mix.
+            return untyped_literal_value(e)
+                .is_some_and(|v| v < 0)
+                .then_some((true, IrType::SInt(None)));
         }
         match self.scalar_assignment_type(e) {
             Some(ty @ IrType::UInt(Some(_))) => Some((false, ty)),
@@ -4358,14 +4653,23 @@ impl FuncBuilder<'_> {
         ) {
             return Ok(());
         }
-        let (Some((ls, lt)), Some((rs, rt))) = (
+        let (ld, rd) = (
             self.declared_operand_signedness(l),
             self.declared_operand_signedness(r),
-        ) else {
-            return Ok(());
+        );
+        let (Some((ls, lt)), Some((rs, rt))) = (ld.clone(), rd.clone()) else {
+            return self.reject_literal_misfit_peer(
+                &format!("operator `{}`", crate::pretty::binary_op_str(op)),
+                l,
+                r,
+            );
         };
         if ls == rs {
-            return Ok(());
+            return self.reject_literal_misfit_peer(
+                &format!("operator `{}`", crate::pretty::binary_op_str(op)),
+                l,
+                r,
+            );
         }
         Err(LowerError::Invalid(format!(
             "operator `{}` mixes signed and unsigned operands (left is `{}`, right is \
@@ -4374,6 +4678,86 @@ impl FuncBuilder<'_> {
             crate::pretty::binary_op_str(op),
             scalar_type_spelling(&lt),
             scalar_type_spelling(&rt),
+        )))
+    }
+
+    /// Strict fit (owner decision, R16 review): an untyped literal operand
+    /// adapts to a typed peer only when its exact value fits the peer's
+    /// type, so `s < 0x8000000000000000` on a `sint<64>` `s`, or `a == 300`
+    /// on a `uint<8>` `a`, is a compile-time error rather than a silent
+    /// reinterpretation in the peer's carrier.
+    /// Comparisons, equality and `& | ^` require the fit. `+ - *` (and the
+    /// wraps) widen per ARCH and the literal contributes its own value bits
+    /// (`uint<8> + 256` is a 10-bit value, `s64 + 0x8000000000000000` a
+    /// 65-bit one), so there it need only match the peer's signedness (D1).
+    pub(super) fn reject_literal_misfit_peer(
+        &self,
+        what: &str,
+        l: &Expr,
+        r: &Expr,
+    ) -> Result<(), LowerError> {
+        for (lit, peer) in [(l, r), (r, l)] {
+            if !expr_is_untyped_literal(lit) {
+                continue;
+            }
+            // An untyped literal tree must be evaluable wherever it appears.
+            if let Err(detail) = untyped_literal_eval(lit) {
+                return Err(LowerError::Invalid(format!("{what}: {detail}")));
+            }
+            if expr_is_untyped_literal(peer) {
+                continue;
+            }
+            let Some((signed, IrType::UInt(Some(w)) | IrType::SInt(Some(w)))) =
+                self.declared_operand_signedness(peer)
+            else {
+                continue;
+            };
+            // A composed peer's type is its ARCH result type (`u * u` on
+            // two `uint<64>` is a `uint<128>`).
+            let w = match self.arch_composed_type(peer) {
+                Some((aw, s)) if s == signed => aw,
+                _ => w,
+            };
+            // `+ - *` (and the wraps) widen per ARCH: the literal
+            // contributes its own value bits and need only match the peer's
+            // signedness, which D1 judges.
+            if ["`+`", "`-`", "`*`", "`+%`", "`-%`", "`*%`"]
+                .iter()
+                .any(|op| what == format!("operator {op}"))
+            {
+                continue;
+            }
+            if let Some(v) = untyped_literal_misfit(lit, w, signed).map_err(LowerError::Invalid)? {
+                return Err(LowerError::Invalid(format!(
+                    "{what}: the untyped literal value {v} does not fit its operand's type {}. \
+                     An untyped literal adapts to its peer only when its value fits — write a \
+                     value that fits, or convert explicitly with `as sint<N>` / `as uint<N>`.",
+                    scalar_range_spelling(w, signed)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The two arms of a conditional must agree on declared signedness
+    /// (owner decision, R16 review), under the same exemptions as a binary
+    /// operator's operands.
+    fn reject_mixed_signedness_arms(&self, t: &Expr, e: &Expr) -> Result<(), LowerError> {
+        let (Some((ts, tt)), Some((es, et))) = (
+            self.declared_operand_signedness(t),
+            self.declared_operand_signedness(e),
+        ) else {
+            return self.reject_literal_misfit_peer("a conditional `? :`", t, e);
+        };
+        if ts == es {
+            return self.reject_literal_misfit_peer("a conditional `? :`", t, e);
+        }
+        Err(LowerError::Invalid(format!(
+            "the arms of a conditional `? :` mix signed and unsigned values (then is `{}`, \
+             else is `{}`). Signed and unsigned values never combine implicitly — convert \
+             one arm explicitly with `as sint<N>` or `as uint<N>`.",
+            scalar_type_spelling(&tt),
+            scalar_type_spelling(&et),
         )))
     }
 
@@ -6035,9 +6419,6 @@ impl FuncBuilder<'_> {
             (s, a) => s.or(a),
         };
         if let Some(why) = width_method_violation(kind_name, width, checked_width) {
-            if width_method_violation(kind_name, width, src_width).is_some() {
-                return Err(LowerError::Invalid(why));
-            }
             return Err(LowerError::Invalid(why));
         }
         // The cast sees the receiver's ARCH width, carry included:
@@ -6895,6 +7276,54 @@ pub(crate) fn parse_int_literal_words(s: &str) -> Option<Vec<u32>> {
         words.push(0);
     }
     Some(words)
+}
+
+/// Any wider-than-64-bit integer literal spelling, as LSB-first words.
+pub(crate) fn parse_wide_int_literal(s: &str) -> Option<Vec<u32>> {
+    parse_wide_hex_literal(s)
+        .or_else(|| parse_wide_binary_literal(s))
+        .or_else(|| parse_wide_decimal_literal(s))
+        .or_else(|| parse_wide_sized_binary_literal(s))
+        .or_else(|| parse_wide_sized_decimal_literal(s))
+        .or_else(|| parse_wide_sized_hex_literal(s))
+}
+
+/// A folded constant as an IR value. A value that fits its 64-bit carrier
+/// is the ordinary literal; a wider one (constants are exact at their ARCH
+/// width, so `A * B` of two `uint<64>` constants can be 128 bits) is its
+/// two's-complement pattern at its width, as the cast `(<pattern> as
+/// uint<W>)` / `as sint<W>`.
+pub(crate) fn const_value_expr(v: &super::ConstVal) -> Expr {
+    let ty = v.value_type();
+    let fits = match &ty {
+        IrType::SInt(_) => v.exact.fits_i64(),
+        IrType::Bool => true,
+        _ => v.exact.fits_u64(),
+    };
+    if fits {
+        return Expr::Literal { value: v.bits, ty };
+    }
+    // An untyped constant stays an untyped literal value, judged by strict
+    // fit wherever it is used; only a typed constant carries its type.
+    if matches!(
+        v.provenance,
+        super::ConstProvenance::Untyped | super::ConstProvenance::EnumVariant
+    ) {
+        return untyped_literal_expr(&v.exact);
+    }
+    let width = v.width.unwrap_or(0).max(v.exact.literal_width()).max(65);
+    let signed = v.exact.is_negative() || matches!(ty, IrType::SInt(_));
+    let (kind, src_width) = if signed {
+        (WidthCastKind::Sext, Some(width))
+    } else {
+        (WidthCastKind::Trunc, None)
+    };
+    Expr::WidthCast {
+        kind,
+        width,
+        src_width,
+        inner: Box::new(Expr::WideLiteral(v.exact.pattern_words(width))),
+    }
 }
 
 pub(crate) fn parse_wide_hex_literal(s: &str) -> Option<Vec<u32>> {

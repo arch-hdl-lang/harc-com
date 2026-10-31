@@ -563,9 +563,10 @@ fn lower_record_field(
                     &format!("{kind} field `{owner}.{fname}`"),
                 )?
             }
-            ExprKind::Int(s) => crate::ir::ScalarDefault::Narrow(
-                super::exprs::parse_int_literal(s)
-                    .or_else(|| super::exprs::parse_sized_int_literal(s))
+            // A sized literal declares its value's width; a plain one is
+            // judged by strict fit through the shared folder below.
+            ExprKind::Int(s) if s.contains('\'') => crate::ir::ScalarDefault::Narrow(
+                super::exprs::parse_sized_int_literal(s)
                     .ok_or_else(|| record_default_literal(kind, owner, fname, s))?,
             ),
             ExprKind::Bool(b) => crate::ir::ScalarDefault::Narrow(*b as u64),

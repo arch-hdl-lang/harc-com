@@ -236,6 +236,113 @@ let bound = i < hi ? i : hi - 1
 
 Lowers to a parenthesized C++ ternary in the generated TB.
 
+**Result widths and signedness of binary operators.** Plain arithmetic
+widens like ARCH (ARCH spec §3.2) and never wraps silently; signed and
+unsigned operands never combine implicitly.
+
+| Expression | Static result width |
+|---|---|
+| `a + b`, `a - b` | `max(W(a), W(b)) + 1` |
+| `a * b` | `W(a) + W(b)` |
+| `a / b`, `a % b`, `a << n`, `a >> n` | `W(a)` |
+| `a \| b`, `a ^ b` | `max(W(a), W(b))` (an untyped literal operand must fit its typed peer, so this is the typed width) |
+| `a & b` | the narrower unsigned operand's width (a literal mask bounds it; the result is then unsigned) |
+| `a +% b`, `a -% b`, `a *% b` | `max(W(a), W(b))` (unsigned residue) |
+| `x.trunc/zext/sext/resize<N>()` | `N` |
+
+An untyped integer literal or untyped `const` contributes the bits of its
+value, so `uint<8> + 1` and `uint<8> + K` (with `const K = 3`) are 9-bit
+values. The value is exact at that width: the operation runs in the carrier
+its result needs (`u64 + 1` is a 65-bit value with its carry, `p * q` on two
+`uint<40>` is 80 bits), and an unsigned difference is its result-width
+pattern (`uint<8>(1) - uint<8>(255)` is the `uint<9>` value 258).
+
+Storing a result into a narrower typed slot — a typed `let`, a local, a
+component / scoreboard / testbench / transactor-state field, a record or
+transaction field, a `Vec` element, a queue push, a helper argument, a return
+value, or a typed `const` — is the ordinary narrowing error. Write the intent
+explicitly: a wrapping operator (`count = count +% 1`; through 64 bits),
+`.trunc<N>()` (`(a + 1).trunc<8>()`, at any width), an explicit `as` cast in a
+`const`, or a wider declaration. A signed accumulator keeps its sign with
+`.resize<N>()` (`total = (total + v).resize<32>()`), because a wrapping
+operator's residue is unsigned; negate with unary `-x` rather than `0 - x`.
+
+An untyped `let` of a composed expression infers its result type (`let c =
+a + 1` is a `uint<9>`, `let pq = p * q` a `uint<80>`), so storing it later
+into a narrower slot is a narrowing error, and it shifts and divides at that
+width; this changes one case of the shift and division rules above, where an
+untyped `let` was width-erased. `let x = 5` — an untyped integer literal or
+literal-only expression with no type (`let x = 1 + 299`, `let n = ~0`,
+`let s = 1 << 3`, `let k = K` for an untyped `const K`) — is an error: a
+literal has no width or signedness to infer, so the declaration names one
+(`let x : uint<32> = 5`). A sized literal (`4'd3`) declares its width and is
+accepted. A discard is no exception: `let _ = 1` is the same error.
+
+An untyped literal as the left operand of a shift by a non-constant amount
+is an error for the same reason — `5 << n` has no width to shift in. Give it
+one with a cast: `(5 as uint<16>) << n`. A shift whose amount is a constant
+is a literal-only expression and is evaluated exactly.
+
+A width method sees its receiver's result width, carry included:
+`(a + 1).zext<16>()` keeps bit 8 of the 9-bit sum, `.trunc<8>()` narrows that
+sum, and on a signed receiver `(s + t).sext<16>()` extends from the 9-bit
+result, so a sum that overflows 8 bits keeps its true value instead of
+wrapping first. One exception: a composed *signed* receiver whose operands are
+wider than 64 bits is extended from the operands' width, because a signed
+value of that width is held as its declared-width bit pattern in an unsigned
+carrier, so the bit above it is not a sign bit until the operand is extended.
+
+A binary operator whose two operands have declared, different signedness —
+comparison, equality, arithmetic or bitwise — is a compile-time error in
+procedural code, in a `const` initializer and in a `keep` / `randomize ...
+with` constraint (including `Vec`/list elements and `foreach` variables), and
+so are the two arms of a conditional `? :`. Convert one side with
+`as sint<N>` / `as uint<N>`. An untyped literal or untyped constant —
+including a literal expression such as `~0` — is judged by its exact value:
+a negative one is a signed value, so `a < -1`, `a < ~0` or `a < NEG` (with
+`const NEG = -5`) on a `uint` `a` is the mixed-signedness error. Enum values
+and widthless values (a list `.size()`, an unsized DUT-port read) are not
+judged, and neither are a shift count and the logical `&&` / `||`.
+
+**Strict fit.** An untyped literal or untyped constant has no type of its
+own, so it takes the type it meets — and its exact value must fit that type.
+There is one rule, in procedural code, in a `const` initializer and in a
+constraint, with no reinterpretation of bit patterns anywhere:
+
+- Stored into a typed slot (a typed `let` or `const`, an assignment, a
+  field or a field `default`, a `Vec` element, a queue push, a helper
+  argument or return value),
+  it must fit the declared type: `let x : uint<8> = -1`,
+  `let s : sint<8> = 0xFF`, `let u : uint<32> = ~0` and
+  `const ALL : uint<64> = ~0` are errors. Write the value that fits
+  (`0xFFFF_FFFF_FFFF_FFFF`, `-1`) or convert explicitly
+  (`(~0) as uint<64>`).
+- As an operand of a comparison, an equality or a bitwise `& | ^`, it adapts
+  to the typed peer only when its value fits the peer's type:
+  `s < 0x8000000000000000` or `s == 0xFFFF_FFFF_FFFF_FFFF` on a `sint<64>`
+  `s`, `a == 300` and `a | 300` on a `uint<8>` `a`, are errors (so the
+  `| ^` max-width rule above applies to typed operands). The same holds for
+  the members and range bounds of a membership test (`keep u in {1, 300}`),
+  and for the constant values and range bounds of a covergroup bin on a
+  coverpoint of declared type (one that reads no width-erased DUT port):
+  `[2..300]` or `{-1}` on a `uint<8>` coverpoint is an error.
+- `+ - *` (and `+% -% *%`) widen per ARCH: the literal contributes its own
+  value bits and need only match the peer's signedness (a non-negative value
+  against a `uint`, any value against a `sint`), at any width —
+  `a + 300` is a 10-bit value, `s + 0x8000000000000000` on a `sint<64>` a
+  65-bit one, and `u * 0x1_0000_0000_0000_0000` on a `uint<64>` a 129-bit
+  one.
+- A literal-only expression is evaluated exactly before it is judged:
+  `3 << 63` is `3 * 2**63`, so it fits a `uint<128>` but not a `uint<64>`,
+  and `(0 - 3) << 62` stays negative. One that cannot be evaluated — a zero
+  divisor (`1 / 0`), a shift amount outside `0..=1024` — is an error
+  wherever it appears, as it is in a `const`.
+
+Because constants are evaluated exactly, like runtime values, a `const` and
+the same expression at runtime always agree: `const C : uint<65> = ~0` and
+`let c : uint<65> = ~0` are both errors, and with the explicit cast both are
+`2**65 - 1`.
+
 ---
 
 ## 2.5 Source-level documentation comments

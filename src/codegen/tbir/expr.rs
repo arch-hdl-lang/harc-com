@@ -750,8 +750,38 @@ pub(super) fn resolve_state_instance(cx: &ECx<'_>, instance: &str) -> Result<Str
     )))
 }
 
+thread_local! {
+    /// Set while rendering the receiver of a `Trunc` to at most 64 bits:
+    /// only the low bits of a `+ - *` chain are observed there, and those
+    /// depend only on the operands' low bits, so the ARCH result-carrier
+    /// promotion (`arch_arithmetic_cpp`) is unnecessary. This keeps a
+    /// wrapping `u64 +% x` a plain 64-bit add. Cleared for any subtree
+    /// that is not itself `+ - *` (a quotient, shift or comparison sees
+    /// the full value).
+    static LOW_BITS_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with `LOW_BITS_ONLY` set to `on`, restoring the previous value.
+fn with_low_bits_only<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    let prev = LOW_BITS_ONLY.with(|c| c.replace(on));
+    let out = f();
+    LOW_BITS_ONLY.with(|c| c.set(prev));
+    out
+}
+
+fn low_bits_only() -> bool {
+    LOW_BITS_ONLY.with(std::cell::Cell::get)
+}
+
 /// Render an IR expression.
 pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
+    if low_bits_only() && !matches!(e, Expr::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul, ..)) {
+        return with_low_bits_only(false, || expr_cpp_node(cx, e));
+    }
+    expr_cpp_node(cx, e)
+}
+
+fn expr_cpp_node(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
     Ok(match e {
         Expr::Literal { value, ty } => match ty {
             crate::ir::IrType::SInt(_) => signed_literal_cpp(*value),
@@ -1170,6 +1200,16 @@ pub(super) fn expr_cpp(cx: &ECx<'_>, e: &Expr) -> Result<String, EmitError> {
                         eq
                     });
                 }
+            }
+            // ARCH result widths (spec §2.4): `+ - *` produce a wider
+            // value than their operands. When that width crosses the
+            // carrier tier the operands live in (`u64 + 1` is 65 bits), the
+            // operation runs in the result's carrier so the carry is exact.
+            // An unsigned difference is reduced to its result width, so
+            // `uint<8>(1) - uint<8>(255)` is the 9-bit value 258, not a
+            // wrapped 64-bit carrier pattern.
+            if let Some(cpp) = arch_arithmetic_cpp(cx, *op, a, b)? {
+                return Ok(cpp);
             }
             let mut a_cpp = expr_cpp(cx, a)?;
             let mut b_cpp = expr_cpp(cx, b)?;
@@ -1925,7 +1965,8 @@ fn width_cast_cpp(
     src_width: Option<u32>,
     inner: &Expr,
 ) -> Result<String, EmitError> {
-    let e = expr_cpp(cx, inner)?;
+    let low_bits = matches!(kind, WidthCastKind::Trunc) && width <= 64;
+    let e = with_low_bits_only(low_bits, || expr_cpp(cx, inner))?;
     if let Some(words) = super::wide_scalar_words(width) {
         return match kind {
             WidthCastKind::Trunc => Ok(format!("harc_rt::harc_wide_trunc<{words}>({e}, {width})")),
@@ -2546,7 +2587,143 @@ pub(super) fn scalar_assignment_expr_cpp(
     ))
 }
 
+/// The carrier tier a scalar width is held in: 64-bit host scalar,
+/// `_harc_u128`, or `HarcWide<N>`.
+fn carrier_tier(width: u32) -> u8 {
+    match width {
+        0..=64 => 0,
+        65..=128 => 1,
+        _ => 2,
+    }
+}
+
+/// ARCH static width of an operand for result-width arithmetic, and
+/// whether it is an untyped literal (which adapts to its peer). Mirrors the
+/// lowering's `arch_shape` (spec §2.4): `+ -` add a bit, `*` sums, `/ % <<
+/// >>` keep the left width, `| ^` the wider, `&` the narrower unsigned.
+fn arch_operand_width(cx: &ECx<'_>, e: &Expr) -> Option<(u32, bool)> {
+    match e {
+        Expr::Literal {
+            value,
+            ty: crate::ir::IrType::Unknown,
+        } => Some(((64 - value.leading_zeros()).max(1), true)),
+        Expr::Literal {
+            ty: crate::ir::IrType::UInt(None) | crate::ir::IrType::SInt(None),
+            ..
+        } => None,
+        Expr::Unary(UnOp::Neg | UnOp::BitNot, inner) => arch_operand_width(cx, inner),
+        Expr::Binary(op, a, b) => {
+            let (aw, al) = arch_operand_width(cx, a)?;
+            if matches!(op, BinOp::Shl | BinOp::Shr) {
+                return Some((aw, al));
+            }
+            let (bw, bl) = arch_operand_width(cx, b)?;
+            let width = match op {
+                BinOp::Add | BinOp::Sub => aw.max(bw) + 1,
+                BinOp::Mul => aw + bw,
+                BinOp::Div | BinOp::Mod => aw,
+                BinOp::BitOr | BinOp::BitXor => aw.max(bw),
+                BinOp::BitAnd => aw.min(bw),
+                _ => return None,
+            };
+            Some((width, al && bl))
+        }
+        Expr::Ternary(_, t, f) => {
+            let (tw, tl) = arch_operand_width(cx, t)?;
+            let (fw, fl) = arch_operand_width(cx, f)?;
+            Some((tw.max(fw), tl && fl))
+        }
+        _ => expr_static_width(cx, e).map(|w| (w, false)),
+    }
+}
+
+/// `+ - *` under ARCH result widths, when the width matters: the result
+/// crosses its operands' carrier tier (promote both operands to the
+/// result's carrier first), or an unsigned difference must be reduced to
+/// its result width. `None` leaves the ordinary emission in place.
+fn arch_arithmetic_cpp(
+    cx: &ECx<'_>,
+    op: BinOp,
+    a: &Expr,
+    b: &Expr,
+) -> Result<Option<String>, EmitError> {
+    if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) || low_bits_only() {
+        return Ok(None);
+    }
+    let (Some((aw, a_lit)), Some((bw, b_lit))) =
+        (arch_operand_width(cx, a), arch_operand_width(cx, b))
+    else {
+        return Ok(None);
+    };
+    if a_lit && b_lit {
+        return Ok(None);
+    }
+    let width = match op {
+        BinOp::Mul => aw + bw,
+        _ => aw.max(bw) + 1,
+    };
+    let sym = match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        _ => "*",
+    };
+    let signed = (a_lit || expr_is_signed(cx, a)) && (b_lit || expr_is_signed(cx, b));
+    let crosses = needs_result_carrier(width, aw.max(bw), signed);
+    let reduce = matches!(op, BinOp::Sub) && !signed && width < 64;
+    if !crosses && !reduce {
+        return Ok(None);
+    }
+    if !crosses {
+        let (a_cpp, b_cpp) = (expr_cpp(cx, a)?, expr_cpp(cx, b)?);
+        return Ok(Some(format!(
+            "((uint64_t)(((uint64_t)(({a_cpp}) - ({b_cpp}))) & 0x{:X}ULL))",
+            (1u64 << width) - 1
+        )));
+    }
+    let a_cpp = wide_operand_to_width(cx, a, Some(aw), width)?;
+    let b_cpp = wide_operand_to_width(cx, b, Some(bw), width)?;
+    let raw = format!("(({a_cpp}) {sym} ({b_cpp}))");
+    Ok(Some(if signed {
+        raw
+    } else if width > 128 {
+        format!("harc_rt::harc_wide_mask_bits({raw}, {width})")
+    } else {
+        format!("harc_rt::harc_trunc_u128({raw}, {width})")
+    }))
+}
+
+/// The ARCH width of a `+ - *` whose result crosses its operands' carrier
+/// tier: `arch_arithmetic_cpp` computes it in the result's carrier, so its
+/// consumers see that width, not the operands'.
+fn arch_crossing_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
+    let Expr::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul, a, b) = e else {
+        return None;
+    };
+    if low_bits_only() {
+        return None;
+    }
+    let ((aw, a_lit), (bw, b_lit)) = (arch_operand_width(cx, a)?, arch_operand_width(cx, b)?);
+    let (width, _) = arch_operand_width(cx, e)?;
+    let signed = (a_lit || expr_is_signed(cx, a)) && (b_lit || expr_is_signed(cx, b));
+    (!(a_lit && b_lit) && needs_result_carrier(width, aw.max(bw), signed)).then_some(width)
+}
+
+/// Does a `width`-bit ARCH result need its operands promoted to the
+/// result's carrier first? Yes when the result crosses a carrier tier, when
+/// a `HarcWide<N>` result needs more words than its operands, and for a
+/// signed operation on wide operands: those hold their declared-width
+/// pattern, not a carrier-wide sign extension, so the bits above the
+/// operand width are not the sign until the operand is extended.
+fn needs_result_carrier(width: u32, operand_width: u32, signed: bool) -> bool {
+    carrier_tier(width) > carrier_tier(operand_width)
+        || (width > 128 && width.div_ceil(32) > operand_width.div_ceil(32))
+        || (signed && operand_width > 64)
+}
+
 fn expr_binary_operand_width(cx: &ECx<'_>, value: &Expr) -> Option<u32> {
+    if let Some(width) = arch_crossing_width(cx, value) {
+        return Some(width);
+    }
     if let Expr::Literal { value, ty } = value {
         return match ty {
             crate::ir::IrType::Unknown => Some((64 - value.leading_zeros()).max(1)),
@@ -2574,7 +2751,32 @@ fn shift_lhs_width(cx: &ECx<'_>, lhs: &Expr) -> Option<u32> {
             _ => Some(64),
         };
     }
+    // A carrier-crossing `+ - *` is held in its result's carrier, also
+    // through a conditional or a `-`/`~` over one.
+    if let Some(width) = held_crossing_width(cx, lhs) {
+        return Some(width);
+    }
     expr_shift_width(cx, lhs)
+}
+
+/// The carrier width of a value that holds a carrier-crossing `+ - *`
+/// result: the operation itself, a conditional with such an arm, or a
+/// unary `-`/`~` over one.
+fn held_crossing_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
+    match e {
+        Expr::Binary(..) => arch_crossing_width(cx, e),
+        Expr::Ternary(_, t, f) => {
+            let (tw, fw) = (held_crossing_width(cx, t), held_crossing_width(cx, f));
+            if tw.is_none() && fw.is_none() {
+                return None;
+            }
+            tw.max(fw)
+                .max(expr_static_width(cx, t))
+                .max(expr_static_width(cx, f))
+        }
+        Expr::Unary(UnOp::Neg | UnOp::BitNot, inner) => held_crossing_width(cx, inner),
+        _ => None,
+    }
 }
 
 /// The left operand's declared width when it is exact — the width the
@@ -2796,7 +2998,11 @@ pub(super) fn expr_static_width(cx: &ECx<'_>, e: &Expr) -> Option<u32> {
             | BinOp::And
             | BinOp::Or => Some(1),
             BinOp::Shl | BinOp::Shr => shift_lhs_width(cx, a),
-            _ => expr_static_width(cx, a).max(expr_static_width(cx, b)),
+            // A `+ - *` that crosses its operands' carrier tier is computed
+            // in its result's carrier (`arch_arithmetic_cpp`), so that is
+            // the width its consumers see.
+            _ => arch_crossing_width(cx, e)
+                .or_else(|| expr_static_width(cx, a).max(expr_static_width(cx, b))),
         },
         Expr::Unary(UnOp::Not, _) => Some(1),
         Expr::Unary(UnOp::BitNotHost, _) => None,
