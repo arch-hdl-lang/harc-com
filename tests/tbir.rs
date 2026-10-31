@@ -21588,11 +21588,18 @@ fn clock_periods_must_have_two_positive_half_cycles() {
         )
     };
 
-    for (mhz, period) in [(2_000_000, 0), (333, 3003)] {
+    for (mhz, period) in [(333, 3003)] {
         let msg = assert_invalid(&lower_src(&source(mhz)).unwrap_err());
         assert!(msg.contains(&format!("invalid period of {period} ps")), "{msg}");
         assert!(msg.contains("positive and even"), "{msg}");
     }
+    // Above 1 THz the period would round to 0 ps; the domain itself is
+    // rejected, naming the bad frequency.
+    let msg = assert_invalid(&lower_src(&source(2_000_000)).unwrap_err());
+    assert!(
+        msg.contains("`freq_mhz: 2000000`") && msg.contains("no greater than 1000000"),
+        "{msg}"
+    );
 
     let mut corrupted = lower_src(&source(100)).expect("valid 10 ns clock lowers");
     corrupted.tests[0].clocks[0].period_ps = 0;
