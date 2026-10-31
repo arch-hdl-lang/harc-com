@@ -12,7 +12,7 @@ transactor PostEvalCycleObserver
     hits : uint<32> default 0
 
     on dut.count_out == 1 phase post_eval level
-        hits = hits + 1
+        hits = (hits + 1).trunc<32>()
     end on
 end transactor PostEvalCycleObserver
 

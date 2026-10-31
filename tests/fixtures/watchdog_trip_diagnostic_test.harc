@@ -26,7 +26,7 @@ agent SilentAgent
     seen  : uint<32> default 0
 
     on in_ev(t)
-        seen = seen + 1   // never fires; here so the agent has the heartbeat plumbing
+        seen = (seen + 1).trunc<32>()   // never fires; here so the agent has the heartbeat plumbing
     end on
 
     watchdog

@@ -59,7 +59,7 @@ impl TbirBackendSmokeTest for TbirBackendSmokeTb
             else fail("(count_out=10 as uint<8>) +% 250 must wrap to 4, got ${wrapped}")
 
         // The non-wrapping form on the same operand must NOT mask.
-        let widened : uint<9> = (dut.count_out as uint<9>) + 250
+        let widened : uint<10> = (dut.count_out as uint<9>) + 250
         assert widened == 260
             else fail("`+` must not wrap: got ${widened}, want 260")
 

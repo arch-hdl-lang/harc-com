@@ -31,7 +31,7 @@ agent Producer
     seen  : uint<32> default 0
 
     on in_ev(t)
-        seen = seen + 1
+        seen = (seen + 1).trunc<32>()
     end on
 
     watchdog

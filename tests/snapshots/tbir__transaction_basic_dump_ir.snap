@@ -14,7 +14,7 @@ tb-ir program
 
 fn fn0 run_TransactionBasicTest [kind=Run, owner=tb0]
   locals:
-    %0 total : unknown
+    %0 total : uint<32>
     %1 i : unknown
     %2 cmd : record(r0)
     %3 _anon : unknown
@@ -44,7 +44,7 @@ fn fn0 run_TransactionBasicTest [kind=Run, owner=tb0]
     AssertCheck { cond: (%cmd.tag == 7), on_fail: "cmd[%lld]: default tag=%lld, expected 7", %i, %cmd.tag }
     AssertCheck { cond: (%cmd.expect == 0), on_fail: "cmd[%lld]: expect not re-zeroed (%lld)", %i, %cmd.expect }
     RecordFieldWrite(%cmd.ticks, (%cmd.ticks + %i))
-    Assign(%total, (%total + %cmd.ticks))
+    Assign(%total, (%total + %cmd.ticks).trunc<32 from 33>())
     RecordFieldWrite(%cmd.expect, %total)
     -> Branch(%cmd.flag, b7, b8)
 

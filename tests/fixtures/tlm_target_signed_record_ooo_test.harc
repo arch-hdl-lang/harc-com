@@ -9,18 +9,18 @@ bus SignedRecordBus
 end bus SignedRecordBus
 
 transactor SignedRecordTarget bound to SignedRecordBus
-    requests : uint<8> default 0
+    requests : uint<32> default 0
 
     thread bus.widen(value: sint<8>)
-        requests = requests + 1
+        requests = (requests + 1).trunc<32>()
         wait 1 cycle
         return value
     end thread
 
     thread bus.transform(request: SignedRecordReply)
-        requests = requests + 1
+        requests = (requests + 1).trunc<32>()
         let reply : SignedRecordReply
-        reply.narrow = request.narrow - 1
+        reply.narrow = (request.narrow - 1).resize<8>()
         reply.wide = request.wide
         if request.narrow == -5
             wait 5 cycles

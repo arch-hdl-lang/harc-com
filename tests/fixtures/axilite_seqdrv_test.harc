@@ -50,8 +50,8 @@ transactor SeqXactor
 
             // Read phase — store result in `last_read` so the test
             // can observe the round-trip.
-            let val = 0
-            let saw = 0
+            let val : uint<32> = 0
+            let saw : uint<64> = 0
             dut.axil_ar_addr = t.addr
             dut.axil_ar_valid = 1
             for _ in 0 .. 9
@@ -121,14 +121,14 @@ impl AxiLiteSeqDrvTest for AxiLiteSeqDrvTb
         // synchronously, drives the bus, and stashes the
         // observed read into drv.last_read.
         let txns = RandomTxns(5)
-        let i = 0
+        let i : uint<64> = 0
         for t in txns
             emit drv.req(t)
             logf("axi_master.log", info,
                  "seqdrv[${i}] addr=0x${t.addr:02x} wrote=0x${t.value:08x} got=0x${drv.last_read:08x}")
             assert drv.last_read == t.value
                 else fail("seqdrv[${i}] mismatch: wrote 0x${t.value:08x} got 0x${drv.last_read:08x}")
-            i = i + 1
+            i = i +% 1
         end for
 
         log(info, "PASS: 5 sequencer→transactor round-trips via event dispatch")

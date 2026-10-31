@@ -293,7 +293,7 @@ int run_TbReactivePostEval(int argc, char** argv) {
                 break;
             }
             case 2: {
-                self.mismatches = (self.mismatches + 1);
+                self.mismatches = ((uint64_t)(((uint64_t)((self.mismatches + 1)) & 0xFFFFFFFFULL)));
                 __bb = 1;
                 break;
             }

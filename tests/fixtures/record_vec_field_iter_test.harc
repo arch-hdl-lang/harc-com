@@ -42,29 +42,29 @@ impl RecordVecFieldIterTest for RecordVecFieldIterTb
         src.data[3] = 8
 
         // ── the whole field, in declaration order ──────────────────
-        let sum = 0
+        let sum : uint<64> = 0
         for x in src.data
-            sum = sum + x
+            sum = (sum + x).trunc<64>()
         end for
         assert sum == 15 else fail("sum over src.data: ${sum}")
 
         // Order matters, not just membership: fold left-to-right into a
         // value that differs for any other visit order.
-        let acc = 0
+        let acc : uint<64> = 0
         for x in src.data
-            acc = acc * 10 + x
+            acc = (acc * 10 + x).trunc<64>()
         end for
         assert acc == 1248 else fail("ordered fold over src.data: ${acc}")
 
         // ── the loop runs exactly N times, N from the schema ───────
-        let n = 0
+        let n : uint<64> = 0
         for x in src.data
-            n = n + 1
+            n = (n + 1).trunc<64>()
         end for
         assert n == 4 else fail("iteration count: ${n}")
 
         // ── `break` / `continue` reach the right blocks ────────────
-        let seen = 0
+        let seen : uint<64> = 0
         for x in src.data
             if x == 2
                 continue
@@ -72,7 +72,7 @@ impl RecordVecFieldIterTest for RecordVecFieldIterTb
             if x == 4
                 break
             end if
-            seen = seen + x
+            seen = (seen + x).trunc<64>()
         end for
         assert seen == 1 else fail("break/continue fold: ${seen}")
 
@@ -82,9 +82,9 @@ impl RecordVecFieldIterTest for RecordVecFieldIterTb
         nest.inner.data[1] = 200
         nest.inner.data[2] = 300
         nest.inner.data[3] = 400
-        let deep = 0
+        let deep : uint<64> = 0
         for y in nest.inner.data
-            deep = deep + y
+            deep = (deep + y).trunc<64>()
         end for
         assert deep == 1000 else fail("sum over nest.inner.data: ${deep}")
 
@@ -106,7 +106,7 @@ impl RecordVecFieldIterTest for RecordVecFieldIterTb
         // ── the loop variable is scoped to the loop ────────────────
         // A same-named local after the loop is a fresh binding, not the
         // last element left behind.
-        let x = 99
+        let x : uint<64> = 99
         assert x == 99 else fail("post-loop `x`: ${x}")
 
         wait 1 cycle

@@ -99,7 +99,7 @@ end transaction Txn
 scoreboard Sink
     calls : uint<32> default 0
     hookable accept(t: Txn, v: sint<8>, u: uint<8>)
-        calls = calls + 1
+        calls = (calls + 1).resize<32>()
     end accept
 end scoreboard Sink
 
@@ -162,7 +162,7 @@ end transaction Txn
 scoreboard Sink
     calls : uint<32> default 0
     hookable accept(t: Txn, v: sint<8>)
-        calls = calls + 1
+        calls = (calls + 1).resize<32>()
     end accept
 end scoreboard Sink
 
@@ -170,21 +170,17 @@ covergroup Cov @(sink.accept(t, v) post)
     cp_field_up : cover t.f.resize<16>()
         bins
             neg = {-1}
-            raw = {0xFFFF}
         end bins
     cp_field_dn : cover t.g.resize<8>()
         bins
             neg = {-128}
-            raw = {0x80}
         end bins
     cp_param_up : cover v.resize<16>()
         bins
             neg = {-1}
-            raw = {0xFFFF}
         end bins
     cp_as_uint : cover v as uint<16>
         bins
-            neg = {-1}
             raw = {0xFFFF}
         end bins
 end covergroup Cov
@@ -206,13 +202,9 @@ impl Test for Tb
     end run
     check
         assert cov.cp_field_up.neg == 1 else fail("sint<8> -1 .resize<16>() must sample -1")
-        assert cov.cp_field_up.raw == 0 else fail("signed resize must not sample the raw pattern")
         assert cov.cp_field_dn.neg == 1 else fail("sint<16> 0x0180 .resize<8>() must sample -128")
-        assert cov.cp_field_dn.raw == 0 else fail("signed narrowing resize must not sample 0x80")
         assert cov.cp_param_up.neg == 1 else fail("hook param .resize<16>() must sample -1")
-        assert cov.cp_param_up.raw == 0 else fail("hook param resize must stay signed")
         assert cov.cp_as_uint.raw == 1 else fail("`as uint<16>` stays an unsigned 16-bit value")
-        assert cov.cp_as_uint.neg == 0 else fail("`as uint<16>` must not become signed")
     end check
 end impl Test
 "#,
@@ -226,7 +218,7 @@ fn coverpoint_bitnot_complements_within_the_operand_width() {
         r#"scoreboard Sink
     calls : uint<32> default 0
     hookable accept(u: uint<8>, s: sint<8>)
-        calls = calls + 1
+        calls = (calls + 1).resize<32>()
     end accept
 end scoreboard Sink
 
@@ -234,12 +226,10 @@ covergroup Cov @(sink.accept(u, s) post)
     cp_not : cover ~u
         bins
             ff = {0xFF}
-            big = [0x100..0xFFFFFFFF]
         end bins
     cp_snot : cover ~s
         bins
             minus_six = {-6}
-            raw = {0xFA}
         end bins
 end covergroup Cov
 
@@ -258,9 +248,7 @@ impl Test for Tb
     end run
     check
         assert cov.cp_not.ff == 1 else fail("~uint<8> 0 must sample 0xFF")
-        assert cov.cp_not.big == 0 else fail("~uint<8> must not sample the 64-bit complement")
         assert cov.cp_snot.minus_six == 1 else fail("~sint<8> 5 must sample -6")
-        assert cov.cp_snot.raw == 0 else fail("~sint<8> must stay signed")
     end check
 end impl Test
 "#,
@@ -274,7 +262,7 @@ fn coverpoints_wider_than_128_bits_sample_at_full_width() {
         r#"scoreboard Sink
     calls : uint<32> default 0
     hookable accept(u: uint<200>, s: sint<200>, n: sint<8>)
-        calls = calls + 1
+        calls = (calls + 1).resize<32>()
     end accept
 end scoreboard Sink
 
@@ -304,9 +292,9 @@ end testbench Tb
 impl Test for Tb
     run
         let u : uint<200> = 1
-        u = (u << 150) + 1
+        u = ((u << 150) + 1).resize<200>()
         let s : sint<200> = 0
-        s = s - 1
+        s = (s - 1).resize<200>()
         let n : sint<8> = -1
         sink.accept(u, s, n)
         wait 1 cycle
@@ -409,12 +397,12 @@ test SignedDist
                 r.s dist { -2 :/ 100 }
             end randomize
             if r.s == -2
-                hits = hits + 1
+                hits = (hits + 1).resize<32>()
             end if
             let a : A
             randomize(a)
             if a.s == -3
-                ahits = ahits + 1
+                ahits = (ahits + 1).resize<32>()
             end if
         end repeat
         log(info, "hits=${hits} ahits=${ahits}")
@@ -584,7 +572,7 @@ fn coverpoint_width_methods_at_carrier_boundaries() {
         r#"scoreboard Sink
     calls : uint<32> default 0
     hookable accept(a: sint<64>, b: sint<63>, c: sint<128>, d: sint<129>, e: sint<65>, r65: uint<65>, r129: uint<129>, s128: sint<128>, s129: sint<129>, u63: uint<63>)
-        calls = calls + 1
+        calls = (calls + 1).resize<32>()
     end accept
 end scoreboard Sink
 
@@ -600,7 +588,6 @@ covergroup Cov @(sink.accept(a, b, c, d, e, r65, r129, s128, s129, u63) post)
     z128_129 : cover c.zext<129>()
         bins
             ok = {r129}
-            neg = {-1}
         end bins
     r64_65 : cover a.resize<65>()
         bins
@@ -656,7 +643,7 @@ impl Test for Tb
         let e : sint<65> = -1
         let r65 : uint<65> = 0xFFFFFFFFFFFFFFFF
         let r129 : uint<129> = 1
-        r129 = (r129 << 128) - 1
+        r129 = ((r129 << 128) - 1).resize<129>()
         let s128 : sint<128> = -1
         let s129 : sint<129> = -1
         let u63 : uint<63> = 0
@@ -667,7 +654,6 @@ impl Test for Tb
         assert cov.z64_65.ok == 1 else fail("sint<64> -1 .zext<65>() is 2^64-1")
         assert cov.z63_64.ok == 1 else fail("sint<63> -1 .zext<64>() is 2^63-1")
         assert cov.z128_129.ok == 1 else fail("sint<128> -1 .zext<129>() is 2^128-1")
-        assert cov.z128_129.neg == 0 else fail("zext must not sign-extend")
         assert cov.r64_65.ok == 1 else fail("sint<64> -1 .resize<65>() is -1")
         assert cov.r64_65.raw == 0 else fail("signed resize must not zero-extend")
         assert cov.r65_64.ok == 1 else fail("sint<65> -1 .resize<64>() is -1")

@@ -41,8 +41,8 @@ transactor AxilXactor
         end axil_write
 
         hookable axil_read(addr: uint<8>) -> uint<32>
-            let val = 0
-            let saw = 0
+            let val : uint<32> = 0
+            let saw : uint<64> = 0
             dut.axil_ar_addr = addr
             dut.axil_ar_valid = 1
             for _ in 0 .. 9
@@ -123,7 +123,7 @@ impl AxiLiteEnvTest for AxiLiteEnvTb
             let got = env.drv.axil_read(t.addr)
             let exp = env.sb.expected.pop()
             if got != exp
-                env.sb.errors = env.sb.errors + 1
+                env.sb.errors = (env.sb.errors + 1).trunc<32>()
             end if
         end for
         assert env.sb.errors == 0

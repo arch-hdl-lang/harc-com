@@ -7,7 +7,7 @@ end testbench ImplLocalShadowTb
 
 impl ImplLocalShadow for ImplLocalShadowTb
     run
-        let value : uint<8> = value + 1
+        let value : uint<8> = (value + 1).trunc<8>()
         assert value == 8 else fail("local initializer did not read the field")
         assert _tb.value == 7 else fail("explicit field access changed")
 

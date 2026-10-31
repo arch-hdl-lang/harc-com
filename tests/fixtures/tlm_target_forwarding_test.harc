@@ -15,13 +15,13 @@ transactor TlmForwardingTarget bound to TlmMemBus
     back_checksum : uint<32> default 0
 
     thread bus.read(addr: uint<8>)
-        route_count = route_count + 1
-        front_checksum = front_checksum + addr
-        let back_addr : uint<8> = addr + 1
-        back_checksum = back_checksum + back_addr
+        route_count = (route_count + 1).trunc<32>()
+        front_checksum = (front_checksum + addr).trunc<32>()
+        let back_addr : uint<8> = (addr + 1).trunc<8>()
+        back_checksum = (back_checksum + back_addr).trunc<32>()
 
         let raw = back.read(back_addr)
-        return raw + 4096
+        return (raw + 4096).trunc<32>()
     end thread
 end transactor TlmForwardingTarget
 

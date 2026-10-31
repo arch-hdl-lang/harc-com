@@ -9,7 +9,7 @@ tb-ir program
 fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
   locals:
     %0 one : uint<256>
-    %1 total : unknown
+    %1 total : uint<32>
     %2 i : unknown
     %3 bump : unknown
     %4 queued : uint<32>
@@ -46,7 +46,7 @@ fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
     ScoreboardOp(sb0.sb, expected.push(%total))
     Assign(%queued, ScoreboardQuery(sb0.sb.expected.front()))
     AssertCheck { cond: (%queued == %total), on_fail: "front changed or removed the queued expectation" }
-    ScoreboardOp(sb0.sb, writes = (ScoreboardQuery(sb0.sb.writes) + 1))
+    ScoreboardOp(sb0.sb, writes = (ScoreboardQuery(sb0.sb.writes) + 1).trunc<32 from 33>())
     DutWrite(dut.en, 1)
     Assign(%_anon, 1)
     Assign(%__t0, %bump)
@@ -81,7 +81,7 @@ fn fn0 run_ScoreboardBasicTest [kind=Run, owner=tb0]
 
   b12:
     ScoreboardOp(sb0.sb, %want = expected.pop())
-    ScoreboardOp(sb0.sb, reads = (ScoreboardQuery(sb0.sb.reads) + 1))
+    ScoreboardOp(sb0.sb, reads = (ScoreboardQuery(sb0.sb.reads) + 1).trunc<32 from 33>())
     DutRead(%got, dut.count_out)
     AssertCheck { cond: (%got == %want), on_fail: "run[%lld]: count_out=%lld, expected %lld", %i, %got, %want }
     Log(info, "run[%lld] bump=%lld count_out=%lld matched expected=%lld", %i, %bump, %got, %want)

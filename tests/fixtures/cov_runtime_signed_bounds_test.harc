@@ -5,28 +5,28 @@
 scoreboard NarrowWide
     calls : uint<32> default 0
     hookable accept(value: sint<8>, lo: sint<65>, hi: sint<65>)
-        calls = calls + 1
+        calls = (calls + 1).trunc<32>()
     end accept
 end scoreboard NarrowWide
 
 scoreboard WideNarrow
     calls : uint<32> default 0
     hookable accept(value: sint<65>, lo: sint<8>, hi: sint<8>)
-        calls = calls + 1
+        calls = (calls + 1).trunc<32>()
     end accept
 end scoreboard WideNarrow
 
 scoreboard Signed65
     calls : uint<32> default 0
     hookable accept(value: sint<65>, lo: sint<65>, hi: sint<65>)
-        calls = calls + 1
+        calls = (calls + 1).trunc<32>()
     end accept
 end scoreboard Signed65
 
 scoreboard Unsigned65
     calls : uint<32> default 0
     hookable accept(value: uint<65>, lo: uint<65>, hi: uint<65>)
-        calls = calls + 1
+        calls = (calls + 1).trunc<32>()
     end accept
 end scoreboard Unsigned65
 

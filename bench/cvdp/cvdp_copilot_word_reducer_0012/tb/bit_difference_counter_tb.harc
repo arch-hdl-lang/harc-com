@@ -16,7 +16,7 @@ function hamming3(a: uint<3>, b: uint<3>) -> uint<2>
     let c : uint<2> = 0
     for bit in 0 .. 2
         if (((x >> bit) & 1) == 1)
-            c = c + 1
+            c = c +% 1
         end if
     end for
     return c
@@ -79,7 +79,7 @@ impl BitDifferenceCounterTest for BitDifferenceCounterTb
         // Exhaustive input-space sweep: 64 combinations, all distances 0..3.
         for a in 0 .. 7
             for b in 0 .. 7
-                errors = errors + apply_and_check(a, b)
+                errors = errors +% apply_and_check(a, b)
             end for
         end for
 
@@ -91,7 +91,7 @@ impl BitDifferenceCounterTest for BitDifferenceCounterTb
                 s.diff != 0
             end randomize
             let b : uint<3> = s.a ^ s.diff
-            errors = errors + apply_and_check(s.a, b)
+            errors = errors +% apply_and_check(s.a, b)
         end for
 
         assert errors == 0

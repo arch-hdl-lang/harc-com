@@ -19,8 +19,8 @@ transactor DmaMemTarget bound to DmaMemTlmBus
     error_count : uint<32> default 0
 
     thread bus.read(addr: uint<32>)
-        read_count = read_count + 1
-        read_checksum = read_checksum + addr
+        read_count = (read_count + 1).trunc<32>()
+        read_checksum = (read_checksum + addr).trunc<32>()
         prep_acc = 0
 
         let limit : uint<32> = (addr & 3) + 1
@@ -35,11 +35,11 @@ transactor DmaMemTarget bound to DmaMemTlmBus
     end thread
 
     thread bus.write(addr: uint<32>, data: uint<32>)
-        write_count = write_count + 1
-        write_checksum = write_checksum + addr + data
+        write_count = (write_count + 1).trunc<32>()
+        write_checksum = (write_checksum + addr + data).trunc<32>()
 
         if data + 4096 != addr
-            error_count = error_count + 1
+            error_count = (error_count + 1).trunc<32>()
             return
         end if
 

@@ -16,7 +16,7 @@ fn fn0 double_it [kind=Helper]
   entry = b0
 
   b0:
-    Assign(%__ret, (%x + %x))
+    Assign(%__ret, (%x + %x).resize<8 from 9>())
     -> Return
 
 fn fn1 run_HelperMixTest [kind=Run, owner=tb0]

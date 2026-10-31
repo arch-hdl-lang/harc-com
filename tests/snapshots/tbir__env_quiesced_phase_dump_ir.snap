@@ -22,7 +22,7 @@ fn fn0 comp_on_0 [kind=ComponentMethod(c0)]
   entry = b0
 
   b0:
-    ComponentFieldWrite(self.seen, (self.seen + 1))
+    ComponentFieldWrite(self.seen, (self.seen + 1).trunc<32 from 33>())
     -> Return
 
 fn fn1 run_EnvQuiescedPhaseTest [kind=Run, owner=tb0]
@@ -74,7 +74,7 @@ fn fn1 run_EnvQuiescedPhaseTest [kind=Run, owner=tb0]
 
   b10:
     ScoreboardOp(top.sb, %drained = expected.pop())
-    ScoreboardOp(top.sb, popped = (ScoreboardQuery(top.sb.popped) + 1))
+    ScoreboardOp(top.sb, popped = (ScoreboardQuery(top.sb.popped) + 1).trunc<32 from 33>())
     -> Jump(b9)
 
   b11:

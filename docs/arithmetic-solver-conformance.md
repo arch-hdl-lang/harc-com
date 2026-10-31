@@ -42,8 +42,12 @@ The normal corpus includes:
   a narrower negative quotient, whose masked representation must sign-extend.
 - Same-type signed/unsigned solver division and remainder at widths 3, 8, 32
   and 64. Each correct pinned constraint has a separate contradictory query.
-- Native mixed signed/unsigned 64-bit division, remainder and ordered
-  comparisons, including negative operands converted to unsigned at equal rank.
+- Native 64-bit division, remainder and ordered comparisons of operands that
+  start mixed signed/unsigned. A mix is a compile-time error (spec §2.4), so
+  the signed operand's typed constant is converted explicitly with
+  `as uint<64>` -- including negative operands -- and the solver runs in the
+  unsigned domain; every original mixed spelling is separately checked to be
+  rejected by the compiler before any solver runs.
 
 For SAT, the runner validates the returned pinned fields and native expression
 value. For UNSAT, **every individual query** must emit its UNSAT diagnostic
@@ -64,12 +68,14 @@ arithmetic covers all listed widths. Native v1 covers arithmetic through 64 bits
 and ordered/equality comparisons through 128 bits. Its other wide operations
 are outside this target's coverage. Mixed native comparisons use direct
 predicates or their negation, rather than equality with a named Boolean constant. The typed SMT checks cover same-type
-division/remainder; the mixed-rank checks exercise the active native solvers.
+division/remainder; the explicitly converted mixed-rank checks exercise the active native solvers.
 Existing targeted tests still cover contextual literals, constants and nested
 mixed-width operands; this suite complements them.
 
 Ordinary arithmetic cases that overflow their declared result range are
-excluded, as are zero divisors and signed minimum divided by -1. Explicit wraps
+excluded, as are zero divisors and signed minimum divided by -1. Plain `+`,
+`-` and `*` results land in untyped lets, which infer the ARCH result width
+(spec §2.4), so no generated store narrows. Explicit wraps
 exercise overflow without relying on native signed-overflow undefined behavior.
 Shift counts are within the declared width. Wide signed inputs are assembled
 from small limbs where wide casts are unsupported. Negative native inputs use

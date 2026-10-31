@@ -100,7 +100,7 @@ end testbench MsgTb
 
 impl MsgTest for MsgTb
     run
-        let lo = 0
+        let lo : uint<64> = 0
         assert past(dut.a) == 0 else fail("a was ${dut.a} lo=${lo}")
         assert dut.b[lo:0] == 1 |-> dut.c == 1 else fail("b lsb set without c")
         wait 1 cycle

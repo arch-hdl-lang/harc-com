@@ -10,11 +10,11 @@ env EventHub
     total   : uint<32> default 0
 
     on inbound(v)
-        total = total + v
+        total = (total + v).trunc<32>()
     end on
 
     on duplex(v)
-        total = total + v * 10
+        total = (total + v * 10).trunc<32>()
     end on
 
     on flag(v)
@@ -28,7 +28,7 @@ transactor DuplexConsumer
     total  : uint<32> default 0
 
     on duplex(v)
-        total = total + v
+        total = (total + v).trunc<32>()
     end on
 end transactor DuplexConsumer
 

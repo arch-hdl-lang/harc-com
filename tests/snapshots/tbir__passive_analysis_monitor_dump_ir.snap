@@ -31,7 +31,7 @@ fn fn0 comp_method_0 [kind=ComponentMethod(c0)]
   entry = b0
 
   b0:
-    ComponentFieldWrite(self.starts, (self.starts + 1))
+    ComponentFieldWrite(self.starts, (self.starts + 1).trunc<32 from 33>())
     RecordInit(%r, r0)
     RecordFieldWrite(%r.tag, %tag)
     RecordFieldWrite(%r.stamp, self.starts)
@@ -47,7 +47,7 @@ fn fn1 comp_method_1 [kind=ComponentMethod(c0)]
   entry = b0
 
   b0:
-    ComponentFieldWrite(self.stops, (self.stops + 1))
+    ComponentFieldWrite(self.stops, (self.stops + 1).trunc<32 from 33>())
     ComponentEmit(self.seen, [%tag])
     -> Return
 
@@ -59,7 +59,7 @@ fn fn2 comp_method_2 [kind=ComponentMethod(c1)]
   entry = b0
 
   b0:
-    ComponentFieldWrite(self.count, (self.count + 1))
+    ComponentFieldWrite(self.count, (self.count + 1).trunc<32 from 33>())
     ComponentFieldWrite(self.last, %v)
     -> Return
 

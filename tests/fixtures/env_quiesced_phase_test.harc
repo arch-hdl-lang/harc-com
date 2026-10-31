@@ -16,7 +16,7 @@ agent Producer
     seen  : uint<32> default 0
 
     on in_ev(t)
-        seen = seen + 1
+        seen = (seen + 1).trunc<32>()
     end on
 end agent Producer
 
@@ -60,7 +60,7 @@ impl EnvQuiescedPhaseTest for EnvQuiescedPhaseTb
 
         while !top.sb.expected.empty()
             let drained = top.sb.expected.pop()
-            top.sb.popped = top.sb.popped + 1
+            top.sb.popped = (top.sb.popped + 1).trunc<32>()
         end while
 
         drain()

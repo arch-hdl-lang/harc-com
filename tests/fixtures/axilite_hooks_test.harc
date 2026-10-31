@@ -35,8 +35,8 @@ transactor HookXactor
             wait 2 cycles
 
             // Read phase
-            let val = 0
-            let saw = 0
+            let val : uint<32> = 0
+            let saw : uint<64> = 0
             dut.axil_ar_addr = t.addr
             dut.axil_ar_valid = 1
             for _ in 0 .. 9
@@ -70,15 +70,15 @@ impl AxiLiteHooksTest for AxiLiteHooksTb
 
     // Pre-hook: bump a counter every time `drv.send` is about to fire.
     on drv.send pre
-        pre_count = pre_count + 1
+        pre_count = (pre_count + 1).trunc<32>()
         logf("axi_master.log", debug, "pre  drv.send addr=0x${t.addr:02x} val=0x${t.value:08x}")
     end on
 
     // Post-hook: bump a separate counter and accumulate the payload.
     // Same `t` arg as the method; runs after the body completes.
     on drv.send post
-        post_count = post_count + 1
-        post_value_sum = post_value_sum + t.value
+        post_count = (post_count + 1).trunc<32>()
+        post_value_sum = (post_value_sum + t.value).trunc<32>()
         logf("axi_master.log", debug, "post drv.send last_read=0x${drv.last_read:08x}")
     end on
 
@@ -114,13 +114,13 @@ impl AxiLiteHooksTest for AxiLiteHooksTb
         // Issue 4 calls. Each fires the pre-hook, then the body,
         // then the post-hook. Counters should land at 4/4 with
         // post_value_sum equal to the sum of all sent payloads.
-        let total = 0
+        let total : uint<64> = 0
         for i in 0 .. 3
             let t : RegOp
             t.addr = 24
             t.value = (i + 1) * 1000000
             drv.send(t)
-            total = total + t.value
+            total = (total + t.value).trunc<64>()
             assert drv.last_read == t.value
                 else fail("call ${i}: drv.last_read=0x${drv.last_read:08x} != 0x${t.value:08x}")
         end for

@@ -56,8 +56,8 @@ fn fn1 comp_method_1 [kind=ComponentMethod(c1)]
   entry = b0
 
   b0:
-    ComponentFieldWrite(self.count, (self.count + 1))
-    ComponentFieldWrite(self.sum, (self.sum + %v))
+    ComponentFieldWrite(self.count, (self.count + 1).trunc<32 from 33>())
+    ComponentFieldWrite(self.sum, (self.sum + %v).trunc<32 from 33>())
     -> Return
 
 fn fn2 run_SequencerConnectTest [kind=Run, owner=tb0]

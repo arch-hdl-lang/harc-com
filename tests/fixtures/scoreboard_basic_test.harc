@@ -67,7 +67,7 @@ impl ScoreboardBasicTest for ScoreboardBasicTb
         // Three runs; run i enables the counter for (i+1) more cycles.
         // The expected running total is pushed before the DUT advances,
         // then popped back and compared after.
-        let total = 0
+        let total : uint<32> = 0
         for i in 0 .. 2
             let bump = i + 1               // 1, 2, 3 cycles of en
             total = total + bump
@@ -79,7 +79,7 @@ impl ScoreboardBasicTest for ScoreboardBasicTb
             // deliberately discarded (a host-side no-op in both backends).
             sb.expected.size()
             sb.expected.empty()
-            sb.writes = sb.writes + 1
+            sb.writes = (sb.writes + 1).trunc<32>()
 
             dut.en = 1
             for _ in 1 .. bump
@@ -89,7 +89,7 @@ impl ScoreboardBasicTest for ScoreboardBasicTb
             wait 1 cycle                   // let the last count settle
 
             let want = sb.expected.pop()
-            sb.reads = sb.reads + 1
+            sb.reads = (sb.reads + 1).trunc<32>()
             let got = dut.count_out
             assert got == want
                 else fail("run[${i}]: count_out=${got}, expected ${want}")

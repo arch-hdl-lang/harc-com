@@ -134,7 +134,7 @@ impl DmaEngineTest for DmaEngineTb
 
         // ── Run transfer ─────────────────────────────────────────
         // Watch for IRQ; bail out as soon as it fires.
-        let irq_seen = 0
+        let irq_seen : uint<64> = 0
         for _ in 0 .. 49
             wait 1 cycle
             if dut.irq

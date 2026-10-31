@@ -243,7 +243,7 @@ int run_SequencerConnectTest(int argc, char** argv) {
             switch (__bb) {
             case 0: {
                 i = 0;
-                __t0 = (n - 1);
+                __t0 = ((uint64_t)(((uint64_t)((n) - (1))) & 0x1FFULL));
                 __bb = 1;
                 break;
             }
@@ -279,8 +279,8 @@ int run_SequencerConnectTest(int argc, char** argv) {
         while (true) {
             switch (__bb) {
             case 0: {
-                self.count = (self.count + 1);
-                self.sum = (self.sum + v);
+                self.count = ((uint64_t)(((uint64_t)((self.count + 1)) & 0xFFFFFFFFULL)));
+                self.sum = ((uint64_t)(((uint64_t)((self.sum + v)) & 0xFFFFFFFFULL)));
                 return;
                 break;
             }

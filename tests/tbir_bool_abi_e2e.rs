@@ -26,22 +26,22 @@ end function pure_negative
 
 // The local declaration forces the helper through full-CFG inlining.
 function full_zero(d: Top) -> bool
-    let ignored = 0
+    let ignored : uint<64> = 0
     return 0
 end function full_zero
 
 function full_one(d: Top) -> bool
-    let ignored = 0
+    let ignored : uint<64> = 0
     return 1
 end function full_one
 
 function full_truthy(d: Top) -> bool
-    let ignored = 0
+    let ignored : uint<64> = 0
     return 2
 end function full_truthy
 
 function full_negative(d: Top) -> bool
-    let ignored = 0
+    let ignored : uint<64> = 0
     return -1
 end function full_negative
 

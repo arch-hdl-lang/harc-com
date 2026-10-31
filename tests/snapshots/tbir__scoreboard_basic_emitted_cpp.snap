@@ -296,7 +296,7 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                         sim_log_line("FAIL", "front changed or removed the queued expectation");
                         ctx.errors++;
                     }
-                    _tb.sb.writes = (_tb.sb.writes + 1);
+                    _tb.sb.writes = ((uint64_t)(((uint64_t)((_tb.sb.writes + 1)) & 0xFFFFFFFFULL)));
                     harc_rt::harc_assign(dut->en, 1);
                     _anon = 1;
                     __t0 = bump;
@@ -345,7 +345,7 @@ int run_ScoreboardBasicTest(int argc, char** argv) {
                 }
                 case 12: {
                     want = _tb.sb.expected.pop();
-                    _tb.sb.reads = (_tb.sb.reads + 1);
+                    _tb.sb.reads = ((uint64_t)(((uint64_t)((_tb.sb.reads + 1)) & 0xFFFFFFFFULL)));
                     got = harc_rt::harc_read(dut->count_out);
                     if (!((got == want))) {
                         sim_log_line("FAIL", "run[%lld]: count_out=%lld, expected %lld", harc_rt::harc_printf_ll(i), harc_rt::harc_printf_ll(got), harc_rt::harc_printf_ll(want));

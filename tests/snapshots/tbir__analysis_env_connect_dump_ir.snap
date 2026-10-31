@@ -42,8 +42,8 @@ fn fn1 comp_method_1 [kind=ComponentMethod(c1)]
   entry = b0
 
   b0:
-    ComponentFieldWrite(self.count, (self.count + 1))
-    ComponentFieldWrite(self.sum, (self.sum + %v))
+    ComponentFieldWrite(self.count, (self.count + 1).trunc<32 from 33>())
+    ComponentFieldWrite(self.sum, (self.sum + %v).trunc<32 from 33>())
     -> Return
 
 fn fn2 comp_method_2 [kind=ComponentMethod(c2)]
@@ -54,8 +54,8 @@ fn fn2 comp_method_2 [kind=ComponentMethod(c2)]
   entry = b0
 
   b0:
-    ComponentFieldWrite(self.samples, (self.samples + 1))
-    ComponentFieldWrite(self.sum, (self.sum + %v))
+    ComponentFieldWrite(self.samples, (self.samples + 1).trunc<32 from 33>())
+    ComponentFieldWrite(self.sum, (self.sum + %v).trunc<32 from 33>())
     -> Return
 
 fn fn3 run_AnalysisSinkConnectTest [kind=Run, owner=tb0]

@@ -11,9 +11,9 @@
 function bcd_sum(a: uint<4>, b: uint<4>) -> uint<4>
     let total = a + b
     if total >= 10
-        return total - 10
+        return (total - 10).trunc<4>()
     end if
-    return total
+    return total.trunc<4>()
 end function bcd_sum
 
 function bcd_cout(a: uint<4>, b: uint<4>) -> uint<1>
@@ -44,11 +44,11 @@ impl BcdAdderTest for BcdAdderTestTb
                 let exp_cout = bcd_cout(a, b)
                 if dut.sum != exp_sum
                     log(error, "SUM MISMATCH a=${a} b=${b} got=${dut.sum} expected=${exp_sum}")
-                    errors = errors + 1
+                    errors = errors +% 1
                 end if
                 if dut.cout != exp_cout
                     log(error, "COUT MISMATCH a=${a} b=${b} got=${dut.cout} expected=${exp_cout}")
-                    errors = errors + 1
+                    errors = errors +% 1
                 end if
             end for
         end for

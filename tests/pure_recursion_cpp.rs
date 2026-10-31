@@ -19,18 +19,18 @@ const TB: &str = r#"function fact(n: uint<8>) -> uint<32>
     if n <= 1
         return 1
     end if
-    return n * fact(n - 1)
+    return n *% fact(n -% 1)
 end function fact
 
 function ping(x: uint<8>) -> uint<8>
     if x == 0
         return 0
     end if
-    return pong(x - 1)
+    return pong(x -% 1)
 end function ping
 
 function pong(x: uint<8>) -> uint<8>
-    return ping(x) + 1
+    return ping(x) +% 1
 end function pong
 
 testbench RecTb
@@ -130,7 +130,8 @@ fn emitted_recursive_pure_helpers_compile_and_evaluate() {
     let cpp = emit(&dir);
     let helpers = helper_section(&cpp);
     assert!(
-        helpers.contains("harc_helper_fact((n - 1))") && helpers.contains("harc_helper_pong("),
+        helpers.contains("harc_helper_fact(((uint64_t)(((uint64_t)((n - 1)) & 0xFFULL))))")
+            && helpers.contains("harc_helper_pong("),
         "both recursive shapes must be in the extracted section:\n{helpers}"
     );
 

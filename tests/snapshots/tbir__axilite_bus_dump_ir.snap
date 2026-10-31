@@ -8,8 +8,8 @@ tb-ir program
 
 fn fn0 run_AxiLiteBusTest [kind=Run, owner=tb0]
   locals:
-    %0 val : unknown
-    %1 saw : unknown
+    %0 val : uint<64>
+    %1 saw : uint<64>
     %2 _anon : unknown
     %3 __t0 : bool
     %4 __t1 : uint<32>

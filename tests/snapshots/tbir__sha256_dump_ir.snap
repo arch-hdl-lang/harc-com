@@ -8,9 +8,9 @@ tb-ir program
 
 fn fn0 run_Sha256Test [kind=Run, owner=tb0]
   locals:
-    %0 t1 : unknown
+    %0 t1 : uint<64>
     %1 __t0 : unknown
-    %2 t2 : unknown
+    %2 t2 : uint<64>
     %3 __t1 : unknown
   entry = b0
 
@@ -47,7 +47,7 @@ fn fn0 run_Sha256Test [kind=Run, owner=tb0]
     -> WaitCycles(1, b8)
 
   b7:
-    Assign(%t1, (%t1 + 1))
+    Assign(%t1, (%t1 + 1).trunc<64>())
     -> Jump(b4)
 
   b8:
@@ -74,7 +74,7 @@ fn fn0 run_Sha256Test [kind=Run, owner=tb0]
     -> WaitCycles(1, b14)
 
   b13:
-    Assign(%t2, (%t2 + 1))
+    Assign(%t2, (%t2 + 1).trunc<64>())
     -> Jump(b10)
 
   b14:

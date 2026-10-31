@@ -56,11 +56,11 @@ transactor AxilXactor
     last_read : uint<32> default 0
 
     on dut.axil_w_valid && dut.axil_w_ready
-        sb.writes = sb.writes + 1
+        sb.writes = (sb.writes + 1).trunc<32>()
     end on
 
     on dut.axil_r_valid && dut.axil_r_ready
-        sb.reads = sb.reads + 1
+        sb.reads = (sb.reads + 1).trunc<32>()
     end on
 
     when active
@@ -79,8 +79,8 @@ transactor AxilXactor
             wait 2 cycles
 
             // Read phase
-            let val = 0
-            let saw = 0
+            let val : uint<32> = 0
+            let saw : uint<64> = 0
             dut.axil_ar_addr = t.addr
             dut.axil_ar_valid = 1
             for _ in 0 .. 9

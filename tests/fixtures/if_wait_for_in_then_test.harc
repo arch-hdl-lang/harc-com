@@ -54,10 +54,10 @@ impl IfWaitForInThenTest for IfWaitForInThenTb
             wait 1 cycle
 
             if dut.done == 1 && prev_done == 0
-                done_pulses = done_pulses + 1
+                done_pulses = done_pulses +% 1
                 cycles_since_last_done = 0
             else
-                cycles_since_last_done = cycles_since_last_done + 1
+                cycles_since_last_done = cycles_since_last_done +% 1
             end if
             prev_done = dut.done
         end for

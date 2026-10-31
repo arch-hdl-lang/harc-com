@@ -13,11 +13,11 @@ scoreboard Cadence
     slow : uint<32> default 0   // fired by the period-3 handler
 
     function tick_fast()
-        fast = fast + 1
+        fast = (fast + 1).trunc<32>()
     end function tick_fast
 
     function tick_slow()
-        slow = slow + 1
+        slow = (slow + 1).trunc<32>()
     end function tick_slow
 end scoreboard Cadence
 

@@ -48,6 +48,7 @@ pub(crate) mod covergroups;
 mod exprs;
 pub(crate) use exprs::cast_relabel_width;
 pub(crate) use exprs::parse_int_literal;
+pub(crate) use exprs::untyped_literal_exact;
 mod helpers;
 mod records;
 mod regblock;
@@ -61,6 +62,7 @@ use crate::ast::{
     ExprKind, HookableMethod, Item, OnPhase, ScopeDecl, SourceFile, SourceId, SourceSite,
     Stmt as AstStmt, StmtKind, TestDecl, TestItem, TransactorMode, TypeExpr,
 };
+use crate::exact_int::ExactInt;
 use crate::ir::{
     self, BasicBlock, BlockId, ClockSpec, ComponentSchema, ConstraintRef, ConstraintSite,
     CovgroupId, CovgroupSchema, FunctionId, FunctionKind, IrType, LocalId, ProbeId, ProbeSchema,
@@ -349,48 +351,89 @@ pub(crate) enum ConstProvenance {
     EnumVariant,
 }
 
-/// A folded file-scope constant: 64-bit two's-complement bit pattern, the
-/// signedness used while folding, and the declaration provenance used when
-/// substituting the value into typed TB-IR expressions.
+/// A folded file-scope constant. `exact` is its exact value (constants are
+/// evaluated at their ARCH result width, like runtime values, so a 65-bit
+/// difference keeps its carry); `bits` is the low 64 bits of its
+/// two's-complement pattern, the view scalar consumers (lengths, indices,
+/// solver literals) use. `width` is the ARCH result width of a value built
+/// from typed operands, or the declared width of a typed constant; `None`
+/// for an untyped literal value, whose width is the bits of its value.
 #[derive(Clone)]
 pub(crate) struct ConstVal {
     pub(crate) bits: u64,
+    pub(crate) exact: ExactInt,
+    pub(crate) width: Option<u32>,
     pub(crate) signed: bool,
     pub(crate) provenance: ConstProvenance,
 }
 
 impl ConstVal {
-    pub(crate) fn untyped(bits: u64, signed: bool) -> Self {
+    fn from_exact(
+        exact: ExactInt,
+        width: Option<u32>,
+        signed: bool,
+        provenance: ConstProvenance,
+    ) -> Self {
         Self {
-            bits,
+            bits: exact.low_u64(),
+            exact,
+            width,
             signed,
-            provenance: ConstProvenance::Untyped,
+            provenance,
         }
+    }
+
+    pub(crate) fn untyped(bits: u64, signed: bool) -> Self {
+        Self::from_exact(
+            ExactInt::from_bits(bits, signed),
+            None,
+            signed,
+            ConstProvenance::Untyped,
+        )
     }
 
     pub(crate) fn typed(bits: u64, ty: IrType) -> Self {
         let signed = matches!(ty, IrType::SInt(_));
-        Self {
-            bits,
+        let width = match ty {
+            IrType::UInt(w) | IrType::SInt(w) => w,
+            _ => None,
+        };
+        Self::from_exact(
+            ExactInt::from_bits(bits, signed),
+            width,
             signed,
-            provenance: ConstProvenance::Typed(ty),
-        }
+            ConstProvenance::Typed(ty),
+        )
     }
 
     pub(crate) fn enum_variant(bits: u64) -> Self {
-        Self {
-            bits,
-            signed: true,
-            provenance: ConstProvenance::EnumVariant,
-        }
+        Self::from_exact(
+            ExactInt::from_bits(bits, true),
+            None,
+            true,
+            ConstProvenance::EnumVariant,
+        )
     }
 
     fn boolean(value: bool) -> Self {
-        Self {
-            bits: value as u64,
-            signed: true,
-            provenance: ConstProvenance::UntypedBool,
-        }
+        Self::from_exact(
+            ExactInt::from_bits(value as u64, true),
+            None,
+            true,
+            ConstProvenance::UntypedBool,
+        )
+    }
+
+    /// The ARCH operand width of this value inside a constant expression:
+    /// a typed value's width, or the bits of an untyped literal value.
+    fn operand_width(&self) -> u32 {
+        self.width.unwrap_or_else(|| self.exact.literal_width())
+    }
+
+    /// Whether the value adapts to its peer like an untyped literal (an
+    /// untyped constant contributes its value's bits, spec D2).
+    fn is_literal(&self) -> bool {
+        self.width.is_none() && !self.is_boolean_kind()
     }
 
     pub(crate) fn is_boolean_kind(&self) -> bool {
@@ -423,11 +466,8 @@ impl ConstVal {
         }
     }
 
-    fn as_i64(&self) -> i64 {
-        self.bits as i64
-    }
     pub(crate) fn is_negative(&self) -> bool {
-        self.signed && (self.bits as i64) < 0
+        self.exact.is_negative()
     }
 }
 
@@ -475,19 +515,6 @@ fn const_operand_width(e: &crate::ast::Expr, consts: &HashMap<String, ConstVal>)
             Some(if v == 0 { 1 } else { 64 - v.leading_zeros() })
         }
         _ => None,
-    }
-}
-
-/// The `W`-bit value of a 64-bit pattern: masked, or sign-extended from bit
-/// `W - 1` when `signed`.
-fn normalize_const_bits(bits: u64, width: u32, signed: bool) -> u64 {
-    if width >= 64 {
-        bits
-    } else if signed {
-        let shift = 64 - width;
-        (((bits << shift) as i64) >> shift) as u64
-    } else {
-        bits & ((1u64 << width) - 1)
     }
 }
 
@@ -541,6 +568,223 @@ fn const_shift_declared_width(
     }
 }
 
+/// Declared signedness of a `const` initializer operand, for the
+/// mixed-signedness rule (owner decision D1, R16 hunt 1): `Some` only for
+/// an `as uint/sint<N>` cast, a reference to a TYPED constant, and
+/// arithmetic over such operands. Untyped literals and untyped constants
+/// have no declared signedness and adapt to their peer.
+fn const_declared_signedness(
+    e: &crate::ast::Expr,
+    consts: &HashMap<String, ConstVal>,
+) -> Option<bool> {
+    // An untyped literal tree adapts to its peer unless it is negative,
+    // which makes it a signed value (owner decision, R16 review).
+    if let Some(value) = const_untyped_value(e, consts) {
+        return (value < 0).then_some(true);
+    }
+    const_typed_signedness(e, consts)
+}
+
+/// The exact value of an untyped literal tree in a constant expression
+/// (integer literals, untyped constants, `-`, `~`, and the arithmetic,
+/// bitwise and shift operators over them); `None` when any leaf is typed or
+/// the tree is not of that shape. Its sign decides D1 (a negative one is a
+/// signed value), and it must fit the typed peer it adapts to.
+fn const_untyped_exact(
+    e: &crate::ast::Expr,
+    consts: &HashMap<String, ConstVal>,
+) -> Option<ExactInt> {
+    use crate::ast::{BinaryOp, UnaryOp};
+    match &*e.kind {
+        ExprKind::Paren(inner) => const_untyped_exact(inner, consts),
+        ExprKind::Int(text) => match exprs::parse_int_literal(text) {
+            Some(v) => Some(ExactInt::from_bits(v, v <= i64::MAX as u64)),
+            None => exprs::parse_wide_int_literal(text).map(|w| ExactInt::from_words(&w)),
+        },
+        ExprKind::Ident(id) => {
+            let c = consts.get(&id.name)?;
+            matches!(c.provenance, ConstProvenance::Untyped).then(|| c.exact.clone())
+        }
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => Some(const_untyped_exact(expr, consts)?.neg()),
+        ExprKind::Unary {
+            op: UnaryOp::BitNot,
+            expr,
+        } => Some(const_untyped_exact(expr, consts)?.not()),
+        ExprKind::Binary { op, lhs, rhs } => {
+            let (x, y) = (
+                const_untyped_exact(lhs, consts)?,
+                const_untyped_exact(rhs, consts)?,
+            );
+            Some(match op {
+                BinaryOp::Add => x.add(&y),
+                BinaryOp::Sub => x.sub(&y),
+                BinaryOp::Mul => x.mul(&y),
+                BinaryOp::Div => x.div_rem(&y)?.0,
+                BinaryOp::Mod => x.div_rem(&y)?.1,
+                BinaryOp::BitAnd => x.and(&y),
+                BinaryOp::BitOr => x.or(&y),
+                BinaryOp::BitXor => x.xor(&y),
+                BinaryOp::Shl => x.shl(y.to_u32().filter(|n| *n <= crate::MAX_WIDTH_METHOD_BITS)?),
+                BinaryOp::Shr => x.shr(y.to_u32()?),
+                _ => return None,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn const_untyped_value(e: &crate::ast::Expr, consts: &HashMap<String, ConstVal>) -> Option<i128> {
+    const_untyped_exact(e, consts)?.to_i128()
+}
+
+/// Strict fit in a constant expression: an untyped literal operand (or
+/// conditional arm) adapts to a typed peer only when its exact value fits
+/// the peer's type.
+fn const_reject_literal_misfit(
+    what: &str,
+    l: &crate::ast::Expr,
+    r: &crate::ast::Expr,
+    consts: &HashMap<String, ConstVal>,
+) -> Result<(), ConstFoldErr> {
+    for (lit, peer) in [(l, r), (r, l)] {
+        let Some(v) = const_untyped_exact(lit, consts) else {
+            continue;
+        };
+        if const_untyped_exact(peer, consts).is_some() {
+            continue;
+        }
+        let (Some(signed), Some((w, true))) = (
+            const_typed_signedness(peer, consts),
+            const_arch_width(peer, consts, true),
+        ) else {
+            continue;
+        };
+        // `+ - *` widen per ARCH: the literal contributes its own value
+        // bits and need only match the peer's signedness (D1 judges that).
+        if ["`+`", "`-`", "`*`"]
+            .iter()
+            .any(|op| what == format!("operator {op}"))
+        {
+            continue;
+        }
+        if !v.fits(w, signed) {
+            return Err(FoldInvalid(format!(
+                "{what}: the untyped literal value {v} does not fit its operand's type {} in \
+                 a constant expression. An untyped literal adapts to its peer only when its \
+                 value fits — write a value that fits, or convert explicitly with `as sint<N>` \
+                 / `as uint<N>`.",
+                exprs::scalar_range_spelling(w, signed)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn const_typed_signedness(
+    e: &crate::ast::Expr,
+    consts: &HashMap<String, ConstVal>,
+) -> Option<bool> {
+    use crate::ast::{BinaryOp, BuiltinTy, TypeExpr, UnaryOp};
+    let const_declared_signedness = const_typed_signedness;
+    match &*e.kind {
+        ExprKind::Paren(inner) => const_declared_signedness(inner, consts),
+        ExprKind::Cast { ty, .. } => match ty {
+            TypeExpr::Builtin {
+                name: BuiltinTy::SInt | BuiltinTy::SIntCap,
+                ..
+            } => Some(true),
+            TypeExpr::Builtin {
+                name: BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits,
+                ..
+            } => Some(false),
+            _ => None,
+        },
+        ExprKind::Ident(id) => match &consts.get(&id.name)?.provenance {
+            ConstProvenance::Typed(IrType::SInt(_)) => Some(true),
+            ConstProvenance::Typed(IrType::UInt(_)) => Some(false),
+            _ => None,
+        },
+        ExprKind::Unary {
+            op: UnaryOp::Neg | UnaryOp::BitNot,
+            expr,
+        } => const_declared_signedness(expr, consts),
+        ExprKind::Binary {
+            op: BinaryOp::Shl | BinaryOp::Shr,
+            lhs,
+            ..
+        } => const_declared_signedness(lhs, consts),
+        ExprKind::Binary {
+            op:
+                BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor,
+            lhs,
+            rhs,
+        } => const_declared_signedness(lhs, consts).or(const_declared_signedness(rhs, consts)),
+        ExprKind::Binary {
+            op: BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap,
+            ..
+        } => Some(false),
+        _ => None,
+    }
+}
+
+/// ARCH-style static width of a `const` initializer (owner decision D2):
+/// `Some((width, typed))`, where `typed` is false for an untyped literal
+/// tree (its width is the bits of its value). `None` when a leaf has no
+/// declared width (an untyped constant reference, a call).
+fn const_arch_width(
+    e: &crate::ast::Expr,
+    consts: &HashMap<String, ConstVal>,
+    widen: bool,
+) -> Option<(u32, bool)> {
+    use crate::ast::BinaryOp;
+    let const_arch_width = |e, consts| const_arch_width(e, consts, widen);
+    match &*e.kind {
+        ExprKind::Paren(inner) => const_arch_width(inner, consts),
+        ExprKind::Int(s) => {
+            let v = exprs::parse_int_literal(s.as_str())?;
+            Some(((64 - v.leading_zeros()).max(1), false))
+        }
+        ExprKind::Cast { ty, .. } => exprs::cast_relabel_width(ty).map(|w| (w, true)),
+        ExprKind::Ident(id) => consts.get(&id.name)?.declared_width().map(|w| (w, true)),
+        ExprKind::Unary {
+            op: crate::ast::UnaryOp::Neg | crate::ast::UnaryOp::BitNot,
+            expr,
+        } => const_arch_width(expr, consts),
+        ExprKind::Binary { op, lhs, rhs } => {
+            let (lw, lt) = const_arch_width(lhs, consts)?;
+            if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
+                return Some((lw, lt));
+            }
+            let (rw, rt) = const_arch_width(rhs, consts)?;
+            let width = match op {
+                BinaryOp::Add | BinaryOp::Sub if widen => lw.max(rw) + 1,
+                BinaryOp::Mul if widen => lw + rw,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => lw.max(rw),
+                BinaryOp::Div | BinaryOp::Mod => lw,
+                BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::AddWrap
+                | BinaryOp::SubWrap
+                | BinaryOp::MulWrap => lw.max(rw),
+                BinaryOp::BitAnd => lw.min(rw),
+                _ => return None,
+            };
+            Some((width, lt || rt))
+        }
+        _ => None,
+    }
+}
+
 /// Const-fold a file-scope `const` initializer expression, resolving
 /// identifiers against `consts` (earlier `const` values and enum-
 /// variant indices, both in source order; `self_name` is the constant
@@ -558,6 +802,26 @@ fn const_shift_declared_width(
 /// at `max(W(lhs), W(rhs))` when both operand widths are statically
 /// known (see `const_operand_width`) and are rejected when they are not.
 pub(crate) fn fold_const(
+    e: &crate::ast::Expr,
+    consts: &HashMap<String, ConstVal>,
+    self_name: &str,
+) -> Result<ConstVal, ConstFoldErr> {
+    // Constants fold exactly, but these callers (lengths, addresses,
+    // bounds, field defaults) consume a 64-bit scalar, so a value outside
+    // the 64-bit carrier stays outside their domain.
+    let v = fold_const_inner(e, consts, self_name, None, &mut Vec::new())?;
+    if !(v.exact.fits_i64() || v.exact.fits_u64()) {
+        return Err(ConstFoldErr::Unsupported(format!(
+            "the value {} is outside the 64-bit constant-evaluation domain",
+            v.exact
+        )));
+    }
+    Ok(v)
+}
+
+/// `fold_const` without the 64-bit domain gate: the exact value of a
+/// `const` initializer, however wide.
+pub(crate) fn fold_const_exact(
     e: &crate::ast::Expr,
     consts: &HashMap<String, ConstVal>,
     self_name: &str,
@@ -732,16 +996,19 @@ fn const_expr_scalar_shape(
     };
     match &*e.kind {
         ExprKind::Paren(inner) => const_expr_scalar_shape(inner, consts, helpers),
-        ExprKind::Int(text) => exprs::parse_int_literal(text)
-            .map(|value| ConstScalarShape {
+        ExprKind::Int(text) => match exprs::parse_int_literal(text) {
+            Some(value) => Ok(ConstScalarShape {
                 signed: value <= i64::MAX as u64,
                 boolean: false,
-            })
-            .ok_or_else(|| {
-                ConstFoldErr::Unsupported(format!(
-                    "the integer literal `{text}` does not fit the 64-bit constant-evaluation domain"
-                ))
             }),
+            None if exprs::parse_wide_int_literal(text).is_some() => Ok(ConstScalarShape {
+                signed: false,
+                boolean: false,
+            }),
+            None => Err(ConstFoldErr::Unsupported(format!(
+                "the integer literal `{text}` is not a constant integer"
+            ))),
+        },
         ExprKind::Bool(_) => Ok(ConstScalarShape {
             signed: true,
             boolean: true,
@@ -757,10 +1024,9 @@ fn const_expr_scalar_shape(
             // Casts do not evaluate their operand in an unselected arm,
             // but C++ still resolves and type-checks it.
             const_expr_scalar_shape(expr, consts, helpers)?;
-            if !exprs::cast_relabel_width(ty).is_some_and(|width| width <= 64) {
+            if exprs::cast_relabel_width(ty).is_none() {
                 return Err(ConstFoldErr::Unsupported(
-                    "`as` casts outside scalar uint/sint/bits (≤ 64 bits) in a constant expression"
-                        .into(),
+                    "`as` casts outside scalar uint/sint/bits in a constant expression".into(),
                 ));
             };
             Ok(ConstScalarShape {
@@ -890,12 +1156,22 @@ fn check_const_helper_abi_type(
 ) -> Result<ConstVal, String> {
     use crate::ast::{BuiltinTy, TypeExpr};
     let value = check_const_decl_type(ty, value)?;
+    // An untyped helper slot is a `uint64_t`; the value must fit it
+    // (strict fit — no pattern is reinterpreted).
     let Some(TypeExpr::Builtin { name, .. }) = ty else {
-        return Ok(ConstVal {
-            bits: value.bits,
-            signed: false,
-            provenance: value.provenance,
-        });
+        if !value.exact.fits(64, false) {
+            return Err(format!(
+                "value {} does not fit the helper's untyped slot (`uint64`, range 0..={})",
+                value.exact,
+                u64::MAX
+            ));
+        }
+        return Ok(ConstVal::from_exact(
+            value.exact,
+            None,
+            false,
+            value.provenance,
+        ));
     };
     let signed = match name {
         BuiltinTy::UInt
@@ -909,11 +1185,14 @@ fn check_const_helper_abi_type(
         BuiltinTy::SInt | BuiltinTy::SIntCap => true,
         _ => return Ok(value),
     };
-    Ok(ConstVal {
-        bits: value.bits,
+    // The value already fits the slot (strict fit), so no pattern is
+    // reinterpreted at the helper ABI.
+    Ok(ConstVal::from_exact(
+        value.exact,
+        value.width,
         signed,
-        provenance: value.provenance,
-    })
+        value.provenance,
+    ))
 }
 
 fn fold_const_inner(
@@ -933,13 +1212,29 @@ fn fold_const_inner(
         ExprKind::Int(s) => match exprs::parse_int_literal(s) {
             // Decimal literals above i64::MAX are unsigned, like C++.
             Some(v) => Ok(ConstVal::untyped(v, v <= i64::MAX as u64)),
-            None => Err(ConstFoldErr::Unsupported(format!(
-                "the integer literal `{s}` does not fit the 64-bit constant-evaluation domain"
-            ))),
+            None => match exprs::parse_wide_int_literal(s) {
+                Some(words) => Ok(ConstVal::from_exact(
+                    ExactInt::from_words(&words),
+                    None,
+                    false,
+                    ConstProvenance::Untyped,
+                )),
+                None => Err(ConstFoldErr::Unsupported(format!(
+                    "the integer literal `{s}` is not a constant integer"
+                ))),
+            },
         },
         ExprKind::Bool(b) => boolean(*b),
         ExprKind::Ident(id) => match consts.get(&id.name) {
-            Some(v) => Ok(v.clone()),
+            Some(v) => Ok(match &v.provenance {
+                // An untyped constant (or enum value) contributes its
+                // value's bits, like a literal (spec D2).
+                ConstProvenance::Untyped | ConstProvenance::EnumVariant => ConstVal {
+                    width: None,
+                    ..v.clone()
+                },
+                _ => v.clone(),
+            }),
             None if id.name == self_name => Err(FoldInvalid(format!(
                 "references itself — `const {self_name}` is a dependency cycle",
             ))),
@@ -968,14 +1263,9 @@ fn fold_const_inner(
         // uint<W>` keeps the low `W` bits, `as sint<W>` keeps them and
         // sign-extends from bit `W - 1`.
         ExprKind::Cast { expr, ty } => {
-            // The runtime cast accepts wider targets, but the const fold's
-            // value domain is 64-bit — gate at 64 so the accepted subset
-            // matches the documented one.
-            let Some(width) = exprs::cast_relabel_width(ty).filter(|w| *w <= 64) else {
+            let Some(width) = exprs::cast_relabel_width(ty) else {
                 return Err(ConstFoldErr::Unsupported(
-                    "`as` casts outside scalar uint/sint/bits (≤ 64 bits) in a \
-                     constant expression"
-                        .into(),
+                    "`as` casts outside scalar uint/sint/bits in a constant expression".into(),
                 ));
             };
             let v = fold_const_inner(expr, consts, self_name, helpers, call_stack)?;
@@ -986,23 +1276,41 @@ fn fold_const_inner(
                     ..
                 }
             );
-            Ok(ConstVal::untyped(normalize_const_bits(v.bits, width, signed), signed))
+            Ok(ConstVal::from_exact(
+                v.exact.normalize(width, signed),
+                Some(width),
+                signed,
+                ConstProvenance::Untyped,
+            ))
         }
         ExprKind::Unary { op, expr } => {
             let v = fold_const_inner(expr, consts, self_name, helpers, call_stack)?;
+            // A typed value is normalized at its width; an untyped literal is
+            // an exact integer (negating one gives a negative, signed value).
+            let finish = |exact: ExactInt, provenance| {
+                Ok(match v.width {
+                    Some(w) => ConstVal::from_exact(
+                        exact.normalize(w, v.signed),
+                        v.width,
+                        v.signed,
+                        provenance,
+                    ),
+                    None => {
+                        let signed = v.signed || exact.is_negative();
+                        ConstVal::from_exact(exact, None, signed, provenance)
+                    }
+                })
+            };
             match op {
-                UnaryOp::Neg => Ok(ConstVal::untyped(
-                    v.bits.wrapping_neg(),
-                    // C++: negating an unsigned value stays unsigned.
+                UnaryOp::Neg => finish(v.exact.neg(), ConstProvenance::Untyped),
+                UnaryOp::Not | UnaryOp::NotKw => boolean(v.exact.is_zero()),
+                UnaryOp::BitNot if v.is_boolean_kind() => Ok(ConstVal::from_exact(
+                    v.exact.not(),
+                    None,
                     v.signed,
+                    ConstProvenance::UntypedBool,
                 )),
-                UnaryOp::Not | UnaryOp::NotKw => boolean(v.bits == 0),
-                UnaryOp::BitNot if v.is_boolean_kind() => Ok(ConstVal {
-                    bits: !v.bits,
-                    signed: v.signed,
-                    provenance: ConstProvenance::UntypedBool,
-                }),
-                UnaryOp::BitNot => Ok(ConstVal::untyped(!v.bits, v.signed)),
+                UnaryOp::BitNot => finish(v.exact.not(), ConstProvenance::Untyped),
             }
         }
         ExprKind::Binary { op, lhs, rhs } => {
@@ -1016,7 +1324,7 @@ fn fold_const_inner(
                 BinaryOp::AndAnd | BinaryOp::AndKw | BinaryOp::OrOr | BinaryOp::OrKw
             ) {
                 const_expr_scalar_shape(rhs, consts, helpers)?;
-                let lhs_true = a.bits != 0;
+                let lhs_true = !a.exact.is_zero();
                 let short_circuits = match op {
                     BinaryOp::AndAnd | BinaryOp::AndKw => !lhs_true,
                     BinaryOp::OrOr | BinaryOp::OrKw => lhs_true,
@@ -1027,7 +1335,52 @@ fn fold_const_inner(
                 }
             }
             let b = fold_const_inner(rhs, consts, self_name, helpers, call_stack)?;
-            use crate::numeric_semantics::{self, NumericError, Scalar};
+            if !matches!(
+                op,
+                BinaryOp::Shl
+                    | BinaryOp::Shr
+                    | BinaryOp::AndAnd
+                    | BinaryOp::AndKw
+                    | BinaryOp::OrOr
+                    | BinaryOp::OrKw
+            ) {
+                if let (Some(ls), Some(rs)) = (
+                    const_declared_signedness(lhs, consts),
+                    const_declared_signedness(rhs, consts),
+                ) {
+                    if ls != rs {
+                        let side = |signed: bool| if signed { "signed" } else { "unsigned" };
+                        return Err(FoldInvalid(format!(
+                            "operator `{}` mixes signed and unsigned operands in a \
+                                 constant expression (left is {}, right is {}). Signed and \
+                                 unsigned values never combine implicitly — convert one \
+                                 operand explicitly with `as sint<N>` or `as uint<N>`.",
+                            crate::pretty::binary_op_str(*op),
+                            side(ls),
+                            side(rs),
+                        )));
+                    }
+                }
+            }
+            if !matches!(
+                op,
+                BinaryOp::Shl
+                    | BinaryOp::Shr
+                    | BinaryOp::AndAnd
+                    | BinaryOp::AndKw
+                    | BinaryOp::OrOr
+                    | BinaryOp::OrKw
+                    | BinaryOp::AddWrap
+                    | BinaryOp::SubWrap
+                    | BinaryOp::MulWrap
+            ) {
+                const_reject_literal_misfit(
+                    &format!("operator `{}`", crate::pretty::binary_op_str(*op)),
+                    lhs,
+                    rhs,
+                    consts,
+                )?;
+            }
             let wrap_width = if matches!(
                 op,
                 BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap
@@ -1052,74 +1405,17 @@ fn fold_const_inner(
                         if wr.is_some() { "known" } else { "unknown" },
                     )));
                 };
-                let width = wl.max(wr);
-                if width > 64 {
-                    return Err(FoldInvalid(format!(
-                        "the wrapping operators are evaluable in a constant \
-                             initializer only up to 64 bits (this one masks to \
-                             {width})"
-                    )));
-                }
-                Some(width)
+                Some(wl.max(wr))
             } else {
                 None
-            };
-            let scalar = |v: &ConstVal| Scalar {
-                bits: v.bits,
-                signed: v.signed,
-                boolean: v.is_boolean_kind(),
             };
             // A shift keeps its left operand's declared width (the runtime
             // rule): a `<<` whose left operand is a typed constant or a cast
             // of `W < 64` bits drops the bits shifted past `W`.
             let shl_width = matches!(op, BinaryOp::Shl)
                 .then(|| const_shift_declared_width(lhs, consts))
-                .flatten()
-                .filter(|w| *w < 64);
-            match numeric_semantics::fold_binary(*op, scalar(&a), scalar(&b), wrap_width) {
-                Ok(v) => Ok(ConstVal {
-                    bits: match shl_width {
-                        Some(w) => normalize_const_bits(v.bits, w, v.signed),
-                        None => v.bits,
-                    },
-                    signed: v.signed,
-                    provenance: if v.boolean {
-                        ConstProvenance::UntypedBool
-                    } else {
-                        ConstProvenance::Untyped
-                    },
-                }),
-                Err(err) => {
-                    let label = if matches!(op, BinaryOp::Div) {
-                        "division"
-                    } else {
-                        "modulo"
-                    };
-                    match err {
-                        NumericError::ZeroDivisor => Err(FoldInvalid(format!("{label} by zero"))),
-                        NumericError::SignedDivisionOverflow => Err(FoldInvalid(format!(
-                            "signed {label} overflow ({} / -1 exceeds the \
-                             64-bit constant-evaluation domain)",
-                            i64::MIN
-                        ))),
-                        NumericError::NegativeShift => Err(FoldInvalid(format!(
-                            "negative shift amount ({})",
-                            b.as_i64()
-                        ))),
-                        NumericError::ShiftOutOfRange => Err(FoldInvalid(format!(
-                            "shift amount {} is out of range (constant evaluation \
-                             is 64-bit; shift amounts must be 0..=63)",
-                            b.bits
-                        ))),
-                        NumericError::InvalidWrapWidth => {
-                            unreachable!("wrapping width was validated above")
-                        }
-                        NumericError::Unsupported => Err(ConstFoldErr::Unsupported(format!(
-                            "the `{op:?}` operator in a constant expression"
-                        ))),
-                    }
-                }
-            }
+                .flatten();
+            fold_const_binary(*op, &a, &b, wrap_width, shl_width)
         }
 
         ExprKind::Ternary {
@@ -1131,6 +1427,21 @@ fn fold_const_inner(
             // only fold the selected arm. Besides preserving ordinary
             // truthiness, this keeps an invalid expression in the unchosen
             // arm (for example division by zero) from becoming observable.
+            if let (Some(ts), Some(es)) = (
+                const_declared_signedness(then_branch, consts),
+                const_declared_signedness(else_branch, consts),
+            ) {
+                if ts != es {
+                    return Err(FoldInvalid(
+                        "the arms of a conditional `? :` mix signed and unsigned values in a \
+                         constant expression. Signed and unsigned values never combine \
+                         implicitly — convert one arm explicitly with `as sint<N>` or \
+                         `as uint<N>`."
+                            .to_string(),
+                    ));
+                }
+            }
+            const_reject_literal_misfit("a conditional `? :`", then_branch, else_branch, consts)?;
             let then_shape = const_expr_scalar_shape(then_branch, consts, helpers)?;
             let else_shape = const_expr_scalar_shape(else_branch, consts, helpers)?;
             let result_shape = ConstScalarShape {
@@ -1138,13 +1449,34 @@ fn fold_const_inner(
                 boolean: then_shape.boolean && else_shape.boolean,
             };
             let cond = fold_const_inner(cond, consts, self_name, helpers, call_stack)?;
-            let selected = if cond.bits != 0 {
+            let selected = if !cond.exact.is_zero() {
                 then_branch
             } else {
                 else_branch
             };
             let mut value = fold_const_inner(selected, consts, self_name, helpers, call_stack)?;
+            // The conditional's width is the wider arm's (a typed arm keeps
+            // the result typed); the unselected arm is sized, not evaluated.
+            let other = if std::ptr::eq(selected, then_branch) {
+                else_branch
+            } else {
+                then_branch
+            };
+            let other_width =
+                const_arch_width(other, consts, true).and_then(|(w, typed)| typed.then_some(w));
+            value.width = match (value.width, other_width) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b.max(value.exact.literal_width())),
+                (None, None) => None,
+            };
             value.signed = result_shape.signed;
+            if !value.signed && !result_shape.boolean {
+                if let Some(w) = value.width {
+                    value.exact = value.exact.mod_pow2(w);
+                    value.bits = value.exact.low_u64();
+                }
+            }
             value.provenance = if result_shape.boolean {
                 ConstProvenance::UntypedBool
             } else {
@@ -1236,26 +1568,238 @@ fn fold_const_inner(
     }
 }
 
+/// One binary operator of the constant evaluator, exact at ARCH result
+/// widths (spec: result widths of binary operators), so a constant agrees
+/// with the same expression evaluated at runtime. `+ - *` never wrap; an
+/// unsigned result is its result-width pattern (`uint<64>(0) - 15` is
+/// `2**65 - 15`); an untyped literal operand contributes its value's bits
+/// and adapts to its peer's signedness.
+fn fold_const_binary(
+    op: crate::ast::BinaryOp,
+    a: &ConstVal,
+    b: &ConstVal,
+    wrap_width: Option<u32>,
+    shl_width: Option<u32>,
+) -> Result<ConstVal, ConstFoldErr> {
+    use crate::ast::BinaryOp;
+    let boolean = |x: bool| Ok(ConstVal::boolean(x));
+    let (x, y) = (&a.exact, &b.exact);
+    let (la, lb) = (a.is_literal(), b.is_literal());
+    let (wa, wb) = (a.operand_width(), b.operand_width());
+    let label = if matches!(op, BinaryOp::Div) {
+        "division"
+    } else {
+        "modulo"
+    };
+    match op {
+        BinaryOp::Eq => return boolean(x == y),
+        BinaryOp::Ne => return boolean(x != y),
+        BinaryOp::Lt => return boolean(x < y),
+        BinaryOp::Le => return boolean(x <= y),
+        BinaryOp::Gt => return boolean(x > y),
+        BinaryOp::Ge => return boolean(x >= y),
+        BinaryOp::AndAnd | BinaryOp::AndKw => return boolean(!x.is_zero() && !y.is_zero()),
+        BinaryOp::OrOr | BinaryOp::OrKw => return boolean(!x.is_zero() || !y.is_zero()),
+        BinaryOp::AddWrap | BinaryOp::SubWrap | BinaryOp::MulWrap => {
+            let w = wrap_width.expect("validated by the caller");
+            let (p, q) = (x.mod_pow2(w), y.mod_pow2(w));
+            let raw = match op {
+                BinaryOp::SubWrap => p.sub(&q),
+                BinaryOp::MulWrap => p.mul(&q),
+                _ => p.add(&q),
+            };
+            return Ok(ConstVal::from_exact(
+                raw.mod_pow2(w),
+                Some(w),
+                false,
+                ConstProvenance::Untyped,
+            ));
+        }
+        BinaryOp::Shl | BinaryOp::Shr => {
+            if y.is_negative() {
+                return Err(FoldInvalid(format!("negative shift amount ({y})")));
+            }
+            // A literal-only shift is exact (lowering folds the same tree
+            // to the same value), up to the width-method bound; a typed
+            // left operand shifts at its width.
+            let carrier = if la {
+                crate::MAX_WIDTH_METHOD_BITS + 1
+            } else if a.is_boolean_kind() {
+                64
+            } else {
+                wa.max(64)
+            };
+            let Some(n) = y.to_u32().filter(|n| *n < carrier) else {
+                return Err(FoldInvalid(format!(
+                    "shift amount {y} is out of range (shift amounts must be 0..={})",
+                    carrier - 1
+                )));
+            };
+            let (exact, width) = if matches!(op, BinaryOp::Shl) && la {
+                // Exact: `3 << 63` is 3 * 2**63 and `(0 - 3) << 62` stays
+                // negative; strict fit then judges the destination.
+                let exact = x.shl(n);
+                let signed = exact.is_negative() || exact.fits_i64();
+                return Ok(ConstVal::from_exact(
+                    exact,
+                    None,
+                    signed,
+                    ConstProvenance::Untyped,
+                ));
+            } else if matches!(op, BinaryOp::Shl) {
+                let w = shl_width.filter(|w| *w < 64).unwrap_or(carrier);
+                (x.shl(n).normalize(w, a.signed), Some(w))
+            } else {
+                // `>>` is arithmetic for a signed value, logical for an
+                // unsigned one (whose exact value is non-negative).
+                (x.shr(n), a.width)
+            };
+            return Ok(ConstVal::from_exact(
+                exact,
+                width,
+                a.signed,
+                ConstProvenance::Untyped,
+            ));
+        }
+        _ => {}
+    }
+    // Arithmetic and bitwise: the ARCH result shape.
+    let (sa, sb) = ((!la).then_some(a.signed), (!lb).then_some(b.signed));
+    let width = match op {
+        BinaryOp::Add | BinaryOp::Sub => wa.max(wb) + 1,
+        BinaryOp::Mul => wa + wb,
+        BinaryOp::Div | BinaryOp::Mod => wa,
+        BinaryOp::BitOr | BinaryOp::BitXor => wa.max(wb),
+        BinaryOp::BitAnd => {
+            if wa < wb && sa != Some(true) {
+                wa
+            } else if wb < wa && sb != Some(true) {
+                wb
+            } else {
+                wa.max(wb)
+            }
+        }
+        _ => {
+            return Err(ConstFoldErr::Unsupported(format!(
+                "the `{op:?}` operator in a constant expression"
+            )))
+        }
+    };
+    let narrowing_mask = matches!(op, BinaryOp::BitAnd)
+        && ((wa < wb && sa != Some(true)) || (wb < wa && sb != Some(true)))
+        && (sa.is_some() || sb.is_some());
+    let signed = if narrowing_mask {
+        false
+    } else {
+        match (sa, sb) {
+            (Some(l), Some(r)) => l && r,
+            (Some(s), None) | (None, Some(s)) => s,
+            (None, None) => a.signed && b.signed,
+        }
+    };
+    let exact = match op {
+        BinaryOp::Add => x.add(y),
+        BinaryOp::Sub => x.sub(y),
+        BinaryOp::Mul => x.mul(y),
+        BinaryOp::Div | BinaryOp::Mod => {
+            if !la && signed && *x == ExactInt::pow2(wa - 1).neg() && *y == ExactInt::from_i128(-1)
+            {
+                return Err(FoldInvalid(format!(
+                    "signed {label} overflow (-2^{} / -1 does not fit `sint<{wa}>`)",
+                    wa - 1
+                )));
+            }
+            let Some((q, r)) = x.div_rem(y) else {
+                return Err(FoldInvalid(format!("{label} by zero")));
+            };
+            if matches!(op, BinaryOp::Div) {
+                q
+            } else {
+                r
+            }
+        }
+        BinaryOp::BitAnd => x.and(y),
+        BinaryOp::BitOr => x.or(y),
+        _ => x.xor(y),
+    };
+    let boolean_result = a.is_boolean_kind()
+        && b.is_boolean_kind()
+        && matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor);
+    if boolean_result {
+        return Ok(ConstVal::from_exact(
+            exact,
+            None,
+            true,
+            ConstProvenance::UntypedBool,
+        ));
+    }
+    if la && lb {
+        // An untyped literal tree is an exact integer.
+        let signed = signed || exact.is_negative();
+        return Ok(ConstVal::from_exact(
+            exact,
+            None,
+            signed,
+            ConstProvenance::Untyped,
+        ));
+    }
+    Ok(ConstVal::from_exact(
+        exact.normalize(width, signed),
+        Some(width),
+        signed,
+        ConstProvenance::Untyped,
+    ))
+}
+
+/// Owner decision D2 for a typed `const`: an initializer built from typed
+/// operands carries its ARCH result width, and a declared type narrower
+/// than that is the ordinary narrowing error. An untyped literal
+/// initializer is range-checked by `check_const_decl_type` instead.
+fn check_const_result_width(
+    ty: Option<&crate::ast::TypeExpr>,
+    value: &crate::ast::Expr,
+    consts: &HashMap<String, ConstVal>,
+) -> Result<(), ConstFoldErr> {
+    let Some(dw) = ty.and_then(exprs::cast_relabel_width) else {
+        return Ok(());
+    };
+    match const_arch_width(value, consts, true) {
+        Some((rw, true)) if rw > dw => Err(FoldInvalid(format!(
+            "the initializer is a {rw}-bit value (spec §2.4 result widths: `+`/`-` add \
+             one bit to the wider operand, `*` sums the operand widths), but the constant \
+             is declared {dw} bits. Widths must not shrink implicitly — use a wrapping \
+             operator (`+%`, `-%`, `*%`), an explicit `as uint<{dw}>` / `as sint<{dw}>` \
+             cast, or widen the declaration."
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Check the folded value against the declared type and retain that exact
-/// scalar type for later substitution. Widths below 64 are *validated*, not truncated: v1
-/// stores every ≤64-bit const in a 64-bit C type, so silently masking
-/// here would diverge from the legacy backend, and silently keeping an
-/// out-of-range value would make the declared width a lie. A value
-/// that does not fit the declared `uint<W>` / `sint<W>` is a precise
-/// compile-time error instead. Widths ≥ 64 (and missing/unknown
-/// types) pass through unchecked — the 64-bit fold domain cannot
-/// overflow them.
+/// scalar type for later substitution. The value is exact (constants fold at
+/// their ARCH result width), and it must fit the declared `uint<W>` /
+/// `sint<W>` exactly (strict fit, owner decision): a value that does not —
+/// `uint<64> = ~0`, `sint<63> = 0xFFFF_FFFF_FFFF_FFFF` — is a precise
+/// compile-time error, never a masked or reinterpreted pattern. Runtime
+/// stores apply the same rule (`check_literal_store_fits`).
 pub(crate) fn check_const_decl_type(
     ty: Option<&crate::ast::TypeExpr>,
     v: ConstVal,
 ) -> Result<ConstVal, String> {
     use crate::ast::{BuiltinTy, TypeArg, TypeExpr};
     let Some(TypeExpr::Builtin { name, args, .. }) = ty else {
-        // Untyped `const NAME = expr` — v1 stores it as `int64_t`.
         if ty.is_none() && v.is_boolean_kind() {
             return Ok(v);
         }
-        return Ok(ConstVal::untyped(v.bits, ty.is_none() || v.signed));
+        // An untyped constant keeps its exact value: signed while it fits
+        // the signed 64-bit carrier (or is negative), unsigned above that.
+        let signed = v.exact.is_negative() || v.exact.fits_i64();
+        return Ok(ConstVal::from_exact(
+            v.exact,
+            v.width,
+            signed,
+            ConstProvenance::Untyped,
+        ));
     };
     let width: Option<u32> = args.first().and_then(|a| match a {
         TypeArg::Expr(e) => match &*e.kind {
@@ -1265,54 +1809,85 @@ pub(crate) fn check_const_decl_type(
         _ => None,
     });
     match name {
+        BuiltinTy::UInt
+        | BuiltinTy::UIntCap
+        | BuiltinTy::Bits
+        | BuiltinTy::Int
+        | BuiltinTy::Time
+            if width.is_none() =>
+        {
+            // A widthless unsigned slot (`int`, `uint`) is the unsigned
+            // 64-bit carrier; the value must fit it (strict fit).
+            if !v.exact.fits(64, false) {
+                return Err(format!(
+                    "value {} does not fit `{}` (range 0..={})",
+                    v.exact,
+                    type_keyword(name),
+                    u64::MAX
+                ));
+            }
+            Ok(ConstVal::from_exact(
+                v.exact,
+                None,
+                false,
+                ConstProvenance::Typed(IrType::UInt(None)),
+            ))
+        }
         BuiltinTy::UInt | BuiltinTy::UIntCap | BuiltinTy::Bits | BuiltinTy::Int => {
-            if let Some(w) = width.filter(|w| (1..64).contains(w)) {
-                if v.is_negative() {
-                    return Err(format!(
-                        "value {} does not fit `{}<{w}>` — negative values \
-                         cannot initialize an unsigned constant (spell the \
-                         intended {w}-bit value explicitly, e.g. as a hex \
-                         literal)",
-                        v.as_i64(),
-                        type_keyword(name),
-                    ));
-                }
-                if v.bits >> w != 0 {
-                    return Err(format!(
-                        "value {} does not fit `{}<{w}>` (max {})",
-                        v.bits,
-                        type_keyword(name),
-                        (1u64 << w) - 1
-                    ));
+            if let Some(w) = width.filter(|w| *w > 0) {
+                if !v.exact.fits(w, false) {
+                    return Err(strict_fit_message(&v.exact, type_keyword(name), w, false));
                 }
             }
-            Ok(ConstVal::typed(v.bits, IrType::UInt(width)))
+            Ok(ConstVal::from_exact(
+                v.exact,
+                width,
+                false,
+                ConstProvenance::Typed(IrType::UInt(width)),
+            ))
         }
         BuiltinTy::SInt | BuiltinTy::SIntCap => {
-            if let Some(w) = width.filter(|w| (1..64).contains(w)) {
-                // The bit pattern is reinterpreted as signed 64-bit two's
-                // complement regardless of the expression's signedness —
-                // the mod-2^64 conversion C++20 defines and v1 performs
-                // (`sint<63> = 0xFFFF_FFFF_FFFF_FFFF` is -1 under v1, and
-                // `sint<64>` already accepted the same pattern here).
-                let s = v.bits as i64;
-                let min = -(1i64 << (w - 1));
-                let max = (1i64 << (w - 1)) - 1;
-                if s < min || s > max {
-                    return Err(format!(
-                        "value {s} does not fit `sint<{w}>` (range {min}..={max})"
-                    ));
+            if let Some(w) = width.filter(|w| *w > 0) {
+                if !v.exact.fits(w, true) {
+                    return Err(strict_fit_message(&v.exact, "sint", w, true));
                 }
             }
-            Ok(ConstVal::typed(v.bits, IrType::SInt(width)))
+            Ok(ConstVal::from_exact(
+                v.exact,
+                width,
+                true,
+                ConstProvenance::Typed(IrType::SInt(width)),
+            ))
         }
         BuiltinTy::Bool | BuiltinTy::BoolLower | BuiltinTy::Bit => Ok(ConstVal::typed(
             // v1 emits `static constexpr bool` — C++ bool conversion.
-            (v.bits != 0) as u64,
+            (!v.exact.is_zero()) as u64,
             IrType::Bool,
         )),
         _ => Ok(v),
     }
+}
+
+/// The strict-fit diagnostic for a declared constant or field default — the
+/// same wording a runtime store of the value gets.
+fn strict_fit_message(v: &ExactInt, keyword: &str, w: u32, signed: bool) -> String {
+    let one = ExactInt::from_i128(1);
+    let range = if signed {
+        format!(
+            "{}..={}",
+            ExactInt::pow2(w - 1).neg(),
+            ExactInt::pow2(w - 1).sub(&one)
+        )
+    } else {
+        format!("0..={}", ExactInt::pow2(w).sub(&one))
+    };
+    format!(
+        "value {v} does not fit `{keyword}<{w}>` (range {range}; it is {}). An untyped literal \
+         must fit its destination exactly — write the intended value (e.g. a hex literal), \
+         or convert explicitly with `as {}<{w}>`.",
+        exprs::literal_width_spelling(v),
+        if signed { "sint" } else { "uint" },
+    )
 }
 
 /// Surface keyword for an unsigned builtin scalar, for diagnostics.
@@ -1400,6 +1975,32 @@ fn surface_constraint_lower_error(
                 what: "string literal",
                 ..
             } => "String values are not supported in randomize constraints".to_string(),
+            // Owner decision D1 (R16 hunt 1): a sign mix between two
+            // operands of declared signedness is a program error in a
+            // constraint exactly as in procedural code. Before, this error
+            // was swallowed and the native solver silently picked a
+            // signedness by its own width rule.
+            CErr::SignednessMismatch {
+                op,
+                lhs_sign,
+                rhs_sign,
+                declared: true,
+                ..
+            } => {
+                let side = |sign: &crate::constraints::typed::Sign| match sign {
+                    crate::constraints::typed::Sign::Signed => "signed",
+                    crate::constraints::typed::Sign::Unsigned => "unsigned",
+                };
+                let msg = format!(
+                    "in a randomize constraint: operator `{op}` mixes signed and unsigned \
+                     operands (left is {}, right is {}). Signed and unsigned values never \
+                     combine implicitly — convert one operand explicitly with `as sint<N>` \
+                     or `as uint<N>`.",
+                    side(lhs_sign),
+                    side(rhs_sign),
+                );
+                return Some(LowerError::Invalid(msg));
+            }
             // Must stay in step with `LowerError::is_relation_error`,
             // which decides when the constraint walk may stop. A
             // relation variant that reaches here unhandled would be
@@ -1814,7 +2415,11 @@ fn lower_program_impl(
                 let value = sized_literals_as_values(&c.value);
                 let folded =
                     fold_const_with_helpers(&value, &const_vals, &c.name.name, &helper_registry)
-                        .and_then(|v| check_const_decl_type(c.ty.as_ref(), v).map_err(FoldInvalid));
+                        .and_then(|v| check_const_decl_type(c.ty.as_ref(), v).map_err(FoldInvalid))
+                        .and_then(|v| {
+                            check_const_result_width(c.ty.as_ref(), &value, &const_vals)?;
+                            Ok(v)
+                        });
                 let v = match folded {
                     Ok(v) => v,
                     Err(ConstFoldErr::Unsupported(detail)) => {
@@ -2783,6 +3388,9 @@ fn lower_program_impl(
                                     crate::constraints::typed_lower::LowerError::DisallowedInConstraint {
                                         what: "string literal",
                                         ..
+                                    } | crate::constraints::typed_lower::LowerError::SignednessMismatch {
+                                        declared: true,
+                                        ..
                                     }
                                 )
                         })
@@ -2838,6 +3446,9 @@ fn lower_program_impl(
                                 error,
                                 crate::constraints::typed_lower::LowerError::DisallowedInConstraint {
                                     what: "string literal",
+                                    ..
+                                } | crate::constraints::typed_lower::LowerError::SignednessMismatch {
+                                    declared: true,
                                     ..
                                 }
                             )
@@ -6416,6 +7027,7 @@ fn lower_test(
         // order (deterministic schema order).
         for s in &test_let_stmts {
             let StmtKind::Let(l) = &s.kind else { continue };
+            exprs::reject_untyped_literal_let(l, consts)?;
             if !promoted_lets.contains(&l.name.name) {
                 if let Some(ty) = l.ty.as_ref().and_then(tb_scalar_field_ir_type).or_else(|| {
                     l.value.as_ref().and_then(|value| {
@@ -7769,13 +8381,51 @@ fn infer_promoted_scalar_type(
             | BinaryOp::BitAnd
             | BinaryOp::BitOr
             | BinaryOp::BitXor => {
-                let lhs =
+                let lhs_ty =
                     infer_promoted_scalar_type(lhs, prior_lets, helpers, extern_fns, record_ids);
-                let rhs =
+                let rhs_ty =
                     infer_promoted_scalar_type(rhs, prior_lets, helpers, extern_fns, record_ids);
-                match (lhs, rhs) {
-                    (Some(lhs), Some(rhs)) => exprs::common_expr_type(Some(lhs), Some(rhs)),
+                let common = match (lhs_ty.clone(), rhs_ty.clone()) {
+                    (Some(l), Some(r)) => exprs::common_expr_type(Some(l), Some(r)),
                     _ => None,
+                };
+                // Owner decision D2: `+ - *` carry their ARCH result width
+                // (`middle + 1` on a `uint<32>` is `uint<33>`), within the
+                // carrier tier the operands are computed in.
+                let width_of = |e: &crate::ast::Expr, ty: &Option<IrType>| match ty {
+                    Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w))) => Some(*w),
+                    Some(IrType::Unknown) => match &*exprs::unparen_expr(e).kind {
+                        ExprKind::Int(text) => {
+                            exprs::parse_int_literal(text).map(|v| (64 - v.leading_zeros()).max(1))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let arch = match (op, width_of(lhs, &lhs_ty), width_of(rhs, &rhs_ty)) {
+                    (BinaryOp::Add | BinaryOp::Sub, Some(l), Some(r)) => {
+                        Some((l.max(r) + 1, l.max(r)))
+                    }
+                    (BinaryOp::Mul, Some(l), Some(r)) => Some((l + r, l.max(r))),
+                    _ => None,
+                };
+                let tier = |w: u32| match w {
+                    0..=64 => 0,
+                    65..=128 => 1,
+                    _ => 2,
+                };
+                match (arch, &common) {
+                    (Some((width, operands)), Some(IrType::UInt(Some(_))))
+                        if tier(width) == tier(operands) =>
+                    {
+                        Some(IrType::UInt(Some(width)))
+                    }
+                    (Some((width, operands)), Some(IrType::SInt(Some(_))))
+                        if tier(width) == tier(operands) =>
+                    {
+                        Some(IrType::SInt(Some(width)))
+                    }
+                    _ => common,
                 }
             }
             _ => None,
@@ -7806,7 +8456,24 @@ fn infer_promoted_scalar_type(
                 _ => None,
             }
         }
-        ExprKind::Call { callee, .. } => {
+        ExprKind::Call { callee, args } => {
+            // A width method names its result width.
+            if let ExprKind::Field { target, name } = &*callee.kind {
+                let width = match args.first() {
+                    Some(crate::ast::CallArg::Expr(e)) => exprs::const_eval_width(e),
+                    _ => None,
+                };
+                let source =
+                    infer_promoted_scalar_type(target, prior_lets, helpers, extern_fns, record_ids);
+                return match (name.name.as_str(), width) {
+                    ("sext", Some(w)) => Some(IrType::SInt(Some(w))),
+                    ("resize", Some(w)) if matches!(source, Some(IrType::SInt(_))) => {
+                        Some(IrType::SInt(Some(w)))
+                    }
+                    ("trunc" | "zext" | "resize", Some(w)) => Some(IrType::UInt(Some(w))),
+                    _ => None,
+                };
+            }
             let ExprKind::Ident(id) = &*callee.kind else {
                 return None;
             };
@@ -8468,10 +9135,11 @@ pub(crate) fn fold_signed_const(
         ),
         ConstFoldErr::Invalid(detail) => LowerError::Invalid(format!("the {what}: {detail}")),
     })?;
-    Ok(if v.is_negative() {
-        v.as_i64() as i128
-    } else {
-        v.bits as i128
+    v.exact.to_i128().ok_or_else(|| {
+        LowerError::Invalid(format!(
+            "the {what} folds to {}, which does not fit 128 bits",
+            v.exact
+        ))
     })
 }
 
@@ -8570,18 +9238,18 @@ pub(crate) fn fold_addr_const(
         ),
         ConstFoldErr::Invalid(detail) => LowerError::Invalid(format!("the {what}: {detail}")),
     })?;
-    // An untyped `const` is stored SIGNED (`check_const_decl_type`), so
-    // this rejects a value at or above 2^63 reached through one, not
-    // only a genuinely negative fold. That is the intended trade: it
-    // catches `@ 0 - 8`, and an address that large is spelled
-    // `const B : uint<64> = ...`, which folds unsigned and passes. The
-    // message says so rather than leaving the user to discover it.
+    // Constants fold exactly, so only a genuinely negative value (or one
+    // past 64 bits) is rejected; `@ 0 - 8` is caught here.
     if v.is_negative() {
         return Err(LowerError::Invalid(format!(
-            "the {what} folds to {}, and must not be negative. (An untyped `const` folds \
-             SIGNED, so a value at or above 2^63 lands here too; declare it as \
-             `const NAME : uint<64> = ...` to spell one.)",
-            v.as_i64()
+            "the {what} folds to {}, and must not be negative.",
+            v.exact
+        )));
+    }
+    if !v.exact.fits_u64() {
+        return Err(LowerError::Invalid(format!(
+            "the {what} folds to {}, which does not fit 64 bits.",
+            v.exact
         )));
     }
     Ok(v.bits)

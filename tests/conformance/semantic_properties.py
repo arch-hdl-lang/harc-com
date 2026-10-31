@@ -54,7 +54,7 @@ function port_fast(d: Top) -> bool
     return d.scalar
 end function port_fast
 function port_full(d: Top) -> bool
-    let ignored = 0
+    let ignored : uint<64> = 0
     return d.scalar
 end function port_full
 """]
@@ -96,7 +96,7 @@ end function port_full
     return d.value
 end function wide_port_fast
 function wide_port_full(d: Top) -> bool
-    let ignored = 0
+    let ignored : uint<64> = 0
     return d.value
 end function wide_port_full
 """)
@@ -128,10 +128,15 @@ end function select_{key}
                 chosen_a = choose != reverse
                 observation(case, case, -2 if chosen_a else 7, bw)
                 observation(case + "sign", f"{case} < 0", int(chosen_a), 1)
+    # A wrapping result is unsigned, so a conditional pairing it with the
+    # all-ones pattern is unsigned in either arm order and never `< 0`.
+    # The pattern is spelled as an explicit unsigned conversion: a bare
+    # `-1` arm is signed and the conditional would mix signedness (D1).
     for i, op in enumerate(["+%", "-%", "*%"]):
         for choose in [False, True]:
             for reverse in [False, True]:
-                left, right = ("-1", f"(7 {op} 1)") if reverse else (f"(7 {op} 1)", "-1")
+                ones = "(-1 as uint<64>)"
+                left, right = (ones, f"(7 {op} 1)") if reverse else (f"(7 {op} 1)", ones)
                 key = f"wrapshape{i}{int(choose)}{int(reverse)}"
                 constants.append(f"const C{key} : bool = ({str(choose).lower()} ? {left} : {right}) < 0\n")
                 observation(key, f"C{key}", 0, 1)

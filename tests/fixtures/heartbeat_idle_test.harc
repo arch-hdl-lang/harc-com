@@ -41,7 +41,7 @@ agent Producer
     on in_ev(t)
         // Body intentionally simple — the `_last_in_cycle` bump at
         // entry is what matters here, not the body content.
-        seen = seen + 1
+        seen = (seen + 1).trunc<32>()
     end on
 end agent Producer
 
@@ -73,11 +73,11 @@ impl HeartbeatIdleTest for HeartbeatIdleTb
         // After the last emit, the agent should report
         // `idle_in(N)` true once N cycles have elapsed since the
         // last bump. Poll with a bounded safety budget.
-        let waited = 0
-        let budget = 100
+        let waited : uint<64> = 0
+        let budget : uint<64> = 100
         while !prod.idle_in(8) && waited < budget
             wait 1 cycle
-            waited = waited + 1
+            waited = waited +% 1
         end while
 
         assert prod.idle_in(8)

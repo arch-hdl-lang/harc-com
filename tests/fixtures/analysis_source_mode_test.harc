@@ -9,17 +9,17 @@ transactor ModeRelay
     active_ticks : uint<32> default 0
 
     hookable publish(v: uint<8>)
-        published = published + 1
+        published = (published + 1).trunc<32>()
         emit observed(v)
     end publish
 
     when active
         hookable activate()
-            active_calls = active_calls + 1
+            active_calls = (active_calls + 1).trunc<32>()
         end activate
 
         on 1 cycles
-            active_ticks = active_ticks + 1
+            active_ticks = (active_ticks + 1).trunc<32>()
         end on
     end when
 end transactor ModeRelay
@@ -29,8 +29,8 @@ scoreboard ModeSink
     sum   : uint<32> default 0
 
     hookable accept(v: uint<8>)
-        count = count + 1
-        sum = sum + v
+        count = (count + 1).trunc<32>()
+        sum = (sum + v).trunc<32>()
     end accept
 end scoreboard ModeSink
 

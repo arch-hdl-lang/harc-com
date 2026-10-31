@@ -16,10 +16,10 @@ function run_count(dut: FsmCounter, target: uint<8>, expected_count: uint<8>)
     wait 1 cycle               // IDLE → COUNTING (with cnt_r=0, tgt_r=target)
     dut.go = 0
 
-    let _w = 0
+    let _w : uint<64> = 0
     while !dut.done && _w < 20
         wait 1 cycle
-        _w = _w + 1
+        _w = _w +% 1
     end while
     assert dut.done
         else fail("done never asserted within 20 cycles for target=${target}")

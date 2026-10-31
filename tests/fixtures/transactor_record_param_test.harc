@@ -62,7 +62,7 @@ impl TransactorRecordParamTest for TransactorRecordParamTb
         // Three commands of increasing length (1, 2, 3 ticks). Each
         // bumps the running total; `run_for` consumes the record by
         // value and pulses `en` for `cmd.ticks` cycles.
-        let total = 0
+        let total : uint<32> = 0
         for i in 0 .. 2
             let cmd : RunCmd
             assert cmd.ticks == 1
@@ -71,7 +71,7 @@ impl TransactorRecordParamTest for TransactorRecordParamTb
                 else fail("cmd[${i}]: expect not re-zeroed (${cmd.expect})")
 
             cmd.ticks = cmd.ticks + i        // 1, 2, 3
-            total = total + cmd.ticks
+            total = (total + cmd.ticks).trunc<32>()
             cmd.expect = total
 
             drv.run_for(cmd)

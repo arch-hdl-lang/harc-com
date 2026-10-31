@@ -13,9 +13,9 @@ transactor HookedDriver
 
     when active
         hookable go()
-            calls = calls + 1
-            _last_in_cycle = _last_in_cycle + 1
-            _last_out_cycle = _last_out_cycle + 2
+            calls = (calls + 1).trunc<32>()
+            _last_in_cycle = (_last_in_cycle + 1).trunc<32>()
+            _last_out_cycle = (_last_out_cycle + 2).trunc<32>()
             dut.en = 1
         end go
     end when
@@ -32,7 +32,7 @@ impl TransactorHookExactInstanceTest for TransactorHookTb
     clock clk = SysDomain
 
     on left.go post
-        left_hooks = left_hooks + 1
+        left_hooks = (left_hooks + 1).trunc<32>()
     end on
 
     run
