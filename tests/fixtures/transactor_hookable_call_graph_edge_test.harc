@@ -29,13 +29,13 @@ transactor ProducerXact
     helper : HelperCommon
 
     hookable produce_value() -> uint<32>
-        return 7u32
+        return 7
     end produce_value
 end transactor ProducerXact
 
 transactor HelperCommon
     hookable noop() -> uint<32>
-        return 0u32
+        return 0
     end noop
 end transactor HelperCommon
 

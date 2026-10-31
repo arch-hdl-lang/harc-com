@@ -250,7 +250,9 @@ int run_TransactionBasicTest(int argc, char** argv) {
         _fatal = true;
     });
 
-    sim_log_line("INFO", "seed=%llu", (long long)harc_rng.state);
+    // The seed line is logged at verbosity LOW so it prints at every
+    // `--verbosity` (the --seed help promises it on every run).
+    { harc_rt::log::HarcLogAttrScope _harc_seed_always(harc_rt::log::HARC_V_LOW, nullptr); sim_log_line("INFO", "seed=%llu", (long long)harc_rng.state); }
 
     harc_rt::ThreadScheduler sched;
     TxnBasicTb _tb;

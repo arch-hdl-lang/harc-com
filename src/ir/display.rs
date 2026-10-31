@@ -870,8 +870,15 @@ fn stmt_str(func: &TbFunction, s: &Stmt) -> String {
                 local_str(func, *dest)
             )
         }
-        Stmt::Log { level, args } => {
-            format!("Log({}, {})", level_str(level), fmt_args_str(func, args))
+        Stmt::Log { level, args, attrs } => {
+            let mut extra = String::new();
+            if let Some(v) = attrs.verbosity {
+                extra.push_str(&format!(", verbosity={}", v.name()));
+            }
+            if let Some(id) = &attrs.id {
+                extra.push_str(&format!(", id={id:?}"));
+            }
+            format!("Log({}, {}{extra})", level_str(level), fmt_args_str(func, args))
         }
         Stmt::AssumeCheck { cond, on_fail } => format!(
             "AssumeCheck {{ cond: {}, on_fail: {} }}",

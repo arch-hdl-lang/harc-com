@@ -7,10 +7,45 @@
 #include <cstdint>
 #include <cstring>
 #include <cerrno>
+#include <mutex>
+#include <set>
 #include <string>
 
 namespace harc_rt {
+
+// Suite mode: with no `--test` / `HARC_TEST`, the generated `main()` runs
+// every test of the suite in order (`harc_run_suite`). Each test still
+// gets a fresh context; the per-test banner is replaced by one aggregate
+// banner for the whole suite. Output files are shared across the tests of
+// one process through `harc_output_open_mode`.
+struct HarcSuiteRun {
+    bool active = false;
+    size_t index = 0;  // 1-based index of the running test while active
+    const char* name = nullptr;  // running test's name while active
+};
+
+inline HarcSuiteRun& harc_suite_run() {
+    static HarcSuiteRun state;
+    return state;
+}
+
+// fopen mode for an output file (sim.log, the semantic trace, `logf`
+// files, the coverage JSONL). During a whole-suite run, the first open of a
+// path in this process truncates it ("w") and every later open appends
+// ("a"): the suite accumulates every test's output, while a file first
+// written by a later test still starts empty instead of appending to a
+// previous invocation's. Outside a suite run (a selected test, or a
+// harness driving runs itself) every run truncates, as before.
+inline const char* harc_output_open_mode(const char* path) {
+    if (!harc_suite_run().active) return "w";
+    static std::mutex lock;
+    static std::set<std::string> opened;
+    std::lock_guard<std::mutex> guard(lock);
+    return opened.insert(path ? path : "").second ? "w" : "a";
+}
+
 namespace trace {
+
 
 inline std::string harc_trace_u128(unsigned __int128 value) {
     char digits[40];
@@ -66,7 +101,7 @@ struct HarcTraceWriter {
     void open_env() {
         const char* p = std::getenv("HARC_TRACE");
         if (p && *p) {
-            out = std::fopen(p, "w");
+            out = std::fopen(p, harc_output_open_mode(p));
             enabled = (out != nullptr);
             if (!enabled) {
                 open_failed = true;

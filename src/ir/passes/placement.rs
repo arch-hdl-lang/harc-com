@@ -911,6 +911,7 @@ mod tests {
                         fmt: "hello".to_string(),
                         args: vec![],
                     },
+                    attrs: Default::default(),
                 }],
                 Terminator::Return,
             )],

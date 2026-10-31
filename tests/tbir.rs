@@ -10115,26 +10115,17 @@ end impl T"#
 }
 
 #[test]
-fn discarded_scalar_expression_statements_lower_without_a_v1_fallback() {
-    let src = r#"test DiscardExpr
-    let dut : Top
-    run
-        1 + 2
-        true && false
-    end run
-end test DiscardExpr"#;
-    let prog = lower_src(src).expect("discarded scalar expressions lower");
-    verify::verify_program(&prog).expect("discarded scalar expressions verify");
-    let run = prog.function(prog.tests[0].run);
-    assert!(
-        run.blocks
-            .iter()
-            .flat_map(|block| &block.stmts)
-            .filter(|stmt| matches!(stmt, ir::Stmt::Assign(..)))
-            .count()
-            >= 2,
-        "both expressions must remain evaluated in unread temporaries: {run}"
-    );
+fn discarded_scalar_expression_statements_are_rejected() {
+    // Spec §1 "Statement separation": an expression statement must have an
+    // effect, so a pure value whose result is discarded is a compile error
+    // (it used to lower into unread temporaries).
+    for body in ["1 + 2", "true && false"] {
+        let src = format!(
+            "test DiscardExpr\n    let dut : Top\n    run\n        {body}\n    end run\nend test DiscardExpr"
+        );
+        let err = parse_source(&src).expect_err("a discarded pure expression is rejected");
+        assert!(err.to_string().contains("expression statement has no effect"), "{err}");
+    }
 }
 
 #[test]
@@ -49682,7 +49673,7 @@ end test T
 
     let after_src = r#"
 function after_value() -> uint<8>
-    after 1 cycle
+    after 1 cycles
     end after
     return 1
 end function after_value

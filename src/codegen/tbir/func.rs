@@ -3886,7 +3886,7 @@ fn emit_stmt(
             let base = super::expr::port_signal(cx, p)?;
             writeln!(out, "{pad}{base}_en = 0;").ok();
         }
-        Stmt::Log { level, args } => {
+        Stmt::Log { level, args, attrs } => {
             let (sev, file) = match level {
                 LogLevel::Debug => ("DEBUG", None),
                 LogLevel::Info => ("INFO", None),
@@ -3904,7 +3904,24 @@ fn emit_stmt(
                     Some(path.as_str()),
                 ),
             };
-            emit_log_call(out, cx, sev, file, args, depth)?;
+            if attrs.is_empty() {
+                emit_log_call(out, cx, sev, file, args, depth)?;
+            } else {
+                // Per-message verbosity / id: a scoped runtime attribute
+                // the print filter (`harc_log_enabled`) consults.
+                let verbosity = attrs.verbosity.map_or(-1, |v| i32::from(v.rank()));
+                let id = attrs
+                    .id
+                    .as_deref()
+                    .map_or("nullptr".to_string(), |id| format!("\"{}\"", escape_c(id)));
+                writeln!(
+                    out,
+                    "{pad}{{ harc_rt::log::HarcLogAttrScope _harc_log_attrs({verbosity}, {id});"
+                )
+                .ok();
+                emit_log_call(out, cx, sev, file, args, depth + 1)?;
+                writeln!(out, "{pad}}}").ok();
+            }
             // Spec §7.7 test-result semantics (mirrors v1's emit_log).
             match sev {
                 "ERROR" => {
@@ -9289,6 +9306,7 @@ mod lifecycle_classifier_tests {
                     fmt: "boom".to_string(),
                     args: vec![],
                 },
+                attrs: Default::default(),
             }],
             Terminator::Fatal(crate::ir::FmtArgs {
                 fmt: "boom".to_string(),

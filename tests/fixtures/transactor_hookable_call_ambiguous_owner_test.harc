@@ -36,7 +36,7 @@ end transactor CallerXact
 
 transactor HelperA
     hookable produce_value() -> uint<32>
-        return 1u32
+        return 1
     end produce_value
 end transactor HelperA
 
@@ -45,6 +45,6 @@ transactor HelperB
     // ambiguous-owner branch (`externals.len() > 1`) and causes
     // rule 2 to skip the edge.
     hookable produce_value() -> uint<32>
-        return 2u32
+        return 2
     end produce_value
 end transactor HelperB

@@ -703,7 +703,7 @@ impl Emitter {
         if log_seed {
             writeln!(
                 self.out,
-                "{INDENT}sim_log_line(\"INFO\", \"seed=%llu\", (long long)harc_rng.state);"
+                "{INDENT}{{ harc_rt::log::HarcLogAttrScope _harc_seed_always(harc_rt::log::HARC_V_LOW, nullptr); sim_log_line(\"INFO\", \"seed=%llu\", (long long)harc_rng.state); }}"
             )
             .ok();
             writeln!(self.out, "").ok();

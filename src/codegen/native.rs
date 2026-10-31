@@ -27,9 +27,10 @@
 //!     - `fatal` increments + sets `_fatal`, and the main simulation loop
 //!       exits at end of the current cycle (this test instance aborts).
 //!     - `warn` / `info` / `debug` have no test-result effect.
-//!   Verbosity flags, component IDs, and per-component overrides are
-//!   spec'd in §7.7 but deferred — the runtime currently prints all
-//!   severities unconditionally.
+//!   The `--verbosity` threshold is applied by the shared runtime
+//!   (`harc_log_enabled` in runtime/harc_log_rt.h; debug is hidden by
+//!   default). Per-message `verbosity=` / `id=` are carried only
+//!   by TB-IR (this deprecated v1 emitter ignores them).
 //!
 //! Out of scope here:
 //! - `tseq`, randomization, properties, coverage groups, fork/join, env/

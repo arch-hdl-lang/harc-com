@@ -85,7 +85,7 @@ enum Cmd {
         #[arg(long)]
         ast: bool,
     },
-    /// Pretty-print HARC source file(s) (round-trip-safe).
+    /// Pretty-print one HARC source file (round-trip-safe).
     Fmt {
         /// Input .harc file
         file: PathBuf,
@@ -149,19 +149,20 @@ enum Cmd {
         /// type of `let dut : <Type>` in the HARC source.
         #[arg(long)]
         top: Option<String>,
-        /// Pick a specific test by name (when input contains more than one).
+        /// Run only the named test. Without it (and without `HARC_TEST`),
+        /// every test in the suite runs and the pass/fail banner covers
+        /// all of them.
         #[arg(long)]
         test: Option<String>,
         /// Codegen scope. `suite` keeps the current build-once-run-many
         /// binary; `test` requires `--test` and compiles only that test.
         #[arg(long, value_enum, default_value_t = CompileScope::Suite)]
         compile_scope: CompileScope,
-        /// C++ emitter selection. Defaults to `tbir` for normal sim/build
-        /// and to `v1` for `--check-backends` until that mode supports
-        /// TB-IR. `v1` remains the legacy direct AST → C++ escape hatch.
-        /// `tbir` covers the MVP statement subset and rejects everything
-        /// else with a structured error. Not combinable with `--mt`,
-        /// `--cpp-split tests`, or `--check-backends`.
+        /// C++ emitter selection. Defaults to `tbir` everywhere, including
+        /// `--check-backends` (both legs use the selected codegen). `v1`
+        /// remains the deprecated direct AST → C++ escape hatch. `tbir`
+        /// covers the MVP statement subset and rejects everything else
+        /// with a structured error.
         #[arg(long, value_enum)]
         codegen: Option<CodegenKind>,
         /// Split generated C++ output. `tests` writes one dispatcher plus
@@ -198,11 +199,13 @@ enum Cmd {
         /// Output directory for the generated C++ TB and arch_sim_build/
         #[arg(long)]
         outdir: Option<PathBuf>,
-        /// PRNG seed for randomize() calls. Default: env HARC_SEED, else 1.
+        /// PRNG seed for randomize() calls. Default: env HARC_SEED (decimal
+        /// or 0x-prefixed hex; an unparsable value is an error), else 1.
         /// The seed is logged to sim.log on every run for reproducibility.
         #[arg(long)]
         seed: Option<u64>,
-        /// Just emit the C++ TB; do not invoke `arch sim`.
+        /// Just emit the C++ TB; do not compile or run it (under
+        /// `--check-backends`, emit both legs and skip the diff).
         #[arg(long)]
         emit_only: bool,
         /// Path to the `arch` binary (default: search $PATH, fall back to
@@ -364,6 +367,21 @@ enum Cmd {
         /// the same cycle) reports as divergence.
         #[arg(long)]
         check_backends: bool,
+        /// Log verbosity threshold (spec §7.7): LOW, MEDIUM, HIGH, DEBUG or
+        /// FULL (case-insensitive). Only messages whose verbosity is at or
+        /// below it print; `error`/`fatal` always print. Default MEDIUM:
+        /// `warn`/`info` (MEDIUM) print, `debug` (HIGH) is hidden until
+        /// `--verbosity HIGH` or above. Suppressed messages are still
+        /// recorded in the semantic trace. Forwarded to the simulation as
+        /// `HARC_VERBOSITY` (both legs under `--check-backends`).
+        #[arg(long, value_enum, ignore_case = true)]
+        verbosity: Option<Verbosity>,
+        /// Per-ID verbosity threshold, repeatable: `--verbosity-of
+        /// AXI_DRV=HIGH`. Applies to log calls carrying that exact
+        /// `id="..."` (spec §7.7) and replaces `--verbosity` for them.
+        /// Forwarded as `HARC_VERBOSITY_OF`.
+        #[arg(long = "verbosity-of", value_name = "ID=LEVEL")]
+        verbosity_of: Vec<String>,
     },
     /// Parse + merge HARC source file(s), lower to the typed TB-IR,
     /// verify it, and print the textual IR form. Exits 1 with a
@@ -638,6 +656,8 @@ fn main() -> Result<()> {
             sim_args,
             check_backends,
             cosim,
+            verbosity,
+            verbosity_of,
         } => {
             let captured = files.clone();
             learn_wrap(&captured, || {
@@ -652,6 +672,8 @@ fn main() -> Result<()> {
                     verilator_args: verilator_args.clone(),
                     jobs,
                     sim_args: sim_args.clone(),
+                    verbosity,
+                    verbosity_of: parse_verbosity_of(&verbosity_of)?,
                 };
                 let z3_opts = Z3PathOpts {
                     root: z3_root.clone(),
@@ -659,6 +681,21 @@ fn main() -> Result<()> {
                     lib_dir: z3_lib_dir.clone(),
                 };
                 let codegen = effective_codegen(codegen);
+                // Name the missing/unreadable path and its flag up front,
+                // instead of a bare OS error from deep inside the build.
+                for (flag, paths) in [
+                    (None, &files),
+                    (Some("--dut"), &dut),
+                    (Some("--sv"), &sv),
+                    (Some("--vlt"), &vlt),
+                    (Some("--ref-src"), &ref_src),
+                ] {
+                    for path in paths {
+                        require_input_file(path, flag)?;
+                    }
+                }
+                // One HARC_SEED parser for plain sim and --check-backends.
+                let seed = resolve_seed(seed, std::env::var_os("HARC_SEED").as_deref())?;
                 if check_backends && coverage_json.is_some() {
                     return Err(miette::miette!(
                         "--coverage-json is not supported with --check-backends"
@@ -678,8 +715,16 @@ fn main() -> Result<()> {
                         params.clone(),
                         top.clone(),
                         test.clone(),
+                        compile_scope,
+                        SplitOpts {
+                            mode: cpp_split,
+                            group_size: cpp_split_group_size,
+                            layout: cpp_split_layout,
+                            emit_jobs,
+                        },
                         outdir.clone(),
                         seed,
+                        emit_only,
                         arch_bin.clone(),
                         mt,
                         coverage,
@@ -687,6 +732,7 @@ fn main() -> Result<()> {
                         build_profile_input.clone(),
                         z3_opts,
                         rebuild,
+                        record_trace.clone(),
                         wave_opts,
                         codegen,
                     )
@@ -922,6 +968,58 @@ struct WaveOpts {
     verilator_args: Vec<String>,
     jobs: Option<u32>,
     sim_args: Vec<String>,
+    /// `--verbosity`: forwarded to the simulation as `HARC_VERBOSITY`.
+    verbosity: Option<Verbosity>,
+    /// `--verbosity-of`, canonical `id=LEVEL,...`; forwarded as
+    /// `HARC_VERBOSITY_OF`.
+    verbosity_of: Option<String>,
+}
+
+/// Validate `--verbosity-of ID=LEVEL` entries and join them into the
+/// canonical `HARC_VERBOSITY_OF` form (`id=LEVEL,id=LEVEL`).
+fn parse_verbosity_of(entries: &[String]) -> Result<Option<String>> {
+    use clap::ValueEnum;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let parsed = entry.rsplit_once('=').and_then(|(id, level)| {
+            let level = Verbosity::from_str(level, true).ok()?;
+            (!id.is_empty() && !id.contains(',')).then(|| format!("{id}={}", level.as_env()))
+        });
+        out.push(parsed.ok_or_else(|| {
+            miette::miette!(
+                "--verbosity-of `{entry}`: expected ID=LEVEL with a non-empty ID (no `,`) and \
+                 LEVEL one of LOW, MEDIUM, HIGH, DEBUG, FULL"
+            )
+        })?);
+    }
+    Ok(Some(out.join(",")))
+}
+
+/// Log verbosity threshold (spec §7.7). Only messages whose verbosity is
+/// at or below the threshold print; `error` and `fatal` always print.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "UPPER")]
+enum Verbosity {
+    Low,
+    Medium,
+    High,
+    Debug,
+    Full,
+}
+
+impl Verbosity {
+    fn as_env(self) -> &'static str {
+        match self {
+            Verbosity::Low => "LOW",
+            Verbosity::Medium => "MEDIUM",
+            Verbosity::High => "HIGH",
+            Verbosity::Debug => "DEBUG",
+            Verbosity::Full => "FULL",
+        }
+    }
 }
 
 /// Split-C++-emission options carried through `cmd_sim`. Groups the
@@ -1458,8 +1556,38 @@ fn resolve_use_imports(
     imported
 }
 
+/// Read a source/input file, naming the path (and the CLI flag that
+/// supplied it, when there is one) in the error instead of surfacing a
+/// bare OS error like "No such file or directory".
+fn read_source_file(path: &std::path::Path, flag: Option<&str>) -> Result<String> {
+    fs::read_to_string(path).map_err(|e| {
+        let what = match flag {
+            Some(flag) => format!("{flag} file"),
+            None => "file".to_string(),
+        };
+        miette::miette!("cannot read {what} `{}`: {e}", path.display())
+    })
+}
+
+/// Fail early, naming the path and flag, when a CLI input file is missing,
+/// unreadable, or not a regular file.
+fn require_input_file(path: &std::path::Path, flag: Option<&str>) -> Result<()> {
+    let what = match flag {
+        Some(flag) => format!("{flag} file"),
+        None => "input file".to_string(),
+    };
+    match fs::metadata(path) {
+        Ok(meta) if meta.is_file() => Ok(()),
+        Ok(_) => Err(miette::miette!(
+            "{what} `{}` is not a regular file",
+            path.display()
+        )),
+        Err(e) => Err(miette::miette!("cannot read {what} `{}`: {e}", path.display())),
+    }
+}
+
 fn parse_file(path: &PathBuf) -> Result<harc::ast::SourceFile> {
-    let src = fs::read_to_string(path).into_diagnostic()?;
+    let src = read_source_file(path, None)?;
     harc::parser::parse_source_named(path.display().to_string(), &src).map_err(|e| {
         Report::new(e).with_source_code(NamedSource::new(path.display().to_string(), src))
     })
@@ -1583,8 +1711,9 @@ fn validate_check_backend_codegen_limitations(path: &PathBuf, src: &str) -> Resu
 
 fn cmd_check(files: Vec<PathBuf>, ast: bool) -> Result<()> {
     let mut total_items = 0;
+    let mut parsed_files = Vec::with_capacity(files.len());
     for file in &files {
-        let src = fs::read_to_string(file).into_diagnostic()?;
+        let src = read_source_file(file, None)?;
         let parsed = parse_file_source(file, &src)?;
         validate_check_backend_codegen_limitations(file, &src)?;
         total_items += parsed.items.len();
@@ -1592,6 +1721,18 @@ fn cmd_check(files: Vec<PathBuf>, ast: bool) -> Result<()> {
             println!("// {}", file.display());
             println!("{:#?}", parsed);
         }
+        parsed_files.push(parsed);
+    }
+    // Qualified `extend` targets resolve across every checked file (spec
+    // §3.6 depth-1 rule); `use` imports carry only buses, never packages.
+    let all: Vec<&harc::ast::SourceFile> = parsed_files.iter().collect();
+    if let Err(e) = harc::codegen::merge::validate_extend_targets(&all) {
+        let source = all.iter().find_map(|f| f.source_for_id(e.source)).cloned();
+        let report = Report::new(e.error);
+        return Err(match source {
+            Some(s) => report.with_source_code(NamedSource::new(s.name.to_string(), s.text.to_string())),
+            None => report,
+        });
     }
     if !ast {
         println!(
@@ -2608,6 +2749,12 @@ fn run_verilator(
     if let Some(s) = seed {
         cmd.env("HARC_SEED", s.to_string());
     }
+    if let Some(v) = waves.verbosity {
+        cmd.env("HARC_VERBOSITY", v.as_env());
+    }
+    if let Some(v) = &waves.verbosity_of {
+        cmd.env("HARC_VERBOSITY_OF", v);
+    }
     // Per-test selection at runtime (Phase 1b of
     // docs/separate-compilation-plan.md). The binary now contains
     // every test in the source as a separate `run_<TestName>`
@@ -2834,6 +2981,26 @@ fn cmd_sim(
     let merged = harc::codegen::merge::merge_for_sim(all_files, test.as_deref())
         .map_err(|e| miette::miette!("{}", e))?;
     let merge_elapsed = merge_started.elapsed();
+    // An ambient `HARC_TEST` selects the test at runtime exactly as
+    // `--test` does, so it counts as a selection here too.
+    if cosim.is_some() && test.is_none() && std::env::var_os("HARC_TEST").is_none() {
+        let names: Vec<&str> = merged
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                harc::ast::Item::Test(t) => Some(t.name.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        if names.len() > 1 {
+            return Err(miette::miette!(
+                "--cosim dpi runs one test per simulation, and this suite has {} tests ({}); \
+                 select one with --test <name> (or HARC_TEST)",
+                names.len(),
+                names.join(", ")
+            ));
+        }
+    }
     // Suite scope hands the merged file straight to codegen. It used to
     // `.clone()` here, which on a large suite is a deep copy of the whole
     // merged AST — 9.4s of a 46s frontend on the 352-test benchmark — and
@@ -3800,6 +3967,12 @@ fn cmd_sim(
     if let Some(s) = seed {
         cmd.env("HARC_SEED", s.to_string());
     }
+    if let Some(v) = waves.verbosity {
+        cmd.env("HARC_VERBOSITY", v.as_env());
+    }
+    if let Some(v) = &waves.verbosity_of {
+        cmd.env("HARC_VERBOSITY_OF", v);
+    }
     forward_arch_test_selection(&mut cmd, test.as_deref());
     // `arch sim` compiles the generated C++ testbench itself. When the TB
     // uses the runtime constraint solver it `#include`s `harc_z3_rt.h`
@@ -3863,8 +4036,11 @@ fn cmd_sim_check_backends(
     params: Vec<String>,
     top: Option<String>,
     test: Option<String>,
+    compile_scope: CompileScope,
+    split: SplitOpts,
     outdir: Option<PathBuf>,
     seed: Option<u64>,
+    emit_only: bool,
     arch_bin: Option<PathBuf>,
     mt: bool,
     coverage: bool,
@@ -3872,6 +4048,7 @@ fn cmd_sim_check_backends(
     external_build_profile_inputs: Vec<String>,
     z3_opts: Z3PathOpts,
     rebuild: bool,
+    record_trace: Option<PathBuf>,
     waves: WaveOpts,
     codegen: CodegenKind,
 ) -> Result<()> {
@@ -3879,6 +4056,24 @@ fn cmd_sim_check_backends(
         return Err(miette::miette!(
             "--check-backends requires BOTH --dut <file.arch> and --sv <file.sv>"
         ));
+    }
+    // Options that cannot mean anything under a dual-backend run are
+    // rejected rather than silently dropped. `--emit-only` and
+    // `--compile-scope` are forwarded to both legs below.
+    if record_trace.is_some() {
+        return Err(miette::miette!(
+            "--record-trace is not supported with --check-backends: the run records one trace \
+             per backend, always at <outdir>/trace_arch.jsonl and <outdir>/trace_sv.jsonl"
+        ));
+    }
+    if split.mode == CppSplit::Tests || split.layout == CppSplitLayout::Common {
+        return Err(miette::miette!(
+            "--cpp-split tests / --cpp-split-layout common are not supported with \
+             --check-backends: the ARCH (--dut) backend has no split C++ build"
+        ));
+    }
+    if compile_scope == CompileScope::Test && test.is_none() {
+        return Err(miette::miette!("--compile-scope test requires --test <name>"));
     }
     // The ARCH leg cannot forward --sim-arg; refuse before creating any
     // output directory (its inner `cmd_sim` would refuse only afterwards).
@@ -3906,9 +4101,8 @@ fn cmd_sim_check_backends(
 
     // Same seed for both runs — randomize() output must match for the
     // diff to be meaningful. Default matches cmd_sim's default.
-    let resolved_seed = seed
-        .or_else(|| std::env::var("HARC_SEED").ok().and_then(|v| v.parse().ok()))
-        .or(Some(1));
+    // `seed` already folds in `$HARC_SEED` (see `resolve_seed`).
+    let resolved_seed = seed.or(Some(1));
 
     eprintln!("--check-backends: running ARCH (`arch sim`) backend...");
     cmd_sim(
@@ -3919,12 +4113,12 @@ fn cmd_sim_check_backends(
         params.clone(),
         top.clone(),
         test.clone(),
-        CompileScope::Suite,
+        compile_scope,
         codegen,
-        SplitOpts::default(),
+        split,
         Some(arch_outdir.clone()),
         resolved_seed,
-        false,
+        emit_only,
         arch_bin.clone(),
         mt,
         coverage,
@@ -3949,12 +4143,12 @@ fn cmd_sim_check_backends(
         params.clone(),
         top.clone(),
         test.clone(),
-        CompileScope::Suite,
+        compile_scope,
         codegen,
-        SplitOpts::default(),
+        split,
         Some(sv_outdir.clone()),
         resolved_seed,
-        false,
+        emit_only,
         arch_bin.clone(),
         mt,
         coverage,
@@ -3972,6 +4166,16 @@ fn cmd_sim_check_backends(
         Vec::new(),
         None,
     )?;
+
+    if emit_only {
+        eprintln!(
+            "--check-backends: --emit-only: emitted both backends' testbenches under {} and {}; \
+             nothing was compiled or run, so there are no traces to diff",
+            arch_outdir.display(),
+            sv_outdir.display()
+        );
+        return Ok(());
+    }
 
     eprintln!(
         "--check-backends: diffing {} against {}...",
@@ -3994,6 +4198,57 @@ fn cmd_sim_check_backends(
             sv_trace.display()
         ))
     }
+}
+
+/// Parse a `HARC_SEED` value: decimal (`42`) or `0x`/`0X`-prefixed hex
+/// (`0x2a`), as an unsigned 64-bit value. A single `_` may separate two
+/// digits (`1_000`, `0xdead_beef`); a leading, trailing or doubled `_`, a
+/// sign, or any other character is an error rather than a silent fallback.
+fn parse_harc_seed(raw: &str) -> std::result::Result<u64, String> {
+    let (body, radix) = match raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        Some(hex) => (hex, 16),
+        None => (raw, 10),
+    };
+    let well_formed = !body.is_empty()
+        && !body.starts_with('_')
+        && !body.ends_with('_')
+        && !body.contains("__")
+        && body.chars().all(|c| c == '_' || c.is_digit(radix));
+    let parsed = if well_formed {
+        u64::from_str_radix(&body.replace('_', ""), radix).ok()
+    } else {
+        None
+    };
+    parsed.ok_or_else(|| {
+        format!(
+            "HARC_SEED=`{raw}` is not a valid seed: expected an unsigned 64-bit decimal \
+             (e.g. 42) or 0x-prefixed hex (e.g. 0x2a) value"
+        )
+    })
+}
+
+/// Resolve the effective seed for `harc sim`: `--seed` wins, then a
+/// non-empty `$HARC_SEED` (parsed by `parse_harc_seed`, an unparsable value
+/// is an error), else `None` (the runtime default of 1). The resolved
+/// value is always handed to the simulation as decimal, so every backend
+/// sees the same number.
+fn resolve_seed(
+    flag: Option<u64>,
+    env: Option<&std::ffi::OsStr>,
+) -> Result<Option<u64>> {
+    if flag.is_some() {
+        return Ok(flag);
+    }
+    let Some(raw) = env else {
+        return Ok(None);
+    };
+    let raw = raw
+        .to_str()
+        .ok_or_else(|| miette::miette!("HARC_SEED is not valid UTF-8"))?;
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    parse_harc_seed(raw).map(Some).map_err(|e| miette::miette!("{e}"))
 }
 
 fn effective_codegen(codegen: Option<CodegenKind>) -> CodegenKind {
@@ -4123,6 +4378,27 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn harc_seed_accepts_decimal_and_hex_and_rejects_the_rest() {
+        assert_eq!(parse_harc_seed("42"), Ok(42));
+        assert_eq!(parse_harc_seed("010"), Ok(10));
+        assert_eq!(parse_harc_seed("0x10"), Ok(16));
+        assert_eq!(parse_harc_seed("0XfF"), Ok(255));
+        assert_eq!(parse_harc_seed("1_000"), Ok(1000));
+        assert_eq!(parse_harc_seed("18446744073709551615"), Ok(u64::MAX));
+        assert_eq!(parse_harc_seed("0xdead_beef"), Ok(0xdead_beef));
+        for bad in [
+            "banana", "-1", "+5", "0x+5", "0x-1", "1__0", "_1", "1_", "0x_1", "0x", "",
+            "18446744073709551616", " 1", "1 ", "1.5", "0b1",
+        ] {
+            assert!(parse_harc_seed(bad).is_err(), "{bad} accepted");
+        }
+        let flag = resolve_seed(Some(7), Some(std::ffi::OsStr::new("banana"))).unwrap();
+        assert_eq!(flag, Some(7), "--seed wins over HARC_SEED");
+        assert_eq!(resolve_seed(None, Some(std::ffi::OsStr::new(""))).unwrap(), None);
+        assert!(resolve_seed(None, Some(std::ffi::OsStr::new("banana"))).is_err());
+    }
 
     /// Regression guard for the `--check-backends` self-poisoning bug:
     /// both backends used to share one outdir, so the ARCH-sim stub

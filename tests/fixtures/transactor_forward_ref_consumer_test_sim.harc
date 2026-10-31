@@ -11,6 +11,6 @@
 
 transactor ProducerXact
     hookable count() -> uint<32>
-        return 0u32
+        return 0
     end count
 end transactor ProducerXact

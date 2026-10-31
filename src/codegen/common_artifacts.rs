@@ -1116,11 +1116,22 @@ fn render_registry_impl(
         writeln!(out, "        }}").ok();
         writeln!(out, "    }}").ok();
     }
+    // No `--test` / `HARC_TEST`: run the whole suite with one aggregate
+    // banner; a single-test suite runs its test directly.
+    writeln!(out, "    if (!test_sel) {{").ok();
     writeln!(
         out,
-        "    if (!test_sel) return harc_suite_tests[0]->run(argc, argv);"
+        "        if (harc_suite_test_count == 1) return harc_suite_tests[0]->run(argc, argv);"
     )
     .ok();
+    writeln!(
+        out,
+        "        return harc_rt::log::harc_run_suite(argc, argv, harc_suite_test_count, \
+         [](size_t i) {{ return harc_suite_tests[i]->name; }}, \
+         [](size_t i, int c, char** v) {{ return harc_suite_tests[i]->run(c, v); }});"
+    )
+    .ok();
+    writeln!(out, "    }}").ok();
     writeln!(
         out,
         "    for (size_t _i = 0; _i < harc_suite_test_count; ++_i) {{"
@@ -2865,7 +2876,10 @@ mod tests {
                     "int main(int argc, char** argv) {{\n",
                     "    const char* test_sel = harc_rt::log::harc_select_test(argc, argv);\n",
                     "    constexpr size_t harc_suite_test_count = sizeof(harc_suite_tests) / sizeof(harc_suite_tests[0]);\n",
-                    "    if (!test_sel) return harc_suite_tests[0]->run(argc, argv);\n",
+                    "    if (!test_sel) {{\n",
+                    "        if (harc_suite_test_count == 1) return harc_suite_tests[0]->run(argc, argv);\n",
+                    "        return harc_rt::log::harc_run_suite(argc, argv, harc_suite_test_count, [](size_t i) {{ return harc_suite_tests[i]->name; }}, [](size_t i, int c, char** v) {{ return harc_suite_tests[i]->run(c, v); }});\n",
+                    "    }}\n",
                     "    for (size_t _i = 0; _i < harc_suite_test_count; ++_i) {{\n",
                     "        if (std::strcmp(test_sel, harc_suite_tests[_i]->name) == 0) {{\n",
                     "            return harc_suite_tests[_i]->run(argc, argv);\n",
