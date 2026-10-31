@@ -45,6 +45,12 @@ class Node:
     data: object = None
 
 
+def flatten(output):
+    """A compiler diagnostic as one line: the renderer wraps long messages
+    across `│`-prefixed lines."""
+    return ' '.join(output.replace('│', ' ').split())
+
+
 def lit(n):
     return Node('lit', data=n)
 
@@ -74,8 +80,68 @@ def shape(e):
         a, b = map(shape, e.args[1:])
     else:
         a, b = map(shape, e.args)
+    if e.op in ('+', '-'):
+        width = max(a.width, b.width) + 1
+    elif e.op == '*':
+        width = a.width + b.width
+    elif e.op in ('/', '%'):
+        width = a.width
+    elif e.op == '&' and not (a.boolean or b.boolean) and (
+            (a.width < b.width and not a.signed) or (b.width < a.width and not b.signed)):
+        # The narrower UNSIGNED operand bounds an `&`; the result is then
+        # unsigned (spec, result widths of binary operators).
+        return Ty(False, min(a.width, b.width))
+    else:
+        width = max(a.width, b.width)
     return Ty(False if e.op in ('+%', '-%', '*%') else a.signed and b.signed,
-              max(a.width, b.width), a.boolean and b.boolean)
+              width, a.boolean and b.boolean)
+
+
+# Operators whose two operands must share declared signedness (owner
+# decision D1): comparison, equality, arithmetic and bitwise. Shift counts
+# and the logical connectives are exempt.
+SIGN_CHECKED = ('+', '-', '*', '/', '%', '&', '|', '^', '==', '!=', '<', '<=', '>', '>=')
+
+
+def binary(op, a, b):
+    """A binary node whose operands agree on signedness. A mixed pair gets
+    an explicit `as uint<64>` on its signed side -- the conversion the
+    previous implicit rule applied -- so mixed-sign evaluation is still
+    exercised, through the explicit cast, and the oracle value is unchanged."""
+    if op in SIGN_CHECKED:
+        sa, sb = shape(a), shape(b)
+        if not (sa.boolean or sb.boolean) and sa.signed != sb.signed:
+            if sa.signed:
+                a = cast(a, U)
+            else:
+                b = cast(b, U)
+    return Node(op, (a, b))
+
+
+def ternary(cond, a, b):
+    """A conditional whose arms agree on signedness (owner decision, R16
+    review: mixed arms are a compile-time error). A mixed pair gets an
+    explicit `as uint<64>` on its signed arm -- the unsigned result type
+    the previous implicit rule gave the conditional -- so the selected
+    bits, and the oracle value, are unchanged."""
+    sa, sb = shape(a), shape(b)
+    if not (sa.boolean or sb.boolean) and sa.signed != sb.signed:
+        if sa.signed:
+            a = cast(a, U)
+        else:
+            b = cast(b, U)
+    return Node('?:', (cond, a, b))
+
+
+def mixes_signedness(e):
+    """Does any sign-checked operator, or a conditional's arms, in `e` see
+    a sint/uint mix?"""
+    pair = e.args[1:] if e.op == '?:' else e.args if e.op in SIGN_CHECKED else ()
+    if pair:
+        sa, sb = map(shape, pair)
+        if not (sa.boolean or sb.boolean) and sa.signed != sb.signed:
+            return True
+    return any(mixes_signedness(a) for a in e.args)
 
 
 def normalize(bits, ty):
@@ -90,13 +156,21 @@ def normalize(bits, ty):
     return low & mask(WORD)
 
 
-def interpret(e, env, word=WORD, legacy_casts=False):
+def interpret(e, env, word=WORD, legacy_casts=False, arch=False):
     """64-bit carrier semantics; `word=w` supplies typed-SMT BV semantics.
 
     `legacy_casts` models the deprecated `--codegen v1` backend, whose casts
     are carrier relabels that leave the 64-bit value unchanged. TB-IR (the
     language) gives a cast the target-width value.
+
+    `arch` is the language's value semantics (spec, result widths of binary
+    operators): every node is exact at its ARCH result width, so `+ - *`
+    never wrap at the 64-bit carrier and an unsigned difference is its
+    result-width pattern (`uint<64>(0) - uint<64>(15)` is the 65-bit
+    2**65 - 15). A value is then held as its `ty.width`-bit pattern.
     """
+    if arch:
+        return interpret_arch(e, env)
     ty = shape(e)
     if e.op == 'lit':
         return Value(e.data & mask(word), ty)
@@ -153,6 +227,65 @@ def interpret(e, env, word=WORD, legacy_casts=False):
     return Value(value & mask(word), ty)
 
 
+def arch_number(v):
+    """The integer an `arch` value denotes: its pattern read at its width."""
+    if v.ty.signed and not v.ty.boolean and v.bits >> (v.ty.width - 1):
+        return v.bits - (1 << v.ty.width)
+    return v.bits
+
+
+def interpret_arch(e, env):
+    """`interpret(..., arch=True)`: exact values at ARCH result widths."""
+    ty = shape(e)
+    def make(value):
+        return Value(int(value) & mask(ty.width), ty)
+    if e.op == 'lit':
+        return make(e.data)
+    if e.op == 'bool':
+        return Value(int(e.data), B)
+    if e.op == 'var':
+        return make(env[e.data[0]])
+    if e.op == 'cast':
+        # The target-width value of the operand's value.
+        inner = arch_number(interpret_arch(e.args[0], env))
+        return make(normalize(inner, ty))
+    a = interpret_arch(e.args[0], env)
+    if e.op == '&&' and a.bits == 0:
+        return Value(0, B)
+    if e.op == '||' and a.bits != 0:
+        return Value(1, B)
+    if e.op == '?:':
+        chosen = e.args[1] if a.bits else e.args[2]
+        return make(arch_number(interpret_arch(chosen, env)))
+    x = arch_number(a)
+    if e.op in ('neg', '~', '!'):
+        value = {'neg': lambda: -x, '~': lambda: ~x, '!': lambda: int(a.bits == 0)}[e.op]()
+        if e.op == 'neg' and ty.signed and not -(1 << (ty.width - 1)) <= value < (1 << (ty.width - 1)):
+            raise OverflowError('signed negation overflow')
+        return make(value)
+    b = interpret_arch(e.args[1], env)
+    y = arch_number(b)
+    if e.op in ('/', '%'):
+        if y == 0:
+            raise ZeroDivisionError('evaluated zero divisor')
+        if a.ty.signed and b.ty.signed and x == -(1 << (a.ty.width - 1)) and y == -1:
+            raise OverflowError('signed division overflow')
+    value = {
+        '+': lambda: x + y, '-': lambda: x - y, '*': lambda: x * y,
+        '+%': lambda: a.bits + b.bits, '-%': lambda: a.bits - b.bits,
+        '*%': lambda: a.bits * b.bits,
+        '/': lambda: quotient(x, y), '%': lambda: x - quotient(x, y) * y,
+        '&': lambda: x & y, '|': lambda: x | y, '^': lambda: x ^ y,
+        '==': lambda: int(x == y), '!=': lambda: int(x != y),
+        '<': lambda: int(x < y), '<=': lambda: int(x <= y),
+        '>': lambda: int(x > y), '>=': lambda: int(x >= y),
+        '<<': lambda: x << b.bits, '>>': lambda: x >> b.bits,
+        '&&': lambda: int(a.bits != 0 and b.bits != 0),
+        '||': lambda: int(a.bits != 0 or b.bits != 0),
+    }[e.op]()
+    return make(value)
+
+
 def render(e, names=None, extra=False):
     names = names or {}
     if e.op == 'var':
@@ -186,14 +319,14 @@ def trees(seed, random_count=80):
         if op == 'cast':
             return cast(number(depth-1), Ty(rng.choice([False, True]), rng.choice([8, 32, 64])))
         if op == 'neg':
-            return Node(op, (cast(Node('%', (number(depth-1), lit(127))), I),))
+            return Node(op, (cast(binary('%', number(depth-1), lit(127)), I),))
         if op == '~':
             # File constants complement all 64 carrier bits. TBIR runtime
             # complements at the operand's declared width; explicit uint64
             # keeps this cross-context property in their shared domain.
             return Node(op, (cast(number(depth-1), U),))
         if op in ('/', '%'):
-            return Node(op, (number(depth-1), lit(rng.choice([1, 2, 3]))))
+            return binary(op, number(depth-1), lit(rng.choice([1, 2, 3])))
         if op in ('<<', '>>'):
             a = number(depth-1)
             if op == '<<':
@@ -204,20 +337,20 @@ def trees(seed, random_count=80):
             return Node(rng.choice(['+%', '-%', '*%']),
                         (cast(number(depth-1), t), cast(number(depth-1), t)))
         if op == '?:':
-            return Node(op, (boolean(depth-1), number(depth-1), number(depth-1)))
+            return ternary(boolean(depth-1), number(depth-1), number(depth-1))
         a, b = number(depth-1), number(depth-1)
         if op in ('+', '-', '*'):
-            a, b = Node('%', (a, lit(127))), Node('%', (b, lit(127)))
-        return Node(op, (a, b))
+            a, b = binary('%', a, lit(127)), binary('%', b, lit(127))
+        return binary(op, a, b)
     def boolean(depth):
         if depth and rng.randrange(3) == 0:
             return Node(rng.choice(['&&', '||']), (boolean(depth-1), boolean(depth-1)))
-        return Node(rng.choice(['==', '!=', '<', '<=', '>', '>=']),
-                    (number(max(0, depth-1)), number(max(0, depth-1))))
+        return binary(rng.choice(['==', '!=', '<', '<=', '>', '>=']),
+                      number(max(0, depth-1)), number(max(0, depth-1)))
     numeric_count = random_count * 3 // 5
     result = [number(4) for _ in range(numeric_count)] + [boolean(4) for _ in range(random_count - numeric_count)]
-    bad = Node('/', (lit(1), lit(0)))
-    bad_bool = Node('==', (bad, lit(0)))
+    bad = binary('/', lit(1), lit(0))
+    bad_bool = binary('==', bad, lit(0))
     result += [Node('&&', (Node('bool', data=False), bad_bool)),
                Node('||', (Node('bool', data=True), bad_bool)),
                Node('?:', (Node('bool', data=True), var('x'), bad)),
@@ -226,8 +359,9 @@ def trees(seed, random_count=80):
     # these boundaries remain covered independently of the seeded trees.
     for op in ['+%', '-%', '*%']:
         wrapped = Node(op, (cast(var('x'), Ty(False, 8)), cast(var('y'), Ty(False, 8))))
-        selected = Node('?:', (Node('<', (var('x'), var('y'))), wrapped, var('u', U)))
-        result += [Node('>>', (cast(selected, I), lit(1))), Node('<', (selected, lit(0)))]
+        selected = Node('?:', (binary('<', var('x'), var('y')), wrapped, var('u', U)))
+        result += [Node('>>', (cast(selected, I), lit(1))), binary('<', selected, lit(0))]
+    assert not any(mixes_signedness(e) for e in result), 'generated tree mixes signedness'
     return result
 
 
@@ -238,7 +372,7 @@ def generate_expressions(root, seed, expressions=None):
     constants, body, expected, expected_v1, cases = [], '', {}, {}, []
     for ei, e in enumerate(expressions):
         for vi, env in enumerate(environments):
-            want = interpret(e, env)
+            want = interpret(e, env, arch=True)
             # The deprecated v1 backend keeps relabel casts; it is checked
             # against that model, the language (TB-IR) against `want`.
             want_v1 = interpret(e, env, legacy_casts=True)
@@ -258,14 +392,17 @@ def generate_expressions(root, seed, expressions=None):
                 constants.append(f'const C{key} = {constant}\n')
                 body += f'        let R{key} = {runtime}\n'
                 width = 1 if want.ty.boolean else 64
+                # The observation reads `(value as uint<64>)`: the low 64
+                # bits of the exact value (a signed value sign-extends).
+                want_bits = want.bits if want.ty.boolean else arch_number(want) & mask(WORD)
                 for context, value in [('const', f'C{key}'), ('runtime', f'R{key}')]:
                     identity = key + context
                     expr = value if width == 1 else f'({value} as uint<64>)'
-                    expected[identity] = [want.bits, width]
+                    expected[identity] = [want_bits, width]
                     expected_v1[identity] = [want_v1.bits, width]
                     body += observe(identity, expr, width)
                 cases.append({'id': key, 'tree': dataclasses.asdict(e), 'environment': env,
-                              'source': runtime, 'expected': want.bits, 'width': width})
+                              'source': runtime, 'expected': want_bits, 'width': width})
     assert expressions and len(expected) == len(expressions) * len(environments) * 4
     (root/'expressions.harc').write_text(''.join(constants) + test('Expressions', body))
     (root/'expression_expected.json').write_text(json.dumps(expected, indent=2))
@@ -373,6 +510,20 @@ def mathematical_accepts(p, x, y):
     raise AssertionError(f'unknown model contract {family}')
 
 
+def pin(signed):
+    """The pin local's type: the model field's signedness (D1)."""
+    return 'sint<64>' if signed else 'uint<64>'
+
+
+def pin_value(index, bias, signed):
+    """`index - bias` as a 64-bit pin. The difference is narrowed back to 64
+    bits explicitly (D2), and an unsigned field's pin is the explicit
+    `as uint<64>` conversion of the signed difference -- the conversion the
+    previous implicit rule applied, so out-of-domain probes stay UNSAT."""
+    value = f'(({index} as sint<64>) - {bias}).resize<64>()'
+    return value if signed else f'({value} as uint<64>)'
+
+
 def generate_models(root):
     typed = root/'models'
     typed.mkdir(exist_ok=True)
@@ -400,8 +551,8 @@ def generate_models(root):
         body += f'''        let p{p.id} : T{p.id}
         for ax in 0..{n+1}
             for by in 0..{n+1}
-                let px : sint<64> = (ax as sint<64>) - {biasx+1}
-                let py : sint<64> = (by as sint<64>) - {biasy+1}
+                let px : {pin(p.signed_x)} = {pin_value('ax', biasx + 1, p.signed_x)}
+                let py : {pin(p.signed_y)} = {pin_value('by', biasy + 1, p.signed_y)}
                 log(info, "MODEL_BEGIN {p.id} ${{ax}} ${{by}}")
                 blocking randomize(p{p.id}) with
                     p{p.id}.x == px
@@ -476,7 +627,35 @@ def compare_models(label, actual, expected):
         raise AssertionError(f'{label}: missing valid models {sorted(missing)[:8]}; accepted invalid models {sorted(extra)[:8]}')
 
 
+def native_expression_rejection(root, harc):
+    """A tree whose operator mixes signedness without the explicit
+    conversion is a compile-time error (D1), as a constant and at runtime."""
+    names = {'x': 'Kx', 'u': 'Ku'}
+    mixed = render(Node('<', (var('x'), var('u', U))), names)
+    arms = render(Node('?:', (Node('bool', data=True), var('x'), var('u', U))), names)
+    assert mixes_signedness(Node('?:', (Node('bool', data=True), var('x'), var('u', U))))
+    for name, body in [('const', f'const Kx : sint<64> = -1\nconst Ku : uint<64> = 5\nconst Cmixed = {mixed}\n'
+                                 + test('RejectedConst', '        log(info, "${Cmixed}")\n')),
+                       ('runtime', test('RejectedRuntime', '        let Kx : sint<64> = -1\n        let Ku : uint<64> = 5\n'
+                                       f'        let Rmixed = {mixed}\n        log(info, "${{Rmixed}}")\n'))]:
+        probe = root/f'expression_rejected_{name}.harc'
+        probe.write_text(body)
+        code, output = run([harc, 'dump-ir', probe], root, 60, env={**os.environ, 'HARC_NO_LEARN': '1'})
+        assert code != 0 and 'mixes signed and unsigned operands' in flatten(output), (name, output)
+    # Conditional arms of different signedness are rejected the same way.
+    for name, body in [('const_arms', f'const Kx : sint<64> = -1\nconst Ku : uint<64> = 5\nconst Carms = {arms}\n'
+                                      + test('RejectedConstArms', '        log(info, "${Carms}")\n')),
+                       ('runtime_arms', test('RejectedRuntimeArms', '        let Kx : sint<64> = -1\n        let Ku : uint<64> = 5\n'
+                                            f'        let Rarms = {arms}\n        log(info, "${{Rarms}}")\n'))]:
+        probe = root/f'expression_rejected_{name}.harc'
+        probe.write_text(body)
+        code, output = run([harc, 'dump-ir', probe], root, 60, env={**os.environ, 'HARC_NO_LEARN': '1'})
+        assert code != 0 and 'arms of a conditional' in flatten(output), (name, output)
+    print('expressions: unconverted mixed-sign operators and conditional arms rejected (const and runtime)', flush=True)
+
+
 def native_expressions(root, harc, backends=('v1', 'tbir')):
+    native_expression_rejection(root, harc)
     for backend in backends:
         name = 'expression_expected_v1.json' if backend == 'v1' else 'expression_expected.json'
         expected = json.loads((root/name).read_text())
@@ -525,7 +704,35 @@ def native_models(root, harc):
         print(f'models/{backend}: 38 exact model sets, 4120 assignments including boundaries', flush=True)
 
 
+MIXED_CAPTURES = {
+    'A': ('U32', 'a.x == 0\n            a.x < lim64', 'let lim64 : sint<64> = -1'),
+    'B': ('S32', 'b.x == -1\n            b.x < lim8', 'let lim8 : uint<8> = 255'),
+    'C': ('S8', 'c.x == -1\n            c.x < lim32', 'let lim32 : uint<32> = 0'),
+}
+
+
+def native_capture_rejections(root, harc):
+    """The pre-D1 spellings compare a field with a capture of the other
+    signedness; each is a compile-time error before any solver runs."""
+    for identity, (txn, clauses, binding) in MIXED_CAPTURES.items():
+        field = {'U32': 'uint<32>', 'S32': 'sint<32>', 'S8': 'sint<8>'}[txn]
+        receiver = identity.lower()
+        source = (f'transaction {txn}\n    x : {field}\nend transaction {txn}\n'
+                  + test('Rejected' + identity, f"""        {binding}
+        let {receiver} : {txn}
+        blocking randomize({receiver}) with
+            {clauses}
+        end randomize
+"""))
+        probe = root/f'capture_rejected_{identity}.harc'
+        probe.write_text(source)
+        code, output = run([harc, 'dump-ir', probe], root, 60, env={**os.environ, 'HARC_NO_LEARN': '1'})
+        assert code != 0 and 'mixes signed and unsigned operands' in flatten(output), (identity, output)
+    print('capture ranks: 3 mixed-sign captures rejected at compile time', flush=True)
+
+
 def native_capture_ranks(root, harc):
+    native_capture_rejections(root, harc)
     source = """transaction U32
     x : uint<32>
 end transaction U32
@@ -539,19 +746,23 @@ end transaction S8
         let lim64 : sint<64> = -1
         let lim8 : uint<8> = 255
         let lim32 : uint<32> = 0
+        // Explicit conversions into each field's signedness (D1).
+        let lim64_u : uint<32> = (lim64 as uint<64>).trunc<32>()
+        let lim8_s : sint<32> = (lim8.zext<32>() as sint<32>)
+        let lim32_s : sint<8> = (lim32.trunc<8>() as sint<8>)
         let a : U32
         let b : S32
         let c : S8
         log(info, "RANK_BEGIN A")
         blocking randomize(a) with
             a.x == 0
-            a.x < lim64
+            a.x < lim64_u
         end randomize
         log(info, "RANK_END A")
         log(info, "RANK_BEGIN B")
         blocking randomize(b) with
             b.x == -1
-            b.x < lim8
+            b.x < lim8_s
             !((b.x < 0) != flag)
             flag
         end randomize
@@ -559,7 +770,7 @@ end transaction S8
         log(info, "RANK_BEGIN C")
         blocking randomize(c) with
             c.x == -1
-            c.x < lim32
+            c.x < lim32_s
         end randomize
         log(info, "RANK_END C")
 """)
@@ -571,17 +782,37 @@ end transaction S8
                         '--outdir', root/'capture_ranks'], root, 180,
                        env={**os.environ, 'HARC_NO_LEARN': '1'})
     (root/'capture_ranks.log').write_text(output)
-    assert code > 0, output
-    assert re.findall(r'(?m)^(\d+) TESTS FAILED$', output) == ['2'], output
-    for identity, unsat in [('A', True), ('B', False), ('C', True)]:
+    # Explicit conversions: 0 < 0xffffffff, -1 < 255 and -1 < 0 all hold.
+    assert code == 0 and 'ALL TESTS PASSED' in output, output
+    for identity, unsat in [('A', False), ('B', False), ('C', False)]:
         segments = re.findall(rf'RANK_BEGIN {identity}\n(.*?)RANK_END {identity}', output, re.S)
         assert len(segments) == 1 and ('UNSAT' in segments[0]) == unsat, output
         assert 'unknown' not in segments[0].lower(), output
     assert 'RANK_END B ffffffffffffffff' in output, output
-    print('capture ranks/tbir: 3 signed/unsigned runtime binding contracts', flush=True)
+    print('capture ranks/tbir: 3 explicitly converted runtime binding contracts', flush=True)
 
 
 def self_test():
+    # ARCH result widths: an unsigned difference of two `uint<64>` is a
+    # 65-bit value, so `(0 - 15) % 127` is (2**65 - 15) % 127 = 116, not
+    # the 64-bit carrier's (2**64 - 15) % 127 = 114; carries are exact.
+    diff = binary('%', binary('-', var('a', U), var('b', U)), cast(lit(127), U))
+    assert interpret(diff, dict(a=0, b=15), arch=True).bits == 116
+    assert interpret(diff, dict(a=0, b=15)).bits == 114
+    carry = binary('+', var('a', U), cast(lit(1), U))
+    assert interpret(carry, dict(a=mask(64)), arch=True).bits == 1 << 64
+    assert arch_number(interpret(binary('*', var('x'), var('y')),
+                                 dict(x=-(1 << 63), y=-(1 << 63)), arch=True)) == 1 << 126
+    # `&` with a narrower unsigned operand is that operand's width, unsigned.
+    assert shape(binary('&', cast(var('x'), Ty(False, 8)), var('u', U))) == Ty(False, 8)
+    # `ternary` converts a mixed pair explicitly without changing the
+    # selected value, and the converted form no longer mixes.
+    for choose in (True, False):
+        raw = Node('?:', (Node('bool', data=choose), var('x'), var('u', U)))
+        converted = ternary(Node('bool', data=choose), var('x'), var('u', U))
+        assert mixes_signedness(raw) and not mixes_signedness(converted)
+        env = dict(x=-7, u=5)
+        assert interpret(raw, env).bits == interpret(converted, env).bits
     assert interpret(Node('/', (lit(-5), lit(3))), {}).number() == -1
     assert interpret(Node('%', (lit(-5), lit(3))), {}).number() == -2
     # A cast is the target-width value: `-1 as uint<8>` is 255, `0xFC as
@@ -609,6 +840,26 @@ def self_test():
         else:
             raise AssertionError('model comparator accepted missing/extra models')
     compare_models('identity', {(0, 0)}, {(0, 0)})
+    # D2: ARCH result widths drive the shape (and untyped-let inference).
+    u8 = cast(var('u', U), Ty(False, 8))
+    assert shape(Node('+', (u8, u8))).width == 9
+    assert shape(Node('-', (u8, u8))).width == 9
+    assert shape(Node('*', (u8, u8))).width == 16
+    assert shape(Node('+%', (u8, u8))).width == 8
+    assert shape(Node('/', (u8, cast(lit(3), Ty(False, 2))))).width == 8
+    # D1: a mixed pair gets an explicit conversion with the old value, and
+    # the generated trees never mix signedness.
+    mixed = Node('<', (var('x'), var('u', U)))
+    assert mixes_signedness(mixed)
+    converted = binary('<', var('x'), var('u', U))
+    assert not mixes_signedness(converted) and converted.args[0].op == 'cast'
+    for env in [dict(x=-1, u=5), dict(x=3, u=5)]:
+        assert interpret(converted, env).bits == interpret(mixed, env).bits
+    assert not any(mixes_signedness(e) for e in trees(SEED))
+    assert not any(mixes_signedness(e) for e in trees(1))
+    assert len(trees(SEED)) == 80 + 4 + 6
+    assert pin_value('ax', 3, False) == '(((ax as sint<64>) - 3).resize<64>() as uint<64>)'
+
 
 
 def main():
