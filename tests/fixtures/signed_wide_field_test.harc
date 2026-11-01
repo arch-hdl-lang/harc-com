@@ -35,7 +35,7 @@ impl SignedWideFieldTest for SignedFieldTb
         wait 1 cycle
         let got : sint<129> = holder.read()
         assert got < 0 else fail("component signed wide field lost its sign")
-        let back : sint<129> = 0 - got
+        let back : sint<129> = -got
         assert back > 0 else fail("component signed wide field magnitude wrong")
 
         // data-only scoreboard field

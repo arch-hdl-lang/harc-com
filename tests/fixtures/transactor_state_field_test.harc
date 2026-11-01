@@ -66,7 +66,7 @@ transactor CamStateXactor
             last_any = dut.search_any != 0
             // Bare-name state read + write — TransactorState read,
             // TransactorStateWrite of the incremented value.
-            probe_count = probe_count + 1
+            probe_count = (probe_count + 1).trunc<32>()
         end do_probe
 
         // Recursive fixed-vector state retains every index in both the

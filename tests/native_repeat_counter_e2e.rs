@@ -12,18 +12,18 @@ end testbench RepeatCounterTb
 
 impl RepeatCounterTest for RepeatCounterTb
     run
-        let __harc_repeat_counter_1 = 99
-        let count = 0
+        let __harc_repeat_counter_1 : uint<64> = 99
+        let count : uint<64> = 0
         repeat __harc_repeat_counter_0
-            count = count + 1
+            count = count +% 1
         end repeat
         assert count == 3 else fail("repeat bound did not execute exactly 3 times")
 
-        let _r = 2
+        let _r : uint<64> = 2
         repeat 2
-            _r = _r + 1
+            _r = _r +% 1
             repeat _r
-                count = count + 1
+                count = count +% 1
             end repeat
         end repeat
         assert _r == 4 else fail("source _r was not writable")

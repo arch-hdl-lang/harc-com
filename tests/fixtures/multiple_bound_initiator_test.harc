@@ -6,7 +6,7 @@ transactor CountingHelper bound to BusAxiLite
     when active
         hookable clear_aw()
             bus.aw.valid = 0
-            calls = calls + 1
+            calls = calls +% 1
         end clear_aw
 
         hookable clear_aw_twice()

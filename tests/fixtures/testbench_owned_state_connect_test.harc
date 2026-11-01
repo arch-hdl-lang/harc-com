@@ -18,8 +18,8 @@ scoreboard TbSink
     sum   : uint<32> default 0
 
     hookable accept(v: uint<8>)
-        count = count + 1
-        sum = sum + v
+        count = (count + 1).trunc<32>()
+        sum = (sum + v).trunc<32>()
     end accept
 end scoreboard TbSink
 

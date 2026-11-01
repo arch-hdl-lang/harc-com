@@ -40,7 +40,7 @@ testbench TseqLcTb
     setup
         let txns = Gen(3)
         for t in txns
-            total = total + t.len
+            total = (total + t.len).trunc<32>()
         end for
     end setup
 

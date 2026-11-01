@@ -48,7 +48,7 @@ test AnalysisSignedConnectTest
             else fail("uint-to-sint bridge produced ${env.sink.as_signed}")
 
         env.source.publish_signed(0 - 1)
-        assert env.sink.as_unsigned + 1 == 0
+        assert (env.sink.as_unsigned + 1).trunc<64>() == 0
             else fail("sint-to-uint bridge produced ${env.sink.as_unsigned}")
 
         log(info, "PASS: signed scalar connect conversions")

@@ -43,11 +43,11 @@ impl FixedVecTseqAbiTest for FixedVecTseqAbiTb
         let echoed = echo_rows(rows)
         let bounced = bounce(echoed)
         let relayed = relay.relay(bounced)
-        let count = 0
-        let sum = 0
+        let count : uint<64> = 0
+        let sum : uint<64> = 0
         for row in relayed
-            sum = sum + row[0] + row[1]
-            count = count + 1
+            sum = (sum + row[0] + row[1]).trunc<64>()
+            count = (count + 1).trunc<64>()
         end for
         assert count == 2 else fail("expected two rows, got ${count}")
         assert sum == 26 else fail("fixed-vector TSeq ABI changed data: sum=${sum}")

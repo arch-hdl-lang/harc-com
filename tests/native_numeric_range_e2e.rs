@@ -12,25 +12,25 @@ impl NumericRangeTest for NumericRangeTb
     run
         let umax : uint<64> = 0xffffffffffffffff
         let smax : sint<64> = 0x7fffffffffffffff
-        let count = 0
+        let count : uint<64> = 0
 
         for i in umax .. umax
-            count = count + 1
+            count = count +% 1
         end for
         assert count == 1 else fail("unsigned MAX singleton repeated")
 
         for i in umax - 1 .. umax
-            count = count + 1
+            count = count +% 1
         end for
         assert count == 3 else fail("unsigned MAX range did not terminate")
 
         for i in smax .. smax
-            count = count + 1
+            count = count +% 1
         end for
         assert count == 4 else fail("signed MAX singleton repeated")
 
         for i in smax - 1 .. smax
-            count = count + 1
+            count = count +% 1
         end for
         assert count == 6 else fail("signed MAX range did not terminate")
 
@@ -38,13 +38,13 @@ impl NumericRangeTest for NumericRangeTb
             if i == 2
                 continue
             end if
-            count = count + 1
+            count = count +% 1
         end for
         assert count == 8 else fail("terminal range continue mismatch")
 
-        let terminal_continue_count = 0
+        let terminal_continue_count : uint<64> = 0
         for i in umax - 1 .. umax
-            terminal_continue_count = terminal_continue_count + 1
+            terminal_continue_count = terminal_continue_count +% 1
             if terminal_continue_count > 2
                 break
             end if
@@ -58,13 +58,13 @@ impl NumericRangeTest for NumericRangeTb
             if i == 2
                 break
             end if
-            count = count + 1
+            count = count +% 1
         end for
         assert count == 9 else fail("range break mismatch")
 
         for outer in 1 .. 2
             for inner in umax .. umax
-                count = count + 1
+                count = count +% 1
             end for
         end for
         assert count == 11 else fail("nested terminal ranges mismatch")

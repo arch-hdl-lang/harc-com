@@ -45,7 +45,7 @@ test TernaryImpureHelper
         assert port_else == 0 else fail("direct else port arm")
         assert dut.en == 0 else fail("opposite helper arm ran")
 
-        let pure = true ? 11 : 22
+        let pure : uint<8> = true ? 11 : 22
         assert pure == 11 else fail("pure ternary value")
     end run
 end test TernaryImpureHelper

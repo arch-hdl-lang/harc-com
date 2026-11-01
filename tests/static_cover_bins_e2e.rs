@@ -7,6 +7,8 @@ const DUT: &str = r#"module Top(input logic clk); endmodule"#;
 const TEST: &str = r#"
 const NEG8 : sint<8> = -1
 const MIN64 : sint<64> = -9223372036854775808
+// A bin bound must fit its coverpoint (strict fit): the sint<8> minimum.
+const MIN8 : sint<8> = -128
 const UMAX64 : uint<64> = 0xFFFFFFFFFFFFFFFF
 
 scoreboard Sink
@@ -14,7 +16,7 @@ scoreboard Sink
     hookable accept(value: sint<8>, lo: sint<8>, hi: sint<8>, uvalue: uint<64>)
         assert value >= lo else fail("signed lower control")
         assert value <= hi else fail("signed upper control")
-        calls = calls + 1
+        calls = (calls + 1).resize<32>()
     end accept
 end scoreboard Sink
 
@@ -22,10 +24,14 @@ covergroup Cov @(sink.accept(value, lo, hi, uvalue) post)
     signed_cp : cover value
         bins
             cross_zero = [NEG8..1]
-            from_min = [MIN64..1]
+            from_min = [MIN8..1]
             negative_only = [NEG8..NEG8]
             positive_only = [1..1]
             runtime_equivalent = [lo..hi]
+        end bins
+    wide_signed_cp : cover value.sext<64>()
+        bins
+            from_min64 = [MIN64..1]
         end bins
     unsigned_cp : cover uvalue
         bins
@@ -50,6 +56,7 @@ impl Test for Tb
         assert sink.calls == 3 else fail("delivery")
         assert cov.signed_cp.cross_zero == 3 else fail("cross zero")
         assert cov.signed_cp.from_min == 3 else fail("minimum signed bound")
+        assert cov.wide_signed_cp.from_min64 == 3 else fail("64-bit minimum signed bound")
         assert cov.signed_cp.negative_only == 1 else fail("negative only")
         assert cov.signed_cp.positive_only == 1 else fail("positive only")
         assert cov.signed_cp.runtime_equivalent == 3 else fail("runtime equivalent")

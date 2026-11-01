@@ -65,7 +65,7 @@ impl VecOfStructFieldTest for VecOfStructFieldTb
         assert tbl.entries[2].tag == 0xA5 else fail("tag[2] clobbered: 0x${tbl.entries[2].tag:02x}")
 
         // A runtime (non-literal) element index reads the same slot.
-        let i = 1
+        let i : uint<64> = 1
         assert tbl.entries[i].value == 0x11223344 else fail("entries[i]: 0x${tbl.entries[i].value:08x}")
 
         // ── whole-element copy IN (`entries[i] = e`) ────────────────

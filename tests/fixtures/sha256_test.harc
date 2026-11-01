@@ -38,10 +38,10 @@ impl Sha256Test for Sha256Tb
         wait 1 cycle
         dut.start = 0
 
-        let t1 = 0
+        let t1 : uint<64> = 0
         while !dut.done && t1 < 100
             wait 1 cycle
-            t1 = t1 + 1
+            t1 = t1 +% 1
         end while
 
         assert dut.done
@@ -67,10 +67,10 @@ impl Sha256Test for Sha256Tb
         wait 1 cycle
         dut.start = 0
 
-        let t2 = 0
+        let t2 : uint<64> = 0
         while !dut.done && t2 < 100
             wait 1 cycle
-            t2 = t2 + 1
+            t2 = t2 +% 1
         end while
 
         assert dut.done

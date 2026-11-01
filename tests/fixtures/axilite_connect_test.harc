@@ -67,8 +67,8 @@ transactor AxilXactor
             wait 2 cycles
 
             // Read phase
-            let val = 0
-            let saw = 0
+            let val : uint<32> = 0
+            let saw : uint<64> = 0
             dut.axil_ar_addr = t.addr
             dut.axil_ar_valid = 1
             for _ in 0 .. 9
@@ -163,7 +163,7 @@ impl AxiLiteConnectTest for AxiLiteConnectTb
         for t in txns
             let exp = env.sb.expected.pop()
             if env.drv.last_read != exp
-                env.sb.errors = env.sb.errors + 1
+                env.sb.errors = (env.sb.errors + 1).trunc<32>()
             end if
         end for
         assert env.sb.errors > 0 || env.sb.expected.empty()

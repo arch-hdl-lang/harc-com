@@ -36,7 +36,7 @@ scoreboard Auditor
     function audit(g : uint<64>, e : uint<64>)
         last_got = g
         if g != e
-            mismatches = mismatches + 1
+            mismatches = (mismatches + 1).trunc<32>()
         end if
     end function audit
 end scoreboard Auditor

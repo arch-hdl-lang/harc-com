@@ -24,7 +24,7 @@ end domain SysDomain
 
 test CheckPhaseLetTest
     let dut : Top
-    let expected_total = 0      // test-scope let: written in run, read in check
+    let expected_total : uint<32> = 0      // test-scope let: written in run, read in check
 
     clock clk = SysDomain       // 100 MHz
 

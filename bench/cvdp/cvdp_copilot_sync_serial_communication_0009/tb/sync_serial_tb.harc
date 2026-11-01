@@ -135,27 +135,27 @@ impl SyncSerialTest for SyncSerialTb
         reset_serial()
         let errors : uint<32> = 0
 
-        errors = errors + drive_no_transfer(0)
-        errors = errors + drive_no_transfer(7)
+        errors = errors +% drive_no_transfer(0)
+        errors = errors +% drive_no_transfer(7)
 
         reset_serial()
-        errors = errors + drive_transfer(1, 0x00000000000000AA)
+        errors = errors +% drive_transfer(1, 0x00000000000000AA)
         reset_serial()
-        errors = errors + drive_transfer(2, 0x000000000000BEEF)
+        errors = errors +% drive_transfer(2, 0x000000000000BEEF)
         reset_serial()
-        errors = errors + drive_transfer(3, 0x00000000DEADBEEF)
+        errors = errors +% drive_transfer(3, 0x00000000DEADBEEF)
         reset_serial()
-        errors = errors + drive_transfer(4, 0x0123456789ABCDEF)
+        errors = errors +% drive_transfer(4, 0x0123456789ABCDEF)
         reset_serial()
-        errors = errors + drive_transfer(1, 0x00000000000000FF)
+        errors = errors +% drive_transfer(1, 0x00000000000000FF)
 
-        errors = errors + reset_mid_transfer()
+        errors = errors +% reset_mid_transfer()
 
         for _ in 0 .. 7
             let s : SerialStim
             randomize(s)
             reset_serial()
-            errors = errors + drive_transfer(s.sel, s.data)
+            errors = errors +% drive_transfer(s.sel, s.data)
         end for
 
         reset_serial()

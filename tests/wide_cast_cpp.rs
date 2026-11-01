@@ -243,6 +243,35 @@ int main() {{
             // named zero-extend still introduces no sign bits.
             && (harc_rt::harc_wide_zext<8>(-(1)).words[7] == 0u);
     }}
+    {{  // Storage padding above a declared width is not value. Spec §2.4
+        // result widths mean source can no longer build such a value
+        // (`max130 + one130` is a 131-bit result that must be narrowed
+        // explicitly), so the padding normalization `wide_cast_test`
+        // used to reach is pinned here on raw storage: bits 130 and 159
+        // of a `uint<130>` carrier are padding, and every extension, the
+        // same-width signed normalization and `==` must discard them.
+        harc_rt::HarcWide<5> dirty130;
+        harc_rt::harc_wide_set_bit(dirty130, 130);
+        harc_rt::harc_wide_set_bit(dirty130, 159);
+        auto zext256 = harc_rt::harc_wide_zext<8>(dirty130, 130);
+        auto same130 = harc_rt::harc_wide_mask_bits(dirty130, 130);
+        // sext reads the DIRTY storage directly: the padding must not leak
+        // into the extension (bit 129, the sign, is clear).
+        auto sext256 = harc_rt::harc_wide_sext<8>(dirty130, 130, 256);
+        // With the sign bit set, dirty padding must not change the result
+        // either: it equals the extension of the clean pattern.
+        harc_rt::HarcWide<5> dirty_neg = dirty130;
+        harc_rt::harc_wide_set_bit(dirty_neg, 129);
+        harc_rt::HarcWide<5> clean_neg;
+        harc_rt::harc_wide_set_bit(clean_neg, 129);
+        ok += (harc_rt::harc_wide_sext<8>(dirty_neg, 130, 256)
+               == harc_rt::harc_wide_sext<8>(clean_neg, 130, 256))
+            && !(harc_rt::harc_wide_sext<8>(clean_neg, 130, 256) == 0);
+        ok += (zext256 == 0) && (same130 == 0) && (sext256 == 0)
+            && !(dirty130 == 0)
+            && (harc_rt::harc_wide_mask_bits(dirty130, 130)
+                == harc_rt::harc_wide_mask_bits(harc_rt::HarcWide<5>(), 130));
+    }}
     printf("%d\n", ok);
     return 0;
 }}
@@ -280,7 +309,7 @@ int main() {{
     assert!(run.status.success(), "probe exited non-zero");
     assert_eq!(
         String::from_utf8_lossy(&run.stdout).trim(),
-        "4",
+        "6",
         "wide-cast shapes compiled but computed the wrong values",
     );
     let _ = std::fs::remove_dir_all(&dir);

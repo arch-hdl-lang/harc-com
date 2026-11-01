@@ -1784,7 +1784,7 @@ fn cover_const_u64(
                 &format!(
                     "covergroup `{group}` point `{point}` {} {}",
                     role.name(),
-                    v.as_i64()
+                    v.exact
                 ),
                 "v1 emits the negative bound verbatim and compiles, so the point samples at \
                  a position nobody wrote",
@@ -1794,7 +1794,7 @@ fn cover_const_u64(
                 &format!(
                     "covergroup `{group}` point `{point}` {} {}",
                     role.name(),
-                    v.as_i64()
+                    v.exact
                 ),
                 "a width is never negative",
                 status,

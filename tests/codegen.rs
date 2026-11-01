@@ -7520,7 +7520,7 @@ test A
     let user : ProbeUser
     run
         let before : uint<32> = user.read_probe()
-        user.force_probe(before + 1)
+        user.force_probe(before +% 1)
         user.release_probe()
     end run
 end test A
@@ -7645,7 +7645,7 @@ test A
     run
         user.chip = dut
         let before : uint<32> = user.read_probe()
-        user.force_probe(before + 1)
+        user.force_probe(before +% 1)
         user.release_probe()
     end run
 end test A
@@ -9789,13 +9789,33 @@ end test T"#,
     );
 }
 
-/// A bare integer literal is not a narrowing source: v1 must not reject
-/// `let b : uint<8> = 300` while TB-IR (which types a bare literal as
-/// widthless) accepts it. Reverting the exclusion re-introduces exactly
-/// that accepted-set divergence, silently.
+/// A bare integer literal is not a WIDTH narrowing source: v1 must not
+/// reject `let z : uint<0> = 0`-style initializers by literal width. Under
+/// strict fit (owner decision, R16 review) TB-IR checks the literal's VALUE
+/// instead: `let b : uint<8> = 300` is a TB-IR error, which the deprecated
+/// v1 backend does not diagnose.
 #[test]
 fn a_bare_literal_initializer_is_not_a_narrowing_error() {
-    for src in [
+    let merged = |src: &str| {
+        let parsed = parse_source(src).expect("parses");
+        merge::merge_for_sim(vec![parsed], None).expect("merge")
+    };
+    let fits = merged(
+        r#"test T
+    let dut : Top
+    run
+        let z : uint<0> = 0
+        let b : uint<8> = 255
+        log(info, "${z} ${b}")
+    end run
+end test T"#,
+    );
+    assert!(cpp_tb::emit(&fits).is_ok(), "v1 accepts fitting literals");
+    assert!(
+        harc::ir::lower::lower_program(&fits).is_ok(),
+        "TB-IR accepts fitting literals"
+    );
+    let misfit = merged(
         r#"test T
     let dut : Top
     run
@@ -9803,25 +9823,19 @@ fn a_bare_literal_initializer_is_not_a_narrowing_error() {
         log(info, "${b}")
     end run
 end test T"#,
-        r#"test T
-    let dut : Top
-    run
-        let z : uint<0> = 0
-        log(info, "${z}")
-    end run
-end test T"#,
-    ] {
-        let parsed = parse_source(src).expect("parses");
-        let merged = merge::merge_for_sim(vec![parsed], None).expect("merge");
-        assert!(
-            cpp_tb::emit(&merged).is_ok(),
-            "v1 must accept a bare-literal initializer, as TB-IR does"
-        );
-        assert!(
-            harc::ir::lower::lower_program(&merged).is_ok(),
-            "TB-IR must accept it too — the two accepted sets have to match"
-        );
-    }
+    );
+    assert!(
+        cpp_tb::emit(&misfit).is_ok(),
+        "v1 (deprecated) does not judge a literal's value"
+    );
+    let err = harc::ir::lower::lower_program(&misfit)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        err.contains("does not fit"),
+        "TB-IR applies strict fit: {err}"
+    );
 }
 
 /// `probe_widths` is keyed by bare probe name, so the wrap-operand lookup
@@ -9900,8 +9914,8 @@ end test T"#;
         .map(|e| e.to_string())
         .unwrap_or_default();
     assert!(
-        tbir.contains("narrows"),
-        "TB-IR must reject it too; got: {tbir}"
+        tbir.contains("does not fit") && tbir.contains("80-bit"),
+        "TB-IR must reject it too (strict fit); got: {tbir}"
     );
 }
 
@@ -10855,7 +10869,7 @@ end test T"#,
 #[test]
 fn derived_signed_and_boolean_constants_reach_both_constraint_paths() {
     let src = r#"const BASE : uint<8> = 2
-const LIMIT : uint<8> = BASE + 3
+const LIMIT : uint<8> = (BASE as uint<8>) +% 3
 const NEG : sint<8> = -1
 const ENABLE : bool = LIMIT == 5
 

@@ -80,8 +80,8 @@ impl AxiLiteBusTest for AxiLiteBusTb
         wait 2 cycles
 
         // Read back through the AR/R channels.
-        let val = 0
-        let saw = 0
+        let val : uint<64> = 0
+        let saw : uint<64> = 0
         axil.ar.addr = 24
         axil.ar.valid = 1
         for _ in 0 .. 9

@@ -18,8 +18,8 @@ function axil_write(dut: AxiLiteRegs, addr: uint<8>, data: uint<32>)
 end function axil_write
 
 function axil_read(dut: AxiLiteRegs, addr: uint<8>) -> uint<32>
-    let val = 0
-    let saw = 0    // single-shot capture flag (no `break` in v0)
+    let val : uint<32> = 0
+    let saw : uint<64> = 0    // single-shot capture flag (no `break` in v0)
     dut.axil_ar_addr = addr
     dut.axil_ar_valid = 1
     // Walk a fixed-cycle budget; on the first observed r_valid, capture

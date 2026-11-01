@@ -70,6 +70,11 @@ pub(crate) fn solver_binary_is_signed(
     left == Signed || right == Signed
 }
 
+// The 64-bit constant kernel below is what proofs/arithmetic/kani.rs
+// proves. Constant folding now evaluates exactly at ARCH result widths
+// (`crate::exact_int`), so the compiler no longer calls it; re-targeting
+// the proofs is a follow-up.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Scalar {
     pub bits: u64,
@@ -77,6 +82,7 @@ pub(crate) struct Scalar {
     pub boolean: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NumericError {
     ZeroDivisor,
@@ -90,6 +96,7 @@ pub(crate) enum NumericError {
 /// One node of the 64-bit constant evaluator. Width is needed only for
 /// wrapping operators. Relabel casts and AST width inference are outside
 /// this kernel. Boolean inputs may carry noncanonical bits after bit-not.
+#[allow(dead_code)]
 pub(crate) fn fold_binary(
     op: BinaryOp,
     a: Scalar,

@@ -8,11 +8,11 @@ bus ByteStream
 end bus ByteStream
 
 transactor ByteMonitor bound to ByteStream
-    count : uint<8> default 0
+    count : uint<32> default 0
     last : uint<8> default 0
 
     on bus.beat.handshake(value)
-        count = count + 1
+        count = (count + 1).trunc<32>()
         last = value
     end on
 

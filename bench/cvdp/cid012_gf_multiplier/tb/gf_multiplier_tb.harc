@@ -58,7 +58,7 @@ impl GfMultiplierTest for GfMultiplierTestTb
                 let expected = gf_mul_ref(a, b)
                 if dut.result != expected
                     log(error, "MISMATCH A=${a:1x} B=${b:1x} got=${dut.result:1x} expected=${expected:1x}")
-                    errors = errors + 1
+                    errors = errors +% 1
                 end if
             end for
         end for

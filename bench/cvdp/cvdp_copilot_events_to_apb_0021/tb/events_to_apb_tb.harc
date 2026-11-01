@@ -227,15 +227,15 @@ testbench EventsToApbTb
     function trigger_and_complete(a: bool, b: bool, c: bool, want_addr: uint<32>, want_data: uint<32>, ready_delay: uint<5>) -> uint<32>
         pulse_events(a, b, c)
         let errors : uint<32> = 0
-        errors = errors + rsp.expect_setup(want_addr, want_data)
-        errors = errors + rsp.complete_current(ready_delay)
+        errors = errors +% rsp.expect_setup(want_addr, want_data)
+        errors = errors +% rsp.complete_current(ready_delay)
         return errors
     end function trigger_and_complete
 
     function complete_expected(want_addr: uint<32>, want_data: uint<32>, ready_delay: uint<5>) -> uint<32>
         let errors : uint<32> = 0
-        errors = errors + rsp.expect_setup(want_addr, want_data)
-        errors = errors + rsp.complete_current(ready_delay)
+        errors = errors +% rsp.expect_setup(want_addr, want_data)
+        errors = errors +% rsp.complete_current(ready_delay)
         return errors
     end function complete_expected
 
@@ -264,31 +264,31 @@ impl EventsToApbTest for EventsToApbTb
             0x00000020, 0x22222222,
             0x00000030, 0x33333333)
 
-        errors = errors + trigger_and_complete(true, false, false, 0x00000010, 0x11111111, 0)
-        errors = errors + trigger_and_complete(false, true, false, 0x00000020, 0x22222222, 2)
-        errors = errors + trigger_and_complete(false, false, true, 0x00000030, 0x33333333, 1)
+        errors = errors +% trigger_and_complete(true, false, false, 0x00000010, 0x11111111, 0)
+        errors = errors +% trigger_and_complete(false, true, false, 0x00000020, 0x22222222, 2)
+        errors = errors +% trigger_and_complete(false, false, true, 0x00000030, 0x33333333, 1)
 
         // Simultaneous events choose A first, then queued B, then queued C.
         pulse_events(true, true, true)
-        errors = errors + complete_expected(0x00000010, 0x11111111, 0)
-        errors = errors + complete_expected(0x00000020, 0x22222222, 0)
-        errors = errors + complete_expected(0x00000030, 0x33333333, 0)
+        errors = errors +% complete_expected(0x00000010, 0x11111111, 0)
+        errors = errors +% complete_expected(0x00000020, 0x22222222, 0)
+        errors = errors +% complete_expected(0x00000030, 0x33333333, 0)
 
         // AB simultaneous chooses A first, then queued B.
         pulse_events(true, true, false)
-        errors = errors + complete_expected(0x00000010, 0x11111111, 1)
-        errors = errors + complete_expected(0x00000020, 0x22222222, 0)
+        errors = errors +% complete_expected(0x00000010, 0x11111111, 1)
+        errors = errors +% complete_expected(0x00000020, 0x22222222, 0)
 
         // BC simultaneous chooses B first, then C.
         pulse_events(false, true, true)
-        errors = errors + complete_expected(0x00000020, 0x22222222, 3)
-        errors = errors + complete_expected(0x00000030, 0x33333333, 0)
+        errors = errors +% complete_expected(0x00000020, 0x22222222, 3)
+        errors = errors +% complete_expected(0x00000030, 0x33333333, 0)
 
         // Timeout abort while in ACCESS.
         set_payloads(0x00000040, 0x44444444,
             0x00000020, 0x22222222,
             0x00000030, 0x33333333)
-        errors = errors + timeout_event(true, false, false, 0x00000040, 0x44444444)
+        errors = errors +% timeout_event(true, false, false, 0x00000040, 0x44444444)
 
         // Randomized payloads for event A. Use one event at a time so the
         // data/addr checker remains simple while the solver still varies
@@ -298,7 +298,7 @@ impl EventsToApbTest for EventsToApbTb
             randomize(s)
             let addr : uint<32> = make_addr(s.tag, s.index)
             set_payloads(addr, s.data, 0x00000020, 0x22222222, 0x00000030, 0x33333333)
-            errors = errors + trigger_and_complete(true, false, false, addr, s.data, 0)
+            errors = errors +% trigger_and_complete(true, false, false, addr, s.data, 0)
         end for
 
         reset_ctrl()

@@ -42,16 +42,16 @@ impl PureHelperTseqTest for PureHelperTseqTb
     run
         let beats = MakeBeats()
         let echoed_beats = twice_beats(beats)
-        let beat_sum : uint<16> = 0
+        let beat_sum : uint<32> = 0
         for beat in echoed_beats
-            beat_sum = beat_sum + beat.value
+            beat_sum = (beat_sum + beat.value).trunc<32>()
         end for
 
         let nums = MakeNums()
         let echoed_nums = echo_nums(nums)
-        let num_sum : uint<16> = 0
+        let num_sum : uint<32> = 0
         for num in echoed_nums
-            num_sum = num_sum + num
+            num_sum = (num_sum + num).trunc<32>()
         end for
 
         assert beat_sum == 15 else fail("beat sum ${beat_sum}")

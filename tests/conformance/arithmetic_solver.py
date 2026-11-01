@@ -72,7 +72,9 @@ def declare(name, value, width, signed):
         for lo in reversed(range(0, abs(value).bit_length(), 32)):
             text += f"        {name} = ({name} << 32) | {hex((abs(value) >> lo) & mask(32))}\n"
         if value < 0:
-            text += f"        {name} = 0 - {name}\n"
+            # Unary minus keeps the operand width; `0 - x` would widen by one
+            # bit (ARCH result widths) and no longer fit the typed slot.
+            text += f"        {name} = -{name}\n"
         return text
     return f"        let {name} : {t} = {literal(value)}\n"
 
@@ -250,19 +252,43 @@ def solver_cases(seed, extended=False):
 class MixedSolver(Solver):
     b_signed: bool = False
 
-    def declarations(self):
+    def keep(self):
         comparison = self.op in ("<", "<=", ">", ">=")
         value = self.expected if self.sat else (1 - self.expected if comparison else (self.expected + 1) & mask(64))
         result_type = "bool" if comparison else "uint<64>"
         result = str(bool(value)).lower() if comparison else literal(value)
         predicate = f"a {self.op} b"
         keep = (predicate if value else f"!({predicate})") if comparison else f"({predicate}) == E{self.id}"
-        return (f"const A{self.id} : {ty(64, self.signed)} = {literal(self.a)}\n"
-                f"const B{self.id} : {ty(64, self.b_signed)} = {literal(self.b)}\n"
-                f"const E{self.id} : {result_type} = {result}\n"
-                f"transaction T{self.id}\n    a : {ty(64, self.signed)}\n    b : {ty(64, self.b_signed)}\n"
+        return keep, f"const E{self.id} : {result_type} = {result}\n"
+
+    def declarations(self):
+        # A sint/uint mix is a compile-time error (owner decision D1, R16),
+        # and constraint position has no casts. The signed operand's typed
+        # constant is converted explicitly with `as uint<64>` -- the equal-
+        # rank conversion the oracle applies -- and both fields share the
+        # unsigned domain, so the mixed-sign evaluation is still exercised
+        # through the explicit cast.
+        keep, expected = self.keep()
+        return (f"const SA{self.id} : {ty(64, self.signed)} = {literal(self.a)}\n"
+                f"const SB{self.id} : {ty(64, self.b_signed)} = {literal(self.b)}\n"
+                f"const A{self.id} : uint<64> = (SA{self.id} as uint<64>)\n"
+                f"const B{self.id} : uint<64> = (SB{self.id} as uint<64>)\n"
+                + expected +
+                f"transaction T{self.id}\n    a : uint<64>\n    b : uint<64>\n"
                 f"    keep a == A{self.id}\n    keep b == B{self.id}\n"
                 f"    keep {keep}\nend transaction T{self.id}\n")
+
+    def rejected_source(self):
+        """The pre-D1 spelling: mixed-sign fields compared directly. The
+        compiler must reject it before any solver is involved."""
+        keep, expected = self.keep()
+        return (f"const A{self.id} : {ty(64, self.signed)} = {literal(self.a)}\n"
+                f"const B{self.id} : {ty(64, self.b_signed)} = {literal(self.b)}\n"
+                + expected +
+                f"transaction T{self.id}\n    a : {ty(64, self.signed)}\n    b : {ty(64, self.b_signed)}\n"
+                f"    keep a == A{self.id}\n    keep b == B{self.id}\n"
+                f"    keep {keep}\nend transaction T{self.id}\n"
+                + test("Rejected" + self.id, f"        let t : T{self.id}\n        randomize(t)\n"))
 
 
 def mixed_solver_cases():
@@ -327,6 +353,10 @@ def generate(root, seed, extended):
     (root / "cases.json").write_text(json.dumps({"seed": seed, "arithmetic": [dataclasses.asdict(c) for c in arithmetic],
                                                "solver": [dataclasses.asdict(c) for c in solver],
                                                "native_extra": [dataclasses.asdict(c) for c in mixed_solver_cases()]}, indent=2))
+    rejected = root / "rejected"
+    rejected.mkdir(exist_ok=True)
+    for c in mixed_solver_cases():
+        (rejected / (c.id + ".harc")).write_text(c.rejected_source())
     typed = root / "typed"
     typed.mkdir(exist_ok=True)
     for c in solver:
@@ -366,8 +396,25 @@ def arithmetic_groups(cases):
     return list(groups.items())
 
 
+def native_rejections(root, repo, harc, timeout):
+    """Every pre-D1 mixed-sign constraint is a compile-time error."""
+    env = {**os.environ, "HARC_NO_LEARN": "1"}
+    probes = sorted((root / "rejected").glob("*.harc"))
+    assert len(probes) == len(mixed_solver_cases()), "missing mixed-sign rejection probes"
+    for probe in probes:
+        status, output = run([harc, "dump-ir", probe], repo, timeout, env)
+        # The diagnostic renderer wraps long messages across `│` lines.
+        flat = " ".join(output.replace("│", " ").split())
+        if status == 0 or "mixes signed and unsigned operands" not in flat:
+            failure(root, None, output)
+            raise AssertionError(f"{probe.name}: mixed-sign constraint was not rejected: {output[-2000:]}")
+    print(f"mixed-sign rejections: {len(probes)} compile-time D1 diagnostics", flush=True)
+
+
 def native(root, repo, harc, arithmetic, solver, timeout, only="all", backend_choice="both"):
     env = {**os.environ, "HARC_NO_LEARN": "1"}
+    if only in ("all", "solver"):
+        native_rejections(root, repo, harc, timeout)
     for backend in (["tbir", "v1"] if backend_choice == "both" else [backend_choice]):
         selected = [c for c in arithmetic if backend == "tbir" or c.width <= 64 or
                     (c.width <= 128 and c.op in ("<", "<=", ">", ">=", "==", "!="))]
@@ -528,6 +575,18 @@ def self_test():
         raise AssertionError("checker accepted a noncanonical Boolean")
     assert arithmetic == arithmetic_cases(SEED)
     assert solver == solver_cases(SEED)
+    # D1: generated native sources never mix declared signedness, while the
+    # rejection probes keep the original mixed spelling for the compiler.
+    mixed = mixed_solver_cases()
+    assert all(c.signed != c.b_signed for c in mixed), "mixed pairs must stay mixed"
+    for c in mixed:
+        fields = re.findall(r"^    [ab] : (\w+)<64>$", c.declarations(), re.M)
+        assert fields == ["uint", "uint"], (c.id, fields)
+        assert re.search(rf"\(SA{c.id} as uint<64>\)", c.declarations()), c.id
+        rejected = re.findall(r"^    [ab] : (\w+)<64>$", c.rejected_source(), re.M)
+        assert sorted(rejected) == ["sint", "uint"], (c.id, rejected)
+    # D2: a negative wide operand is built without a widening `0 - x`.
+    assert "0 - " not in declare("n", -(1 << 100), 129, True)
     print("oracle and observation-checker self-tests: passed", flush=True)
 
 

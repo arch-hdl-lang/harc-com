@@ -171,28 +171,28 @@ impl BstSearchTest for BstSearchTb
         let keys_empty : uint<240> = 0
 
         // Balanced 7-node tree: sorted order 2,4,6,8,10,12,14.
-        errors = errors + run_search(0, keys_bal, left_bal, right_bal, 8, true, 3)
-        errors = errors + run_search(0, keys_bal, left_bal, right_bal, 2, true, 0)
-        errors = errors + run_search(0, keys_bal, left_bal, right_bal, 6, true, 2)
-        errors = errors + run_search(0, keys_bal, left_bal, right_bal, 10, true, 4)
-        errors = errors + run_search(0, keys_bal, left_bal, right_bal, 14, true, 6)
-        errors = errors + run_search(0, keys_bal, left_bal, right_bal, 11, false, 31)
+        errors = errors +% run_search(0, keys_bal, left_bal, right_bal, 8, true, 3)
+        errors = errors +% run_search(0, keys_bal, left_bal, right_bal, 2, true, 0)
+        errors = errors +% run_search(0, keys_bal, left_bal, right_bal, 6, true, 2)
+        errors = errors +% run_search(0, keys_bal, left_bal, right_bal, 10, true, 4)
+        errors = errors +% run_search(0, keys_bal, left_bal, right_bal, 14, true, 6)
+        errors = errors +% run_search(0, keys_bal, left_bal, right_bal, 11, false, 31)
 
         // Skewed trees force deep left-only and right-only traversals.
-        errors = errors + run_search(0, keys_right, left_null, right_chain, 5, true, 4)
-        errors = errors + run_search(0, keys_right, left_null, right_chain, 0x0033, false, 31)
-        errors = errors + run_search(0, keys_left, left_chain, right_null, 1, true, 0)
-        errors = errors + run_search(0, keys_left, left_chain, right_null, 3, true, 2)
+        errors = errors +% run_search(0, keys_right, left_null, right_chain, 5, true, 4)
+        errors = errors +% run_search(0, keys_right, left_null, right_chain, 0x0033, false, 31)
+        errors = errors +% run_search(0, keys_left, left_chain, right_null, 1, true, 0)
+        errors = errors +% run_search(0, keys_left, left_chain, right_null, 3, true, 2)
 
         // Single-node and empty-tree cases.
-        errors = errors + run_search(0, keys_single, left_null, right_null, 42, true, 0)
-        errors = errors + run_search(0, keys_single, left_null, right_null, 41, false, 31)
-        errors = errors + run_search(31, keys_empty, left_null, right_null, 8, false, 31)
+        errors = errors +% run_search(0, keys_single, left_null, right_null, 42, true, 0)
+        errors = errors +% run_search(0, keys_single, left_null, right_null, 41, false, 31)
+        errors = errors +% run_search(31, keys_empty, left_null, right_null, 8, false, 31)
 
         for _ in 0 .. 7
             let s : SearchStim
             randomize(s)
-            errors = errors + run_search(0, keys_bal, left_bal, right_bal, s.key, false, 31)
+            errors = errors +% run_search(0, keys_bal, left_bal, right_bal, s.key, false, 31)
         end for
 
         reset_bst()

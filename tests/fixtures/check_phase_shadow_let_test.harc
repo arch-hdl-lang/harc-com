@@ -8,7 +8,7 @@ end domain SysDomain
 
 test CheckPhaseShadowLetTest
     let dut : Top
-    let expected_total = 0
+    let expected_total : uint<32> = 0
 
     clock clk = SysDomain
 
@@ -33,7 +33,7 @@ test CheckPhaseShadowLetTest
             assert expected_total == 3
                 else fail("outer expected_total lost: got ${expected_total}, want 3")
         else
-            let expected_total = 99
+            let expected_total : uint<32> = 99
             fail("unexpected count_out=${dut.count_out}; local expected_total=${expected_total}")
         end if
     end check

@@ -211,7 +211,7 @@ int run_TlmTargetThreadIfTest(int argc, char** argv) {
                     switch (__bb) {
                     case 0: {
                         req_seq = target.read_count;
-                        target.read_count = (target.read_count + 1);
+                        target.read_count = ((uint64_t)(((uint64_t)((target.read_count + 1)) & 0xFFFFFFFFULL)));
                         target.prep_acc = 0;
                         i = 0;
                         __bb = 1;
@@ -245,12 +245,12 @@ int run_TlmTargetThreadIfTest(int argc, char** argv) {
                         break;
                     }
                     case 7: {
-                        __ret = (((256 + addr) + req_seq) + target.prep_acc);
+                        __ret = ((uint64_t)(((uint64_t)((((256 + addr) + req_seq) + target.prep_acc)) & 0xFFFFFFFFULL)));
                         __done = true;
                         break;
                     }
                     case 8: {
-                        __ret = (((512 + addr) + req_seq) + target.prep_acc);
+                        __ret = ((uint64_t)(((uint64_t)((((512 + addr) + req_seq) + target.prep_acc)) & 0xFFFFFFFFULL)));
                         __done = true;
                         break;
                     }

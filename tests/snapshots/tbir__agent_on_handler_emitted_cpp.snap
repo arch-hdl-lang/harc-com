@@ -223,7 +223,7 @@ int run_AgentOnHandlerTest(int argc, char** argv) {
         while (true) {
             switch (__bb) {
             case 0: {
-                self.seen = (self.seen + 1);
+                self.seen = ((uint64_t)(((uint64_t)((self.seen + 1)) & 0xFFFFFFFFULL)));
                 self.last = t;
                 return;
                 break;
@@ -309,15 +309,15 @@ int run_AgentOnHandlerTest(int argc, char** argv) {
                 }
                 case 11: {
                     if (!((((uint64_t)cycle_count - tagger._last_in_cycle) >= (uint64_t)(4)))) {
-                        sim_log_line("FAIL", "agent never reported idle_in(4); waited=%lld", harc_rt::harc_printf_ll(waited));
+                        sim_log_line("FAIL", "agent never reported idle_in(4); waited=%llu", harc_rt::harc_printf_ull(waited));
                         ctx.errors++;
                     }
-                    sim_log_line("INFO", "PASS: agent handled %lld events, idle_in(4) after %lld cycles", harc_rt::harc_printf_ll(tagger.seen), harc_rt::harc_printf_ll(waited));
+                    sim_log_line("INFO", "PASS: agent handled %lld events, idle_in(4) after %llu cycles", harc_rt::harc_printf_ll(tagger.seen), harc_rt::harc_printf_ull(waited));
                     __done = true;
                     break;
                 }
                 case 12: {
-                    waited = (waited + 1);
+                    waited = ((uint64_t)((waited + 1)));
                     __bb = 9;
                     break;
                 }

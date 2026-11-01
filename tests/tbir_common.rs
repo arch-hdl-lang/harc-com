@@ -414,7 +414,7 @@ scoreboard SharedScoreboard
 end scoreboard SharedScoreboard
 
 function plus_one(x: uint<8>) -> uint<8>
-    return x + 1
+    return (x + 1).resize<8>()
 end function plus_one
 
 function widen_plus_one(x: uint<8>) -> uint<130>
@@ -489,7 +489,7 @@ impl SharedTypesA for SharedTypesTb
         item.lanes[0] = 9
         item.lanes[1] = 11
         sb.pending.push(item)
-        sb.writes = sb.writes + 1
+        sb.writes = (sb.writes + 1).resize<16>()
         _tb.last = sb.pending.pop()
         let raw_record_values = RecordValues(5)
         let record_values = CopyRecordValues(raw_record_values)
@@ -500,18 +500,18 @@ impl SharedTypesA for SharedTypesTb
         for echoed_value in echoed_values
             assert echoed_value.wide == 5 else fail("record parameter value")
         end for
-        count = count + 1
+        count = (count + 1).resize<16>()
         pending_values.push(13)
         let queued = pending_values.pop()
         let raw_values = ForwardPure(5)
         let copied_values = CopyScalarValues(raw_values)
         let before = cycle_count
         let ys = ForwardTimed(6)
-        let pure_value = 0
+        let pure_value : uint<64> = 0
         for value in copied_values
             pure_value = value
         end for
-        let timed_value = 0
+        let timed_value : uint<64> = 0
         for value in ys
             timed_value = value
         end for
@@ -532,7 +532,7 @@ impl SharedTypesB for SharedTypesTb
     clock clk = CommonDomain
     run
         let values = PureValues(9)
-        let observed = 0
+        let observed : uint<64> = 0
         for value in values
             observed = value
         end for
@@ -591,7 +591,7 @@ const COMMON_COMPONENT_METHODS_SRC: &str = r#"
 agent LeftCounter
     value : uint<16> default 1
     function bump(delta: uint<16>) -> uint<16>
-        value = value + delta
+        value = (value + delta).resize<16>()
         return value
     end function bump
 end agent LeftCounter
@@ -599,7 +599,7 @@ end agent LeftCounter
 agent RightCounter
     value : uint<16> default 10
     function bump(delta: uint<16>) -> uint<16>
-        value = value + delta
+        value = (value + delta).resize<16>()
         return value
     end function bump
 end agent RightCounter
@@ -658,7 +658,7 @@ testbench MethodTb
     saved : Beat
 
     function later(delta: uint<16>) -> uint<16>
-        count = count + delta
+        count = (count + delta).resize<16>()
         return count
     end function later
 
@@ -672,7 +672,7 @@ testbench MethodTb
 
     function save(beat: Beat) -> uint<16>
         saved = beat
-        saved.value = saved.value + 1
+        saved.value = (saved.value + 1).resize<16>()
         return saved.value
     end function save
 
@@ -724,7 +724,7 @@ transactor TinyDriver bound to TinyBus
     calls : uint<8> default 0
     when active
         function drive_raw(value: uint<8>)
-            calls = calls + 1
+            calls = (calls + 1).resize<8>()
             bus.req.data = value
             bus.req.valid = 1
             wait 1 cycle
@@ -859,7 +859,7 @@ impl ProbeAccessA for ProbeAccessTb
     clock clk = 10ns
     run
         let before : uint<8> = access.sample()
-        access.drive(before + 1)
+        access.drive(before +% 1)
         access.release_drive()
     end run
 end impl ProbeAccessA
@@ -868,7 +868,7 @@ impl ProbeAccessB for ProbeAccessTb
     clock clk = 10ns
     run
         let before : uint<8> = access.sample()
-        access.drive(before + 2)
+        access.drive(before +% 2)
         access.release_drive()
     end run
 end impl ProbeAccessB
@@ -1527,7 +1527,7 @@ fn testbench_lifecycle_probe_predicate_uses_capsule_plan_bindings() {
     hits : uint<8> default 0
 
     on dut.status != 0
-        hits = hits + 1
+        hits = (hits + 1).resize<8>()
     end on
 end testbench ProbeServiceTb
 
@@ -4791,7 +4791,7 @@ transactor AlphaLocal
     value : uint<16> default 0
     when active
         function touch()
-            value = value + 1
+            value = (value + 1).resize<16>()
         end function touch
     end when
 end transactor AlphaLocal
@@ -4801,7 +4801,7 @@ transactor BetaLocal
     value : uint<32> default 0
     when active
         function touch()
-            value = value + 1
+            value = (value + 1).resize<32>()
         end function touch
     end when
 end transactor BetaLocal
@@ -5903,7 +5903,7 @@ fn common_plan_places_an_ordinary_component_method_in_common_runtime() {
 agent Stateful
     count : uint<16> default 0
     function bump(value: uint<16>) -> uint<16>
-        count = count + value
+        count = (count + value).resize<16>()
         return count
     end function bump
 end agent Stateful
@@ -5942,7 +5942,7 @@ fn hookable_component_method_is_common_until_a_test_owns_a_subscription() {
 agent Counter
     count : uint<16> default 0
     hookable bump(value: uint<16>) -> uint<16>
-        count = count + value
+        count = (count + value).resize<16>()
         return count
     end bump
 end agent Counter
@@ -6288,7 +6288,7 @@ testbench SharedBusTb
         let first = fork link.read_ooo(addr)
         let second = fork link.read_ooo(addr + 1)
         join_all
-        return first + second
+        return (first + second).resize<8>()
     end function read_pair
 end testbench SharedBusTb
 
@@ -6591,7 +6591,7 @@ fn callable_placement_shares_one_explicit_bound_bus_adapter() {
 fn common_bound_bus_rising_cycle_handler_passes_adapter_arguments() {
     let source_text = BOUND_BUS_PLACEMENT_SRC.replacen(
         "    end when\nend transactor TinyDriver",
-        "    end when\n\n    on calls < 200 rising\n        calls = calls + bus.req.data\n    end on\nend transactor TinyDriver",
+        "    end when\n\n    on calls < 200 rising\n        calls = (calls + bus.req.data).resize<8>()\n    end on\nend transactor TinyDriver",
         1,
     );
     let source = parse_source(&source_text).expect("bound-bus cycle source parses");
@@ -7070,20 +7070,20 @@ fn verifier_rejects_same_abi_component_and_testbench_method_identity_swaps() {
         r#"
 agent IdentityAgent
     function first(value: uint<16>) -> uint<16>
-        return value + 1
+        return (value + 1).resize<16>()
     end function first
     function second(value: uint<16>) -> uint<16>
-        return value + 2
+        return (value + 2).resize<16>()
     end function second
 end agent IdentityAgent
 
 testbench IdentityTb
     dut : CommonReg
     function first(value: uint<16>) -> uint<16>
-        return value + 3
+        return (value + 3).resize<16>()
     end function first
     function second(value: uint<16>) -> uint<16>
-        return value + 4
+        return (value + 4).resize<16>()
     end function second
 end testbench IdentityTb
 
@@ -7894,7 +7894,7 @@ fn helper_call_edges_keep_their_exact_function_identity() {
     let source = parse_source(
         r#"
 function add_one(value: uint<8>) -> uint<8>
-    return value + 1
+    return (value + 1).resize<8>()
 end function add_one
 
 test HelperIdentity

@@ -47,7 +47,7 @@ impl StructBasicTest for StructBasicTb
 
         // Three plans; each enables the counter for plan.ticks cycles
         // (2, 3, 4) and checks the running total.
-        let total = 0
+        let total : uint<32> = 0
         for i in 0 .. 2
             let plan : CountPlan
             assert plan.ticks == 2
@@ -58,7 +58,7 @@ impl StructBasicTest for StructBasicTb
                 else fail("plan[${i}]: expect not re-zeroed (${plan.expect})")
 
             plan.ticks = plan.ticks + i        // 2, 3, 4
-            total = total + plan.ticks
+            total = (total + plan.ticks).trunc<32>()
             plan.expect = total
 
             if plan.enabled

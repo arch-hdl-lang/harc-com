@@ -309,7 +309,7 @@ int run_TransactionBasicTest(int argc, char** argv) {
                         ctx.errors++;
                     }
                     cmd.ticks = (cmd.ticks + i);
-                    total = (total + cmd.ticks);
+                    total = ((uint64_t)(((uint64_t)((total + cmd.ticks)) & 0xFFFFFFFFULL)));
                     cmd.expect = total;
                     if (cmd.flag) { __bb = 7; } else { __bb = 8; }
                     break;

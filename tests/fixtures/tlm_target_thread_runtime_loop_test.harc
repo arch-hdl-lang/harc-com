@@ -14,7 +14,7 @@ transactor TlmMemTarget bound to TlmMemBus
 
     thread bus.read(addr: uint<8>, len: uint<4>)
         let req_seq : uint<32> = read_count
-        read_count = read_count + 1
+        read_count = (read_count + 1).trunc<32>()
         prep_acc = 0
         // len >= 1 for this test (DUT issues looping reads); inclusive range needs len-1
         for i in 0 .. len - 1
@@ -22,9 +22,9 @@ transactor TlmMemTarget bound to TlmMemBus
         end for
         wait 1 cycle
         if addr < 8
-            return 256 + prep_acc + req_seq
+            return (256 + prep_acc + req_seq).trunc<32>()
         else
-            return 512 + prep_acc + req_seq
+            return (512 + prep_acc + req_seq).trunc<32>()
         end if
     end thread
 end transactor TlmMemTarget

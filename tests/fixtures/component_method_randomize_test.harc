@@ -43,7 +43,7 @@ agent Randomizer
             r.value < 2000
             r.addr == 24
         end randomize
-        seen = seen + 1
+        seen = (seen + 1).trunc<32>()
         last = r.value
     end on
 end agent Randomizer

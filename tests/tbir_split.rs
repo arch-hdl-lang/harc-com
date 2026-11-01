@@ -714,7 +714,7 @@ test A
     let user : ProbeUser
     run
         let before : uint<32> = user.read_probe()
-        user.force_probe(before + 1)
+        user.force_probe(before +% 1)
         user.release_probe()
     end run
 end test A
@@ -726,7 +726,7 @@ test B
     let user : ProbeUser
     run
         let before : uint<32> = user.read_probe()
-        user.force_probe(before + 2)
+        user.force_probe(before +% 2)
         user.release_probe()
     end run
 end test B"#,

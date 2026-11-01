@@ -26,7 +26,7 @@ agent Tagger
     last  : uint<8>  default 0
 
     on in_ev(t)
-        seen = seen + 1
+        seen = (seen + 1).trunc<32>()
         last = t
     end on
 end agent Tagger
@@ -59,10 +59,10 @@ test AgentOnHandlerTest
 
         // After the last emit, let the input go quiet; idle_in must flip
         // true once >= 4 cycles have elapsed since the last emit.
-        let waited = 0
+        let waited : uint<64> = 0
         while !tagger.idle_in(4) && waited < 100
             wait 1 cycle
-            waited = waited + 1
+            waited = waited +% 1
         end while
 
         assert tagger.idle_in(4)

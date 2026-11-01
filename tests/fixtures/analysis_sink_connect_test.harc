@@ -15,8 +15,8 @@ scoreboard AnalysisSb
     sum   : uint<32> default 0
 
     hookable write_obs(v: uint<8>)
-        count = count + 1
-        sum = sum + v
+        count = (count + 1).trunc<32>()
+        sum = (sum + v).trunc<32>()
     end write_obs
 end scoreboard AnalysisSb
 
@@ -25,8 +25,8 @@ scoreboard AnalysisCovCollector
     sum     : uint<32> default 0
 
     hookable sample_obs(v: uint<8>)
-        samples = samples + 1
-        sum = sum + v
+        samples = (samples + 1).trunc<32>()
+        sum = (sum + v).trunc<32>()
     end sample_obs
 end scoreboard AnalysisCovCollector
 

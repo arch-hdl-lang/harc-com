@@ -892,10 +892,12 @@ reason. Code locations are authoritative.
       unobservable; in port-allowed positions (assert conditions,
       format args, wait predicates) the ternary emits as `?:` with
       inline reads, byte-equivalent to v1.
-    - *`const` initializers* use a 64-bit integer evaluator for literals,
-      earlier constants and enum variants, scalar casts, unary/binary
-      operators, and one-expression pure scalar helper calls. Wider
-      shapes remain explicit rejections.
+    - *`const` initializers* are evaluated exactly at each operation's
+      ARCH result width (`src/exact_int.rs`), like the same expression at
+      runtime, for literals, earlier constants and enum variants, scalar
+      casts, unary/binary operators, and one-expression pure scalar helper
+      calls. Lengths, addresses, bounds and field defaults still require a
+      value within the 64-bit carrier.
     - *Width methods* cover 1..=1024 bits (#434, #537): casts ≤ 64 bits
       target `uint64_t`, 65..128-bit casts target v1's `_harc_u128`
       (`cpp_uint_for_width`) — trunc via `harc_rt::harc_trunc_u128`,

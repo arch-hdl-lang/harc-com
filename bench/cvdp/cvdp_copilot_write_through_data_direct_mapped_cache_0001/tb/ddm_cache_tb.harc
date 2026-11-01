@@ -221,31 +221,31 @@ impl DdmCacheTest for DdmCacheTb
         let errors : uint<32> = 0
 
         // Read miss fills index 0, then same address hits with memory not ready.
-        errors = errors + read_request(0x00000000, 0x11111111, 0)
-        errors = errors + expect_hit_read(0x00000000, 0x11111111)
+        errors = errors +% read_request(0x00000000, 0x11111111, 0)
+        errors = errors +% expect_hit_read(0x00000000, 0x11111111)
 
         // Write allocates an adjacent cache index, then a read hits the write data.
-        errors = errors + write_request(0x00000004, 0xAABBCCDD, false, 0)
-        errors = errors + expect_hit_read(0x00000004, 0xAABBCCDD)
+        errors = errors +% write_request(0x00000004, 0xAABBCCDD, false, 0)
+        errors = errors +% expect_hit_read(0x00000004, 0xAABBCCDD)
 
         // Same index with a different tag replaces the earlier line.
-        errors = errors + read_request(0x00000100, 0x22222222, 2)
-        errors = errors + expect_hit_read(0x00000100, 0x22222222)
-        errors = errors + read_request(0x00000000, 0x33333333, 1)
+        errors = errors +% read_request(0x00000100, 0x22222222, 2)
+        errors = errors +% expect_hit_read(0x00000100, 0x22222222)
+        errors = errors +% read_request(0x00000000, 0x33333333, 1)
 
         // Uncached writes should drive memory but not allocate the cache line.
-        errors = errors + write_request(0xF0000008, 0xDEADBEEF, true, 1)
-        errors = errors + read_request(0xF0000008, 0xCAFEBABE, 0)
+        errors = errors +% write_request(0xF0000008, 0xDEADBEEF, true, 1)
+        errors = errors +% read_request(0xF0000008, 0xCAFEBABE, 0)
 
         // Boundary and last-index cases.
-        errors = errors + write_request(0xFFFFFFFC, 0xFFFFFFFF, false, 0)
-        errors = errors + expect_hit_read(0xFFFFFFFC, 0xFFFFFFFF)
-        errors = errors + write_request(0x00000008, 0x00000001, false, 0)
-        errors = errors + expect_hit_read(0x00000008, 0x00000001)
+        errors = errors +% write_request(0xFFFFFFFC, 0xFFFFFFFF, false, 0)
+        errors = errors +% expect_hit_read(0xFFFFFFFC, 0xFFFFFFFF)
+        errors = errors +% write_request(0x00000008, 0x00000001, false, 0)
+        errors = errors +% expect_hit_read(0x00000008, 0x00000001)
 
         // Reset invalidates previously cached entries.
         reset_cache()
-        errors = errors + read_request(0x00000004, 0x44444444, 0)
+        errors = errors +% read_request(0x00000004, 0x44444444, 0)
 
         // Solver-backed variation across tags, indexes, data, read/write, and
         // cached/uncached controls.
@@ -254,12 +254,12 @@ impl DdmCacheTest for DdmCacheTb
             randomize(s)
             let addr : uint<32> = make_addr(s.tag, s.index)
             if s.write
-                errors = errors + write_request(addr, s.data, s.uncached, 0)
+                errors = errors +% write_request(addr, s.data, s.uncached, 0)
                 if not s.uncached
-                    errors = errors + expect_hit_read(addr, s.data)
+                    errors = errors +% expect_hit_read(addr, s.data)
                 end if
             else
-                errors = errors + read_request(addr, s.data, 0)
+                errors = errors +% read_request(addr, s.data, 0)
             end if
         end for
 

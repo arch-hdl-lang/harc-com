@@ -1855,7 +1855,7 @@ fn print_log_call(out: &mut String, kw: &str, args: &[CallArg], depth: usize) {
     writeln!(out, ")").ok();
 }
 
-fn binary_op_str(op: BinaryOp) -> &'static str {
+pub(crate) fn binary_op_str(op: BinaryOp) -> &'static str {
     use BinaryOp::*;
     match op {
         Add => "+",

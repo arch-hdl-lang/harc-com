@@ -6088,10 +6088,15 @@ impl Checker<'_> {
                     // Invariant 15.
                     if self.func.locals.get(l.index()).is_some() {
                         let expected = &self.func.local(*l).ty;
+                        // An untyped literal value (a wide literal or
+                        // untyped constant included) was judged against a
+                        // scalar local by strict fit at lowering.
+                        let literal_into_scalar = untyped_literal_fits(expected, e);
                         if let Some(actual) = expr_type(self.prog, self.func, e) {
                             if !string_value_compatible(expected, &actual)
                                 || (*expected != IrType::Unknown
                                     && actual != IrType::Unknown
+                                    && !literal_into_scalar
                                     && !assign_compatible(expected, &actual))
                             {
                                 self.errs.push(VerifyError::TypeMismatch {
@@ -7103,8 +7108,11 @@ impl Checker<'_> {
                                 self.scoreboard_scalar_type(*sb, scalar),
                                 self.aggregate_assignment_expr_type(value),
                             ) {
-                                if self.contains_invalid_record_composition(value)
-                                    || !aggregate_assignment_compatible(&expected, &actual)
+                                // An untyped literal was judged against the
+                                // field by strict fit at lowering.
+                                if !untyped_literal_fits(&expected, value)
+                                    && (self.contains_invalid_record_composition(value)
+                                        || !aggregate_assignment_compatible(&expected, &actual))
                                 {
                                     self.errs.push(VerifyError::BadProgramRef {
                                         what: format!(
@@ -7155,7 +7163,15 @@ impl Checker<'_> {
                         dst_ty,
                         Some(IrType::UInt(Some(w)) | IrType::SInt(Some(w))) if w > 64
                     );
-                    if non_vec_dest && wide_dest {
+                    // An untyped literal (`-1`, `5`) carries no width of
+                    // its own; lowering range-checks it against the field,
+                    // exactly as invariant 15 treats a literal into a
+                    // local. Classifying `-1` as `uint<1>` here raised an
+                    // internal error for `r = -1` on a `sint<200>` field.
+                    let untyped_literal = dst_ty
+                        .as_ref()
+                        .is_some_and(|ty| untyped_literal_fits(ty, value));
+                    if non_vec_dest && wide_dest && !untyped_literal {
                         if let (Some(expected), Some(actual)) =
                             (dst_ty, self.aggregate_assignment_expr_type(value))
                         {
@@ -10866,6 +10882,57 @@ fn queue_elem_accepts_type(elem: &QueueElem, actual: &IrType) -> bool {
 /// narrower destination would lose queue data.
 fn queue_elem_fits_dest(elem: &QueueElem, dest: &IrType) -> bool {
     matches!(dest, IrType::Unknown) || assign_compatible(dest, &elem.ir_type())
+}
+
+/// An untyped integer literal, possibly negated or complemented (`-1`).
+/// An untyped literal value (a literal, an untyped constant, a wide
+/// literal, or `-`/`~`/arithmetic over them). Lowering judges each one
+/// against its destination by strict fit, so it carries no width of its
+/// own to verify against a typed slot.
+fn is_untyped_literal_value(e: &Expr) -> bool {
+    match e {
+        Expr::Literal {
+            ty: IrType::Unknown | IrType::UInt(None) | IrType::SInt(None),
+            ..
+        }
+        | Expr::WideLiteral(_) => true,
+        Expr::Unary(
+            crate::ir::UnOp::Neg | crate::ir::UnOp::BitNot | crate::ir::UnOp::BitNotHost,
+            inner,
+        ) => is_untyped_literal_value(inner),
+        Expr::Binary(
+            crate::ir::BinOp::Add
+            | crate::ir::BinOp::Sub
+            | crate::ir::BinOp::Mul
+            | crate::ir::BinOp::Div
+            | crate::ir::BinOp::Mod
+            | crate::ir::BinOp::BitAnd
+            | crate::ir::BinOp::BitOr
+            | crate::ir::BinOp::BitXor
+            | crate::ir::BinOp::Shl
+            | crate::ir::BinOp::Shr,
+            a,
+            b,
+        ) => is_untyped_literal_value(a) && is_untyped_literal_value(b),
+        _ => false,
+    }
+}
+
+/// An untyped literal value whose exact value fits the scalar `expected`
+/// (strict fit, which lowering applied). A literal that does not fit — or a
+/// rewritten IR literal no source could produce — falls through to the
+/// ordinary width checks, so the verifier still backstops storage.
+fn untyped_literal_fits(expected: &IrType, e: &Expr) -> bool {
+    if !is_untyped_literal_value(e) {
+        return false;
+    }
+    let exact = crate::ir::lower::untyped_literal_exact(e);
+    match expected {
+        IrType::UInt(Some(w)) => exact.is_some_and(|v| v.fits(*w, false)),
+        IrType::SInt(Some(w)) => exact.is_some_and(|v| v.fits(*w, true)),
+        IrType::UInt(None) | IrType::SInt(None) => true,
+        _ => false,
+    }
 }
 
 pub(crate) fn assign_compatible(expected: &IrType, actual: &IrType) -> bool {

@@ -143,21 +143,21 @@ impl SobelTest for SobelTb
         reset_sobel()
         let errors : uint<32> = 0
 
-        errors = errors + drive_midstream_gap()
-        errors = errors + drive_midstream_reset()
+        errors = errors +% drive_midstream_gap()
+        errors = errors +% drive_midstream_reset()
 
         // Uniform no-edge windows.
-        errors = errors + drive_window(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-        errors = errors + drive_window(255, 255, 255, 255, 255, 255, 255, 255, 255, 0)
+        errors = errors +% drive_window(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        errors = errors +% drive_window(255, 255, 255, 255, 255, 255, 255, 255, 255, 0)
 
         // Edge windows chosen to hit positive/negative Gx and Gy absolute-value paths.
-        errors = errors + drive_window(0, 0, 0, 0, 128, 255, 0, 128, 255, 255)
-        errors = errors + drive_window(255, 128, 0, 255, 128, 0, 255, 128, 0, 255)
-        errors = errors + drive_window(255, 255, 255, 0, 0, 0, 0, 0, 0, 255)
-        errors = errors + drive_window(0, 0, 0, 0, 0, 0, 255, 255, 255, 255)
+        errors = errors +% drive_window(0, 0, 0, 0, 128, 255, 0, 128, 255, 255)
+        errors = errors +% drive_window(255, 128, 0, 255, 128, 0, 255, 128, 0, 255)
+        errors = errors +% drive_window(255, 255, 255, 0, 0, 0, 0, 0, 0, 255)
+        errors = errors +% drive_window(0, 0, 0, 0, 0, 0, 255, 255, 255, 255)
 
         // Small perturbation below threshold.
-        errors = errors + drive_window(10, 10, 10, 10, 11, 10, 10, 10, 10, 0)
+        errors = errors +% drive_window(10, 10, 10, 10, 11, 10, 10, 10, 10, 0)
 
         for _ in 0 .. 11
             let s : PixelStim

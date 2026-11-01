@@ -18,14 +18,14 @@ fn fn0 comp_on_0 [kind=ComponentMethod(c0)]
   entry = b0
 
   b0:
-    ComponentFieldWrite(self.seen, (self.seen + 1))
+    ComponentFieldWrite(self.seen, (self.seen + 1).trunc<32 from 33>())
     ComponentFieldWrite(self.last, %t)
     -> Return
 
 fn fn1 run_AgentOnHandlerTest [kind=Run, owner=tb0]
   locals:
     %0 i : unknown
-    %1 waited : unknown
+    %1 waited : uint<64>
   entry = b0
 
   b0:
@@ -76,5 +76,5 @@ fn fn1 run_AgentOnHandlerTest [kind=Run, owner=tb0]
     -> Return
 
   b12:
-    Assign(%waited, (%waited + 1))
+    Assign(%waited, (%waited + 1).trunc<64>())
     -> Jump(b9)

@@ -30,6 +30,16 @@ constants alike. The deprecated `--codegen v1` backend still relabels the
 (`expression_expected_v1.json`) generated from the same trees. This suite
 does not claim coverage of arbitrary wide arithmetic or undefined inputs.
 
+Operands never mix declared signedness (spec §2.4): where a generated
+comparison, arithmetic or bitwise operator would pair a `sint` with a `uint`
+operand, the signed side carries an explicit `as uint<64>` -- the conversion
+the previous implicit rule applied -- so the mixed-sign evaluation stays in the
+corpus with an unchanged oracle value. The interpreter's types follow ARCH
+result widths (`+`/`-` add a bit, `*` sums the operand widths), which is what an
+untyped `let` of the expression infers. The native phase also checks that an
+unconverted mixed operator is rejected by the compiler, as a constant and at
+runtime.
+
 Model families cover equality, ordering, ordering partition, bitwise subset,
 disjoint bits, zero quotient, divisibility and right-shift-to-zero. Division
 excludes zero divisors and signed minimum divided by minus one; excluded
@@ -39,7 +49,8 @@ bit-vector width and the native 64-bit carrier width before source is emitted.
 The chosen predicates have the same model set in both domains.
 
 Every native assignment is pinned by a blocking constraint using runtime loop
-locals. SAT results must preserve the full normalized 64-bit values of those
+locals. A pin local has its field's signedness; an unsigned field's pin is the
+explicit `as uint<64>` conversion of the signed probe value. SAT results must preserve the full normalized 64-bit values of those
 pins, observed as `(field as uint<64>)` (a hex capture of a narrow `sint`
 prints only its declared-width pattern). Missing queries, duplicates, unknown solver results, wrong field values,
 and either extra or missing models fail the test. Out-of-domain pins must be
@@ -54,8 +65,10 @@ metadata, so a blocking constraint referring to a loop local failed with
 LocalIds and the renderer binds them through backend-assigned names. Focused
 regressions cover shadowed locals, reserved C++ names, the helper scope fence,
 consistent file-constant precedence in constraint value/signedness lookup, and
-Boolean captures. Three additional native TBIR queries check mixed-rank
-signed/unsigned comparisons and Boolean constraints. Runtime captures wider
+Boolean captures. Three additional native TBIR queries check signed/unsigned
+captures that are converted explicitly into each field's signedness, and
+Boolean constraints; the same three captures written without the conversion
+must each be rejected at compile time. Runtime captures wider
 than 64 bits fail with a diagnostic; they are not silently truncated.
 
 The tree seeds are `0x45585052` and `1`. Override the first corpus with

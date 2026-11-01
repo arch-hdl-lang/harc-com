@@ -96,7 +96,7 @@ impl TransactorActiveTest for TransactorActiveTb
         // recent observed value. Cross-check by popping all
         // expected values; the LAST pop is what xact.last_read
         // should match.
-        let final_val = 0
+        let final_val : uint<64> = 0
         for t in txns
             final_val = sb.expected.pop()
         end for

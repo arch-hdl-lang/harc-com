@@ -61,21 +61,21 @@ impl TseqBasicTest for TseqBasicTb
         let txns = Gen(5)
 
         // First pass: every item satisfies the keeps and the override.
-        let count = 0
+        let count : uint<64> = 0
         for t in txns
             assert t.len >= 1 && t.len <= 16
                 else fail("len=${t.len} violates `keep len in [1..16]`")
             assert t.addr == 64
                 else fail("addr=${t.addr} was not overridden to 64")
-            count = count + 1
+            count = (count + 1).trunc<64>()
         end for
         assert count == 5 else fail("expected 5 generated txns, saw ${count}")
 
         // Second pass over the SAME materialized sequence — proves the
         // tseq result is a reusable value, not a consumed stream.
-        let sum_len = 0
+        let sum_len : uint<64> = 0
         for t in txns
-            sum_len = sum_len + t.len
+            sum_len = (sum_len + t.len).trunc<64>()
         end for
         assert sum_len >= 5 && sum_len <= 80
             else fail("sum of 5 lens (each 1..16) out of range: ${sum_len}")

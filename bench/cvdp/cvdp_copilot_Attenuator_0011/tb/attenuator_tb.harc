@@ -83,15 +83,15 @@ testbench AttenuatorTb
         log(error, "timeout waiting for ATTN_LE")
         return 1
     end function wait_for_latch
-    function drive_changed(value: uint<5>) -> uint<1>
-        let errors : uint<1> = 0
+    function drive_changed(value: uint<5>) -> uint<8>
+        let errors : uint<8> = 0
         dut.data = value
-        errors = errors + wait_for_shift_pulse(16)
-        errors = errors + wait_for_latch(24)
+        errors = errors +% wait_for_shift_pulse(16)
+        errors = errors +% wait_for_latch(24)
         wait 4 cycles on clk
         if dut.ATTN_LE != 0
             log(error, "ATTN_LE stayed high after value ${value:02x}")
-            errors = errors + 1
+            errors = errors +% 1
         end if
         return errors
     end function drive_changed
@@ -117,16 +117,16 @@ impl AttenuatorTest for AttenuatorTb
         reset_attn()
         let errors : uint<32> = 0
 
-        errors = errors + hold_unchanged(0, 10)
+        errors = errors +% hold_unchanged(0, 10)
 
-        errors = errors + drive_changed(0x1F)
-        errors = errors + hold_unchanged(0x1F, 8)
+        errors = errors +% drive_changed(0x1F)
+        errors = errors +% hold_unchanged(0x1F, 8)
 
-        errors = errors + drive_changed(0x00)
-        errors = errors + drive_changed(0x10)
-        errors = errors + drive_changed(0x01)
-        errors = errors + drive_changed(0x0A)
-        errors = errors + drive_changed(0x15)
+        errors = errors +% drive_changed(0x00)
+        errors = errors +% drive_changed(0x10)
+        errors = errors +% drive_changed(0x01)
+        errors = errors +% drive_changed(0x0A)
+        errors = errors +% drive_changed(0x15)
 
         for bit in 0 .. 4
             let pat : uint<5> = ((1 as uint<5>) << bit).trunc<5>()

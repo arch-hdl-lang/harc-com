@@ -1,7 +1,7 @@
 // Known legacy v1 limitation: HarcWide has ambiguous implicit bool conversion.
 // TBIR must preserve the high bit and return true. See docs/semantic-properties.md.
 function wide_pred(d: Top) -> bool
-    let ignored = 0
+    let ignored : uint<64> = 0
     return d.value
 end function wide_pred
 

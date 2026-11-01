@@ -21,7 +21,7 @@ testbench RecordReturnTb
 
     function bump(r: Result) -> Result
         let out : Result
-        out.value = r.value + 1
+        out.value = (r.value + 1).trunc<8>()
         return out
     end function bump
 end testbench RecordReturnTb

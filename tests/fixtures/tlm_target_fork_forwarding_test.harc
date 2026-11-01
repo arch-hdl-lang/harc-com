@@ -20,19 +20,19 @@ transactor TlmForkForwardingTarget bound to FrontTlmBus
     back_checksum : uint<32> default 0
 
     thread bus.read(addr: uint<8>)
-        route_count = route_count + 1
-        front_checksum = front_checksum + addr
+        route_count = (route_count + 1).trunc<32>()
+        front_checksum = (front_checksum + addr).trunc<32>()
 
-        let addr0 : uint<8> = addr + 1
-        let addr1 : uint<8> = addr + 2
-        back_checksum = back_checksum + addr0 + addr1
-        fork_count = fork_count + 2
+        let addr0 : uint<8> = (addr + 1).trunc<8>()
+        let addr1 : uint<8> = (addr + 2).trunc<8>()
+        back_checksum = (back_checksum + addr0 + addr1).trunc<32>()
+        fork_count = (fork_count + 2).trunc<32>()
 
         let data0 = fork back.read_ooo(addr0)
         let data1 = fork back.read_ooo(addr1)
         join_all
 
-        return data0 + data1 + 4096
+        return (data0 + data1 + 4096).trunc<32>()
     end thread
 end transactor TlmForkForwardingTarget
 

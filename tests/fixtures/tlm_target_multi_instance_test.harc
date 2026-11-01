@@ -11,8 +11,8 @@ transactor CountingTarget bound to TlmMemBus
     calls : uint<32> default 0
 
     thread bus.read(addr: uint<8>)
-        calls = calls + 1
-        return calls * 100 + addr
+        calls = (calls + 1).trunc<32>()
+        return (calls * 100 + addr).trunc<32>()
     end thread
 end transactor CountingTarget
 

@@ -408,12 +408,12 @@ testbench RuntimeCellTb
     service_hits : uint<16> default 0
 
     on 1 cycles phase post_eval
-        service_hits = service_hits + 1
+        service_hits = (service_hits + 1).resize<16>()
         log(info, "TB_PERIODIC")
     end on
 
     on dut.q != 0
-        service_hits = service_hits + 10
+        service_hits = (service_hits + 10).resize<16>()
         log(info, "TB_EDGE")
     end on
 end testbench RuntimeCellTb
@@ -506,19 +506,19 @@ agent LifecycleCell
     end function arm
 
     on 1 cycles phase post_eval
-        periodic_hits = periodic_hits + 1
+        periodic_hits = (periodic_hits + 1).resize<16>()
         log(info, "CELL_PERIODIC=${marker}:${periodic_hits}")
     end on
 
     on armed != 0
-        edge_hits = edge_hits + 1
+        edge_hits = (edge_hits + 1).resize<16>()
         log(info, "CELL_EDGE=${marker}:${edge_hits}")
     end on
 
     watchdog
         period 1 cycles
         max_idle 100 cycles
-        watchdog_hits = watchdog_hits + 1
+        watchdog_hits = (watchdog_hits + 1).resize<16>()
         log(info, "CELL_WATCHDOG=${marker}:${watchdog_hits}")
     end watchdog
 end agent LifecycleCell
@@ -564,11 +564,11 @@ agent HookCell
     _harc_hook_bump_post : uint<16> default 43
 
     hookable bump(delta: uint<16>)
-        value = value + delta
+        value = (value + delta).resize<16>()
     end bump
 
     hookable touch()
-        value = value + 1
+        value = (value + 1).resize<16>()
     end touch
 
     function arm()
@@ -576,7 +576,7 @@ agent HookCell
     end function arm
 
     on armed != 0
-        edge_hits = edge_hits + 1
+        edge_hits = (edge_hits + 1).resize<16>()
     end on
 end agent HookCell
 
@@ -592,15 +592,15 @@ impl HookIsolation for HookIsolationTb
     run
         let offset : uint<16> = 3
         on left.bump pre
-            observed = observed + delta + offset
+            observed = (observed + delta + offset).resize<16>()
             log(info, "LEFT_PRE=${observed}")
         end on
         on left.bump post
-            observed = observed + 10
+            observed = (observed + 10).resize<16>()
             log(info, "LEFT_POST=${observed}")
         end on
         on left.touch pre
-            observed = observed + 100
+            observed = (observed + 100).resize<16>()
             log(info, "LEFT_TOUCH=${observed}")
         end on
         right.bump(4)
@@ -654,7 +654,7 @@ impl ZHookFatal for HookIsolationTb
     run
         let offset : uint<16> = 77
         on left.bump pre
-            observed = observed + delta + offset
+            observed = (observed + delta + offset).resize<16>()
             log(error, "UNREACHABLE_FATAL_HOOK=${observed}")
         end on
         log(fatal, "EXPECTED_HOOK_FATAL")
@@ -677,7 +677,7 @@ scoreboard EventSinkCell
     total : uint<16> default 0
 
     hookable accept(value: uint<16>)
-        total = total + value
+        total = (total + value).resize<16>()
         log(info, "EVENT_ACCEPT=${value}:${total}")
     end accept
 end scoreboard EventSinkCell
@@ -687,7 +687,7 @@ agent EventRelayCell
     total : uint<16> default 0
 
     on incoming(value)
-        total = total + value
+        total = (total + value).resize<16>()
         log(info, "EVENT_RELAY=${value}:${total}")
     end on
 end agent EventRelayCell
@@ -737,7 +737,7 @@ agent DurableCell
     total : uint<16> default 0
 
     function add(value: uint<16>)
-        total = total + value
+        total = (total + value).resize<16>()
     end function add
 
     hookable sample()
@@ -751,7 +751,7 @@ testbench PersistentCaptureTb
     hits : uint<16> default 0
 
     function bump()
-        hits = hits + 1
+        hits = (hits + 1).resize<16>()
     end function bump
 end testbench PersistentCaptureTb
 
@@ -780,7 +780,7 @@ impl PersistentCapture for PersistentCaptureTb
         on 1 cycles
             let values = DurableValues(3)
             for value in values
-                cell.add(dut.q.zext<16>() + value)
+                cell.add((dut.q.zext<16>() + value).trunc<16>())
             end for
             bump()
             log(info, "PERSISTENT_TICK=${dut.q}:${hits}")
@@ -805,11 +805,11 @@ agent HookBindingsCell
     total : uint<16> default 0
 
     hookable fire(delta: uint<8>)
-        total = total + delta
+        total = (total + delta).resize<16>()
     end fire
 
     function add(delta: uint<16>)
-        total = total + delta
+        total = (total + delta).resize<16>()
     end function add
 end agent HookBindingsCell
 
@@ -819,7 +819,7 @@ testbench HookBindingsTb
     total : uint<16> default 0
 
     function bump(delta: uint<16>)
-        total = total + delta
+        total = (total + delta).resize<16>()
     end function bump
 
     on 1 cycles phase post_eval
@@ -876,7 +876,7 @@ testbench RuntimeCellNameTb
     ticks : uint<8> default 0
 
     on 1 cycles
-        ticks = ticks + 1
+        ticks = (ticks + 1).resize<8>()
     end on
 end testbench RuntimeCellNameTb
 
@@ -887,8 +887,8 @@ impl RuntimeCellNames for RuntimeCellNameTb
         let _harc_opaque_state : uint<8> = 5
         _harc_runtime_cells.value = runtime_cells
         _harc_run_state.value = _harc_opaque_state
-        _last_in_cycle = _last_in_cycle + 1
-        _last_out_cycle = _last_out_cycle + 1
+        _last_in_cycle = (_last_in_cycle + 1).resize<8>()
+        _last_out_cycle = (_last_out_cycle + 1).resize<8>()
         wait 2 cycles
         assert _harc_runtime_cells.value == 4 else fail("runtime-cell member collision")
         assert _harc_run_state.value == 5 else fail("run-state member collision")
@@ -904,7 +904,7 @@ const COMMON_COMPONENT_METHODS_TESTBENCH: &str = r#"
 agent Counter
     value : uint<16> default 1
     hookable bump(delta: uint<16>) -> uint<16>
-        value = value + delta
+        value = (value + delta).resize<16>()
         return value
     end bump
 end agent Counter
@@ -919,7 +919,7 @@ env CounterPair
         assert left.value == left_before else fail("component parameter aliased receiver")
         let left_value = left.bump(left_delta)
         let right_value = right.bump(right_delta)
-        return left_value + right_value
+        return (left_value + right_value).resize<16>()
     end function sum_after
     function bump_copy(model: Counter, delta: uint<16>) -> uint<16>
         return model.bump(delta)
@@ -958,7 +958,7 @@ transaction Beat
 end transaction Beat
 
 function combine(first: uint<16>, second: uint<16>) -> uint<32>
-    return first * 1000 + second
+    return (first * 1000 + second).resize<32>()
 end function combine
 
 testbench MethodTb
@@ -971,7 +971,7 @@ testbench MethodTb
     end function ordered
 
     hookable later(delta: uint<16>) -> uint<16>
-        count = count + delta
+        count = (count + delta).resize<16>()
         return count
     end later
 
@@ -981,7 +981,7 @@ testbench MethodTb
 
     function save(beat: Beat) -> uint<16>
         saved = beat
-        saved.value = saved.value + 1
+        saved.value = (saved.value + 1).resize<16>()
         return saved.value
     end function save
 
@@ -1059,7 +1059,7 @@ agent TimingAgent
 
     function wall(delta: uint<16>) -> uint<16>
         wait 1ps
-        total = total + delta
+        total = (total + delta).resize<16>()
         return total
     end function wall
 
@@ -1069,13 +1069,13 @@ agent TimingAgent
 
     function from_tseqs(seed: uint<8>) -> uint<16>
         let pure = PureValues(seed)
-        let timed = TimedValues(seed + 1)
+        let timed = TimedValues((seed + 1).trunc<8>())
         let result : uint<16> = 0
         for value in pure
-            result = result + value
+            result = (result + value).resize<16>()
         end for
         for value in timed
-            result = result + value
+            result = (result + value).resize<16>()
         end for
         return result
     end function from_tseqs
@@ -1088,7 +1088,7 @@ testbench TimingTb
 
     function wall(delta: uint<16>) -> uint<16>
         wait 1ps
-        total = total + delta
+        total = (total + delta).resize<16>()
         return total
     end function wall
 
@@ -1098,13 +1098,13 @@ testbench TimingTb
 
     function from_tseqs(seed: uint<8>) -> uint<16>
         let pure = PureValues(seed)
-        let timed = TimedValues(seed + 1)
+        let timed = TimedValues((seed + 1).trunc<8>())
         let result : uint<16> = 0
         for value in pure
-            result = result + value
+            result = (result + value).resize<16>()
         end for
         for value in timed
-            result = result + value
+            result = (result + value).resize<16>()
         end for
         return result
     end function from_tseqs
@@ -1140,7 +1140,7 @@ end transaction HookBeat
 agent HookCounter
     value : uint<16> default 0
     hookable bump(delta: uint<16>)
-        value = value + delta
+        value = (value + delta).resize<16>()
     end bump
 end agent HookCounter
 
@@ -1152,11 +1152,11 @@ end testbench HookStateTb
 
 impl HookRecordState for HookStateTb
     on counter.bump pre
-        saved.value = saved.value + delta
+        saved.value = (saved.value + delta).resize<16>()
     end on
 
     on counter.bump post
-        saved.value = saved.value + 10
+        saved.value = (saved.value + 10).resize<16>()
     end on
 
     clock clk = 10ns
@@ -1185,14 +1185,14 @@ agent ReceiverCell
     board : ReceiverBoard
 
     function bump(ctx: uint<16>) -> uint<16>
-        value = value + ctx
-        board.count = board.count + 1
+        value = (value + ctx).resize<16>()
+        board.count = (board.count + 1).resize<16>()
         let beat : ReceiverBeat
         beat.value = value
         board.pending.push(beat)
         let observed = board.pending.pop()
         assert observed.value == value else fail("component scoreboard queue")
-        return value + board.count
+        return (value + board.count).resize<16>()
     end function bump
 end agent ReceiverCell
 
@@ -1215,9 +1215,9 @@ testbench ReceiverTb
     board : ReceiverBoard
 
     function invoke(_harc_tb_component_receiver: uint<16>) -> uint<16>
-        board.count = board.count + 1
+        board.count = (board.count + 1).resize<16>()
         let result = receiver.copied_bump(_harc_tb_component_receiver)
-        return result + board.count
+        return (result + board.count).resize<16>()
     end function invoke
 
     function local_collision(delta: uint<16>) -> uint<16>
@@ -1271,9 +1271,9 @@ testbench LogicalOrderTb
 
     function read_pair(addr: uint<8>) -> uint<32>
         let first = fork mem.read_ooo(addr)
-        let second = fork mem.read_ooo(addr + 1)
+        let second = fork mem.read_ooo((addr + 1).trunc<8>())
         join_all
-        return first + second
+        return (first + second).resize<32>()
     end function read_pair
 end testbench LogicalOrderTb
 
@@ -1369,7 +1369,7 @@ covergroup StateCov @(posedge dut.clk)
 end covergroup StateCov
 
 function plus_one(x: uint<8>) -> uint<8>
-    return x + 1
+    return (x + 1).resize<8>()
 end function plus_one
 
 function widen_plus_one(x: uint<8>) -> uint<130>
@@ -1442,7 +1442,7 @@ impl SharedTypesA for SharedTypesTb
         item.lanes[0] = 9
         item.lanes[1] = 11
         sb.pending.push(item)
-        sb.writes = sb.writes + 1
+        sb.writes = (sb.writes + 1).resize<16>()
         _tb.last = sb.pending.pop()
         let raw_record_values = RecordValues(5)
         let record_values = CopyRecordValues(raw_record_values)
@@ -1453,18 +1453,18 @@ impl SharedTypesA for SharedTypesTb
         for echoed_value in echoed_values
             assert echoed_value.wide == 5 else fail("record parameter value")
         end for
-        count = count + 1
+        count = (count + 1).resize<16>()
         pending_values.push(13)
         let queued = pending_values.pop()
         let raw_values = ForwardPure(5)
         let copied_values = CopyScalarValues(raw_values)
         let before = cycle_count
         let ys = ForwardTimed(6)
-        let pure_value = 0
+        let pure_value : uint<64> = 0
         for value in copied_values
             pure_value = value
         end for
-        let timed_value = 0
+        let timed_value : uint<64> = 0
         for value in ys
             timed_value = value
         end for
@@ -1487,7 +1487,7 @@ impl SharedTypesB for SharedTypesTb
     clock clk = CommonDomain
     run
         let values = PureValues(9)
-        let observed = 0
+        let observed : uint<64> = 0
         for value in values
             observed = value
         end for
@@ -2620,7 +2620,7 @@ const rng : uint<8> = 4
 const _cells : uint<8> = 5
 
 function ctx(value : uint<8>) -> uint<8>
-    return value + errors + rng + _cells
+    return (value + errors + rng + _cells).resize<8>()
 end function ctx
 
 tseq harc_rng_next() -> TSeq<uint<8>>
@@ -2634,7 +2634,7 @@ test GlobalNameCollision
         let values = harc_rng_next()
         let observed : uint<8> = 0
         for value in values
-            observed = observed + value
+            observed = (observed + value).resize<8>()
         end for
         assert observed == 27
         log(info, "GLOBAL_NAME_COLLISION_OK")
@@ -2683,7 +2683,7 @@ fn generated_runtime_binders_do_not_capture_enum_variants_in_every_layout() {
 test EnumNameCollision
     let dut : EnumNameCollisionTop
     run
-        let observed : uint<8> = ctx + errors + rng + _cells
+        let observed : uint<8> = (ctx + errors + rng + _cells).resize<8>()
         assert observed == 6
         log(info, "ENUM_NAME_COLLISION_OK")
     end run
@@ -5901,15 +5901,15 @@ testbench DivergentTlmTb
 
     function read_pair(addr: uint<8>) -> uint<32>
         let first = fork mem.read_ooo(addr)
-        let second = fork mem.read_ooo(addr + 1)
+        let second = fork mem.read_ooo((addr + 1).trunc<8>())
         join_all
-        return first + second
+        return (first + second).resize<32>()
     end function read_pair
 
     function read_all(addr: uint<8>) -> uint<32>
         let direct = read_once(addr)
-        let pair = read_pair(addr + 1)
-        return direct + pair
+        let pair = read_pair((addr + 1).trunc<8>())
+        return (direct + pair).resize<32>()
     end function read_all
 end testbench DivergentTlmTb
 
@@ -6224,7 +6224,7 @@ end bus WaitBus
 transactor WaitTarget bound to WaitBus
     thread bus.read(addr: uint<8>)
         wait 1 cycle
-        return 0x100 + addr
+        return (0x100 + addr).resize<32>()
     end thread
 end transactor WaitTarget
 
@@ -6793,7 +6793,7 @@ end bus TlmMemBus
 
 transactor TlmMemTarget bound to TlmMemBus
     thread bus.read(addr: uint<8>)
-        return 256 + addr
+        return (256 + addr).resize<32>()
     end thread
 end transactor TlmMemTarget
 
@@ -8022,7 +8022,7 @@ transactor TinyDriver bound to TinyBus
     calls : uint<8> default 0
     when active
         function drive_raw(value: uint<8>)
-            calls = calls + 1
+            calls = (calls + 1).resize<8>()
             bus.req.data = value
             bus.req.valid = 1
             wait 1 cycle
@@ -8072,7 +8072,7 @@ impl BoundBusA for BusTbA
     let event_driver_a : TinyEventDriver active = bind first
     clock clk = 10ns
     on driver_a.drive post
-        hook_count = hook_count + 1
+        hook_count = (hook_count + 1).resize<8>()
         let hook_read = driver_a.read_back(value)
         assert hook_read == value + 1 else fail("first hook TLM remap ${hook_read}")
         log(info, "BOUND_BUS_HOOK=A:${value}")
@@ -8107,7 +8107,7 @@ impl BoundBusB for BusTbB
     let event_driver_b : TinyEventDriver active = bind second
     clock clk = 10ns
     on driver_b.drive post
-        hook_count = hook_count + 1
+        hook_count = (hook_count + 1).resize<8>()
         let hook_read = driver_b.read_back(value)
         assert hook_read == value + 1 else fail("second hook TLM remap ${hook_read}")
         log(info, "BOUND_BUS_HOOK=B:${value}")
@@ -8543,9 +8543,9 @@ impl RalRemapFirst for RalRemapTb
     end on
     run
         let high : uint<64> = 1.zext<64>() << 63
-        let callback_value : uint<64> = high + 4660
-        let write_value : uint<64> = high + 1
-        let poison : uint<64> = high + 43690
+        let callback_value : uint<64> = (high + 4660).resize<64>()
+        let write_value : uint<64> = (high + 1).resize<64>()
+        let poison : uint<64> = (high + 43690).resize<64>()
         dut.rst = 0
         dut.second_data = poison
         regs.record_write(5, callback_value)
@@ -8574,9 +8574,9 @@ impl RalRemapSecond for RalRemapTb
     end on
     run
         let high : uint<64> = 1.zext<64>() << 63
-        let callback_value : uint<64> = high + 22136
-        let write_value : uint<64> = high + 2
-        let poison : uint<64> = high + 21845
+        let callback_value : uint<64> = (high + 22136).resize<64>()
+        let write_value : uint<64> = (high + 2).resize<64>()
+        let poison : uint<64> = (high + 21845).resize<64>()
         dut.rst = 0
         dut.first_data = poison
         regs.record_write(5, callback_value)

@@ -19,15 +19,15 @@ fn fn0 comp_on_0 [kind=ComponentMethod(c0)]
   entry = b0
 
   b0:
-    ComponentFieldWrite(self.seen, (self.seen + 1))
+    ComponentFieldWrite(self.seen, (self.seen + 1).trunc<32 from 33>())
     -> Return
 
 fn fn1 run_HeartbeatIdleTest [kind=Run, owner=tb0]
   locals:
     %0 i : unknown
     %1 t : record(r0)
-    %2 waited : unknown
-    %3 budget : unknown
+    %2 waited : uint<64>
+    %3 budget : uint<64>
   entry = b0
 
   b0:
@@ -80,5 +80,5 @@ fn fn1 run_HeartbeatIdleTest [kind=Run, owner=tb0]
     -> Return
 
   b12:
-    Assign(%waited, (%waited + 1))
+    Assign(%waited, (%waited + 1).trunc<64>())
     -> Jump(b9)

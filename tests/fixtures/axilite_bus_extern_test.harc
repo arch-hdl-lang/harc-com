@@ -65,8 +65,8 @@ impl AxiLiteBusExternTest for AxiLiteBusExternTb
         wait 2 cycles
 
         // Read it back.
-        let val = 0
-        let saw = 0
+        let val : uint<64> = 0
+        let saw : uint<64> = 0
         axil.ar.addr = 24
         axil.ar.valid = 1
         for _ in 0 .. 9

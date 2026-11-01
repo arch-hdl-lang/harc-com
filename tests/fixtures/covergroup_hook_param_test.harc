@@ -85,11 +85,11 @@ impl CovHookParamTest for CovHookParamTb
         //   cmd[1]: ticks=2 expect=3   (pair / small)
         //   cmd[2]: ticks=3 expect=6   (pair / big)
         // So cp_ticks: one=1, pair=2; cp_expect: small=2, big=1.
-        let total = 0
+        let total : uint<32> = 0
         for i in 0 .. 2
             let cmd : RunCmd
             cmd.ticks = cmd.ticks + i        // 1, 2, 3
-            total = total + cmd.ticks
+            total = (total + cmd.ticks).trunc<32>()
             cmd.expect = total
 
             drv.run_for(cmd)

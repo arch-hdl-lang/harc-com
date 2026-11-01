@@ -1,0 +1,73 @@
+// Constants fold exactly at their ARCH result width, like runtime values,
+// so a `const` and the same expression evaluated at runtime always agree:
+// a 65-bit unsigned difference keeps its carry, and 128- and 192-bit
+// intermediates are exact. Each constant is checked against its known
+// value and against the runtime evaluation of the same expression.
+
+const A : uint<64> = 0
+const B : uint<64> = 15
+const UMAX : uint<64> = 0xFFFFFFFFFFFFFFFF
+const SMIN : sint<64> = -9223372036854775807 - 1
+
+// uint<64>(0) - uint<64>(15) is the 65-bit 2**65 - 15; mod 127 that is
+// 116 (a 64-bit carrier would give 114).
+const DIFF_MOD = (A - B) % 127
+// A 128-bit product, kept whole.
+const SQ = UMAX * UMAX
+// 192-bit intermediates, unsigned and signed.
+const CUBE_MOD = (UMAX * UMAX * UMAX) % 1000003
+const SCUBE_MOD = (SMIN * SMIN * SMIN) % 1000003
+// A signed 65-bit difference below sint<64>'s range.
+const SBELOW_MOD = (SMIN - 1) % 1000
+// Literal-only shifts, exact.
+const SH : uint<128> = 3 << 63
+const NSH : sint<128> = (0 - 3) << 62
+
+test ConstExactWidthTest
+    let dut : Top
+
+    run
+        let a : uint<64> = 0
+        let b : uint<64> = 15
+        let umax : uint<64> = 0xFFFFFFFFFFFFFFFF
+        let smin : sint<64> = -9223372036854775807 - 1
+
+        assert DIFF_MOD == 116 else fail("const (A - B) % 127 = ${DIFF_MOD}")
+        assert (a - b) % 127 == 116 else fail("runtime (a - b) % 127")
+        assert DIFF_MOD == (a - b) % 127 else fail("const and runtime difference disagree")
+
+        assert SQ == 0xfffffffffffffffe0000000000000001 else fail("const 128-bit product")
+        assert SQ == umax * umax else fail("const and runtime 128-bit product disagree")
+
+        assert CUBE_MOD == 218658 else fail("const 192-bit unsigned cube = ${CUBE_MOD}")
+        assert CUBE_MOD == (umax * umax * umax) % 1000003
+            else fail("const and runtime 192-bit unsigned cube disagree")
+
+        assert SCUBE_MOD == -396961 else fail("const 192-bit signed cube = ${SCUBE_MOD}")
+        assert SCUBE_MOD == (smin * smin * smin) % 1000003
+            else fail("const and runtime 192-bit signed cube disagree")
+
+        assert SBELOW_MOD == -809 else fail("const sint<65> difference = ${SBELOW_MOD}")
+        assert SBELOW_MOD == (smin - 1) % 1000
+            else fail("const and runtime sint<65> difference disagree")
+
+        // Literal-only shifts are exact in both contexts (never computed
+        // in, or sign-extended from, a 64-bit carrier).
+        let sh : uint<128> = 3 << 63
+        assert sh == SH else fail("const and runtime 3 << 63 disagree")
+        assert sh[64:63] == 3 else fail("3 << 63 lost its bit 64")
+        let ns : sint<128> = (0 - 3) << 62
+        assert ns == NSH else fail("const and runtime (0 - 3) << 62 disagree")
+        assert ns < 0 else fail("(0 - 3) << 62 changed sign")
+
+        // `+ - *` with a literal widen per ARCH, at any width.
+        let s : sint<64> = 1
+        let s65 : sint<65> = s + 0x8000000000000000
+        assert s65 == 0x8000000000000001 else fail("s64 + 2**63 is not exact")
+        let two : uint<64> = 2
+        let p129 : uint<129> = two * 0x10000000000000000
+        assert p129 == 0x20000000000000000 else fail("u64 * 2**64 is not exact")
+
+        log(info, "PASS: constants are exact at their ARCH result widths")
+    end run
+end test ConstExactWidthTest

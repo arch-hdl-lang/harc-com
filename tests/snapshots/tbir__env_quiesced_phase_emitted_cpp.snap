@@ -303,7 +303,7 @@ int run_EnvQuiescedPhaseTest(int argc, char** argv) {
         while (true) {
             switch (__bb) {
             case 0: {
-                self.seen = (self.seen + 1);
+                self.seen = ((uint64_t)(((uint64_t)((self.seen + 1)) & 0xFFFFFFFFULL)));
                 return;
                 break;
             }
@@ -380,7 +380,7 @@ int run_EnvQuiescedPhaseTest(int argc, char** argv) {
                 }
                 case 10: {
                     drained = top.sb.expected.pop();
-                    top.sb.popped = (top.sb.popped + 1);
+                    top.sb.popped = ((uint64_t)(((uint64_t)((top.sb.popped + 1)) & 0xFFFFFFFFULL)));
                     __bb = 9;
                     break;
                 }

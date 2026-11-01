@@ -35,7 +35,7 @@ impl BinaryToBcdTest for BinaryToBcdTestTb
             let expected = bcd_ref(n)
             if dut.bcd_out != expected
                 log(error, "MISMATCH n=${n:3} got=${dut.bcd_out:03x} expected=${expected:03x}")
-                errors = errors + 1
+                errors = errors +% 1
             end if
         end for
 

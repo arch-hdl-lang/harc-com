@@ -8,6 +8,7 @@ pub mod graph;
 pub mod ir;
 pub mod learn;
 pub mod lexer;
+pub(crate) mod exact_int;
 mod numeric_semantics;
 pub mod parser;
 pub mod pretty;

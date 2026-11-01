@@ -35,8 +35,8 @@ testbench LazyMessageTb
     calls : uint<8> default 0
 
     function bump(x: uint<8>) -> uint<8>
-        calls = calls + 1
-        return x + calls
+        calls = (calls + 1).trunc<8>()
+        return (x + calls).trunc<8>()
     end function bump
 end testbench LazyMessageTb
 

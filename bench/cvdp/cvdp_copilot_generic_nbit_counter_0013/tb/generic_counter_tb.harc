@@ -208,7 +208,7 @@ impl GenericCounterTest for GenericCounterTestTb
         dut.enable_in = 1
         dut.mode_in = 2  // MODULO_256 - uses ref_modulo branches
         for v in 0 .. 7
-            dut.ref_modulo = 1 << v   // single-bit walking-1: 0x01,0x02,0x04,...,0x80
+            dut.ref_modulo = (1 as uint<8>) << v   // single-bit walking-1: 0x01,0x02,0x04,...,0x80
             wait 1 cycle
         end for
         dut.ref_modulo = 0xFF

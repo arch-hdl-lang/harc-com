@@ -255,14 +255,14 @@ impl Lz4BlockDecoderTest for Lz4Tb
         // advances both wr_ptr and mat_rd_ptr by 1 → always reads the most
         // recently written 'a' (run-length expansion).
         dut.in_valid = 0
-        let t3 = 0
+        let t3 : uint<64> = 0
         while t3 < 4
             assert dut.out_valid == 1
                 else fail("T3: out_valid=0 on match byte ${t3}")
             assert dut.out_data == 0x61
                 else fail("T3: match[${t3}] expected 'a'(0x61), got ${dut.out_data}")
             wait 1 cycle
-            t3 = t3 + 1
+            t3 = t3 +% 1
         end while
         // → READ_TOKEN
 
@@ -321,12 +321,12 @@ impl Lz4BlockDecoderTest for Lz4Tb
             else fail("T4: error=0 after offset==0; expected ERROR state")
 
         // Error persists without reset
-        let t4 = 0
+        let t4 : uint<64> = 0
         while t4 < 3
             wait 1 cycle
             assert dut.error == 1
                 else fail("T4: error cleared without reset at cycle ${t4}")
-            t4 = t4 + 1
+            t4 = t4 +% 1
         end while
 
         // Reset clears error

@@ -101,13 +101,13 @@ test LoopBounds
         let n : uint<8> = 3
         let a : uint<8> = 0
         for n in 0 .. n
-            a = a + 1
+            a = a +% 1
         end for
         assert a == 4 else fail("for-hi resolved to the loop variable")
         let neg : sint<8> = -2
         let s : uint<16> = 0
         repeat neg
-            s = s + 1
+            s = s +% 1
             if s == 1000
                 break
             end if
@@ -116,7 +116,7 @@ test LoopBounds
         let three : sint<8> = 3
         let t : uint<16> = 0
         repeat three
-            t = t + 1
+            t = t +% 1
         end repeat
         assert t == 3 else fail("signed positive repeat count mismatch")
         log(info, "LOOPS a=${a} s=${s} t=${t}")
@@ -148,7 +148,7 @@ test NegRepeat
     run
         let s : uint<16> = 0
         repeat N
-            s = s + 1
+            s = s +% 1
         end repeat
     end run
 end test NegRepeat

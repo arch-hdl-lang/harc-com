@@ -44,20 +44,20 @@ impl TseqScalarTest for TseqScalarTb
         let xs = Squares(4)
 
         // First pass: count items and accumulate the sum (1+4+9+16 = 30).
-        let count = 0
-        let sum = 0
+        let count : uint<64> = 0
+        let sum : uint<64> = 0
         for x in xs
-            count = count + 1
-            sum = sum + x
+            count = (count + 1).trunc<64>()
+            sum = (sum + x).trunc<64>()
         end for
         assert count == 4 else fail("expected 4 generated scalars, saw ${count}")
         assert sum == 30 else fail("expected sum 30 (1+4+9+16), saw ${sum}")
 
         // Second pass over the SAME materialized sequence — proves the
         // tseq result is a reusable value, not a consumed stream.
-        let sum2 = 0
+        let sum2 : uint<64> = 0
         for x in xs
-            sum2 = sum2 + x
+            sum2 = (sum2 + x).trunc<64>()
         end for
         assert sum2 == 30 else fail("second pass sum mismatch: ${sum2}")
 

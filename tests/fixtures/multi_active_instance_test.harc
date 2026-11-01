@@ -26,7 +26,7 @@ transactor Drv
     calls : uint<32> default 0
     when active
         hookable go()
-            calls = calls + 1
+            calls = (calls + 1).trunc<32>()
             dut.en = 1
         end go
     end when

@@ -8,7 +8,7 @@ impl TernarySignedWideningC08Test for TernarySignedWideningC08Tb
     run
         let one65 : sint<65> = 1
         let neg65 : sint<65> = -8 / 3
-        let min65 : sint<65> = 0 - (one65 << 64)
+        let min65 : sint<65> = -(one65 << 64)
         let zero100 : sint<100> = 0
         let neg100 : sint<100> = -2
         let zero128 : sint<128> = 0

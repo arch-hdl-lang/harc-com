@@ -211,7 +211,7 @@ end transactor Source
 scoreboard Sink
     seen : uint<8> default 0
     hookable take(value : uint<8>)
-        seen = seen + value
+        seen = (seen + value).resize<8>()
     end take
     hookable read() -> uint<8>
         return seen
@@ -315,7 +315,7 @@ transactor LocalWatcher
     seen : uint<8> default 0
 
     on dut.rst == 1
-        seen = seen + 1
+        seen = (seen + 1).resize<8>()
     end on
 
     hookable read() -> uint<8>
@@ -390,7 +390,7 @@ agent Listener
     seen : uint<8> default 0
 
     on input(value)
-        seen = seen + value
+        seen = (seen + value).resize<8>()
     end on
 
     hookable read() -> uint<8>
@@ -492,7 +492,7 @@ agent Listener
     seen : uint<8> default 0
 
     on input(value)
-        seen = seen + value
+        seen = (seen + value).resize<8>()
     end on
 
     hookable read() -> uint<8>

@@ -14,8 +14,8 @@ transactor OooMemTarget bound to OooMemBus
     checksum : uint<32> default 0
 
     thread bus.read_ooo(addr: uint<8>)
-        read_count = read_count + 1
-        checksum = checksum + addr
+        read_count = (read_count + 1).trunc<32>()
+        checksum = (checksum + addr).trunc<32>()
         if addr < 8
             wait 5 cycles
             return 4096 + addr

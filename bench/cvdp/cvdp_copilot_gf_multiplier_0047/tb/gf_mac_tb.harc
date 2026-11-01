@@ -31,7 +31,7 @@ impl GfMacTest for GfMacTb
         dut.enable = 1
         dut.pass_through = 1
         for k in 0 .. 7
-            dut.a = (1 << (k * 4))
+            dut.a = ((1 as uint<32>) << (k * 4))
             dut.b = 0xA5A5A5A5
             wait 1 cycle
         end for

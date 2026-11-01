@@ -36,8 +36,8 @@ scoreboard SeqSb
     sum   : uint<32> default 0
 
     hookable sink(v: uint<8>)
-        count = count + 1
-        sum = sum + v
+        count = (count + 1).trunc<32>()
+        sum = (sum + v).trunc<32>()
     end sink
 end scoreboard SeqSb
 

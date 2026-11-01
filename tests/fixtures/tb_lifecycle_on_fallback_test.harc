@@ -10,7 +10,7 @@ testbench OnLifecycleTb
     setup
         let ev : event<uint<8>>
         on ev(v)
-            seen = seen + v
+            seen = (seen + v).trunc<32>()
         end on
         emit ev(2)
         wait 1 cycle

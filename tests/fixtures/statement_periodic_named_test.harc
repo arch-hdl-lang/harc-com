@@ -16,7 +16,7 @@ end testbench StatementPeriodicNamedTb
 
 impl StatementPeriodicNamedTest for StatementPeriodicNamedTb
     clock clk = SysDomain
-    let per = 2
+    let per : uint<64> = 2
 
     run
         dut.rst = 1
@@ -25,7 +25,7 @@ impl StatementPeriodicNamedTest for StatementPeriodicNamedTb
         fires = 0
 
         on per cycles
-            fires = fires + 1
+            fires = (fires + 1).trunc<32>()
         end on
 
         wait 8 cycles

@@ -14,7 +14,7 @@ fn fn0 harc_crc8_step [kind=Helper]
     %0 crc : uint<8>
     %1 byte : uint<8>
     %2 __ret : uint<8>
-    %3 x : unknown
+    %3 x : uint<8>
     %4 _anon : unknown
   ret = %__ret
   entry = b0
@@ -54,8 +54,8 @@ fn fn0 harc_crc8_step [kind=Helper]
 
 fn fn1 run_ExternFnRefTest [kind=Run, owner=tb0]
   locals:
-    %0 crc_ref : unknown
-    %1 crc_harc : unknown
+    %0 crc_ref : uint<8>
+    %1 crc_harc : uint<8>
     %2 i : unknown
     %3 b : unknown
   entry = b0

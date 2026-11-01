@@ -16,16 +16,16 @@ fn after_body_has_lexical_scope_and_restores_outer_bindings() {
         r#"test AfterScope
     let dut : Top
     run
-        let x = 1
+        let x : uint<64> = 1
         after 1 cycles
-            let x = 2
+            let x : uint<64> = 2
             assert x == 2 else fail("inner")
         end after
         assert x == 1 else fail("outer x=${x}")
         after 1 cycles
             x = 3
             after 1 cycles
-                let x = 4
+                let x : uint<64> = 4
                 assert x == 4 else fail("nested inner")
             end after
             assert x == 3 else fail("nested outer x=${x}")

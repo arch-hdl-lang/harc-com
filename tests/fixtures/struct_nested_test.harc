@@ -82,7 +82,7 @@ impl StructNestedTest for StructNestedTb
         // Three scenarios of increasing length (1, 2, 3 ticks). Each
         // builds a nested descriptor expectation, verifies the nested
         // reads/writes/copies, then runs it through the hookable method.
-        let total = 0
+        let total : uint<64> = 0
         for i in 0 .. 2
             let sc : Scenario
             // Nested defaults re-run on every construction.
@@ -122,7 +122,7 @@ impl StructNestedTest for StructNestedTb
             assert sc2.trigger_mask == 5
                 else fail("sc[${i}]: copy lost top-level field")
 
-            total = total + sc.expected.count
+            total = (total + sc.expected.count).trunc<64>()
             // Mirror the nested count into a top-level field (nested read
             // in test scope), then pass the parent struct (nested
             // descriptor and all) by value through the hookable method,

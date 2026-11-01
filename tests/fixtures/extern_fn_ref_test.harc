@@ -59,8 +59,8 @@ impl ExternFnRefTest for ExternFnRefTb
         // Run 16 bytes through both implementations and compare.
         // The C reference is the source of truth; mismatches would
         // surface immediately and identify the diverging byte.
-        let crc_ref = 0xFF
-        let crc_harc = 0xFF
+        let crc_ref : uint<8> = 0xFF
+        let crc_harc : uint<8> = 0xFF
         for i in 0 .. 15
             let b = (i * 17 + 42) & 0xFF
             crc_ref = ref_crc8_step(crc_ref, b)

@@ -13,7 +13,7 @@ fn fn0 comp_periodic_0 [kind=ComponentMethod(c0)]
   entry = b0
 
   b0:
-    ComponentFieldWrite(self.beats, (self.beats + 1))
+    ComponentFieldWrite(self.beats, (self.beats + 1).trunc<32 from 33>())
     Log(info, "[tick %lld] beats=%lld", cycle_count, self.beats)
     -> Return
 

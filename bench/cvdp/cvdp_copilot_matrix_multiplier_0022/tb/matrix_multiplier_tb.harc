@@ -112,8 +112,8 @@ testbench MatrixMultiplierTb
         end if
         return 0
     end function drive_gap
-    function drive_back_to_back() -> uint<1>
-        let errors : uint<1> = 0
+    function drive_back_to_back() -> uint<8>
+        let errors : uint<8> = 0
 
         dut.matrix_a = 0x01000000000100000000010000000001
         dut.matrix_b = 0x100F0E0D0C0B0A090807060504030201
@@ -133,16 +133,16 @@ testbench MatrixMultiplierTb
         end if
         if dut.matrix_c != 0x00040000F00038000D00030000B000280009000200007000180005000100003000080001
             log(error, "back-to-back first product mismatch")
-            errors = errors + 1
+            errors = errors +% 1
         end if
         wait 1 cycle on clk
         if dut.valid_out != 1
             log(error, "back-to-back second valid_out missing")
-            errors = errors + 1
+            errors = errors +% 1
         end if
         if dut.matrix_c != 0x000100004000100004000100004000100004000100004000100004000100004000100004
             log(error, "back-to-back second product mismatch")
-            errors = errors + 1
+            errors = errors +% 1
         end if
         wait 2 cycles on clk
         return errors
@@ -168,25 +168,25 @@ impl MatrixMultiplierTest for MatrixMultiplierTb
         reset_matrix()
         let errors : uint<32> = 0
 
-        errors = errors + drive_gap()
+        errors = errors +% drive_gap()
 
-        errors = errors + drive_matrix(0x01000000000100000000010000000001,
+        errors = errors +% drive_matrix(0x01000000000100000000010000000001,
             0x100F0E0D0C0B0A090807060504030201,
             0x00040000F00038000D00030000B000280009000200007000180005000100003000080001)
 
-        errors = errors + drive_matrix(0x01010101010101010101010101010101,
+        errors = errors +% drive_matrix(0x01010101010101010101010101010101,
             0x01010101010101010101010101010101,
             0x000100004000100004000100004000100004000100004000100004000100004000100004)
 
-        errors = errors + drive_matrix(0x02000000000200000000020000000002,
+        errors = errors +% drive_matrix(0x02000000000200000000020000000002,
             0x0F0E0D0C0B0A09080706050403020100,
             0x00078001C00068001800058001400048001000038000C000280008000180004000080000)
 
-        errors = errors + drive_matrix(0x0A090807020100050102030404030201,
+        errors = errors +% drive_matrix(0x0A090807020100050102030404030201,
             0x08000700000600050400030000020001,
             0x001C0004400178003400040001000038000A00050001400040000E000A00014000880010)
 
-        errors = errors + drive_back_to_back()
+        errors = errors +% drive_back_to_back()
 
         // RHS-fork TLM view of the same fixed-latency pipeline: issue two
         // matrix products back-to-back, then join the ordered low-64b results.

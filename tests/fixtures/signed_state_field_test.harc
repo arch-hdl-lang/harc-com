@@ -15,11 +15,11 @@ transactor TlmMemTarget bound to TlmMemBus
     body_ok : uint<32> default 0
 
     thread bus.read(addr: uint<8>, len: uint<4>)
-        read_count = read_count + 1
+        read_count = (read_count + 1).trunc<32>()
         sacc = 0 - 8
         let half : sint<8> = sacc >> 1
         if half == 0 - 4
-            body_ok = body_ok + 1
+            body_ok = (body_ok + 1).trunc<32>()
         end if
         return 4096 + addr + len
     end thread

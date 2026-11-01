@@ -35,7 +35,7 @@ transactor RecFieldXactor
         hookable stamp(t: uint<8>, d: uint<32>)
             cur.tag = t
             cur.data = d
-            runs = runs + 1
+            runs = (runs + 1).trunc<32>()
             wait 1 cycle
         end stamp
 
@@ -43,7 +43,7 @@ transactor RecFieldXactor
         // observed through the method's own receiver rather than only
         // from the test.
         hookable double_data()
-            cur.data = cur.data + cur.data
+            cur.data = (cur.data + cur.data).trunc<32>()
             wait 1 cycle
         end double_data
     end when

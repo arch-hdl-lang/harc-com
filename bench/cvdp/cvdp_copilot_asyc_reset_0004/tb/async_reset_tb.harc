@@ -41,7 +41,7 @@ impl AsyncResetTest for AsyncResetTestTb
         for _ in 0 .. 31
             wait 1 cycle
             if expected_cnt > 0
-                expected_cnt = expected_cnt - 1
+                expected_cnt = expected_cnt -% 1
             end if
             assert dut.cnt_q == expected_cnt
                 else fail("countdown: cnt_q=${dut.cnt_q:02x}, expected ${expected_cnt:02x}")

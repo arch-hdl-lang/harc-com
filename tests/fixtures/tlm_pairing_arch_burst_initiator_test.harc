@@ -15,19 +15,19 @@ bus PairingBurstBus
 end bus PairingBurstBus
 
 transactor PairingBurstTarget bound to PairingBurstBus
-    read_count : uint<8> default 0
+    read_count : uint<32> default 0
     last_addr : uint<32> default 0
     last_len : uint<3> default 0
 
     thread bus.read_burst(addr: uint<32>, len: uint<3>)
-        read_count = read_count + 1
+        read_count = (read_count + 1).trunc<32>()
         last_addr = addr
         last_len = len
         let rsp : HarcBurstResp32x4
-        rsp.data[0] = addr + 0x10
-        rsp.data[1] = addr + 0x14
-        rsp.data[2] = addr + 0x18
-        rsp.data[3] = addr + 0x1c
+        rsp.data[0] = (addr + 0x10).trunc<32>()
+        rsp.data[1] = (addr + 0x14).trunc<32>()
+        rsp.data[2] = (addr + 0x18).trunc<32>()
+        rsp.data[3] = (addr + 0x1c).trunc<32>()
         rsp.len = len
         rsp.resp = 2
         wait 1 cycle

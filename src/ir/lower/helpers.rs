@@ -689,6 +689,11 @@ impl FuncBuilder<'_> {
             IrType::SInt(Some(width)) => (*width, true),
             _ => return Ok(None),
         };
+        // An untyped literal value is judged only by strict fit.
+        if super::exprs::expr_is_untyped_literal(value) {
+            self.check_literal_store_fits(value, expected, what)?;
+            return Ok(Some(expected.clone()));
+        }
         let ScalarValueEvidence::Integer {
             width,
             signed,
@@ -736,6 +741,8 @@ impl FuncBuilder<'_> {
                 )));
             }
         }
+        self.check_literal_store_fits(value, expected, what)?;
+        self.check_arch_result_width(value, dest_width, what)?;
         Ok(Some(expected.clone()))
     }
 
@@ -1072,7 +1079,10 @@ impl FuncBuilder<'_> {
                             )));
                         }
                     }
-                    if let Err(error) = self.check_slot_ir(&ir, &expected, "helper return") {
+                    if let Err(error) = self
+                        .check_slot_ir(&ir, &expected, "helper return")
+                        .and_then(|()| self.check_scalar_return(&ir, &expected))
+                    {
                         self.record_error_span(e.span);
                         return Err(error);
                     }
@@ -1119,7 +1129,10 @@ impl FuncBuilder<'_> {
                         ));
                     }
                 }
-                if let Err(error) = self.check_slot_ir(&ir, &expected, "helper return") {
+                if let Err(error) = self
+                    .check_slot_ir(&ir, &expected, "helper return")
+                    .and_then(|()| self.check_scalar_return(&ir, &expected))
+                {
                     self.record_error_span(e.span);
                     return Err(error);
                 }
@@ -1130,6 +1143,32 @@ impl FuncBuilder<'_> {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// A returned arithmetic result carries its ARCH-style result width
+    /// (owner decision D2): `return a + b` from a `-> uint<4>` helper on
+    /// `uint<4>` operands is a 5-bit value and is the ordinary narrowing
+    /// error. (An untyped `let total = a + b` now infers `uint<5>`, so
+    /// `return total` reached the verifier as an internal error before
+    /// this check named it.)
+    fn check_scalar_return(&self, value: &Expr, expected: &IrType) -> Result<(), LowerError> {
+        let (IrType::UInt(Some(dw)) | IrType::SInt(Some(dw))) = expected else {
+            return Ok(());
+        };
+        if super::exprs::expr_is_untyped_literal(value) {
+            return self.check_literal_store_fits(value, expected, "the return value");
+        }
+        if let Some(IrType::UInt(Some(aw)) | IrType::SInt(Some(aw))) = self.expr_type(value) {
+            if aw > *dw && !matches!(value, Expr::Binary(..) | Expr::Unary(..)) {
+                return Err(LowerError::Invalid(format!(
+                    "assignment of a {aw}-bit value to the return value, declared {dw} bits, \
+                     narrows. Widths must not shrink implicitly — use `.trunc<{dw}>()` to \
+                     narrow explicitly, or widen the declared return type."
+                )));
+            }
+        }
+        self.check_literal_store_fits(value, expected, "the return value")?;
+        self.check_arch_result_width(value, *dw, "the return value")
     }
 
     fn coerce_bool_return(&self, value: Expr, expected: &IrType) -> Expr {

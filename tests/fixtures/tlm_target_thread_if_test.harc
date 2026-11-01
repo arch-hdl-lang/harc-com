@@ -15,16 +15,16 @@ transactor TlmMemTarget bound to TlmMemBus
 
     thread bus.read(addr: uint<8>)
         let req_seq : uint<32> = read_count
-        read_count = read_count + 1
+        read_count = (read_count + 1).trunc<32>()
         prep_acc = 0
         for i in 0 .. 3
             prep_acc = prep_acc + addr + i
         end for
         wait 1 cycle
         if addr < 8
-            return 256 + addr + req_seq + prep_acc
+            return (256 + addr + req_seq + prep_acc).trunc<32>()
         else
-            return 512 + addr + req_seq + prep_acc
+            return (512 + addr + req_seq + prep_acc).trunc<32>()
         end if
     end thread
 end transactor TlmMemTarget

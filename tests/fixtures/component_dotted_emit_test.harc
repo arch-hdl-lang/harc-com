@@ -8,7 +8,7 @@ agent DottedEmitSink
     last     : uint<8> default 0
 
     on received(v)
-        seen = seen + 1
+        seen = (seen + 1).trunc<32>()
         last = v
     end on
 end agent DottedEmitSink

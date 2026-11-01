@@ -26,7 +26,7 @@ end domain SysDomain
 transactor CounterDrv
     dut        : Top
     last_count : uint<8>  default 0
-    fires      : uint<8>  default 0
+    fires      : uint<32> default 0
 
     when active
         req : in event<uint<8>>
@@ -35,7 +35,7 @@ transactor CounterDrv
         // body runs synchronously per `emit`, so `wait` lowers to a
         // sync tick loop (no scheduler suspension).
         on req(n)
-            fires = fires + 1
+            fires = (fires + 1).trunc<32>()
             dut.en = 1
             wait n cycles
             dut.en = 0

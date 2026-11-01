@@ -51,7 +51,7 @@ transactor WideQueueResponder bound to TlmMemBus
             else fail("target signed queue did not drain")
 
         let odd_one : uint<65> = 1
-        odd_values.push((odd_one << 64) + addr)
+        odd_values.push(((odd_one << 64) + addr).trunc<65>())
         return 256 + addr
     end thread
 end transactor WideQueueResponder
@@ -74,9 +74,9 @@ impl TargetWideQueueStateTest for TargetWideQueueStateTb
             else fail("target TLM response mismatch")
 
         let odd_one : uint<65> = 1
-        responder.odd_values.push((odd_one << 64) + 6)
-        responder.odd_values.push((odd_one << 64) + 7)
-        responder.odd_values.push((odd_one << 64) + 8)
+        responder.odd_values.push(((odd_one << 64) + 6).trunc<65>())
+        responder.odd_values.push(((odd_one << 64) + 7).trunc<65>())
+        responder.odd_values.push(((odd_one << 64) + 8).trunc<65>())
         assert responder.odd_values.size() == 4
             else fail("instance-qualified wide queue did not retain four values")
 

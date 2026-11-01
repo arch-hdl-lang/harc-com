@@ -22,20 +22,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP" "$N"/*.archi "$SCRIPT_DIR"/fixtures/*/*.archi' EXIT
 
-# Each row: <name> | <top> | <dut .arch files (space-sep, rel to srcdir)> | <test.harc> [| <srcdir>]
-# The optional 5th column overrides the design source dir (default $N). It may
-# reference $SCRIPT_DIR for harc-local fixtures that don't live in arch-com.
+# Each row: <name> | <top> | <dut .arch files (space-sep, rel to srcdir)> | <test.harc> [| <srcdir> [| <testdir>]]
+# The optional 5th column overrides the design source dir (default $N); an
+# empty 5th column keeps the default. The optional 6th column is the dir
+# holding the HARC testbench (default: the design source dir). Either may
+# reference $SCRIPT_DIR for harc-local files that don't live in arch-com.
+# The nic400 testbenches are vendored under fixtures/nic400 (HARC test code
+# follows HARC's typing rules); their .arch DUTs still come from arch-com.
+V="$SCRIPT_DIR/fixtures/nic400"
 read -r -d '' DESIGNS <<EOF || true
-qosfn        | Nic400QosFn  | Nic400QosFn.arch                                                                  | Nic400QosFn_test.harc
-regslice     | RegSliceChannel | RegSliceChannel.arch                                                           | RegSliceChannel_test.harc
-fabric_multi | Nic400Fabric | BusAxi4.arch Nic400DefaultSlave.arch Nic400Fabric.arch Nic400MasterPort.arch Nic400SlavePort.arch | Nic400FabricMultiMaster_test.harc
+qosfn        | Nic400QosFn  | Nic400QosFn.arch                                                                  | Nic400QosFn_test.harc              | | $V
+regslice     | RegSliceChannel | RegSliceChannel.arch                                                           | RegSliceChannel_test.harc          | | $V
+fabric_multi | Nic400Fabric | BusAxi4.arch Nic400DefaultSlave.arch Nic400Fabric.arch Nic400MasterPort.arch Nic400SlavePort.arch | Nic400FabricMultiMaster_test.harc | | $V
 busport_ovr  | RwTarget     | BusRw.arch RwTarget.arch                                                          | RwTarget_test.harc | $SCRIPT_DIR/fixtures/bus_port_override
 EOF
 
 fail=0
-while IFS='|' read -r name top duts test srcdir; do
+while IFS='|' read -r name top duts test srcdir testdir; do
   name="$(echo "$name" | xargs)"; top="$(echo "$top" | xargs)"; test="$(echo "$test" | xargs)"
   srcdir="$(echo "$srcdir" | xargs)"; [ -z "$srcdir" ] && srcdir="$N"
+  testdir="$(echo "$testdir" | xargs)"; [ -z "$testdir" ] && testdir="$srcdir"
   [ -z "$name" ] && continue
   dut_args=(); sv_inputs=()
   for f in $duts; do dut_args+=(--dut "$srcdir/$f"); sv_inputs+=("$srcdir/$f"); done
@@ -45,7 +51,7 @@ while IFS='|' read -r name top duts test srcdir; do
   # every other path; it emits the same TB for both the ARCH-sim and
   # Verilator runs and asserts their traces match.
   out="$("$HARC" sim --check-backends --arch-bin "$ARCH" "${dut_args[@]}" \
-        --sv "$TMP/$name.sv" --top "$top" "$srcdir/$test" 2>&1)"
+        --sv "$TMP/$name.sv" --top "$top" "$testdir/$test" 2>&1)"
   if [[ "$out" == *"traces match across backends"* ]]; then
     echo "  PASS: traces match"
   else

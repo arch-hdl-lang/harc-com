@@ -87,7 +87,7 @@ fn fn1 comp_method_1 [kind=ComponentMethod(c1)]
     ComponentCall(%__t0 = local(l1).c0::predict_read([%addr]))
     Assign(%r, %__t0)
     AssertCheck { cond: (%r.matched != 0), on_fail: "scoreboard saw unexpected addr 0x%02llx", %addr }
-    ComponentFieldWrite(self.seen_count, (self.seen_count + 1))
+    ComponentFieldWrite(self.seen_count, (self.seen_count + 1).trunc<32 from 33>())
     ComponentFieldWrite(self.last_expected, %r.data)
     -> Return
 

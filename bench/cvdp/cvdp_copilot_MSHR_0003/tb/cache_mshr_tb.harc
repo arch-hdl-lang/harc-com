@@ -133,7 +133,7 @@ end function first_valid
 function valid_count(valid_mask: uint<32>) -> uint<6>
     let n : uint<6> = 0
     for i in 0 .. 31
-        n = n + (((valid_mask >> i) & 1).trunc<1>() as uint<6>)
+        n = n +% (((valid_mask >> i) & 1).trunc<1>() as uint<6>)
     end for
     return n
 end function valid_count

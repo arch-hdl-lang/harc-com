@@ -18,7 +18,7 @@ test Bounds
         let bound : uint<8> = 3
         let seen : uint<8> = 0
         for i in 0 .. bound
-            seen = seen + 1
+            seen = (seen + 1).resize<8>()
             bound = 0
         end for
         assert seen == 4 else fail("for bound was reevaluated: ${seen}")
@@ -26,7 +26,7 @@ test Bounds
         bound = 3
         seen = 0
         repeat bound
-            seen = seen + 1
+            seen = (seen + 1).resize<8>()
             bound = 0
         end repeat
         assert seen == 3 else fail("repeat count was reevaluated: ${seen}")
@@ -34,7 +34,7 @@ test Bounds
         bound = 3
         seen = 0
         for i in 0 .. (bound + 0)
-            seen = seen + 1
+            seen = (seen + 1).resize<8>()
             bound = 0
         end for
         assert seen == 4 else fail("for (bound + 0) was reevaluated: ${seen}")
@@ -42,7 +42,7 @@ test Bounds
         bound = 3
         seen = 0
         repeat (bound + 0)
-            seen = seen + 1
+            seen = (seen + 1).resize<8>()
             bound = 0
         end repeat
         assert seen == 3 else fail("repeat (bound + 0) was reevaluated: ${seen}")
@@ -50,7 +50,7 @@ test Bounds
         bound = 1
         seen = 0
         for i in 0 .. bound
-            seen = seen + 1
+            seen = (seen + 1).resize<8>()
             bound = 9
         end for
         assert seen == 2 else fail("growing for bound was reevaluated: ${seen}")
@@ -58,7 +58,7 @@ test Bounds
         bound = 1
         seen = 0
         repeat bound
-            seen = seen + 1
+            seen = (seen + 1).resize<8>()
             bound = 9
         end repeat
         assert seen == 1 else fail("growing repeat count was reevaluated: ${seen}")

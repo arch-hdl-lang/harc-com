@@ -55,7 +55,7 @@ transactor LifecycleMonitor
     history : queue<LifeRec>
 
     hookable note_start(tag: uint<8>)
-        starts = starts + 1
+        starts = (starts + 1).trunc<32>()
         let r : LifeRec
         r.tag = tag
         r.stamp = starts
@@ -64,7 +64,7 @@ transactor LifecycleMonitor
     end note_start
 
     hookable note_stop(tag: uint<8>)
-        stops = stops + 1
+        stops = (stops + 1).trunc<32>()
         emit seen(tag)
     end note_stop
 end transactor LifecycleMonitor
@@ -74,7 +74,7 @@ scoreboard LifeSink
     last  : uint<8>  default 0
 
     hookable accept(v: uint<8>)
-        count = count + 1
+        count = (count + 1).trunc<32>()
         last = v
     end accept
 end scoreboard LifeSink

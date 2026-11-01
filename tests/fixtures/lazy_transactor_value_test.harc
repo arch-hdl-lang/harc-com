@@ -8,7 +8,7 @@ end function readv
 
 transactor LazyValueXactor
     dut : Top
-    calls : uint<8> default 0
+    calls : uint<32> default 0
 
     when active
         hookable clear()
@@ -16,7 +16,7 @@ transactor LazyValueXactor
         end clear
 
         hookable readv() -> bool
-            calls = calls + 1
+            calls = (calls + 1).trunc<32>()
             return true
         end readv
 

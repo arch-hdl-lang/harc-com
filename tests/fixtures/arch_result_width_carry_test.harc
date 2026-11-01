@@ -1,0 +1,495 @@
+// ARCH result widths (spec §2.4) with exact carries: `+ -` widen by one
+// bit and `*` to the sum of the operand widths, at operand widths 63/64/65
+// and 127/128/129 -- each side of the 64- and 128-bit carrier boundaries --
+// for unsigned and signed operands. Each result is stored in a slot exactly
+// as wide as the ARCH result and checked word by word, so a carry lost to
+// the operands' carrier fails. Generated values; 72 results.
+test ArchResultWidthCarryTest
+    let dut : Top
+    run
+        let a_u63_zero : uint<63> = 0
+        let a_u63 : uint<63> = ~a_u63_zero
+        let b_u63_zero : uint<63> = 0
+        let b_u63 : uint<63> = (~b_u63_zero - 1).trunc<63>()
+        let c_u63 : uint<63> = 1
+        let r_add_ab_u63 : uint<64> = a_u63 + b_u63
+        let r_add_ca_u63 : uint<64> = c_u63 + a_u63
+        let r_sub_ab_u63 : uint<64> = a_u63 - b_u63
+        let r_sub_ca_u63 : uint<64> = c_u63 - a_u63
+        let r_mul_ab_u63 : uint<126> = a_u63 * b_u63
+        let r_mul_ca_u63 : uint<126> = c_u63 * a_u63
+        let a_s63_one : sint<63> = 1
+        let a_s63 : sint<63> = (a_s63_one << 62)
+        let b_s63_one : sint<63> = 1
+        let b_s63 : sint<63> = ((b_s63_one << 62) + 1).resize<63>()
+        let c_s63_one : sint<63> = 1
+        let c_s63 : sint<63> = ((c_s63_one << 62) - 1).resize<63>()
+        let r_add_ab_s63 : sint<64> = a_s63 + b_s63
+        let r_add_ca_s63 : sint<64> = c_s63 + a_s63
+        let r_sub_ab_s63 : sint<64> = a_s63 - b_s63
+        let r_sub_ca_s63 : sint<64> = c_s63 - a_s63
+        let r_mul_ab_s63 : sint<126> = a_s63 * b_s63
+        let r_mul_ca_s63 : sint<126> = c_s63 * a_s63
+        let a_u64_zero : uint<64> = 0
+        let a_u64 : uint<64> = ~a_u64_zero
+        let b_u64_zero : uint<64> = 0
+        let b_u64 : uint<64> = (~b_u64_zero - 1).trunc<64>()
+        let c_u64 : uint<64> = 1
+        let r_add_ab_u64 : uint<65> = a_u64 + b_u64
+        let r_add_ca_u64 : uint<65> = c_u64 + a_u64
+        let r_sub_ab_u64 : uint<65> = a_u64 - b_u64
+        let r_sub_ca_u64 : uint<65> = c_u64 - a_u64
+        let r_mul_ab_u64 : uint<128> = a_u64 * b_u64
+        let r_mul_ca_u64 : uint<128> = c_u64 * a_u64
+        let a_s64_one : sint<64> = 1
+        let a_s64 : sint<64> = (a_s64_one << 63)
+        let b_s64_one : sint<64> = 1
+        let b_s64 : sint<64> = ((b_s64_one << 63) + 1).resize<64>()
+        let c_s64_one : sint<64> = 1
+        let c_s64 : sint<64> = ((c_s64_one << 63) - 1).resize<64>()
+        let r_add_ab_s64 : sint<65> = a_s64 + b_s64
+        let r_add_ca_s64 : sint<65> = c_s64 + a_s64
+        let r_sub_ab_s64 : sint<65> = a_s64 - b_s64
+        let r_sub_ca_s64 : sint<65> = c_s64 - a_s64
+        let r_mul_ab_s64 : sint<128> = a_s64 * b_s64
+        let r_mul_ca_s64 : sint<128> = c_s64 * a_s64
+        let a_u65_zero : uint<65> = 0
+        let a_u65 : uint<65> = ~a_u65_zero
+        let b_u65_zero : uint<65> = 0
+        let b_u65 : uint<65> = (~b_u65_zero - 1).trunc<65>()
+        let c_u65 : uint<65> = 1
+        let r_add_ab_u65 : uint<66> = a_u65 + b_u65
+        let r_add_ca_u65 : uint<66> = c_u65 + a_u65
+        let r_sub_ab_u65 : uint<66> = a_u65 - b_u65
+        let r_sub_ca_u65 : uint<66> = c_u65 - a_u65
+        let r_mul_ab_u65 : uint<130> = a_u65 * b_u65
+        let r_mul_ca_u65 : uint<130> = c_u65 * a_u65
+        let a_s65_one : sint<65> = 1
+        let a_s65 : sint<65> = (a_s65_one << 64)
+        let b_s65_one : sint<65> = 1
+        let b_s65 : sint<65> = ((b_s65_one << 64) + 1).resize<65>()
+        let c_s65_one : sint<65> = 1
+        let c_s65 : sint<65> = ((c_s65_one << 64) - 1).resize<65>()
+        let r_add_ab_s65 : sint<66> = a_s65 + b_s65
+        let r_add_ca_s65 : sint<66> = c_s65 + a_s65
+        let r_sub_ab_s65 : sint<66> = a_s65 - b_s65
+        let r_sub_ca_s65 : sint<66> = c_s65 - a_s65
+        let r_mul_ab_s65 : sint<130> = a_s65 * b_s65
+        let r_mul_ca_s65 : sint<130> = c_s65 * a_s65
+        let a_u127_zero : uint<127> = 0
+        let a_u127 : uint<127> = ~a_u127_zero
+        let b_u127_zero : uint<127> = 0
+        let b_u127 : uint<127> = (~b_u127_zero - 1).trunc<127>()
+        let c_u127 : uint<127> = 1
+        let r_add_ab_u127 : uint<128> = a_u127 + b_u127
+        let r_add_ca_u127 : uint<128> = c_u127 + a_u127
+        let r_sub_ab_u127 : uint<128> = a_u127 - b_u127
+        let r_sub_ca_u127 : uint<128> = c_u127 - a_u127
+        let r_mul_ab_u127 : uint<254> = a_u127 * b_u127
+        let r_mul_ca_u127 : uint<254> = c_u127 * a_u127
+        let a_s127_one : sint<127> = 1
+        let a_s127 : sint<127> = (a_s127_one << 126)
+        let b_s127_one : sint<127> = 1
+        let b_s127 : sint<127> = ((b_s127_one << 126) + 1).resize<127>()
+        let c_s127_one : sint<127> = 1
+        let c_s127 : sint<127> = ((c_s127_one << 126) - 1).resize<127>()
+        let r_add_ab_s127 : sint<128> = a_s127 + b_s127
+        let r_add_ca_s127 : sint<128> = c_s127 + a_s127
+        let r_sub_ab_s127 : sint<128> = a_s127 - b_s127
+        let r_sub_ca_s127 : sint<128> = c_s127 - a_s127
+        let r_mul_ab_s127 : sint<254> = a_s127 * b_s127
+        let r_mul_ca_s127 : sint<254> = c_s127 * a_s127
+        let a_u128_zero : uint<128> = 0
+        let a_u128 : uint<128> = ~a_u128_zero
+        let b_u128_zero : uint<128> = 0
+        let b_u128 : uint<128> = (~b_u128_zero - 1).trunc<128>()
+        let c_u128 : uint<128> = 1
+        let r_add_ab_u128 : uint<129> = a_u128 + b_u128
+        let r_add_ca_u128 : uint<129> = c_u128 + a_u128
+        let r_sub_ab_u128 : uint<129> = a_u128 - b_u128
+        let r_sub_ca_u128 : uint<129> = c_u128 - a_u128
+        let r_mul_ab_u128 : uint<256> = a_u128 * b_u128
+        let r_mul_ca_u128 : uint<256> = c_u128 * a_u128
+        let a_s128_one : sint<128> = 1
+        let a_s128 : sint<128> = (a_s128_one << 127)
+        let b_s128_one : sint<128> = 1
+        let b_s128 : sint<128> = ((b_s128_one << 127) + 1).resize<128>()
+        let c_s128_one : sint<128> = 1
+        let c_s128 : sint<128> = ((c_s128_one << 127) - 1).resize<128>()
+        let r_add_ab_s128 : sint<129> = a_s128 + b_s128
+        let r_add_ca_s128 : sint<129> = c_s128 + a_s128
+        let r_sub_ab_s128 : sint<129> = a_s128 - b_s128
+        let r_sub_ca_s128 : sint<129> = c_s128 - a_s128
+        let r_mul_ab_s128 : sint<256> = a_s128 * b_s128
+        let r_mul_ca_s128 : sint<256> = c_s128 * a_s128
+        let a_u129_zero : uint<129> = 0
+        let a_u129 : uint<129> = ~a_u129_zero
+        let b_u129_zero : uint<129> = 0
+        let b_u129 : uint<129> = (~b_u129_zero - 1).trunc<129>()
+        let c_u129 : uint<129> = 1
+        let r_add_ab_u129 : uint<130> = a_u129 + b_u129
+        let r_add_ca_u129 : uint<130> = c_u129 + a_u129
+        let r_sub_ab_u129 : uint<130> = a_u129 - b_u129
+        let r_sub_ca_u129 : uint<130> = c_u129 - a_u129
+        let r_mul_ab_u129 : uint<258> = a_u129 * b_u129
+        let r_mul_ca_u129 : uint<258> = c_u129 * a_u129
+        let a_s129_one : sint<129> = 1
+        let a_s129 : sint<129> = (a_s129_one << 128)
+        let b_s129_one : sint<129> = 1
+        let b_s129 : sint<129> = ((b_s129_one << 128) + 1).resize<129>()
+        let c_s129_one : sint<129> = 1
+        let c_s129 : sint<129> = ((c_s129_one << 128) - 1).resize<129>()
+        let r_add_ab_s129 : sint<130> = a_s129 + b_s129
+        let r_add_ca_s129 : sint<130> = c_s129 + a_s129
+        let r_sub_ab_s129 : sint<130> = a_s129 - b_s129
+        let r_sub_ca_s129 : sint<130> = c_s129 - a_s129
+        let r_mul_ab_s129 : sint<258> = a_s129 * b_s129
+        let r_mul_ca_s129 : sint<258> = c_s129 * a_s129
+        assert r_add_ab_u63[31:0] == 0xfffffffd else fail("r_add_ab_u63[31:0]")
+        assert r_add_ab_u63[63:32] == 0xffffffff else fail("r_add_ab_u63[63:32]")
+        assert r_add_ca_u63[31:0] == 0x0 else fail("r_add_ca_u63[31:0]")
+        assert r_add_ca_u63[63:32] == 0x80000000 else fail("r_add_ca_u63[63:32]")
+        assert r_sub_ab_u63[31:0] == 0x1 else fail("r_sub_ab_u63[31:0]")
+        assert r_sub_ab_u63[63:32] == 0x0 else fail("r_sub_ab_u63[63:32]")
+        assert r_sub_ca_u63[31:0] == 0x2 else fail("r_sub_ca_u63[31:0]")
+        assert r_sub_ca_u63[63:32] == 0x80000000 else fail("r_sub_ca_u63[63:32]")
+        assert r_mul_ab_u63[31:0] == 0x2 else fail("r_mul_ab_u63[31:0]")
+        assert r_mul_ab_u63[63:32] == 0x80000000 else fail("r_mul_ab_u63[63:32]")
+        assert r_mul_ab_u63[95:64] == 0xfffffffe else fail("r_mul_ab_u63[95:64]")
+        assert r_mul_ab_u63[125:96] == 0x3fffffff else fail("r_mul_ab_u63[125:96]")
+        assert r_mul_ca_u63[31:0] == 0xffffffff else fail("r_mul_ca_u63[31:0]")
+        assert r_mul_ca_u63[63:32] == 0x7fffffff else fail("r_mul_ca_u63[63:32]")
+        assert r_mul_ca_u63[95:64] == 0x0 else fail("r_mul_ca_u63[95:64]")
+        assert r_mul_ca_u63[125:96] == 0x0 else fail("r_mul_ca_u63[125:96]")
+        assert r_add_ab_s63[31:0] == 0x1 else fail("r_add_ab_s63[31:0]")
+        assert r_add_ab_s63[63:32] == 0x80000000 else fail("r_add_ab_s63[63:32]")
+        assert r_add_ca_s63[31:0] == 0xffffffff else fail("r_add_ca_s63[31:0]")
+        assert r_add_ca_s63[63:32] == 0xffffffff else fail("r_add_ca_s63[63:32]")
+        assert r_sub_ab_s63[31:0] == 0xffffffff else fail("r_sub_ab_s63[31:0]")
+        assert r_sub_ab_s63[63:32] == 0xffffffff else fail("r_sub_ab_s63[63:32]")
+        assert r_sub_ca_s63[31:0] == 0xffffffff else fail("r_sub_ca_s63[31:0]")
+        assert r_sub_ca_s63[63:32] == 0x7fffffff else fail("r_sub_ca_s63[63:32]")
+        assert r_mul_ab_s63[31:0] == 0x0 else fail("r_mul_ab_s63[31:0]")
+        assert r_mul_ab_s63[63:32] == 0xc0000000 else fail("r_mul_ab_s63[63:32]")
+        assert r_mul_ab_s63[95:64] == 0xffffffff else fail("r_mul_ab_s63[95:64]")
+        assert r_mul_ab_s63[125:96] == 0xfffffff else fail("r_mul_ab_s63[125:96]")
+        assert r_mul_ca_s63[31:0] == 0x0 else fail("r_mul_ca_s63[31:0]")
+        assert r_mul_ca_s63[63:32] == 0x40000000 else fail("r_mul_ca_s63[63:32]")
+        assert r_mul_ca_s63[95:64] == 0x0 else fail("r_mul_ca_s63[95:64]")
+        assert r_mul_ca_s63[125:96] == 0x30000000 else fail("r_mul_ca_s63[125:96]")
+        assert r_add_ab_u64[31:0] == 0xfffffffd else fail("r_add_ab_u64[31:0]")
+        assert r_add_ab_u64[63:32] == 0xffffffff else fail("r_add_ab_u64[63:32]")
+        assert r_add_ab_u64[64:64] == 0x1 else fail("r_add_ab_u64[64:64]")
+        assert r_add_ca_u64[31:0] == 0x0 else fail("r_add_ca_u64[31:0]")
+        assert r_add_ca_u64[63:32] == 0x0 else fail("r_add_ca_u64[63:32]")
+        assert r_add_ca_u64[64:64] == 0x1 else fail("r_add_ca_u64[64:64]")
+        assert r_sub_ab_u64[31:0] == 0x1 else fail("r_sub_ab_u64[31:0]")
+        assert r_sub_ab_u64[63:32] == 0x0 else fail("r_sub_ab_u64[63:32]")
+        assert r_sub_ab_u64[64:64] == 0x0 else fail("r_sub_ab_u64[64:64]")
+        assert r_sub_ca_u64[31:0] == 0x2 else fail("r_sub_ca_u64[31:0]")
+        assert r_sub_ca_u64[63:32] == 0x0 else fail("r_sub_ca_u64[63:32]")
+        assert r_sub_ca_u64[64:64] == 0x1 else fail("r_sub_ca_u64[64:64]")
+        assert r_mul_ab_u64[31:0] == 0x2 else fail("r_mul_ab_u64[31:0]")
+        assert r_mul_ab_u64[63:32] == 0x0 else fail("r_mul_ab_u64[63:32]")
+        assert r_mul_ab_u64[95:64] == 0xfffffffd else fail("r_mul_ab_u64[95:64]")
+        assert r_mul_ab_u64[127:96] == 0xffffffff else fail("r_mul_ab_u64[127:96]")
+        assert r_mul_ca_u64[31:0] == 0xffffffff else fail("r_mul_ca_u64[31:0]")
+        assert r_mul_ca_u64[63:32] == 0xffffffff else fail("r_mul_ca_u64[63:32]")
+        assert r_mul_ca_u64[95:64] == 0x0 else fail("r_mul_ca_u64[95:64]")
+        assert r_mul_ca_u64[127:96] == 0x0 else fail("r_mul_ca_u64[127:96]")
+        assert r_add_ab_s64[31:0] == 0x1 else fail("r_add_ab_s64[31:0]")
+        assert r_add_ab_s64[63:32] == 0x0 else fail("r_add_ab_s64[63:32]")
+        assert r_add_ab_s64[64:64] == 0x1 else fail("r_add_ab_s64[64:64]")
+        assert r_add_ca_s64[31:0] == 0xffffffff else fail("r_add_ca_s64[31:0]")
+        assert r_add_ca_s64[63:32] == 0xffffffff else fail("r_add_ca_s64[63:32]")
+        assert r_add_ca_s64[64:64] == 0x1 else fail("r_add_ca_s64[64:64]")
+        assert r_sub_ab_s64[31:0] == 0xffffffff else fail("r_sub_ab_s64[31:0]")
+        assert r_sub_ab_s64[63:32] == 0xffffffff else fail("r_sub_ab_s64[63:32]")
+        assert r_sub_ab_s64[64:64] == 0x1 else fail("r_sub_ab_s64[64:64]")
+        assert r_sub_ca_s64[31:0] == 0xffffffff else fail("r_sub_ca_s64[31:0]")
+        assert r_sub_ca_s64[63:32] == 0xffffffff else fail("r_sub_ca_s64[63:32]")
+        assert r_sub_ca_s64[64:64] == 0x0 else fail("r_sub_ca_s64[64:64]")
+        assert r_mul_ab_s64[31:0] == 0x0 else fail("r_mul_ab_s64[31:0]")
+        assert r_mul_ab_s64[63:32] == 0x80000000 else fail("r_mul_ab_s64[63:32]")
+        assert r_mul_ab_s64[95:64] == 0xffffffff else fail("r_mul_ab_s64[95:64]")
+        assert r_mul_ab_s64[127:96] == 0x3fffffff else fail("r_mul_ab_s64[127:96]")
+        assert r_mul_ca_s64[31:0] == 0x0 else fail("r_mul_ca_s64[31:0]")
+        assert r_mul_ca_s64[63:32] == 0x80000000 else fail("r_mul_ca_s64[63:32]")
+        assert r_mul_ca_s64[95:64] == 0x0 else fail("r_mul_ca_s64[95:64]")
+        assert r_mul_ca_s64[127:96] == 0xc0000000 else fail("r_mul_ca_s64[127:96]")
+        assert r_add_ab_u65[31:0] == 0xfffffffd else fail("r_add_ab_u65[31:0]")
+        assert r_add_ab_u65[63:32] == 0xffffffff else fail("r_add_ab_u65[63:32]")
+        assert r_add_ab_u65[65:64] == 0x3 else fail("r_add_ab_u65[65:64]")
+        assert r_add_ca_u65[31:0] == 0x0 else fail("r_add_ca_u65[31:0]")
+        assert r_add_ca_u65[63:32] == 0x0 else fail("r_add_ca_u65[63:32]")
+        assert r_add_ca_u65[65:64] == 0x2 else fail("r_add_ca_u65[65:64]")
+        assert r_sub_ab_u65[31:0] == 0x1 else fail("r_sub_ab_u65[31:0]")
+        assert r_sub_ab_u65[63:32] == 0x0 else fail("r_sub_ab_u65[63:32]")
+        assert r_sub_ab_u65[65:64] == 0x0 else fail("r_sub_ab_u65[65:64]")
+        assert r_sub_ca_u65[31:0] == 0x2 else fail("r_sub_ca_u65[31:0]")
+        assert r_sub_ca_u65[63:32] == 0x0 else fail("r_sub_ca_u65[63:32]")
+        assert r_sub_ca_u65[65:64] == 0x2 else fail("r_sub_ca_u65[65:64]")
+        assert r_mul_ab_u65[31:0] == 0x2 else fail("r_mul_ab_u65[31:0]")
+        assert r_mul_ab_u65[63:32] == 0x0 else fail("r_mul_ab_u65[63:32]")
+        assert r_mul_ab_u65[95:64] == 0xfffffffa else fail("r_mul_ab_u65[95:64]")
+        assert r_mul_ab_u65[127:96] == 0xffffffff else fail("r_mul_ab_u65[127:96]")
+        assert r_mul_ab_u65[129:128] == 0x3 else fail("r_mul_ab_u65[129:128]")
+        assert r_mul_ca_u65[31:0] == 0xffffffff else fail("r_mul_ca_u65[31:0]")
+        assert r_mul_ca_u65[63:32] == 0xffffffff else fail("r_mul_ca_u65[63:32]")
+        assert r_mul_ca_u65[95:64] == 0x1 else fail("r_mul_ca_u65[95:64]")
+        assert r_mul_ca_u65[127:96] == 0x0 else fail("r_mul_ca_u65[127:96]")
+        assert r_mul_ca_u65[129:128] == 0x0 else fail("r_mul_ca_u65[129:128]")
+        assert r_add_ab_s65[31:0] == 0x1 else fail("r_add_ab_s65[31:0]")
+        assert r_add_ab_s65[63:32] == 0x0 else fail("r_add_ab_s65[63:32]")
+        assert r_add_ab_s65[65:64] == 0x2 else fail("r_add_ab_s65[65:64]")
+        assert r_add_ca_s65[31:0] == 0xffffffff else fail("r_add_ca_s65[31:0]")
+        assert r_add_ca_s65[63:32] == 0xffffffff else fail("r_add_ca_s65[63:32]")
+        assert r_add_ca_s65[65:64] == 0x3 else fail("r_add_ca_s65[65:64]")
+        assert r_sub_ab_s65[31:0] == 0xffffffff else fail("r_sub_ab_s65[31:0]")
+        assert r_sub_ab_s65[63:32] == 0xffffffff else fail("r_sub_ab_s65[63:32]")
+        assert r_sub_ab_s65[65:64] == 0x3 else fail("r_sub_ab_s65[65:64]")
+        assert r_sub_ca_s65[31:0] == 0xffffffff else fail("r_sub_ca_s65[31:0]")
+        assert r_sub_ca_s65[63:32] == 0xffffffff else fail("r_sub_ca_s65[63:32]")
+        assert r_sub_ca_s65[65:64] == 0x1 else fail("r_sub_ca_s65[65:64]")
+        assert r_mul_ab_s65[31:0] == 0x0 else fail("r_mul_ab_s65[31:0]")
+        assert r_mul_ab_s65[63:32] == 0x0 else fail("r_mul_ab_s65[63:32]")
+        assert r_mul_ab_s65[95:64] == 0xffffffff else fail("r_mul_ab_s65[95:64]")
+        assert r_mul_ab_s65[127:96] == 0xffffffff else fail("r_mul_ab_s65[127:96]")
+        assert r_mul_ab_s65[129:128] == 0x0 else fail("r_mul_ab_s65[129:128]")
+        assert r_mul_ca_s65[31:0] == 0x0 else fail("r_mul_ca_s65[31:0]")
+        assert r_mul_ca_s65[63:32] == 0x0 else fail("r_mul_ca_s65[63:32]")
+        assert r_mul_ca_s65[95:64] == 0x1 else fail("r_mul_ca_s65[95:64]")
+        assert r_mul_ca_s65[127:96] == 0x0 else fail("r_mul_ca_s65[127:96]")
+        assert r_mul_ca_s65[129:128] == 0x3 else fail("r_mul_ca_s65[129:128]")
+        assert r_add_ab_u127[31:0] == 0xfffffffd else fail("r_add_ab_u127[31:0]")
+        assert r_add_ab_u127[63:32] == 0xffffffff else fail("r_add_ab_u127[63:32]")
+        assert r_add_ab_u127[95:64] == 0xffffffff else fail("r_add_ab_u127[95:64]")
+        assert r_add_ab_u127[127:96] == 0xffffffff else fail("r_add_ab_u127[127:96]")
+        assert r_add_ca_u127[31:0] == 0x0 else fail("r_add_ca_u127[31:0]")
+        assert r_add_ca_u127[63:32] == 0x0 else fail("r_add_ca_u127[63:32]")
+        assert r_add_ca_u127[95:64] == 0x0 else fail("r_add_ca_u127[95:64]")
+        assert r_add_ca_u127[127:96] == 0x80000000 else fail("r_add_ca_u127[127:96]")
+        assert r_sub_ab_u127[31:0] == 0x1 else fail("r_sub_ab_u127[31:0]")
+        assert r_sub_ab_u127[63:32] == 0x0 else fail("r_sub_ab_u127[63:32]")
+        assert r_sub_ab_u127[95:64] == 0x0 else fail("r_sub_ab_u127[95:64]")
+        assert r_sub_ab_u127[127:96] == 0x0 else fail("r_sub_ab_u127[127:96]")
+        assert r_sub_ca_u127[31:0] == 0x2 else fail("r_sub_ca_u127[31:0]")
+        assert r_sub_ca_u127[63:32] == 0x0 else fail("r_sub_ca_u127[63:32]")
+        assert r_sub_ca_u127[95:64] == 0x0 else fail("r_sub_ca_u127[95:64]")
+        assert r_sub_ca_u127[127:96] == 0x80000000 else fail("r_sub_ca_u127[127:96]")
+        assert r_mul_ab_u127[31:0] == 0x2 else fail("r_mul_ab_u127[31:0]")
+        assert r_mul_ab_u127[63:32] == 0x0 else fail("r_mul_ab_u127[63:32]")
+        assert r_mul_ab_u127[95:64] == 0x0 else fail("r_mul_ab_u127[95:64]")
+        assert r_mul_ab_u127[127:96] == 0x80000000 else fail("r_mul_ab_u127[127:96]")
+        assert r_mul_ab_u127[159:128] == 0xfffffffe else fail("r_mul_ab_u127[159:128]")
+        assert r_mul_ab_u127[191:160] == 0xffffffff else fail("r_mul_ab_u127[191:160]")
+        assert r_mul_ab_u127[223:192] == 0xffffffff else fail("r_mul_ab_u127[223:192]")
+        assert r_mul_ab_u127[253:224] == 0x3fffffff else fail("r_mul_ab_u127[253:224]")
+        assert r_mul_ca_u127[31:0] == 0xffffffff else fail("r_mul_ca_u127[31:0]")
+        assert r_mul_ca_u127[63:32] == 0xffffffff else fail("r_mul_ca_u127[63:32]")
+        assert r_mul_ca_u127[95:64] == 0xffffffff else fail("r_mul_ca_u127[95:64]")
+        assert r_mul_ca_u127[127:96] == 0x7fffffff else fail("r_mul_ca_u127[127:96]")
+        assert r_mul_ca_u127[159:128] == 0x0 else fail("r_mul_ca_u127[159:128]")
+        assert r_mul_ca_u127[191:160] == 0x0 else fail("r_mul_ca_u127[191:160]")
+        assert r_mul_ca_u127[223:192] == 0x0 else fail("r_mul_ca_u127[223:192]")
+        assert r_mul_ca_u127[253:224] == 0x0 else fail("r_mul_ca_u127[253:224]")
+        assert r_add_ab_s127[31:0] == 0x1 else fail("r_add_ab_s127[31:0]")
+        assert r_add_ab_s127[63:32] == 0x0 else fail("r_add_ab_s127[63:32]")
+        assert r_add_ab_s127[95:64] == 0x0 else fail("r_add_ab_s127[95:64]")
+        assert r_add_ab_s127[127:96] == 0x80000000 else fail("r_add_ab_s127[127:96]")
+        assert r_add_ca_s127[31:0] == 0xffffffff else fail("r_add_ca_s127[31:0]")
+        assert r_add_ca_s127[63:32] == 0xffffffff else fail("r_add_ca_s127[63:32]")
+        assert r_add_ca_s127[95:64] == 0xffffffff else fail("r_add_ca_s127[95:64]")
+        assert r_add_ca_s127[127:96] == 0xffffffff else fail("r_add_ca_s127[127:96]")
+        assert r_sub_ab_s127[31:0] == 0xffffffff else fail("r_sub_ab_s127[31:0]")
+        assert r_sub_ab_s127[63:32] == 0xffffffff else fail("r_sub_ab_s127[63:32]")
+        assert r_sub_ab_s127[95:64] == 0xffffffff else fail("r_sub_ab_s127[95:64]")
+        assert r_sub_ab_s127[127:96] == 0xffffffff else fail("r_sub_ab_s127[127:96]")
+        assert r_sub_ca_s127[31:0] == 0xffffffff else fail("r_sub_ca_s127[31:0]")
+        assert r_sub_ca_s127[63:32] == 0xffffffff else fail("r_sub_ca_s127[63:32]")
+        assert r_sub_ca_s127[95:64] == 0xffffffff else fail("r_sub_ca_s127[95:64]")
+        assert r_sub_ca_s127[127:96] == 0x7fffffff else fail("r_sub_ca_s127[127:96]")
+        assert r_mul_ab_s127[31:0] == 0x0 else fail("r_mul_ab_s127[31:0]")
+        assert r_mul_ab_s127[63:32] == 0x0 else fail("r_mul_ab_s127[63:32]")
+        assert r_mul_ab_s127[95:64] == 0x0 else fail("r_mul_ab_s127[95:64]")
+        assert r_mul_ab_s127[127:96] == 0xc0000000 else fail("r_mul_ab_s127[127:96]")
+        assert r_mul_ab_s127[159:128] == 0xffffffff else fail("r_mul_ab_s127[159:128]")
+        assert r_mul_ab_s127[191:160] == 0xffffffff else fail("r_mul_ab_s127[191:160]")
+        assert r_mul_ab_s127[223:192] == 0xffffffff else fail("r_mul_ab_s127[223:192]")
+        assert r_mul_ab_s127[253:224] == 0xfffffff else fail("r_mul_ab_s127[253:224]")
+        assert r_mul_ca_s127[31:0] == 0x0 else fail("r_mul_ca_s127[31:0]")
+        assert r_mul_ca_s127[63:32] == 0x0 else fail("r_mul_ca_s127[63:32]")
+        assert r_mul_ca_s127[95:64] == 0x0 else fail("r_mul_ca_s127[95:64]")
+        assert r_mul_ca_s127[127:96] == 0x40000000 else fail("r_mul_ca_s127[127:96]")
+        assert r_mul_ca_s127[159:128] == 0x0 else fail("r_mul_ca_s127[159:128]")
+        assert r_mul_ca_s127[191:160] == 0x0 else fail("r_mul_ca_s127[191:160]")
+        assert r_mul_ca_s127[223:192] == 0x0 else fail("r_mul_ca_s127[223:192]")
+        assert r_mul_ca_s127[253:224] == 0x30000000 else fail("r_mul_ca_s127[253:224]")
+        assert r_add_ab_u128[31:0] == 0xfffffffd else fail("r_add_ab_u128[31:0]")
+        assert r_add_ab_u128[63:32] == 0xffffffff else fail("r_add_ab_u128[63:32]")
+        assert r_add_ab_u128[95:64] == 0xffffffff else fail("r_add_ab_u128[95:64]")
+        assert r_add_ab_u128[127:96] == 0xffffffff else fail("r_add_ab_u128[127:96]")
+        assert r_add_ab_u128[128:128] == 0x1 else fail("r_add_ab_u128[128:128]")
+        assert r_add_ca_u128[31:0] == 0x0 else fail("r_add_ca_u128[31:0]")
+        assert r_add_ca_u128[63:32] == 0x0 else fail("r_add_ca_u128[63:32]")
+        assert r_add_ca_u128[95:64] == 0x0 else fail("r_add_ca_u128[95:64]")
+        assert r_add_ca_u128[127:96] == 0x0 else fail("r_add_ca_u128[127:96]")
+        assert r_add_ca_u128[128:128] == 0x1 else fail("r_add_ca_u128[128:128]")
+        assert r_sub_ab_u128[31:0] == 0x1 else fail("r_sub_ab_u128[31:0]")
+        assert r_sub_ab_u128[63:32] == 0x0 else fail("r_sub_ab_u128[63:32]")
+        assert r_sub_ab_u128[95:64] == 0x0 else fail("r_sub_ab_u128[95:64]")
+        assert r_sub_ab_u128[127:96] == 0x0 else fail("r_sub_ab_u128[127:96]")
+        assert r_sub_ab_u128[128:128] == 0x0 else fail("r_sub_ab_u128[128:128]")
+        assert r_sub_ca_u128[31:0] == 0x2 else fail("r_sub_ca_u128[31:0]")
+        assert r_sub_ca_u128[63:32] == 0x0 else fail("r_sub_ca_u128[63:32]")
+        assert r_sub_ca_u128[95:64] == 0x0 else fail("r_sub_ca_u128[95:64]")
+        assert r_sub_ca_u128[127:96] == 0x0 else fail("r_sub_ca_u128[127:96]")
+        assert r_sub_ca_u128[128:128] == 0x1 else fail("r_sub_ca_u128[128:128]")
+        assert r_mul_ab_u128[31:0] == 0x2 else fail("r_mul_ab_u128[31:0]")
+        assert r_mul_ab_u128[63:32] == 0x0 else fail("r_mul_ab_u128[63:32]")
+        assert r_mul_ab_u128[95:64] == 0x0 else fail("r_mul_ab_u128[95:64]")
+        assert r_mul_ab_u128[127:96] == 0x0 else fail("r_mul_ab_u128[127:96]")
+        assert r_mul_ab_u128[159:128] == 0xfffffffd else fail("r_mul_ab_u128[159:128]")
+        assert r_mul_ab_u128[191:160] == 0xffffffff else fail("r_mul_ab_u128[191:160]")
+        assert r_mul_ab_u128[223:192] == 0xffffffff else fail("r_mul_ab_u128[223:192]")
+        assert r_mul_ab_u128[255:224] == 0xffffffff else fail("r_mul_ab_u128[255:224]")
+        assert r_mul_ca_u128[31:0] == 0xffffffff else fail("r_mul_ca_u128[31:0]")
+        assert r_mul_ca_u128[63:32] == 0xffffffff else fail("r_mul_ca_u128[63:32]")
+        assert r_mul_ca_u128[95:64] == 0xffffffff else fail("r_mul_ca_u128[95:64]")
+        assert r_mul_ca_u128[127:96] == 0xffffffff else fail("r_mul_ca_u128[127:96]")
+        assert r_mul_ca_u128[159:128] == 0x0 else fail("r_mul_ca_u128[159:128]")
+        assert r_mul_ca_u128[191:160] == 0x0 else fail("r_mul_ca_u128[191:160]")
+        assert r_mul_ca_u128[223:192] == 0x0 else fail("r_mul_ca_u128[223:192]")
+        assert r_mul_ca_u128[255:224] == 0x0 else fail("r_mul_ca_u128[255:224]")
+        assert r_add_ab_s128[31:0] == 0x1 else fail("r_add_ab_s128[31:0]")
+        assert r_add_ab_s128[63:32] == 0x0 else fail("r_add_ab_s128[63:32]")
+        assert r_add_ab_s128[95:64] == 0x0 else fail("r_add_ab_s128[95:64]")
+        assert r_add_ab_s128[127:96] == 0x0 else fail("r_add_ab_s128[127:96]")
+        assert r_add_ab_s128[128:128] == 0x1 else fail("r_add_ab_s128[128:128]")
+        assert r_add_ca_s128[31:0] == 0xffffffff else fail("r_add_ca_s128[31:0]")
+        assert r_add_ca_s128[63:32] == 0xffffffff else fail("r_add_ca_s128[63:32]")
+        assert r_add_ca_s128[95:64] == 0xffffffff else fail("r_add_ca_s128[95:64]")
+        assert r_add_ca_s128[127:96] == 0xffffffff else fail("r_add_ca_s128[127:96]")
+        assert r_add_ca_s128[128:128] == 0x1 else fail("r_add_ca_s128[128:128]")
+        assert r_sub_ab_s128[31:0] == 0xffffffff else fail("r_sub_ab_s128[31:0]")
+        assert r_sub_ab_s128[63:32] == 0xffffffff else fail("r_sub_ab_s128[63:32]")
+        assert r_sub_ab_s128[95:64] == 0xffffffff else fail("r_sub_ab_s128[95:64]")
+        assert r_sub_ab_s128[127:96] == 0xffffffff else fail("r_sub_ab_s128[127:96]")
+        assert r_sub_ab_s128[128:128] == 0x1 else fail("r_sub_ab_s128[128:128]")
+        assert r_sub_ca_s128[31:0] == 0xffffffff else fail("r_sub_ca_s128[31:0]")
+        assert r_sub_ca_s128[63:32] == 0xffffffff else fail("r_sub_ca_s128[63:32]")
+        assert r_sub_ca_s128[95:64] == 0xffffffff else fail("r_sub_ca_s128[95:64]")
+        assert r_sub_ca_s128[127:96] == 0xffffffff else fail("r_sub_ca_s128[127:96]")
+        assert r_sub_ca_s128[128:128] == 0x0 else fail("r_sub_ca_s128[128:128]")
+        assert r_mul_ab_s128[31:0] == 0x0 else fail("r_mul_ab_s128[31:0]")
+        assert r_mul_ab_s128[63:32] == 0x0 else fail("r_mul_ab_s128[63:32]")
+        assert r_mul_ab_s128[95:64] == 0x0 else fail("r_mul_ab_s128[95:64]")
+        assert r_mul_ab_s128[127:96] == 0x80000000 else fail("r_mul_ab_s128[127:96]")
+        assert r_mul_ab_s128[159:128] == 0xffffffff else fail("r_mul_ab_s128[159:128]")
+        assert r_mul_ab_s128[191:160] == 0xffffffff else fail("r_mul_ab_s128[191:160]")
+        assert r_mul_ab_s128[223:192] == 0xffffffff else fail("r_mul_ab_s128[223:192]")
+        assert r_mul_ab_s128[255:224] == 0x3fffffff else fail("r_mul_ab_s128[255:224]")
+        assert r_mul_ca_s128[31:0] == 0x0 else fail("r_mul_ca_s128[31:0]")
+        assert r_mul_ca_s128[63:32] == 0x0 else fail("r_mul_ca_s128[63:32]")
+        assert r_mul_ca_s128[95:64] == 0x0 else fail("r_mul_ca_s128[95:64]")
+        assert r_mul_ca_s128[127:96] == 0x80000000 else fail("r_mul_ca_s128[127:96]")
+        assert r_mul_ca_s128[159:128] == 0x0 else fail("r_mul_ca_s128[159:128]")
+        assert r_mul_ca_s128[191:160] == 0x0 else fail("r_mul_ca_s128[191:160]")
+        assert r_mul_ca_s128[223:192] == 0x0 else fail("r_mul_ca_s128[223:192]")
+        assert r_mul_ca_s128[255:224] == 0xc0000000 else fail("r_mul_ca_s128[255:224]")
+        assert r_add_ab_u129[31:0] == 0xfffffffd else fail("r_add_ab_u129[31:0]")
+        assert r_add_ab_u129[63:32] == 0xffffffff else fail("r_add_ab_u129[63:32]")
+        assert r_add_ab_u129[95:64] == 0xffffffff else fail("r_add_ab_u129[95:64]")
+        assert r_add_ab_u129[127:96] == 0xffffffff else fail("r_add_ab_u129[127:96]")
+        assert r_add_ab_u129[129:128] == 0x3 else fail("r_add_ab_u129[129:128]")
+        assert r_add_ca_u129[31:0] == 0x0 else fail("r_add_ca_u129[31:0]")
+        assert r_add_ca_u129[63:32] == 0x0 else fail("r_add_ca_u129[63:32]")
+        assert r_add_ca_u129[95:64] == 0x0 else fail("r_add_ca_u129[95:64]")
+        assert r_add_ca_u129[127:96] == 0x0 else fail("r_add_ca_u129[127:96]")
+        assert r_add_ca_u129[129:128] == 0x2 else fail("r_add_ca_u129[129:128]")
+        assert r_sub_ab_u129[31:0] == 0x1 else fail("r_sub_ab_u129[31:0]")
+        assert r_sub_ab_u129[63:32] == 0x0 else fail("r_sub_ab_u129[63:32]")
+        assert r_sub_ab_u129[95:64] == 0x0 else fail("r_sub_ab_u129[95:64]")
+        assert r_sub_ab_u129[127:96] == 0x0 else fail("r_sub_ab_u129[127:96]")
+        assert r_sub_ab_u129[129:128] == 0x0 else fail("r_sub_ab_u129[129:128]")
+        assert r_sub_ca_u129[31:0] == 0x2 else fail("r_sub_ca_u129[31:0]")
+        assert r_sub_ca_u129[63:32] == 0x0 else fail("r_sub_ca_u129[63:32]")
+        assert r_sub_ca_u129[95:64] == 0x0 else fail("r_sub_ca_u129[95:64]")
+        assert r_sub_ca_u129[127:96] == 0x0 else fail("r_sub_ca_u129[127:96]")
+        assert r_sub_ca_u129[129:128] == 0x2 else fail("r_sub_ca_u129[129:128]")
+        assert r_mul_ab_u129[31:0] == 0x2 else fail("r_mul_ab_u129[31:0]")
+        assert r_mul_ab_u129[63:32] == 0x0 else fail("r_mul_ab_u129[63:32]")
+        assert r_mul_ab_u129[95:64] == 0x0 else fail("r_mul_ab_u129[95:64]")
+        assert r_mul_ab_u129[127:96] == 0x0 else fail("r_mul_ab_u129[127:96]")
+        assert r_mul_ab_u129[159:128] == 0xfffffffa else fail("r_mul_ab_u129[159:128]")
+        assert r_mul_ab_u129[191:160] == 0xffffffff else fail("r_mul_ab_u129[191:160]")
+        assert r_mul_ab_u129[223:192] == 0xffffffff else fail("r_mul_ab_u129[223:192]")
+        assert r_mul_ab_u129[255:224] == 0xffffffff else fail("r_mul_ab_u129[255:224]")
+        assert r_mul_ab_u129[257:256] == 0x3 else fail("r_mul_ab_u129[257:256]")
+        assert r_mul_ca_u129[31:0] == 0xffffffff else fail("r_mul_ca_u129[31:0]")
+        assert r_mul_ca_u129[63:32] == 0xffffffff else fail("r_mul_ca_u129[63:32]")
+        assert r_mul_ca_u129[95:64] == 0xffffffff else fail("r_mul_ca_u129[95:64]")
+        assert r_mul_ca_u129[127:96] == 0xffffffff else fail("r_mul_ca_u129[127:96]")
+        assert r_mul_ca_u129[159:128] == 0x1 else fail("r_mul_ca_u129[159:128]")
+        assert r_mul_ca_u129[191:160] == 0x0 else fail("r_mul_ca_u129[191:160]")
+        assert r_mul_ca_u129[223:192] == 0x0 else fail("r_mul_ca_u129[223:192]")
+        assert r_mul_ca_u129[255:224] == 0x0 else fail("r_mul_ca_u129[255:224]")
+        assert r_mul_ca_u129[257:256] == 0x0 else fail("r_mul_ca_u129[257:256]")
+        assert r_add_ab_s129[31:0] == 0x1 else fail("r_add_ab_s129[31:0]")
+        assert r_add_ab_s129[63:32] == 0x0 else fail("r_add_ab_s129[63:32]")
+        assert r_add_ab_s129[95:64] == 0x0 else fail("r_add_ab_s129[95:64]")
+        assert r_add_ab_s129[127:96] == 0x0 else fail("r_add_ab_s129[127:96]")
+        assert r_add_ab_s129[129:128] == 0x2 else fail("r_add_ab_s129[129:128]")
+        assert r_add_ca_s129[31:0] == 0xffffffff else fail("r_add_ca_s129[31:0]")
+        assert r_add_ca_s129[63:32] == 0xffffffff else fail("r_add_ca_s129[63:32]")
+        assert r_add_ca_s129[95:64] == 0xffffffff else fail("r_add_ca_s129[95:64]")
+        assert r_add_ca_s129[127:96] == 0xffffffff else fail("r_add_ca_s129[127:96]")
+        assert r_add_ca_s129[129:128] == 0x3 else fail("r_add_ca_s129[129:128]")
+        assert r_sub_ab_s129[31:0] == 0xffffffff else fail("r_sub_ab_s129[31:0]")
+        assert r_sub_ab_s129[63:32] == 0xffffffff else fail("r_sub_ab_s129[63:32]")
+        assert r_sub_ab_s129[95:64] == 0xffffffff else fail("r_sub_ab_s129[95:64]")
+        assert r_sub_ab_s129[127:96] == 0xffffffff else fail("r_sub_ab_s129[127:96]")
+        assert r_sub_ab_s129[129:128] == 0x3 else fail("r_sub_ab_s129[129:128]")
+        assert r_sub_ca_s129[31:0] == 0xffffffff else fail("r_sub_ca_s129[31:0]")
+        assert r_sub_ca_s129[63:32] == 0xffffffff else fail("r_sub_ca_s129[63:32]")
+        assert r_sub_ca_s129[95:64] == 0xffffffff else fail("r_sub_ca_s129[95:64]")
+        assert r_sub_ca_s129[127:96] == 0xffffffff else fail("r_sub_ca_s129[127:96]")
+        assert r_sub_ca_s129[129:128] == 0x1 else fail("r_sub_ca_s129[129:128]")
+        assert r_mul_ab_s129[31:0] == 0x0 else fail("r_mul_ab_s129[31:0]")
+        assert r_mul_ab_s129[63:32] == 0x0 else fail("r_mul_ab_s129[63:32]")
+        assert r_mul_ab_s129[95:64] == 0x0 else fail("r_mul_ab_s129[95:64]")
+        assert r_mul_ab_s129[127:96] == 0x0 else fail("r_mul_ab_s129[127:96]")
+        assert r_mul_ab_s129[159:128] == 0xffffffff else fail("r_mul_ab_s129[159:128]")
+        assert r_mul_ab_s129[191:160] == 0xffffffff else fail("r_mul_ab_s129[191:160]")
+        assert r_mul_ab_s129[223:192] == 0xffffffff else fail("r_mul_ab_s129[223:192]")
+        assert r_mul_ab_s129[255:224] == 0xffffffff else fail("r_mul_ab_s129[255:224]")
+        assert r_mul_ab_s129[257:256] == 0x0 else fail("r_mul_ab_s129[257:256]")
+        assert r_mul_ca_s129[31:0] == 0x0 else fail("r_mul_ca_s129[31:0]")
+        assert r_mul_ca_s129[63:32] == 0x0 else fail("r_mul_ca_s129[63:32]")
+        assert r_mul_ca_s129[95:64] == 0x0 else fail("r_mul_ca_s129[95:64]")
+        assert r_mul_ca_s129[127:96] == 0x0 else fail("r_mul_ca_s129[127:96]")
+        assert r_mul_ca_s129[159:128] == 0x1 else fail("r_mul_ca_s129[159:128]")
+        assert r_mul_ca_s129[191:160] == 0x0 else fail("r_mul_ca_s129[191:160]")
+        assert r_mul_ca_s129[223:192] == 0x0 else fail("r_mul_ca_s129[223:192]")
+        assert r_mul_ca_s129[255:224] == 0x0 else fail("r_mul_ca_s129[255:224]")
+        assert r_mul_ca_s129[257:256] == 0x3 else fail("r_mul_ca_s129[257:256]")
+        // An unsigned difference is its result-width pattern, typed or
+        // inferred, and a width method sees the widened signed sum.
+        let small : uint<8> = 1
+        let big : uint<8> = 255
+        let d9 : uint<9> = small - big
+        assert d9 == 258 else fail("uint<9> difference")
+        let du = small - big
+        assert du == 258 else fail("inferred uint<9> difference")
+        assert (small - big).zext<16>() == 258 else fail("zext of the 9-bit difference")
+        let s100 : sint<8> = 100
+        let s16 : sint<16> = (s100 + s100).sext<16>()
+        assert s16 == 200 else fail("sext of the 9-bit signed sum")
+        let p40 : uint<40> = 0xFFFFFFFFFF
+        let pq = p40 * p40
+        let pq80 : uint<80> = pq
+        assert pq80[79:40] == 0xFFFFFFFFFE else fail("inferred uint<80> product high half")
+        assert pq80[39:0] == 1 else fail("inferred uint<80> product low half")
+        log(info, "PASS: 72 exact ARCH-width results")
+    end run
+end test ArchResultWidthCarryTest

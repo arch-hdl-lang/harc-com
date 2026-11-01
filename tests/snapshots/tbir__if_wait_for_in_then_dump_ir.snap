@@ -78,12 +78,12 @@ fn fn0 run_IfWaitForInThenTest [kind=Run, owner=tb0]
     -> Jump(b6)
 
   b13:
-    Assign(%done_pulses, (%done_pulses + 1))
+    Assign(%done_pulses, (%done_pulses + 1).trunc<32>())
     Assign(%cycles_since_last_done, 0)
     -> Jump(b12)
 
   b14:
-    Assign(%cycles_since_last_done, (%cycles_since_last_done + 1))
+    Assign(%cycles_since_last_done, (%cycles_since_last_done + 1).trunc<32>())
     -> Jump(b12)
 
   b15:

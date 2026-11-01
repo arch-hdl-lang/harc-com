@@ -414,7 +414,9 @@ fn collect_integer_consts(file: &SourceFile) -> BTreeMap<String, IntegerConstSch
     for item in &file.items {
         match item {
             Item::Const(c) => {
-                let Ok(value) = crate::ir::lower::fold_const(&c.value, &values, &c.name.name)
+                // The exact value (constants fold at their ARCH width); the
+                // schema below records its 64-bit carrier view.
+                let Ok(value) = crate::ir::lower::fold_const_exact(&c.value, &values, &c.name.name)
                     .and_then(|value| {
                         crate::ir::lower::check_const_decl_type(c.ty.as_ref(), value)
                             .map_err(crate::ir::lower::ConstFoldErr::Invalid)

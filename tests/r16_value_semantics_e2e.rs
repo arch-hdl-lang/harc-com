@@ -126,7 +126,7 @@ test Values
         let ushr = u8v >> n9
         assert ushr == 0 else fail("uint<8> 0x80 >> 9 = ${ushr}")
         // A width-erased value shifts in its 64-bit carrier.
-        let wide1 = 1 << 40
+        let wide1 : uint<64> = 1 << 40
         assert wide1 == 0x10000000000 else fail("1 << 40")
         // The 65+ tiers are unchanged: they saturate at the declared width.
         let w65 : uint<65> = 1

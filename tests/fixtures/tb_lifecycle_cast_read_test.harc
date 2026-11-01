@@ -26,7 +26,7 @@ scoreboard TbSink
     count : uint<32> default 0
 
     hookable accept(v: uint<8>)
-        count = count + 1
+        count = (count + 1).trunc<32>()
     end accept
 end scoreboard TbSink
 

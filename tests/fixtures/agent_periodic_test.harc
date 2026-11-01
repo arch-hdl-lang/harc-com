@@ -20,7 +20,7 @@ agent Ticker
     beats : uint<32> default 0
 
     on 10 cycles
-        beats = beats + 1
+        beats = (beats + 1).trunc<32>()
         log(info, "[tick ${cycle_count}] beats=${beats}")
     end on
 end agent Ticker
