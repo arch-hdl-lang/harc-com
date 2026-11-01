@@ -149,7 +149,25 @@ impl FuncBuilder<'_> {
         // Upper bound — evaluated once, on loop entry: snapshot it (even a
         // bare local the body may reassign) into a synthesized local so
         // the header re-reads a fixed value.
-        let hi_ir = self.lower_expr_no_ports(hi)?;
+        //
+        // Both bounds resolve in the ENCLOSING scope (spec §7.4), like
+        // `lo` above: `for n in 0 .. n` reads the outer `n`. The loop
+        // variable is already declared (its `lo` assignment must precede
+        // any statements lowering `hi` emits, to keep `lo`-then-`hi`
+        // evaluation order), so hide its binding while `hi` resolves.
+        let hidden = self
+            .scopes
+            .last_mut()
+            .expect("scope stack never empty")
+            .remove(&f.var.name);
+        let hi_ir = self.lower_expr_no_ports(hi);
+        if let Some(id) = hidden {
+            self.scopes
+                .last_mut()
+                .expect("scope stack never empty")
+                .insert(f.var.name.clone(), id);
+        }
+        let hi_ir = hi_ir?;
         self.validate_numeric_expr(&hi_ir, "range upper bound")?;
         let signed_range = lo_signed || self.range_bound_requires_signed(hi, &hi_ir);
         if signed_range
@@ -461,9 +479,31 @@ impl FuncBuilder<'_> {
         ));
         let count_ir = self.lower_expr_no_ports(&r.count)?;
         self.validate_numeric_expr(&count_ir, "repeat count")?;
-        // Same synthesized `uint64_t` counter as `for`, same silent
-        // truncation, same v1 build failure.
-        let count_operand = self.stash_if_impure(count_ir);
+        // A negative repeat count (spec §7.4): a compile-time constant
+        // is rejected; a runtime negative count runs zero iterations.
+        if let Ok(value) = super::fold_const(&r.count, &self.ctx.consts, "") {
+            if value.is_negative() {
+                return Err(LowerError::Invalid(format!(
+                    "`repeat` count is the negative constant {}; a repeat count must be \
+                     non-negative",
+                    value.as_i64()
+                )));
+            }
+        }
+        // A signed count gets a signed counter so `0 < count` compares in
+        // the signed domain: a runtime negative count runs zero
+        // iterations instead of converting to a huge unsigned bound.
+        // Unsigned counts keep the synthesized `uint64_t` counter.
+        let signed_count = self.range_bound_requires_signed(&r.count, &count_ir);
+        if signed_count {
+            self.set_local_type(var, IrType::SInt(None));
+        }
+        let fallback = if signed_count {
+            IrType::SInt(None)
+        } else {
+            IrType::Unknown
+        };
+        let count_operand = self.stash_if_impure_with_fallback(count_ir, fallback);
         let cond = Expr::Binary(
             BinOp::Lt,
             Box::new(Expr::Local(var)),
@@ -1109,15 +1149,6 @@ impl FuncBuilder<'_> {
         Ok(())
     }
 
-    /// Snapshot a loop bound into a synthesized local so it is evaluated
-    /// exactly once, on loop entry. Only literals are left in place: a
-    /// bare local must be copied too, because the body can reassign it
-    /// (`for i in 0 .. n … n = 0`) and the header would otherwise re-read
-    /// the new value every iteration.
-    fn stash_if_impure(&mut self, e: Expr) -> Expr {
-        self.stash_if_impure_with_fallback(e, IrType::Unknown)
-    }
-
     fn range_bound_requires_signed(&self, source: &AstExpr, lowered: &Expr) -> bool {
         matches!(self.expr_type(lowered), Some(IrType::SInt(_)))
             || super::fold_const(source, &self.ctx.consts, "")
@@ -1125,7 +1156,13 @@ impl FuncBuilder<'_> {
                 .unwrap_or(false)
     }
 
-    /// Snapshot a loop bound while preserving its known type. A
+    /// Snapshot a loop bound into a synthesized local so it is evaluated
+    /// exactly once, on loop entry. Only literals are left in place: a
+    /// bare local must be copied too, because the body can reassign it
+    /// (`for i in 0 .. n … n = 0`) and the header would otherwise re-read
+    /// the new value every iteration.
+    ///
+    /// The snapshot preserves the bound's known type. A
     /// numeric range supplies signedness for an otherwise unknown bound so a
     /// cached negative upper bound cannot become an unsigned `uint64_t`.
     fn stash_if_impure_with_fallback(&mut self, e: Expr, fallback: IrType) -> Expr {
