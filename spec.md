@@ -1415,11 +1415,11 @@ Compiles to one coroutine per branch with explicit suspend points at each cycle 
 **Loops.** Four loop forms cover the common cases:
 
 - `for i in lo .. hi ... end for` — bounded count, **inclusive of both `lo` and `hi`** (`i = lo, lo+1, …, hi`, i.e. `hi - lo + 1` iterations), matching ARCH's `..`; `i` available in the body, or `_` when unused. (To repeat exactly `N` times, `for _ in 1 .. N` or `repeat N`; to index an `N`-element structure, `for i in 0 .. N - 1`.)
-- `repeat <expr> ... end repeat` — fixed iteration count; no induction variable.
+- `repeat <expr> ... end repeat` — fixed iteration count; no induction variable. A count that is a negative compile-time constant is a compile error; a count that is negative at run time runs the body zero times.
 - `while <cond> ... end while` — pre-tested loop; the body re-checks `cond` on each iteration.
 - `loop ... end loop` — infinite; exit via `break` (typically inside an `if`).
 
-A `for` range's bounds and a `repeat` count are evaluated **once, on loop entry**; assignments in the body to variables they mention (e.g. `for i in 0 .. n … n = 0`) do not change the iteration count. Only a `while` condition is re-evaluated on every iteration.
+A `for` range's bounds and a `repeat` count are evaluated **once, on loop entry**; assignments in the body to variables they mention (e.g. `for i in 0 .. n … n = 0`) do not change the iteration count. Only a `while` condition is re-evaluated on every iteration. Both bounds of a `for` range are evaluated in the **enclosing** scope: the loop variable is not in scope in its own bounds, so `for n in 0 .. n` iterates up to the outer `n`.
 
 `break` exits the innermost enclosing loop; `continue` skips to its next iteration. Both are statements in their own right and lower to C++ `break` / `continue`, so they also work inside `for` / `repeat` / `loop` bodies.
 
