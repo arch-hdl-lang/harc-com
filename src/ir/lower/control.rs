@@ -481,12 +481,14 @@ impl FuncBuilder<'_> {
         self.validate_numeric_expr(&count_ir, "repeat count")?;
         // A negative repeat count (spec §7.4): a compile-time constant
         // is rejected; a runtime negative count runs zero iterations.
-        if let Ok(value) = super::fold_const(&r.count, &self.ctx.consts, "") {
+        // Judged on the exact constant value (any width), so a count below
+        // the 64-bit range is rejected too rather than escaping the fold.
+        if let Ok(value) = super::fold_const_exact(&r.count, &self.ctx.consts, "") {
             if value.is_negative() {
                 return Err(LowerError::Invalid(format!(
                     "`repeat` count is the negative constant {}; a repeat count must be \
                      non-negative",
-                    value.as_i64()
+                    value.exact
                 )));
             }
         }

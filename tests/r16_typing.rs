@@ -755,3 +755,15 @@ fn covergroup_bin_values_must_fit_a_typed_coverpoint() {
     }
     emit(&src("            low = [0..3]\n            top = {255}")).expect("fitting bins emit");
 }
+
+#[test]
+fn a_negative_constant_repeat_count_is_judged_on_its_exact_value() {
+    // #933's diagnostic, judged on the exact constant at any width.
+    for count in ["-3", "-0x100000000000000000000", "(0 - 1) << 70"] {
+        let err = lower_err(&run_body(
+            "",
+            &format!("        let s : uint<16> = 0\n        repeat {count}\n            s = s +% 1\n        end repeat"),
+        ));
+        assert!(err.contains("`repeat` count is the negative constant -"), "{count}: {err}");
+    }
+}
