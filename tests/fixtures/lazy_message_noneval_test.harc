@@ -1,0 +1,214 @@
+// RUNTIME behavioral coverage for #850 ("Lower lazy message calls through
+// TBIR CFG"): a call or queue-pop that sits UNDER a short-circuit (`&&`/`||`)
+// or ternary (`?:`) operator inside a `fail(...)` / `log(...)` message now
+// lowers the WHOLE capture through a branch-local CFG
+// (`materialize_effectful_fmt_ast_expr`). #850 added only lowering + verifier
+// (compile-level) tests; this fixture proves the lowered code behaves
+// correctly at runtime.
+//
+// The property a MUST-PASS fixture can check is SUCCESS-SIDE NON-EVALUATION:
+// a lazy message capture only renders on the failure side of an assert, so
+// when the assert PASSES the call/pop under the short circuit must NOT run.
+// Each assert case asserts a side-effect counter / queue length is exactly
+// what it would be if the capture never evaluated.
+//
+// `log(...)` routes through the same materialize path (lower_fmt_hoisting ->
+// lower_fmt_impl -> materialize_effectful_fmt_ast_expr), but a `log` message
+// is UNCONDITIONAL — it always renders. So the `log` cases test the
+// complementary half at runtime with real teeth:
+//   * SKIPPED side (`true || f()`, `false && f()`, `true ? 7 : f()`): the
+//     message renders but the short circuit means the call still does NOT run.
+//   * TAKEN side (`false || f()`, `true && f()`, `false ? 7 : f()`): the call
+//     DOES run, exactly once, through the branch-local CFG.
+// The taken-side cases prove the capture genuinely lowers and executes the
+// call through the CFG; a passing assert alone cannot show that.
+//
+// The failure-side ordering half (the call stays on the unselected branch) is
+// covered by the three #850 lowering tests in tests/tbir.rs:
+//   component_call_in_message_stays_in_the_failure_branch,
+//   signed_transactor_result_in_message_retains_declared_type,
+//   a_nested_pop_preserves_short_circuit_laziness.
+//
+// Callee kinds exercised (all #850-relevant, all classified conditional-
+// hoistable by fmt_outer_call_needs_hoist): agent/component method,
+// agent-owned queue pop, scoreboard queue pop, transactor method. Each is a
+// Field callee on a named instance. (Two further conditional-in-message
+// callee shapes — a BARE testbench-method call and a testbench-OWNED queue
+// pop — currently fail to lower through this path; see the PR body. They are
+// out of scope for this fixture, not exercised here.) Pure free helpers are
+// deliberately NOT used: they lower to plain C++ functions and never reach
+// the materialize path, so they would be a false-positive test.
+//
+// DUT is the counter `Top` (tests/dut/top_counter.sv); it is reset but its
+// state is incidental — every observable side effect lives in agent /
+// scoreboard / transactor state so the asserts are self-checking. Separate
+// agent instances per operator keep each expected value trivial (0 when
+// skipped, the single call's tag when taken).
+// Every assert passes => the run ends with ALL TESTS PASSED behavior.
+
+domain SysDomain
+    freq_mhz: 100
+end domain SysDomain
+
+// Agent with an impure method: `step` mutates `value` and returns it, so a
+// call is observable through `value` (0 if never called, `tag` after one call
+// on a fresh instance).
+agent NonEvalModel
+    value : uint<32> = 0
+    function step(tag: uint<8>) -> uint<32>
+        value = value * 10 + tag
+        return value
+    end function step
+end agent NonEvalModel
+
+// Agent that owns a queue, to exercise the agent-owned queue-pop shape.
+agent NonEvalQueueModel
+    q : queue<uint<8>>
+end agent NonEvalQueueModel
+
+// Scoreboard queue owner.
+scoreboard NonEvalSb
+    q : queue<uint<8>>
+end scoreboard NonEvalSb
+
+// Transactor with an impure bound method: `readv` bumps `calls`.
+transactor NonEvalXactor
+    dut : Top
+    calls : uint<8> default 0
+
+    when active
+        hookable readv() -> bool
+            calls = calls + 1
+            return true
+        end readv
+    end when
+end transactor NonEvalXactor
+
+testbench LazyMessageNonEvalTb
+    dut : Top
+    m_or : NonEvalModel
+    m_and : NonEvalModel
+    m_tern : NonEvalModel
+    m_wait : NonEvalModel
+    mq : NonEvalQueueModel
+    sb : NonEvalSb
+    xact : NonEvalXactor active
+end testbench LazyMessageNonEvalTb
+
+impl LazyMessageNonEvalTest for LazyMessageNonEvalTb
+    clock clk = SysDomain
+
+    run
+        xact.dut = dut
+        dut.rst = 1
+        dut.en = 0
+        wait 2 cycles
+        dut.rst = 0
+        wait 1 cycle
+
+        // ================= Agent/component method =================
+        // ---- `||` operator ----
+        // Passing assert: `true ||` short-circuits AND the message is on the
+        // dead failure arm, so step() never runs.
+        assert true else fail("skip_or=${true || m_or.step(2) != 0}")
+        assert m_or.value == 0 else fail("assert || message ran step: value=${m_or.value}")
+        // log taken side: `false ||` evaluates the RHS, so step(3) runs once.
+        log(info, "take_or=${false || m_or.step(3) != 0}")
+        assert m_or.value == 3 else fail("log || taken side did not run step once: value=${m_or.value}")
+        // log SKIPPED side — the #850-discriminating case. The message RENDERS
+        // (a log always renders), but `true ||` short-circuits, so step() still
+        // does NOT run and value stays at the taken-side result. A regression
+        // that evaluated both arms of a rendered capture (short-circuit lost,
+        // render-gate intact) would bump value to 3*10+9=39 and trip this.
+        log(info, "skip_log_or=${true || m_or.step(9) != 0}")
+        assert m_or.value == 3 else fail("log || skipped side ran step: value=${m_or.value}")
+
+        // ---- `&&` operator ----
+        // Passing assert: `false &&` short-circuits; step() never runs.
+        assert true else fail("skip_and=${false && m_and.step(2) != 0}")
+        assert m_and.value == 0 else fail("assert && message ran step: value=${m_and.value}")
+        // log taken side: `true &&` evaluates the RHS, so step(4) runs once.
+        log(info, "take_and=${true && m_and.step(4) != 0}")
+        assert m_and.value == 4 else fail("log && taken side did not run step once: value=${m_and.value}")
+        // log SKIPPED side: the message renders, `false &&` short-circuits, so
+        // step() does NOT run — value stays 4 (would be 4*10+9=49 if broken).
+        log(info, "skip_log_and=${false && m_and.step(9) != 0}")
+        assert m_and.value == 4 else fail("log && skipped side ran step: value=${m_and.value}")
+
+        // ---- `?:` operator (parenthesized, explicit `:d` so `:` is not read
+        //      as the format-spec separator) ----
+        // Passing assert: the ternary selects the constant, not the call.
+        assert true else fail("skip_tern=${(true ? 7 : m_tern.step(2)):d}")
+        assert m_tern.value == 0 else fail("assert ?: message ran step: value=${m_tern.value}")
+        // log taken side: `false ?:` selects the call branch, so step(5) runs.
+        log(info, "take_tern=${(false ? 7 : m_tern.step(5)):d}")
+        assert m_tern.value == 5 else fail("log ?: taken side did not run step once: value=${m_tern.value}")
+        // log SKIPPED side: the message renders, the ternary selects the
+        // constant, so step() does NOT run — value stays 5 (5*10+9=59 if broken).
+        log(info, "skip_log_tern=${(true ? 7 : m_tern.step(9)):d}")
+        assert m_tern.value == 5 else fail("log ?: skipped side ran step: value=${m_tern.value}")
+
+        // ================= Scoreboard queue pop =================
+        sb.q.push(7)
+        sb.q.push(8)
+        // Passing assert: pop must not run, so size stays 2.
+        assert true else fail("skip_sb_pop=${true || sb.q.pop() == 7}")
+        assert sb.q.size() == 2 else fail("assert message popped scoreboard queue: size=${sb.q.size()}")
+        // log SKIPPED side: the message renders but `true ||` short-circuits,
+        // so the pop does NOT run — size stays 2 (would be 1 if broken).
+        log(info, "skip_log_sb_pop=${true || sb.q.pop() == 7}")
+        assert sb.q.size() == 2 else fail("log skipped side popped scoreboard queue: size=${sb.q.size()}")
+        // log taken side: pop runs once (FIFO front 7 consumed), size -> 1.
+        log(info, "take_sb_pop=${false || sb.q.pop() == 7}")
+        assert sb.q.size() == 1 else fail("log taken side did not pop scoreboard queue once: size=${sb.q.size()}")
+        assert sb.q.pop() == 8 else fail("scoreboard queue FIFO order disturbed")
+
+        // ================= Agent-owned queue pop =================
+        mq.q.push(5)
+        mq.q.push(6)
+        // Passing assert: pop must not run, so size stays 2.
+        assert true else fail("skip_mq_pop=${true || mq.q.pop() == 5}")
+        assert mq.q.size() == 2 else fail("assert message popped agent queue: size=${mq.q.size()}")
+        // log SKIPPED side: the message renders but `true ||` short-circuits,
+        // so the pop does NOT run — size stays 2 (would be 1 if broken).
+        log(info, "skip_log_mq_pop=${true || mq.q.pop() == 5}")
+        assert mq.q.size() == 2 else fail("log skipped side popped agent queue: size=${mq.q.size()}")
+        // log taken side: pop runs once, size -> 1.
+        log(info, "take_mq_pop=${false || mq.q.pop() == 5}")
+        assert mq.q.size() == 1 else fail("log taken side did not pop agent queue once: size=${mq.q.size()}")
+        assert mq.q.pop() == 6 else fail("agent queue FIFO order disturbed")
+
+        // ================= Transactor method =================
+        // Skipped only: a taken transactor method call can advance simulated
+        // time; non-evaluation is the property to pin here. `true ||` keeps
+        // readv() on the unselected branch, and the passing assert keeps the
+        // whole message off the failure arm, so readv() never runs.
+        assert true else fail("skip_xact=${true || xact.readv()}")
+        assert xact.calls == 0 else fail("assert message ran transactor method: calls=${xact.calls}")
+        // log SKIPPED side: the message renders but `true ||` short-circuits,
+        // so readv() still does NOT run (and so cannot advance time) — calls
+        // stays 0 (would be 1 if the rendered capture evaluated both arms).
+        log(info, "skip_log_xact=${true || xact.readv()}")
+        assert xact.calls == 0 else fail("log skipped side ran transactor method: calls=${xact.calls}")
+
+        // ============ wait-until timeout fail message ============
+        // The `wait until ... timeout N fail(...)` message is a fourth entry
+        // point to the materialize path (lower_threads/control.rs ->
+        // lower_fmt_hoisting). The predicate (count_out >= 0, always true) fires
+        // on the first evaluation, so the timeout arm — and its message — never
+        // render, and the conditional capture never runs: m_wait stays 0. Same
+        // success-side render-gate class as the passing-assert cases, but for a
+        // distinct message site.
+        wait until dut.count_out >= 0 timeout 3 cycles fail("wait_to=${true || m_wait.step(2) != 0}")
+        assert m_wait.value == 0 else fail("wait-until timeout message ran step: value=${m_wait.value}")
+
+        // NOTE: deliberately no `log(info, "ALL TESTS PASSED")` here. The sim
+        // harness (tests/run_fixtures.sh) greps its whole output for the
+        // substring "ALL TESTS PASSED", and the runtime emits that verdict
+        // ITSELF only when no assert/fail fired. Echoing the literal string
+        // from a `log` would print it even on a failing run, masking a real
+        // regression — so this fixture keeps its teeth by letting the runtime
+        // own the verdict.
+        wait 1 cycle
+    end run
+end impl LazyMessageNonEvalTest
