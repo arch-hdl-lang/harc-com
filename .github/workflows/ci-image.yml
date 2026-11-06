@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main, codex/ci-fixture-shards]
-    paths: [ci/Dockerfile, ci/smoke.sh, .github/workflows/ci-image.yml]
+    paths: [ci/Dockerfile, ci/smoke.sh, ci/smoke-lean.sh, .github/workflows/ci-image.yml]
 
 permissions:
   contents: read
@@ -17,6 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       IMAGE: ghcr.io/arch-hdl-lang/harc-ci:verilator-5.034-rust-1.94.0-${{ github.sha }}
+      # Same package, separate tag: base image + Lean toolchain (arch-com proofs).
+      LEAN_IMAGE: ghcr.io/arch-hdl-lang/harc-ci:lean-4.30.0-verilator-5.034-rust-1.94.0-${{ github.sha }}
     steps:
       - uses: actions/checkout@v6
       - name: Log in to GHCR
@@ -24,7 +26,7 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
       - name: Build image
-        run: docker build --platform linux/amd64 -f ci/Dockerfile -t "$IMAGE" ci
+        run: docker build --platform linux/amd64 -f ci/Dockerfile --target base -t "$IMAGE" ci
       - name: Smoke-test toolchain
         run: |
           docker run --rm -v "$PWD/ci:/ci:ro" "$IMAGE" bash /ci/smoke.sh
@@ -36,9 +38,20 @@ jobs:
           docker manifest inspect "$IMAGE" > image-manifest.json
           python3 -c 'import json; m=json.load(open("image-manifest.json")); print("Compressed image layers: %.1f MiB" % (sum(x["size"] for x in m["layers"]) / 1024**2))' | tee image-size.txt
           cat image-size.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Build Lean image
+        run: docker build --platform linux/amd64 -f ci/Dockerfile --target lean -t "$LEAN_IMAGE" ci
+      - name: Smoke-test Lean toolchain
+        run: |
+          docker run --rm -v "$PWD/ci:/ci:ro" "$LEAN_IMAGE" bash /ci/smoke-lean.sh
+      - name: Publish Lean image and record digest
+        run: |
+          docker push "$LEAN_IMAGE"
+          docker inspect --format='{{index .RepoDigests 0}}' "$LEAN_IMAGE" | tee lean-image-digest.txt
+          echo "Lean image: $(cat lean-image-digest.txt)" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
           name: ci-image-digest
           path: |
             image-digest.txt
             image-size.txt
+            lean-image-digest.txt
