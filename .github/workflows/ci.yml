@@ -68,15 +68,20 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Set up Python for MCP smoke
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
+      - name: Set up container Python for MCP smoke
+        # setup-python selects a build for the host runner OS, which can differ
+        # from this pinned container and leave Python unable to load SSL.
+        # Use the container distribution's Python and an isolated pip environment.
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y python3-venv
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/harc-mcp-venv"
+          "$RUNNER_TEMP/harc-mcp-venv/bin/python" -c 'import ssl; print(ssl.OPENSSL_VERSION)'
 
       - name: MCP stdio graph smoke
         run: |
-          python3 -m pip install -r mcp/requirements.txt
-          python3 tools/smoke_codegraph_mcp_stdio.py --harc ./target/release/harc
+          "$RUNNER_TEMP/harc-mcp-venv/bin/python" -m pip install -r mcp/requirements.txt
+          "$RUNNER_TEMP/harc-mcp-venv/bin/python" tools/smoke_codegraph_mcp_stdio.py --harc ./target/release/harc
 
   parse-fixtures:
     # Every fixture must round-trip parse + check cleanly. This catches
