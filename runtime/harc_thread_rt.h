@@ -1723,6 +1723,9 @@ struct ThreadScheduler {
         while (changed) {
             changed = false;
             for (size_t i = 0; i < slots.size(); ++i) {
+                // Callbacks can append scheduler slots during this sweep.
+                if (resumed.size() < slots.size())
+                    resumed.resize(slots.size(), false);
                 if (slots[i] == excluded) continue;
                 if (slots[i]->kind == WaitKind::Ready && !resumed[i]) {
                     resumed[i] = true;
@@ -1732,6 +1735,9 @@ struct ThreadScheduler {
                 }
             }
             for (size_t i = 0; i < slots.size(); ++i) {
+                // Callbacks can append scheduler slots during this sweep.
+                if (resumed.size() < slots.size())
+                    resumed.resize(slots.size(), false);
                 if (slots[i] == excluded) continue;
                 if (!resumed[i] && slots[i]->kind == WaitKind::WaitUntil) {
                     if (slots[i]->pred && slots[i]->pred()) {
