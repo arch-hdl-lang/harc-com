@@ -13273,34 +13273,61 @@ end test StableB"#,
     let expected = vec![
         (
             "stable__suite_api.hpp".to_string(),
-            "cc94ade36195021f".to_string(),
+            "c8d50d6162b45a86".to_string(),
         ),
         (
             "stable__runtime.cpp".to_string(),
-            "2460d205c27224f3".to_string(),
+            "feeab555b97bfc4a".to_string(),
         ),
         (
             "stable__test_StableA.cpp".to_string(),
-            "312dd7ae04e59408".to_string(),
+            "e08ba56260e13286".to_string(),
         ),
         (
             "stable__test_StableB.cpp".to_string(),
-            "0f9d7022e37ca5ec".to_string(),
+            "b77c32bbe549c062".to_string(),
         ),
         (
             "stable__registry.cpp".to_string(),
-            "21a6f59c72b1c1f0".to_string(),
+            "f9364d1aa90ce4b4".to_string(),
         ),
     ];
     assert_eq!(actual, expected);
-    assert_eq!(output.interface_abi, "8293cdb865955310");
+    // Runtime header bytes are part of the interface ABI by design.
+    // Independently reconstruct the canonical ABI input so a runtime-only
+    // change does not require guessing the new anchor from file hashes.
+    let mut runtime = String::from("harc-common-runtime-abi-v1\n");
+    for (name, contents) in [
+        ("harc_thread_rt.h", include_str!("../runtime/harc_thread_rt.h")),
+        ("harc_random_rt.h", include_str!("../runtime/harc_random_rt.h")),
+        ("harc_queue_rt.h", include_str!("../runtime/harc_queue_rt.h")),
+        ("harc_trace_rt.h", include_str!("../runtime/harc_trace_rt.h")),
+        ("harc_log_rt.h", include_str!("../runtime/harc_log_rt.h")),
+        ("harc_z3_rt.h", include_str!("../runtime/harc_z3_rt.h")),
+    ] {
+        runtime.push_str(&format!("{name}={}\n", independent_fnv1a_hex(contents.as_bytes())));
+    }
+    let header = &output.files[0].contents;
+    let interface = header
+        .split_once("// === iface-begin ===")
+        .unwrap()
+        .1
+        .split_once("// === iface-end ===")
+        .unwrap()
+        .0;
+    let canonical = format!(
+        "harc-common-interface-abi-v2\nmanifest_schema=2\nbackend=v1\nlayout=common\nabi_input=runtime_abi={}\n{interface}",
+        independent_fnv1a_hex(runtime.as_bytes())
+    );
+    let expected_abi = independent_fnv1a_hex(canonical.as_bytes());
+    assert_eq!(output.interface_abi, expected_abi);
     assert_eq!(output.build_profile, "f11cada50936fa42");
     assert_eq!(
         output
             .artifact_plan
             .render_manifest(&output.interface_abi, &output.build_profile)
             .expect("render stable manifest"),
-        "{\"schema_version\":1,\"interface_abi\":\"8293cdb865955310\",\"build_profile\":\"f11cada50936fa42\",\"tests\":[\"StableA\",\"StableB\"],\"artifacts\":[\"stable__suite_api.hpp\",\"stable__runtime.cpp\",\"stable__test_StableA.cpp\",\"stable__test_StableB.cpp\",\"stable__registry.cpp\",\"harc_thread_rt.h\",\"harc_random_rt.h\",\"harc_queue_rt.h\",\"harc_trace_rt.h\",\"harc_log_rt.h\",\"harc_z3_rt.h\"]}\n"
+        "{\"schema_version\":1,\"interface_abi\":\"8293cdb865955310\",\"build_profile\":\"f11cada50936fa42\",\"tests\":[\"StableA\",\"StableB\"],\"artifacts\":[\"stable__suite_api.hpp\",\"stable__runtime.cpp\",\"stable__test_StableA.cpp\",\"stable__test_StableB.cpp\",\"stable__registry.cpp\",\"harc_thread_rt.h\",\"harc_random_rt.h\",\"harc_queue_rt.h\",\"harc_trace_rt.h\",\"harc_log_rt.h\",\"harc_z3_rt.h\"]}\n".replace("8293cdb865955310", &expected_abi)
     );
 }
 
