@@ -17,7 +17,7 @@ HarcThread parent(ThreadScheduler& scheduler, ThreadSlot* children, int& count) 
     }
     co_return;
 }
-int main() {
+void resume_growth() {
     ThreadScheduler scheduler;
     int count = 0;
     ThreadSlot children[300], root;
@@ -27,4 +27,40 @@ int main() {
     assert(count == 300);
     scheduler.tick();
     assert(count == 600 && scheduler.all_done());
+}
+
+void predicate_growth() {
+    ThreadScheduler scheduler;
+    int count = 0;
+    ThreadSlot children[300], root, trigger;
+    bool ready = false;
+    bool appended = false;
+    auto enable = [](bool& flag) -> HarcThread {
+        flag = true;
+        co_return;
+    };
+    root.thread = enable(ready);
+    trigger.kind = WaitKind::WaitUntil;
+    trigger.pred = [&] {
+        // Pass 1 sees false; only the fixed-point predicate sweep grows.
+        if (ready && !appended) {
+            appended = true;
+            for (int i = 0; i < 300; ++i) {
+                children[i].thread = child(&children[i], count);
+                scheduler.slots.push_back(&children[i]);
+            }
+        }
+        return ready;
+    };
+    trigger.thread = enable(ready);
+    scheduler.slots = {&root, &trigger};
+    scheduler.tick();
+    assert(appended && count == 300);
+    scheduler.tick();
+    assert(count == 600 && scheduler.all_done());
+}
+
+int main() {
+    resume_growth();
+    predicate_growth();
 }
